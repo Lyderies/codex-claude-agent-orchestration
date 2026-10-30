@@ -55,6 +55,8 @@ class LearningCliTests(unittest.TestCase):
         self.state_root = base / "state"
         self.project = base / "project"
         self.project.mkdir()
+        # Routing needs a repository to prove no provider configuration is committed.
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
         state = LearningState(self.state_root)
         authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
         self.owner_private_key, owner_public_key = generate_test_owner_key(base)

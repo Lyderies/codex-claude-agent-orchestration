@@ -173,6 +173,7 @@ def validate_task(data: Any) -> dict[str, Any]:
         "required_capabilities",
         "prohibited_actions",
         "verification_for_family",
+        "verification_for_provider",
     }
     _required(data, required, "task")
     unknown = sorted(data.keys() - allowed)
@@ -193,6 +194,16 @@ def validate_task(data: Any) -> dict[str, Any]:
             or verification_for_family not in TASK_FAMILIES - {"verification"}
         ):
             raise ContractError("verification_for_family is unsupported")
+    verification_for_provider = data.get("verification_for_provider")
+    if verification_for_provider is not None:
+        if data["family"] != "verification":
+            raise ContractError(
+                "verification_for_provider is valid only for verification tasks"
+            )
+        if not isinstance(verification_for_provider, str) or (
+            verification_for_provider not in {"codex", "claude"}
+        ):
+            raise ContractError("verification_for_provider is unsupported")
     if not isinstance(data["complexity"], str) or data["complexity"] not in COMPLEXITIES:
         raise ContractError(f"unsupported complexity: {data['complexity']}")
     if not isinstance(data["risk"], str) or data["risk"] not in RISKS:

@@ -29,6 +29,7 @@ from typing import Any
 
 import tomllib
 
+from .catalog import CLAUDE_READ_ONLY_TOOLS, CatalogError, parse_claude_agent
 from .contracts import (
     ContractError,
     result_axes,
@@ -41,11 +42,13 @@ from .learning_contracts import (
     CANDIDATE_EFFECTS,
     CANDIDATE_TARGETS,
     CORPUS_STATES,
+    SUPPORTED_MODELS,
     canonical_json,
     content_digest,
     external_id,
     keyed_digest,
     parse_bounded_json_value,
+    provider_for_model,
     validate_canary_report,
     validate_candidate,
     validate_comparison,
@@ -62,6 +65,7 @@ from .learning_contracts import (
     validate_promotion,
     validate_qa_evidence,
 )
+from .routing import provider_model_allowed
 
 COMPARISON_MIN_CASES = 20
 MATERIAL_IMPROVEMENT = 0.10
@@ -72,7 +76,12 @@ GRADER_MIN_SWAP_STABILITY = 0.95
 RUNTIME_BOUND_CANDIDATE_PATHS = {"routing.model_effort"}
 
 
-def _read_managed_bytes(root: Path, relative: str) -> bytes:
+def _read_managed_bytes(
+    root: Path,
+    relative: str,
+    *,
+    allowed_roots: frozenset[str] = frozenset({".agents", ".codex"}),
+) -> bytes:
     """Read one package file through no-follow descriptors."""
 
     path = Path(relative)
@@ -80,7 +89,7 @@ def _read_managed_bytes(root: Path, relative: str) -> bytes:
         path.is_absolute()
         or not path.parts
         or any(part in {"", ".", ".."} for part in path.parts)
-        or path.parts[0] not in {".agents", ".codex"}
+        or path.parts[0] not in allowed_roots
     ):
         raise ContractError("installed package manifest contains an unsafe path")
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -218,6 +227,50 @@ def _installed_managed_files(root: Path) -> tuple[list[str], dict[str, bytes]]:
     return paths, contents
 
 
+CLAUDE_SKILL_PATH = ".claude/skills/claude-agents/SKILL.md"
+# Mirrors the router's default; only a committed project configuration changes it.
+DEFAULT_PROVIDER_CONFIG_DIGEST = content_digest(
+    {
+        "version": 1,
+        "providers": {"codex": {"enabled": True}, "claude": {"enabled": False}},
+        "codex_primary_may_bridge_to_claude": False,
+    }
+)
+
+
+def _claude_agent_definition(raw: bytes) -> tuple[dict[str, Any], str]:
+    """Parse one Claude agent with the discovery parser and require read-only tools."""
+
+    try:
+        metadata, prompt = parse_claude_agent(raw)
+    except CatalogError as exc:
+        raise ContractError(f"installed Claude agent is invalid: {exc}") from exc
+    if not set(metadata["tools"]) <= CLAUDE_READ_ONLY_TOOLS:
+        raise ContractError("installed Claude agent must use read-only tools")
+    return metadata, prompt
+
+
+def _claude_agent_artifacts(
+    root: Path, route: dict[str, Any], agent_type: str
+) -> tuple[bytes, str, dict[str, bytes]]:
+    agent_relative = f".claude/agents/{agent_type}.md"
+    if route.get("agent_path", agent_relative) != agent_relative:
+        raise ContractError("Claude agent path is invalid")
+    claude_roots = frozenset({".claude"})
+    agent_bytes = _read_managed_bytes(root, agent_relative, allowed_roots=claude_roots)
+    if len(agent_bytes) > 1_048_576:
+        raise ContractError("installed Claude agent is too large")
+    metadata, prompt = _claude_agent_definition(agent_bytes)
+    if metadata["name"] != agent_type:
+        raise ContractError("installed agent identity does not match route")
+    skill_contents: dict[str, bytes] = {}
+    if os.path.lexists(root / CLAUDE_SKILL_PATH):
+        skill_contents[CLAUDE_SKILL_PATH] = _read_managed_bytes(
+            root, CLAUDE_SKILL_PATH, allowed_roots=claude_roots
+        )
+    return agent_bytes, prompt, skill_contents
+
+
 def installed_execution_configuration(
     bundle_root: Path,
     route: dict[str, Any],
@@ -232,6 +285,29 @@ def installed_execution_configuration(
     if not isinstance(role, str) or not isinstance(agent_type, str):
         raise ContractError("route role is invalid")
     policy_relative = ".codex/orchestration/config/routing-policy.json"
+    provider = route.get("provider", "codex")
+    if provider == "claude":
+        try:
+            package_paths, package_contents = _installed_managed_files(root)
+            policy_bytes = package_contents[policy_relative]
+        except (KeyError, OSError) as exc:
+            raise ContractError("installed execution artifacts are unavailable") from exc
+        agent_bytes, prompt, skill_contents = _claude_agent_artifacts(
+            root, route, agent_type
+        )
+        return _execution_configuration_record(
+            route,
+            role=role,
+            package_paths=package_paths,
+            package_contents=package_contents,
+            policy_bytes=policy_bytes,
+            agent_bytes=agent_bytes,
+            skill_contents=skill_contents,
+            prompt=prompt,
+            client_capability=client_capability,
+        )
+    if provider != "codex":
+        raise ContractError("route provider is invalid")
     routed_agent_path = route.get("agent_path")
     if routed_agent_path is None:
         agent_relative = f".codex/agents/{agent_type}.toml"
@@ -278,6 +354,31 @@ def installed_execution_configuration(
     prompt = agent.get("developer_instructions")
     if agent.get("name") != agent_type:
         raise ContractError("installed agent identity does not match route")
+    return _execution_configuration_record(
+        route,
+        role=role,
+        package_paths=package_paths,
+        package_contents=package_contents,
+        policy_bytes=policy_bytes,
+        agent_bytes=agent_bytes,
+        skill_contents={path: skill_contents[path] for path in skill_paths},
+        prompt=prompt,
+        client_capability=client_capability,
+    )
+
+
+def _execution_configuration_record(
+    route: dict[str, Any],
+    *,
+    role: str,
+    package_paths: list[str],
+    package_contents: dict[str, bytes],
+    policy_bytes: bytes,
+    agent_bytes: bytes,
+    skill_contents: dict[str, bytes],
+    prompt: Any,
+    client_capability: dict[str, Any],
+) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt:
         raise ContractError("installed agent prompt is unavailable")
     manifest = [
@@ -300,6 +401,19 @@ def installed_execution_configuration(
         policy_digest = content_digest(
             {"routing_policy": policy_digest, "project_agent_mapping": mapping_digest}
         )
+    provider_digest = route.get("provider_config_digest", DEFAULT_PROVIDER_CONFIG_DIGEST)
+    if provider_digest != DEFAULT_PROVIDER_CONFIG_DIGEST:
+        # Only a committed provider configuration changes the replay binding, so
+        # Codex-only projects keep their existing execution digests.
+        if (
+            not isinstance(provider_digest, str)
+            or len(provider_digest) != 64
+            or any(character not in "0123456789abcdef" for character in provider_digest)
+        ):
+            raise ContractError("provider configuration digest is invalid")
+        policy_digest = content_digest(
+            {"routing_policy": policy_digest, "provider_routing": provider_digest}
+        )
     return validate_execution_configuration(
         {
             "model": route["model"],
@@ -317,8 +431,8 @@ def installed_execution_configuration(
             "policy_digest": policy_digest,
             "agent_digest": hashlib.sha256(agent_bytes).hexdigest(),
             "skill_digests": sorted(
-                hashlib.sha256(skill_contents[path]).hexdigest()
-                for path in skill_paths
+                hashlib.sha256(content).hexdigest()
+                for content in skill_contents.values()
             ),
             "prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "client_digest": content_digest(client_capability),
@@ -3007,7 +3121,13 @@ def validate_runtime_candidate(
         raise ContractError("installed routing policy has no model authority")
     for label in ("champion_configuration", "candidate_configuration"):
         configuration = checked[label]
-        efforts = models.get(configuration["model"])
+        provider = provider_for_model(configuration["model"])
+        provider_models = (
+            models
+            if provider == "codex"
+            else policy.get("providers", {}).get(provider, {}).get("models", {})
+        )
+        efforts = provider_models.get(configuration["model"])
         if (
             not isinstance(efforts, list)
             or configuration["effort"] not in efforts
@@ -3040,6 +3160,16 @@ def apply_candidate_to_route(
         if path == "routing.model_effort":
             if {"model": result["model"], "effort": result["effort"]} != before:
                 raise ContractError("candidate base does not match the routed configuration")
+            route_provider = result.get("provider", "codex")
+            if provider_for_model(after["model"]) != route_provider:
+                raise ContractError(
+                    "learning candidates must not move a route to another provider"
+                )
+            if not provider_model_allowed(policy, route_provider, after["model"]):
+                raise ContractError(
+                    "learning candidate model is not allowed by the project provider "
+                    "configuration"
+                )
             if (
                 after["model"] == "gpt-6-astra"
                 and result.get("reason") != "hard_end_to_end_evidence"
@@ -3141,10 +3271,9 @@ def calibrate_grader(
     }
     if not isinstance(configuration, dict) or set(configuration) != expected_configuration:
         raise ContractError("grader configuration must use the closed field set")
-    if configuration["model"] not in {
-        "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol",
-        "gpt-6-luna", "gpt-6-sol", "gpt-6-astra"
-    } or configuration["effort"] not in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+    if configuration["model"] not in SUPPORTED_MODELS or configuration["effort"] not in {
+        "low", "medium", "high", "xhigh", "max", "ultra"
+    }:
         raise ContractError("grader model or effort is unsupported")
     for field in (
         "prompt_digest", "rubric_digest", "drift_digest", "owner_override_digest"

@@ -152,7 +152,7 @@ def assignment() -> dict:
         "task_id": "task-1",
         "objective": "Read one fixture",
         "role": "codex_agents_researcher",
-        "model": "gpt-6-sol",
+        "model": "gpt-6.1-sol",
         "effort": "medium",
         "attempt": 1,
         "meaningful": True,

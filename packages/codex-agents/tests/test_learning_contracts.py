@@ -7,6 +7,7 @@ from codex_agents.contracts import ContractError
 from codex_agents.learning_contracts import (
     candidate_digest,
     parse_bounded_json,
+    provider_for_model,
     validate_candidate,
     validate_host_observation,
     validate_learning_record,
@@ -15,6 +16,29 @@ from tests.learning_support import candidate, event_record, verification_outcome
 
 
 class LearningContractTests(unittest.TestCase):
+    def test_provider_is_derived_from_the_model(self) -> None:
+        self.assertEqual("codex", provider_for_model("gpt-6.1-sol"))
+        self.assertEqual("claude", provider_for_model("claude-opus-5-5"))
+        for model in ("gemini-3", "", None):
+            with self.subTest(model=model), self.assertRaisesRegex(
+                ContractError, "supported provider"
+            ):
+                provider_for_model(model)
+
+    def test_records_reject_a_model_and_role_from_different_providers(self) -> None:
+        outcome = verification_outcome()
+        outcome["model"] = "claude-opus-5-5"
+        with self.assertRaisesRegex(ContractError, "different providers"):
+            validate_learning_record(outcome)
+        outcome = verification_outcome()
+        outcome["role"] = "claude_agents_verification_worker"
+        with self.assertRaisesRegex(ContractError, "different providers"):
+            validate_learning_record(outcome)
+        event = event_record()
+        event.update(model="claude-haiku-5-5", role="codex_agents_researcher")
+        with self.assertRaisesRegex(ContractError, "different providers"):
+            validate_learning_record(event)
+
     def test_host_observation_accepts_one_bounded_contract_repair(self) -> None:
         observation = {
             "run_id": "run_1",

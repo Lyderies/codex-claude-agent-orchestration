@@ -260,11 +260,12 @@ def _validated_assignment(args: argparse.Namespace) -> dict:
                 task,
                 policy,
                 trusted_routing_evidence_refs=trusted,
+                primary_provider=_host_primary_provider(),
             )
         finally:
             _close_ledger(ledger)
     else:
-        route = route_task(task, policy)
+        route = route_task(task, policy, primary_provider=_host_primary_provider())
     return validate_assignment(
         _json_input(args.assignment),
         task=task,
@@ -274,6 +275,16 @@ def _validated_assignment(args: argparse.Namespace) -> dict:
 
 
 TRUSTED_HOST_CLIENT = "codex-host-v1"
+# The primary provider follows the trusted host client and never the task. A
+# Claude host client adds its own entry here.
+HOST_CLIENT_PRIMARY_PROVIDERS = {"codex-host-v1": "codex"}
+
+
+def _host_primary_provider(client: str = TRUSTED_HOST_CLIENT) -> str:
+    provider = HOST_CLIENT_PRIMARY_PROVIDERS.get(client)
+    if provider is None:
+        raise ContractError("host client has no trusted primary provider")
+    return provider
 
 
 def _trusted_host_route(
@@ -296,6 +307,7 @@ def _trusted_host_route(
         task,
         policy,
         trusted_routing_evidence_refs=trusted,
+        primary_provider=_host_primary_provider(),
     )
     clients = load_client_capabilities(
         ORCHESTRATION_ROOT / "config" / "learning-clients.json"
@@ -334,7 +346,10 @@ def _trusted_host_route(
         client_version=TRUSTED_HOST_CLIENT,
     )
     route = _route_task_legacy_fallback(
-        task, policy, trusted_routing_evidence_refs=trusted
+        task,
+        policy,
+        trusted_routing_evidence_refs=trusted,
+        primary_provider=_host_primary_provider(),
     )
     route["fallback"]["receipt_id"] = fallback_receipt
     route["fallback"]["authorization_digest"] = fallback_authorization[
@@ -871,6 +886,7 @@ def main() -> int:
                     args.policy,
                     ORCHESTRATION_ROOT / "config" / "discovery-policy.json",
                 ),
+                primary_provider=_host_primary_provider(),
             )
         elif args.command == "learning-route":
             task = _json_input(args.task)
@@ -895,6 +911,7 @@ def main() -> int:
                     task,
                     policy,
                     trusted_routing_evidence_refs=trusted,
+                    primary_provider=_host_primary_provider(),
                 )
                 configuration = installed_execution_configuration(
                     BUNDLE_ROOT, base_route, client_capability=clients[client_version]
@@ -931,6 +948,7 @@ def main() -> int:
                         task,
                         policy,
                         trusted_routing_evidence_refs=trusted,
+                        primary_provider=_host_primary_provider(),
                     )
                     report["fallback"]["receipt_id"] = receipt["receipt_id"]
                     report["fallback"]["authorization_digest"] = receipt[
@@ -981,7 +999,10 @@ def main() -> int:
                 )
                 trusted = ledger.trusted_routing_evidence_refs(project_id, task)
                 report = route_task(
-                    task, policy, trusted_routing_evidence_refs=trusted
+                    task,
+                    policy,
+                    trusted_routing_evidence_refs=trusted,
+                    primary_provider=_host_primary_provider(),
                 )
                 current_configuration = installed_execution_configuration(
                     BUNDLE_ROOT,
@@ -1486,7 +1507,9 @@ def main() -> int:
                     raise ContractError(
                         "fallback receipts require a trusted host run handle"
                     )
-                route = route_task(task, policy)
+                route = route_task(
+                    task, policy, primary_provider=_host_primary_provider()
+                )
                 current_configuration = installed_execution_configuration(
                     BUNDLE_ROOT,
                     route,

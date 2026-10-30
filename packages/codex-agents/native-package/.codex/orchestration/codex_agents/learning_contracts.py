@@ -70,6 +70,11 @@ ROLES = {
     "codex_agents_implementation_worker",
     "codex_agents_security_reviewer",
     "codex_agents_verification_worker",
+    "claude_agents_researcher",
+    "claude_agents_planner",
+    "claude_agents_implementation_worker",
+    "claude_agents_security_reviewer",
+    "claude_agents_verification_worker",
 }
 TASK_FAMILIES = {
     "inventory",
@@ -196,7 +201,12 @@ SUPPORTED_MODELS = {
     "gpt-5.6-sol",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-astra",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
 }
 SUPPORTED_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 BOUND_KEYS = {
@@ -327,6 +337,29 @@ def _enum(value: Any, choices: set[str], field: str, *, nullable: bool = False) 
         return
     if not isinstance(value, str) or value not in choices:
         raise ContractError(f"{field} has an unsupported value")
+
+
+def provider_for_model(model: Any) -> str:
+    """Derive the provider from a model name; records never store it separately."""
+
+    if isinstance(model, str) and model.startswith("gpt-"):
+        return "codex"
+    if isinstance(model, str) and model.startswith("claude-"):
+        return "claude"
+    raise ContractError("model does not belong to a supported provider")
+
+
+def provider_for_role(role: Any) -> str:
+    if isinstance(role, str) and role.startswith("codex_agents_"):
+        return "codex"
+    if isinstance(role, str) and role.startswith("claude_agents_"):
+        return "claude"
+    raise ContractError("role does not belong to a supported provider")
+
+
+def _provider_consistent(model: Any, role: Any, label: str) -> None:
+    if provider_for_model(model) != provider_for_role(role):
+        raise ContractError(f"{label} model and role belong to different providers")
 
 
 def _integer(
@@ -542,6 +575,8 @@ def validate_event(data: Any) -> dict[str, Any]:
     _identifier(data["model"], "model", nullable=True)
     _enum(data["effort"], SUPPORTED_EFFORTS, "effort", nullable=True)
     _enum(data["role"], ROLES, "role", nullable=True)
+    if data["model"] in SUPPORTED_MODELS and data["role"] is not None:
+        _provider_consistent(data["model"], data["role"], "event")
     _enum(data["task_family"], TASK_FAMILIES, "task_family", nullable=True)
     _identifier(data["task_slice"], "task_slice", nullable=True)
     _identifier(data["topology"], "topology", nullable=True)
@@ -629,6 +664,7 @@ def validate_outcome(data: Any) -> dict[str, Any]:
     _identifier(data["model"], "model")
     _enum(data["effort"], {"low", "medium", "high", "xhigh", "max", "ultra"}, "effort")
     _enum(data["role"], ROLES, "role")
+    _provider_consistent(data["model"], data["role"], "outcome")
     _enum(data["topology"], {"single", "delegated", "parallel"}, "topology")
     for field in (
         "package_digest",
@@ -1100,6 +1136,7 @@ def _execution_configuration(value: Any, label: str) -> dict[str, Any]:
     _enum(value["model"], SUPPORTED_MODELS, f"{label}.model")
     _enum(value["effort"], SUPPORTED_EFFORTS, f"{label}.effort")
     _enum(value["role"], ROLES, f"{label}.role")
+    _provider_consistent(value["model"], value["role"], label)
     _enum(value["topology"], {"single", "delegated", "parallel"}, f"{label}.topology")
     _integer(value["max_parallel"], f"{label}.max_parallel", minimum=1, maximum=64)
     _boolean(value["verification_required"], f"{label}.verification_required")
