@@ -1,8 +1,8 @@
 # Codex–Claude agent orchestration
 
 Let a Codex or Claude coding session delegate bounded sub-tasks to the best-suited Codex or
-Claude child agent. The choice is deterministic: verified quality first, then starting
-preference, then subscription quota headroom. Metered billing is never used.
+Claude child agent. The choice is deterministic: verified quality first, then usage cost, then
+subscription quota headroom. Metered billing is never used.
 
 **Status:** pre-alpha. Nothing here is ready to install yet. See the
 [delivery plan](docs/delivery/plan.md) for the objective and goals.

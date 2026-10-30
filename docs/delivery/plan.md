@@ -9,7 +9,7 @@
 
 Any primary agent session, Codex or Claude, can delegate a bounded sub-task to the best-suited
 Codex or Claude child. The child is chosen deterministically: verified quality first, then
-starting preference, then subscription quota headroom. One command installs the whole system into
+usage cost (how much of that subscription's allowance the task uses), then quota headroom. One command installs the whole system into
 a project. The system measures its own routing while we use it to build itself.
 
 The objective is met when all of these hold:
@@ -54,8 +54,12 @@ The work is mostly integration. The genuinely new pieces are:
 - **Billing:** only the owner's existing subscription logins are used. Metered APIs, usage
   credits and automatic paid fallback are never eligible. Models the owner has not enabled stay
   disabled.
-- **Selection:** quality first, then starting preference, then quota headroom, then latency. It
-  is lexicographic, not a weighted sum. Unknown headroom never counts as ample.
+- **Selection:** quality first. If admitted evidence shows one option clearly better for a task
+  type, it wins regardless of cost. When quality is equivalent or not yet known, the option
+  with the lower usage cost wins, then more quota headroom, then lower latency. Until cost is
+  measured, the starting table stands in for it. The same rule chooses between models within
+  one provider. It is lexicographic, not a weighted sum. Unknown headroom never counts as
+  ample.
 - **Public repository:** no personal or machine identifiers. Ledgers, prompts and run state live
   in a user-local state directory and are never committed. An identifier scanner blocks commits
   and CI.
@@ -63,6 +67,10 @@ The work is mostly integration. The genuinely new pieces are:
   to itself.
 - **Proportionate review:** changes to authority, containment or billing logic get an independent
   security review before release. Everything else gets tests and Ruff.
+- **Branching:** all work, including research, lands on `staging`. Each commit is either
+  product-only or research-only. A `version/<semver>` branch is cut from `main` with only the
+  product commits copied across, and the owner merges it into `main`. Research never merges
+  into `main`. After each merge, `main` is merged back into `staging`.
 - **Portability:** add no new POSIX-only code. CI runs on Linux and macOS; Windows support is
   parked (see the parking lot).
 
@@ -117,9 +125,12 @@ Effort is an estimate in focused working sessions.
   - model and role lists loaded from policy data instead of fixed code lists;
   - Claude models and roles in the policy;
   - Claude agent definitions discoverable for project mapping.
-- **Starting-preference table,** labelled as hypotheses: GPT-6.1 Sol for planning and judgment,
-  Claude Sonnet for coding, and a verifier from the other provider when one is eligible. A
-  paired-run mode can be requested explicitly.
+- **Task-based starting table** (see the design reference below), labelled as hypotheses.
+  Where two options are expected to be comparable, the table prefers the one expected to use
+  less allowance. That expectation is also a hypothesis until G4 measures it. A paired-run
+  mode can be requested explicitly.
+- **Current models:** the policy moves from the earlier GPT-6 Sol to GPT-6.1 Sol and validates
+  against the current Codex client.
 - **Dispatch bridge** built from the already-tested launch code:
   - **Claude:** `claude -p` with a locked profile.
     - Hooks, plugins and MCP off.
@@ -135,13 +146,23 @@ Effort is an estimate in focused working sessions.
   - client version within the reviewed range;
   - provider enabled in project configuration;
   - headroom not exhausted.
+- **Usage observations:** every run records the signals that cost and headroom depend on.
+  - Codex: the percentage of each usage window used, before and after the run.
+  - Claude: tokens, model, and the rate-limit status, type and reset time.
+- **Signal-based limits:**
+  - Comparison runs pause when Codex passes about 70% of a window, or Claude issues any
+    warning.
+  - New children stop for that provider above about 90% for Codex, or on a rejection, until
+    the reset time.
+  - A per-window run count is a backstop, mainly for Claude.
 - **Orchestration skills** for both kinds of primary: they handle bridge routes through the same
   lifecycle as native children (validate, verify, operational QA).
 - **Spikes, resolved inside this goal:**
   - whether a Codex primary can launch `claude` from inside its sandbox, and the narrowest way
     to allow it;
   - read-tool containment for Claude children;
-  - which headroom signals each client reports.
+  - which usage and headroom signals each client reports, and whether Codex usage can also be
+    queried directly.
 - **Pilot install:** installed into a fresh worktree of the pilot project.
 
 **Exit**
@@ -187,7 +208,11 @@ code review and verification. That applies both in this repository and in the pi
 - **Frozen evaluation set:** a small held-out set per task family, with matched settings.
 - **Separate tiers:** the three evidence tiers are stored and reported separately.
 - **Backtest:** replay recorded runs against a candidate preference table.
-- **Headroom-aware ranking.**
+- **Usage-cost model:** estimate how much of each subscription's allowance a task uses, per
+  provider, model and task type. Codex reports percentages directly. Claude reports only
+  tokens and warnings, so its cost is estimated, with the confidence stated.
+- **Cost- and headroom-aware ranking:** a material quality advantage first, then usage cost,
+  then headroom.
 - **Promotion:** quality must be no worse, with at least 20 admitted cases per slice. Promotion
   needs owner approval and can be rolled back.
 
@@ -201,7 +226,7 @@ change it, approved by the owner.
 | A router bug corrupts its own fix | Stable toolchain: a pinned release N builds N+1 |
 | Selection bias, where the router never tries the other provider | Paired runs on a budgeted sample, plus the frozen evaluation set |
 | Narrow, small sample | Evidence tiers kept separate; ordinary dogfood records never change routing on their own |
-| Quota use | A per-provider budget per usage window; paired runs pause when headroom is constrained |
+| Quota use | Live usage signals pause comparison runs, then stop new children for that provider; a run count is a backstop |
 | Delegation overhead on simple work | Simple sequential work stays in one agent; the ledger records overhead |
 | Write-capable children before containment is proven | Read-only until G3's containment review passes |
 
@@ -223,13 +248,34 @@ change it, approved by the owner.
 | Claude | Codex | Bridge runs `codex exec` (child worktree for writes) |
 | Claude | Claude | Bridge for writes; the native subagent only for read-only work |
 
+### Starting table (hypotheses)
+
+These choices come from the owner's experience and widely reported practitioner preference,
+not from measurements. They are priors: quality evidence from paired runs and the frozen
+evaluation set can overturn any row.
+
+| Task type | First choice | Alternative | Reasoning |
+|---|---|---|---|
+| Orchestration (the primary session) | Codex, GPT-6.1 Sol | Claude Sonnet | Strong planning at low allowance cost |
+| Planning, judgment, synthesis | GPT-6.1 Sol | Claude Sonnet | Same strengths, applied to child tasks |
+| Substantial coding and debugging | Claude Sonnet | GPT-6.1 Sol | Widely preferred for coding quality |
+| Bounded, mechanical coding | GPT-6 Luna (high effort) | Claude Haiku | Cheap and capable when executable checks exist |
+| Research and deep research | GPT-6.1 Sol | Claude Sonnet | Strong at search and synthesis, cheaper |
+| Documentation | GPT-6.1 Sol, or Luna for small edits | Claude Sonnet | Cheaper for prose |
+| Security review | GPT-6.1 Sol | Claude Sonnet | Judgment-heavy work |
+| Verification and review | The other provider from the worker | Same provider, a different model | Independence |
+
+Claude Opus and GPT-6 Astra stay reserved for evidenced, hard end-to-end tasks, because both
+use far more allowance. Models the owner has not enabled stay out of the table.
+
 ### Selection rule
 
 1. The router classifies the task: family, stage and verifier.
 2. Provider candidates come from project configuration, intersected with its grants.
 3. A hard eligibility filter fails closed.
-4. Candidates are ranked by admitted quality evidence, then starting preference, then headroom,
-   then latency.
+4. Candidates are ranked by quality: an evidenced, material advantage wins outright. Among
+   candidates of equivalent or unknown quality, the lower usage cost wins, then more headroom,
+   then lower latency. The starting table stands in for cost until G4 measures it.
 5. The verifier comes from the other provider when one is eligible.
 6. The ledger binds the route, the rule that decided it, and the digests of the headroom
    observation and policy, so the route replays exactly.
@@ -245,6 +291,9 @@ change it, approved by the owner.
 
 - **License (decided):** Apache-2.0. The copyright notice names the project's authors, not a
   person.
-- **Dogfood budget (open until G2):** how many child runs the orchestrator may start on each
-  subscription per usage window, and how often a task runs on both providers for comparison.
-  G2 starts with conservative defaults and reports real usage before the owner sets the numbers.
+- **Usage limits (decided approach; thresholds checked in G2):** limits follow live usage
+  signals rather than fixed run counts (see G2). If a provider reports no signal, its headroom
+  is treated as unknown and handled cautiously.
+- **Cost (researched in G4):** the owner expects Codex to use noticeably less allowance than
+  Claude for comparable work. Quality stays the first rule; cost decides only between options
+  of equivalent quality, once it is measured.
