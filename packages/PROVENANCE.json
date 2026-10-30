@@ -152,7 +152,8 @@
         "tests/test_bridge.py": "G2 S2b dispatch bridge; G2 S3 Claude host client and orchestration skills; G2 S3b eligibility and observation gaps; G2 S3c policy table; G2 S4 security review fixes; G2 S4b Codex child tool lockdown",
         "native-package/.claude/skills/agent-orchestration/SKILL.md": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
         "native-package/.codex/orchestration/codex_agents/hosts.py": "G2 S3 Claude host client and orchestration skills",
-        "native-package/.codex/orchestration/codex_agents/claude_host.py": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes"
+        "native-package/.codex/orchestration/codex_agents/claude_host.py": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
+        "native-package/VERSION": "package version 0.8.0, so existing 0.7.2 collectors upgrade instead of refusing the changed build"
       }
     },
     "claude-agents": {
