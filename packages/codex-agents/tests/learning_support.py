@@ -600,7 +600,7 @@ def observe_provider_fixture(
 
 def attest_provider(
     ledger, project_id: str, private_key: Path, provider: str, fingerprint: str,
-    *, issued_at: int = 1,
+    *, issued_at: int = 1, credits_spending_disabled: bool = False,
 ) -> dict:
     """Sign and store an owner billing attestation for one account fingerprint."""
 
@@ -611,6 +611,7 @@ def attest_provider(
         "no_paid_overage": True,
         "no_usage_credits": True,
         "issued_at": issued_at,
+        **({"codex_credits_spending_disabled": True} if credits_spending_disabled else {}),
     })
     authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
     signature = sign_owner_payload(

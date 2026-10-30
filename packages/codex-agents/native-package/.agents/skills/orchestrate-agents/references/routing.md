@@ -127,6 +127,15 @@ first failure denies with a stable `reason_code`:
    account restriction (paid usage in the last day, an unreset exhausted window, a probe
    cooldown or admissions that may still count under a cap) cannot be deleted
    (`project_holds_account_restrictions`).
+   Codex reports credits as `hasCredits`, `unlimited` and `balance`, which cannot show
+   that spending is off, so credits count as paid usage by default. An owner-signed
+   attestation for the same account fingerprint may add
+   `codex_credits_spending_disabled: true` (Codex grants only, never false). Then credits
+   count as not usable if the reading shows `hasCredits: true`, `unlimited: false`, and
+   `spendControlReached` is not `true`, at admission and at the launch re-check.
+   `unlimited: true` and an attestation without the field still deny. The older
+   attestation form stays valid. `codex_spend_control_reached`: any Codex reading in the
+   last day reports `spendControlReached: true`; this denies whatever the attestation says.
 8. `provider_exhausted`: the most restrictive headroom that has not reset yet is
    exhausted. That is Codex at 90 percent or more on any window, or ordinary usage not
    allowed, and Claude with a rejected or full window. A later favourable observation
