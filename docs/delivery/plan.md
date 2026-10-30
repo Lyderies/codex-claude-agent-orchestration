@@ -67,6 +67,19 @@ The work is mostly integration. The genuinely new pieces are:
   to itself.
 - **Proportionate review:** changes to authority, containment or billing logic get an independent
   security review before release. Everything else gets tests and Ruff.
+- **Autonomous execution:** once the owner approves this plan, the primary agent works through
+  the goals continuously. It pauses only for decisions that need the owner:
+  - merging a version branch into `main`;
+  - account, authentication or billing actions, including re-registering the learning collector;
+  - a security review it cannot resolve;
+  - a material change to authority or architecture.
+
+  While a decision is pending, it continues with other work.
+- **Evidence loop:** the primary routes its own sub-tasks by the routing table from G1 onward.
+  - In G1 it uses Claude subagents and read-only Codex runs, and logs each run by hand.
+  - From G2 the ledger records runs automatically.
+  - At every feature merge, and at least every 2–3 hours of work, it reviews the new evidence
+    and updates the table under the rules in [routing-table.md](../routing-table.md).
 - **Branching:** release and feature branches.
   - **Release branch:** each goal gets a `version/<semver>` branch cut from `main`. The owner
     merges it into `main` after the full regression run and CI pass.
@@ -85,7 +98,7 @@ Effort is an estimate in focused working sessions.
 
 | Goal | Feature set | Dogfooding | Exit | Effort |
 |---|---|---|---|---|
-| G1 | Import and one-command install | Not yet | Imported tests pass here; installer reproduces the pilot's current install | 1–2 |
+| G1 | Import and one-command install | Manual, logged by hand | Imported tests pass here; installer reproduces the pilot's current install | 1–2 |
 | G2 | **MVP:** cross-provider read-only routing | Starts at exit | Both primaries reach both providers read-only through recorded, replayable routes | 2–4 |
 | G3 | Write-capable children | Read and write sub-tasks | Contained write children, verified by the other provider | 2–3 |
 | G4 | Evidence-driven routing | Full, with a paired sample | First evidence-backed routing decision | 1–2, then ongoing |
@@ -130,7 +143,7 @@ Effort is an estimate in focused working sessions.
   - model and role lists loaded from policy data instead of fixed code lists;
   - Claude models and roles in the policy;
   - Claude agent definitions discoverable for project mapping.
-- **Task-based starting table** (see the design reference below), labelled as hypotheses.
+- **Task-based starting table** from [routing-table.md](../routing-table.md), labelled as hypotheses.
   Where two options are expected to be comparable, the table prefers the one expected to use
   less allowance. That expectation is also a hypothesis until G4 measures it. A paired-run
   mode can be requested explicitly.
@@ -253,25 +266,11 @@ change it, approved by the owner.
 | Claude | Codex | Bridge runs `codex exec` (child worktree for writes) |
 | Claude | Claude | Bridge for writes; the native subagent only for read-only work |
 
-### Starting table (hypotheses)
+### Starting table
 
-These choices come from the owner's experience and widely reported practitioner preference,
-not from measurements. They are priors: quality evidence from paired runs and the frozen
-evaluation set can overturn any row.
-
-| Task type | First choice | Alternative | Reasoning |
-|---|---|---|---|
-| Orchestration (the primary session) | Codex, GPT-6.1 Sol | Claude Sonnet | Strong planning at low allowance cost |
-| Planning, judgment, synthesis | GPT-6.1 Sol | Claude Sonnet | Same strengths, applied to child tasks |
-| Substantial coding and debugging | Claude Sonnet | GPT-6.1 Sol | Widely preferred for coding quality |
-| Bounded, mechanical coding | GPT-6 Luna (high effort) | Claude Haiku | Cheap and capable when executable checks exist |
-| Research and deep research | GPT-6.1 Sol | Claude Sonnet | Strong at search and synthesis, cheaper |
-| Documentation | GPT-6.1 Sol, or Luna for small edits | Claude Sonnet | Cheaper for prose |
-| Security review | GPT-6.1 Sol | Claude Sonnet | Judgment-heavy work |
-| Verification and review | The other provider from the worker | Same provider, a different model | Independence |
-
-Claude Opus and GPT-6 Astra stay reserved for evidenced, hard end-to-end tasks, because both
-use far more allowance. Models the owner has not enabled stay out of the table.
+The live routing table is in [routing-table.md](../routing-table.md). It holds each task's model
+and effort, alternative, escalation, estimated usage and minutes, confidence, the first paired
+tests, and a changelog of every change with its evidence.
 
 ### Selection rule
 
