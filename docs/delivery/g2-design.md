@@ -120,6 +120,29 @@ The Codex skill (`.agents/skills/orchestrate-agents`) and a new Claude skill
 - spawn natively when `dispatch` is `native`, and call the bridge when it is `bridge`;
 - keep the existing lifecycle: open, admission, bind, validate, verify, operational QA, record.
 
+Built with these rules:
+
+- **Host detection.** The CLI detects its host from the client's own environment markers and
+  refuses when they are missing or contradictory. Markers are a consistency check, not proof.
+  Admission, the bridge flag and the sandbox remain the authority.
+- **Host ownership.** Each orchestration stores its owning host. Every lifecycle mutation refuses a
+  different host. The bridge's execution client is never an owner.
+- **Native Claude children.** The CLI returns the Agent-tool spawn parameters (agent type, model
+  alias and effort) derived from the route, and the skill passes them verbatim. Their reads are
+  advisory, because they run with the parent session's permissions. The Agent tool takes only a
+  model alias, so the exact model is pinned by the client, not by us.
+- **Claude backends.** A Claude-host open is denied when the environment or the settings the
+  parent session loads switch it to an API key, a cloud backend or another configuration
+  directory, or override the subagent model or effort.
+- **Billing probe.** Native children emit no rate-limit event, so before a native Claude open the
+  skill runs a probe: one minimal locked Haiku turn with no tools. The probe passes the same
+  admission as a run first, shares the one-run bootstrap, and reuses evidence under five minutes
+  old.
+- **Claude thresholds.** Claude's rate-limit event reports window utilization. A Claude window at
+  90% or more counts as exhausted, and at 75% or more as constrained, the same as Codex.
+- **Installer.** The Codex package installs exactly one path under `.claude/`, the Claude skill, and
+  refuses any existing file it does not already own, even with identical bytes.
+
 ### S3b: eligibility and observation gaps
 
 A read-only audit of S1 and S2 against the plan found gaps that S4 would otherwise inherit:
