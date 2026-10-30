@@ -44,6 +44,10 @@ CLAUDE_DISABLED_PLUGINS = (
     "cc-plugin-easel@builtin",
 )
 CODEX_REROUTE_EVENTS = {"model/rerouted", "model_rerouted", "model.rerouted"}
+# Claude Code bills a small helper model for housekeeping (seen live in modelUsage
+# while every assistant frame came from the requested model). Helper usage is
+# reported, but only the assistant frames decide whether the work was rerouted.
+CLAUDE_HELPER_MODELS = frozenset({"claude-haiku-5-5"})
 # Claude Code reads these from its working directory and the directories above
 # it, so they are never exported and must not exist above the export.
 CLAUDE_CONTEXT_NAMES = {"claude.md", "claude.local.md", ".claude", ".mcp.json"}
@@ -542,6 +546,7 @@ def run_claude(
     state: dict[str, Any] = {
         "init": None, "result": None, "rate_limit_recorded": False, "frames": 0,
         "models": set(),
+        "helper_models": set(),
     }
 
     def on_frame(frame: dict[str, Any]) -> None:
@@ -569,7 +574,14 @@ def run_claude(
             state["result"] = frame
             usage = frame.get("modelUsage")
             if isinstance(usage, dict):
-                state["models"].update(str(name) for name in usage)
+                for name in usage:
+                    name = str(name)
+                    if name == model:
+                        continue
+                    if name in CLAUDE_HELPER_MODELS:
+                        state["helper_models"].add(name)
+                    else:
+                        state["models"].add(name)
         if kind == "assistant":
             message = frame.get("message")
             served = message.get("model") if isinstance(message, dict) else None
@@ -591,9 +603,10 @@ def run_claude(
         "effort": route["effort"],
         "wall_seconds": round(time.monotonic() - started, 3),
         "read_containment": "enforced",
-        # A fallback after a clean init serves another model; any model other
-        # than the requested one leaves the result unreviewed.
+        # A fallback after a clean init serves another model; any working model
+        # other than the requested one leaves the result unreviewed.
         "rerouted": bool(state["models"] - {model}),
+        "helper_models": sorted(state["helper_models"]),
         "rate_limit_event_recorded": state["rate_limit_recorded"],
         "usage": None,
         "permission_denials": None,

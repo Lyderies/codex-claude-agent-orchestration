@@ -617,7 +617,7 @@ class ReviewHardeningTests(BridgeTestCase):
             [init_frame(),
              {**result_frame(), "modelUsage": {
                  "claude-opus-5-5": {"inputTokens": 1},
-                 "claude-haiku-5-5": {"inputTokens": 1},
+                 "claude-sonnet-5-5": {"inputTokens": 1},
              }}],
         ):
             with self.subTest(frames=len(frames)):
@@ -636,6 +636,19 @@ class ReviewHardeningTests(BridgeTestCase):
             {**result_frame(), "modelUsage": {"claude-opus-5-5": {"inputTokens": 1}}},
         ])
         self.assertTrue(self.dispatch(route, assigned, handle)["bridge_report"]["reviewed"])
+        # Live runs bill a Haiku helper alongside the requested model; that is not a reroute.
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [
+            init_frame(),
+            {"type": "assistant", "message": {"model": "claude-opus-5-5"}},
+            {**result_frame(), "modelUsage": {
+                "claude-opus-5-5": {"inputTokens": 1},
+                "claude-haiku-5-5": {"inputTokens": 1},
+            }},
+        ])
+        report = self.dispatch(route, assigned, handle)["bridge_report"]
+        self.assertEqual((True, False), (report["reviewed"], report["rerouted"]))
+        self.assertEqual(["claude-haiku-5-5"], report["helper_models"])
 
     def test_assignment_bounds_tighten_the_deadline_and_turns(self) -> None:
         self.claude_run()
