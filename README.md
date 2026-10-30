@@ -31,7 +31,9 @@ subscription quota headroom. Metered billing is never used.
 ```sh
 git config core.hooksPath .githooks          # enable the identifier guard on commit
 python3 scripts/check_identifiers.py         # scan tracked files
-python3 -m unittest discover -s tests -v     # run the tests
+python3 -m unittest discover -s tests -v     # run the repository tests
+(cd packages/codex-agents && python3 -m unittest discover -s tests)
+(cd packages/claude-agents && PYTHONPATH=src python3 -m unittest discover -s tests)
 ```
 
 This repository is public. The identifier guard blocks commits that contain personal or machine

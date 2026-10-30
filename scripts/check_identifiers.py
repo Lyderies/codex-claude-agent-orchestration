@@ -32,7 +32,7 @@ PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("home-path", re.compile(r"(?<![\w/])/Users/(?!Shared\b)[A-Za-z0-9._-]+")),
     ("home-path", re.compile(r"(?<![\w/])/home/[A-Za-z0-9._-]+")),
     ("home-path", re.compile(r"\b[A-Za-z]:\\+Users\\+[A-Za-z0-9._-]+", re.IGNORECASE)),
-    ("hostname", re.compile(r"\b[A-Za-z0-9-]+\.local\b")),
+    ("hostname", re.compile(r"\b[A-Za-z0-9-]+\.local\b(?!\.)")),
     ("hostname", re.compile(r"\b[A-Za-z0-9]+-MacBook(?:-[A-Za-z0-9]+)*\b")),
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
 )
@@ -41,7 +41,11 @@ ALLOWED_EMAILS = (
     re.compile(r"^noreply@github\.com$"),
     re.compile(r"^noreply@anthropic\.com$"),
     re.compile(r"^[A-Za-z0-9._%+-]+@example\.(?:com|org|net)$"),
+    re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]*\.(?:invalid|test|example|localhost)$"),
+    re.compile(r"^[A-Za-z0-9._-]+@openssh\.com$"),  # SSH key-type names, not mailboxes
 )
+# Project namespaces that look like mDNS hostnames but identify no machine.
+ALLOWED_HOSTNAMES = frozenset({"codex-agents.local", "claude-agents.local"})
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,8 @@ def scan_text(text: str, location: str, denylist: tuple[str, ...]) -> list[Findi
         for category, pattern in PATTERNS:
             for match in pattern.finditer(line):
                 if category == "email" and email_allowed(match.group(0)):
+                    continue
+                if category == "hostname" and match.group(0).casefold() in ALLOWED_HOSTNAMES:
                     continue
                 findings.append(Finding(category, where))
         folded = line.casefold()

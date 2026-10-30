@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning export v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "export_digest", "scope", "candidate_digest", "artifact_id", "schema_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "learning_export"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "export_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scope": {"enum": ["general", "project"]},
+    "candidate_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "schema_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

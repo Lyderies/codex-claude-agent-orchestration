@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "run_id", "turn_id", "assignment_id", "parent_run_id", "observed_at_ms", "event_code", "model", "effort", "role", "task_family", "task_slice", "topology", "configuration_digest", "status", "stop_reason", "tool_digest", "item_digest", "coverage", "usage"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "event"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "turn_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "assignment_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "parent_run_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "observed_at_ms": {"type": "integer", "minimum": 0},
+    "event_code": {"enum": ["session_started", "session_ended", "turn_started", "turn_stop_observed", "turn_completed", "turn_failed", "turn_interrupted", "subagent_started", "subagent_stop_observed", "tool_started", "tool_output_observed", "item_completed", "model_rerouted", "usage_snapshot", "hook_completed", "no_progress", "retry", "repair", "escalation"]},
+    "model": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra", null]},
+    "role": {"enum": ["codex_agents_researcher", "codex_agents_planner", "codex_agents_implementation_worker", "codex_agents_security_reviewer", "codex_agents_verification_worker", null]},
+    "task_family": {"enum": ["inventory", "research", "planning", "coding", "security", "verification", null]},
+    "task_slice": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "topology": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "configuration_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "status": {"enum": ["started", "observed", "completed", "failed", "interrupted", "cancelled", "rejected", "unknown"]},
+    "stop_reason": {"enum": ["completed", "failed", "interrupted", "cancelled", "blocked", "timeout", "no_progress", "other", "unknown", null]},
+    "tool_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "item_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "coverage": {"enum": ["end_to_end_complete", "root_turn_complete", "lifecycle_partial", "handshake_only", "partial", "conflicting", "unknown"]},
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "cached_tokens", "output_tokens", "reasoning_tokens", "model_calls", "tool_calls", "latency_ms", "cost_microunits"],
+      "properties": {
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cached_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "model_calls": {"type": ["integer", "null"], "minimum": 0},
+        "tool_calls": {"type": ["integer", "null"], "minimum": 0},
+        "latency_ms": {"type": ["integer", "null"], "minimum": 0},
+        "cost_microunits": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  }
+}
