@@ -1631,6 +1631,57 @@ class AdmissionTests(unittest.TestCase):
         ):
             self.assertTrue(self.ledger.delete_project(held).startswith("del_"))
 
+    def test_spend_control_denial_survives_deleting_the_recording_project(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.credits_attest(fingerprint)
+        first = self.project_id
+        # Another project of the same account records spend control reached.
+        with self.other_project():
+            self.attest("codex", fingerprint)
+            self.credits_attest(fingerprint, issued_at=2)
+            self.observe(**{
+                "rateLimits.credits.hasCredits": True,
+                "rateLimits.spendControlReached": True,
+            })
+            held = self.project_id
+            with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+                with self.assertRaisesRegex(LedgerError, "project_holds_account_restrictions"):
+                    self.ledger.delete_project(held)
+        self.assertEqual(first, self.project_id)
+        self.observe(**{"rateLimits.credits.hasCredits": True})
+        self.assert_denied("codex_spend_control_reached")
+        # A reading stamped in the future counts too.
+        with self.other_project():
+            future = self.clock + 3_600_000
+            self.observe(now_ms=future, **{"rateLimits.spendControlReached": True})
+            with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+                with self.assertRaisesRegex(LedgerError, "project_holds_account_restrictions"):
+                    self.ledger.delete_project(self.project_id)
+
+    def test_billing_records_without_spend_control_verify_in_a_backup(self) -> None:
+        identity = self.observe()[0]
+        legacy = self.observe()[2]
+        del legacy["spend_control_reached"]
+        legacy = {**legacy, "record_id": "provider_billing:legacy"}
+        self.assertNotIn("spend_control_reached", validate_learning_record(legacy))
+        self.ledger._store_provider_observations(
+            self.project_id, [legacy], timestamp=self.tick()
+        )
+        self.assertEqual(identity["provider"], "codex")
+        self.ledger.create_sanitized_backup(
+            self.project_id, file_id="legacy_billing",
+            expires_at_ms=time.time_ns() // 1_000_000 + 60_000,
+        )
+        self.ledger.verify_sanitized_backup(self.project_id, file_id="legacy_billing")
+        with self.ledger.repository(self.project_id) as repository:
+            stored = [r for r in repository.records("provider_billing")
+                      if r["record_id"] == "provider_billing:legacy"]
+        self.assertEqual(1, len(stored))
+        self.assertNotIn("spend_control_reached", stored[0])
+        with self.assertRaises(ContractError):
+            validate_learning_record({**legacy, "spend_control_reached": "yes"})
+
     def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
         identity = self.observe()[0]
         self.attest("codex", identity["account_fingerprint"])

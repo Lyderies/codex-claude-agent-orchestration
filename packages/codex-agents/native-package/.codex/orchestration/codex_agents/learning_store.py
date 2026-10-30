@@ -7889,7 +7889,8 @@ class LearningLedger:
         That is paid usage or overage in the last day, an exhausted or rejected
         headroom window that has not reset, ordinary Codex usage disallowed in
         the last 30 minutes, a probe cooldown, or a passing run admission
-        that may still count under a run cap. Records stamped after now count.
+        that may still count under a run cap, or a Codex reading in the last day that
+        reports spend control reached. Records stamped after now count.
         """
 
         from .providers import (
@@ -7912,6 +7913,12 @@ class LearningLedger:
             if kind == "provider_billing" and row["source"] == "provider":
                 if age <= EVIDENCE_HORIZON_MS and (
                     record["paid_usage_usable"] is True or record["is_using_overage"] is True
+                ):
+                    return True
+                if (
+                    age <= EVIDENCE_HORIZON_MS
+                    and record["provider"] == "codex"
+                    and record.get("spend_control_reached") is True
                 ):
                     return True
                 if age <= BILLING_MAX_AGE_MS and record["ordinary_usage_allowed"] is False:

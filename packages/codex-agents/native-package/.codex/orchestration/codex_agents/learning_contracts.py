@@ -1672,12 +1672,15 @@ PROVIDER_HEADROOM_FIELDS = {
 # When an observation was taken relative to the run it belongs to.
 OBSERVATION_PHASES = {"before", "during", "after"}
 HEADROOM_WINDOW_FIELDS = {"window_minutes", "scope", "used_percent", "resets_at"}
-PROVIDER_BILLING_FIELDS = {
+# `spend_control_reached` is optional: records stored before it existed lack the
+# key and keep their digests, so it is never defaulted into stored bytes.
+PROVIDER_BILLING_REQUIRED_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
-    "paid_usage_usable", "has_credits", "unlimited", "spend_control_reached",
+    "paid_usage_usable", "has_credits", "unlimited",
     "ordinary_usage_allowed", "is_using_overage", "overage_status",
     "overage_disabled_reason", "run_id", "phase", "observed_at_ms",
 }
+PROVIDER_BILLING_FIELDS = PROVIDER_BILLING_REQUIRED_FIELDS | {"spend_control_reached"}
 # The owner's optional statement that Codex credit spending is disabled on the
 # account. The observation cannot show it, so only a signed grant carries it.
 CODEX_CREDITS_DISABLED_FIELD = "codex_credits_spending_disabled"
@@ -1817,13 +1820,16 @@ def validate_provider_headroom(data: Any) -> dict[str, Any]:
 
 
 def validate_provider_billing(data: Any) -> dict[str, Any]:
-    data = _closed(data, PROVIDER_BILLING_FIELDS, "provider_billing")
+    data = _closed_optional(
+        data, PROVIDER_BILLING_REQUIRED_FIELDS, PROVIDER_BILLING_FIELDS,
+        "provider_billing",
+    )
     _observation_base(data, "provider_billing")
     for field in (
         "paid_usage_usable", "has_credits", "unlimited", "spend_control_reached",
         "ordinary_usage_allowed", "is_using_overage",
     ):
-        if data[field] is not None:
+        if data.get(field) is not None:
             _boolean(data[field], field)
     _enum(data["overage_status"], CLAUDE_OVERAGE_STATUSES, "overage_status", nullable=True)
     _enum(
