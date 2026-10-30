@@ -20,3 +20,8 @@ sys.path.insert(0, str(ORCHESTRATION_ROOT))
 MACOS_SANDBOX_ONLY = unittest.skipUnless(
     sys.platform == "darwin", "operational-check sandbox (sandbox-exec) is macOS-only"
 )
+
+# Provider admission denies any process with a provider API key, so the tests
+# never inherit one from the developer's shell.
+for _name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+    os.environ.pop(_name, None)

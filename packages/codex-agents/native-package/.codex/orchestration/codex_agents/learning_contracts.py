@@ -1655,7 +1655,7 @@ HEADROOM_WINDOW_FIELDS = {"window_minutes", "scope", "used_percent", "resets_at"
 PROVIDER_BILLING_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
     "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
-    "is_using_overage", "overage_status", "observed_at_ms",
+    "is_using_overage", "overage_status", "overage_disabled_reason", "observed_at_ms",
 }
 BILLING_ATTESTATION_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
@@ -1680,17 +1680,24 @@ ADMISSION_REASON_CODES = {
     "provider_exhausted",
 }
 CLAUDE_HEADROOM_STATUSES = {"allowed", "allowed_warning", "rejected"}
-CLAUDE_OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected", "disabled"}
-
-
-def _label(value: Any, field: str, *, nullable: bool = True) -> None:
-    # Plan, auth and window labels are short typed tokens, never free text.
-    if nullable and value is None:
-        return
-    if not isinstance(value, str) or re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value
-    ) is None:
-        raise ContractError(f"{field} must be a short typed label")
+CLAUDE_OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected"}
+CLAUDE_AUTH_METHODS = frozenset({"claude.ai"})
+CLAUDE_SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
+# The app-server PlanType enum, without its catch-all unknown value.
+CODEX_PLAN_TYPES = frozenset({
+    "free", "go", "plus", "pro", "prolite", "team", "business", "enterprise", "edu",
+})
+# Reasons that mean paid overage is switched off. Credit exhaustion, fetch
+# errors, unknown and "no limits configured" do not prove that, so they stay out.
+CLAUDE_OVERAGE_DISABLED_REASONS = frozenset({
+    "overage_not_provisioned", "org_level_disabled", "org_level_disabled_until",
+    "org_service_level_disabled", "seat_tier_level_disabled", "member_level_disabled",
+    "seat_tier_zero_credit_limit", "group_zero_credit_limit", "member_zero_credit_limit",
+})
+CLAUDE_WINDOW_SCOPES = {
+    "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+    "seven_day_overage_included", "overage",
+}
 
 
 def _observation_base(data: dict[str, Any], record_type: str) -> None:
@@ -1704,8 +1711,12 @@ def validate_provider_identity(data: Any) -> dict[str, Any]:
     data = _closed(data, PROVIDER_IDENTITY_FIELDS, "provider_identity")
     _observation_base(data, "provider_identity")
     _boolean(data["logged_in"], "logged_in")
-    for field in ("auth_method", "subscription_type", "plan_type"):
-        _label(data[field], field)
+    _enum(data["auth_method"], set(CLAUDE_AUTH_METHODS), "auth_method", nullable=True)
+    _enum(
+        data["subscription_type"], set(CLAUDE_SUBSCRIPTION_TYPES), "subscription_type",
+        nullable=True,
+    )
+    _enum(data["plan_type"], set(CODEX_PLAN_TYPES), "plan_type", nullable=True)
     return data
 
 
@@ -1718,7 +1729,7 @@ def validate_provider_headroom(data: Any) -> dict[str, Any]:
     for window in windows:
         window = _closed(window, HEADROOM_WINDOW_FIELDS, "headroom window")
         _integer(window["window_minutes"], "window_minutes", minimum=1, nullable=True)
-        _label(window["scope"], "scope")
+        _enum(window["scope"], CLAUDE_WINDOW_SCOPES, "scope", nullable=True)
         _number(
             window["used_percent"], "used_percent", minimum=0, maximum=100,
             nullable=True,
@@ -1738,6 +1749,10 @@ def validate_provider_billing(data: Any) -> dict[str, Any]:
         if data[field] is not None:
             _boolean(data[field], field)
     _enum(data["overage_status"], CLAUDE_OVERAGE_STATUSES, "overage_status", nullable=True)
+    _enum(
+        data["overage_disabled_reason"], set(CLAUDE_OVERAGE_DISABLED_REASONS),
+        "overage_disabled_reason", nullable=True,
+    )
     return data
 
 
@@ -1775,8 +1790,14 @@ def validate_admission_decision(data: Any) -> dict[str, Any]:
     _enum(data["reason_code"], ADMISSION_REASON_CODES, "reason_code")
     if (data["decision"] == "pass") != (data["reason_code"] == "admitted"):
         raise ContractError("admission decision and reason disagree")
-    if data["decision"] == "pass" and data["run_id"] is None:
-        raise ContractError("an admitted decision must belong to a run")
+    if data["decision"] == "pass" and (
+        data["run_id"] is None
+        or data["account_fingerprint"] is None
+        or not data["evidence_digests"]
+    ):
+        raise ContractError(
+            "an admitted decision needs a run, an account fingerprint, and evidence"
+        )
     _digest(data["account_fingerprint"], "account_fingerprint", nullable=True)
     _digest_list(data["evidence_digests"], "evidence_digests")
     _integer(data["observed_at_ms"], "observed_at_ms")

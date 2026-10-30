@@ -80,7 +80,14 @@ first failure denies with a stable `reason_code`:
 6. `provider_exhausted`: Codex at 90 percent or more on any window, or ordinary usage
    not allowed; Claude with a rejected window.
 
-The decision and the digests of the records it used are stored with the run. Later
-lifecycle steps read that stored decision and never re-evaluate time-varying facts.
-Identities are stored only as keyed fingerprints. Every project, including a Codex-only
-one, needs an attestation before host runs open.
+The ledger evaluates admission itself, from its own records and its own environment,
+and stores the decision and the digests of the records it used with the run. No caller
+can supply a decision. A collector-bound Codex session is admitted once, when it first
+binds. Every result commit, including that legacy path, requires the run's stored
+passing decision and never re-evaluates time-varying facts.
+
+Observations are written only by `provider-observe`, which runs the provider client
+itself, and by the bridge's rate-limit event recorder. No producer, hook or collector
+client can append them. Identities are stored only as keyed fingerprints, and labels
+such as plan and subscription are allow-listed, so anything else is stored as null.
+Every project, including a Codex-only one, needs an attestation before host runs open.

@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-import json
 import subprocess
+import sys
 
 from codex_agents.learning_adapters import empty_usage
 from codex_agents.learning_contracts import candidate_base_digest, content_digest
-from codex_agents.providers import (
-    billing_attestation_record,
-    parse_claude_auth_status,
-    parse_codex_rate_limits,
-)
+from codex_agents.providers import billing_attestation_record
 from codex_agents.learning_engine import (
     OWNER_SIGNATURE_NAMESPACE,
     OwnerGrantAuthority,
@@ -470,24 +466,56 @@ def provider_fixture(name: str) -> bytes:
     return (PROVIDER_FIXTURES / name).read_bytes()
 
 
-def observe_provider_fixture(
-    ledger, project_id: str, provider: str, *, observed_at_ms: int
-) -> list[dict]:
-    """Record the recorded fixture observation for one provider."""
-
-    key = ledger.state.digest_key()
-    if provider == "claude":
-        records = [parse_claude_auth_status(
-            provider_fixture("claude-auth-status.json"),
-            digest_key=key, observed_at_ms=observed_at_ms,
-        )]
+# Stand-ins for the provider clients: each answers from a JSON file in its own
+# directory, so a test changes an observation by rewriting that file. They never
+# contact a provider.
+FAKE_CODEX = """\
+import json, sys
+directory = sys.argv[1]
+log = open(directory + "/methods.log", "a")
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(message["method"] + "\\n")
+    log.flush()
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        result = {"userAgent": "fake"}
+    elif message["method"] == "account/rateLimits/read":
+        result = json.load(open(directory + "/codex-result.json"))
     else:
-        records = parse_codex_rate_limits(
-            json.loads(provider_fixture("codex-rate-limits.json")),
-            digest_key=key, observed_at_ms=observed_at_ms,
-        )
-    ledger.record_provider_observations(project_id, records, now_ms=observed_at_ms)
-    return records
+        print(json.dumps({"id": message["id"], "error": {"code": -1}}), flush=True)
+        continue
+    print(json.dumps({"id": message["id"], "result": result}), flush=True)
+"""
+
+
+def fake_provider_tools(directory: Path) -> dict[str, str]:
+    """Install fake `codex` and `claude` clients; return an environment using them."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "codex-result.json").write_bytes(provider_fixture("codex-rate-limits.json"))
+    (directory / "claude-status.json").write_bytes(provider_fixture("claude-auth-status.json"))
+    (directory / "fake_codex.py").write_text(FAKE_CODEX)
+    scripts = {
+        "codex": f"#!/bin/sh\nexec {sys.executable} {directory / 'fake_codex.py'} {directory}\n",
+        "claude": f"#!/bin/sh\nexec /bin/cat {directory / 'claude-status.json'}\n",
+    }
+    for name, body in scripts.items():
+        (directory / name).write_text(body)
+        (directory / name).chmod(0o755)
+    return {"PATH": str(directory)}
+
+
+def observe_provider_fixture(
+    ledger, project_id: str, provider: str, *, tools: Path, observed_at_ms: int
+) -> list[dict]:
+    """Run the ledger's own observation against the fake clients."""
+
+    return ledger.observe_provider(
+        project_id, provider, project_root=tools,
+        environ={"PATH": str(tools)}, now_ms=observed_at_ms,
+    )
 
 
 def attest_provider(
@@ -521,12 +549,12 @@ def attest_provider(
 
 def admit_provider(
     ledger, project_id: str, private_key: Path, provider: str = "codex",
-    *, observed_at_ms: int,
+    *, tools: Path, observed_at_ms: int,
 ) -> str:
     """Give a project a fresh identity and a matching attestation; return the fingerprint."""
 
     identity = observe_provider_fixture(
-        ledger, project_id, provider, observed_at_ms=observed_at_ms
+        ledger, project_id, provider, tools=tools, observed_at_ms=observed_at_ms
     )[0]
     attest_provider(
         ledger, project_id, private_key, provider, identity["account_fingerprint"]

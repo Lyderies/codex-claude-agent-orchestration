@@ -19,6 +19,11 @@ from typing import Any
 
 from .contracts import ContractError
 from .learning_contracts import (
+    CLAUDE_AUTH_METHODS,
+    CLAUDE_OVERAGE_DISABLED_REASONS,
+    CLAUDE_SUBSCRIPTION_TYPES,
+    CLAUDE_WINDOW_SCOPES,
+    CODEX_PLAN_TYPES,
     content_digest,
     keyed_digest,
     validate_admission_decision,
@@ -70,13 +75,14 @@ def _record(record_type: str, material: dict[str, Any]) -> dict[str, Any]:
     return {**body, "record_id": f"{record_type}:{content_digest(body)}"}
 
 
-def _label(value: Any) -> str | None:
-    # Unknown or malformed labels are dropped rather than stored as free text.
-    if isinstance(value, str) and 0 < len(value) <= 64 and value.replace(
-        "_", ""
-    ).replace("-", "").replace(".", "").isalnum():
-        return value
-    return None
+def _allowed(value: Any, allowed: frozenset[str]) -> str | None:
+    # Labels are allow-listed, never stored as free text: a misplaced identifier
+    # in one of these fields becomes null rather than reaching the ledger.
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _scope(value: Any) -> str | None:
+    return value if value in CLAUDE_WINDOW_SCOPES else None
 
 
 def _timestamp_ms(value: Any) -> int | None:
@@ -108,8 +114,10 @@ def parse_claude_auth_status(
                 digest_key, "claude", data.get("orgId"), data.get("email")
             ),
             "logged_in": logged_in,
-            "auth_method": _label(data.get("authMethod")),
-            "subscription_type": _label(data.get("subscriptionType")),
+            "auth_method": _allowed(data.get("authMethod"), CLAUDE_AUTH_METHODS),
+            "subscription_type": _allowed(
+                data.get("subscriptionType"), CLAUDE_SUBSCRIPTION_TYPES
+            ),
             "plan_type": None,
             "observed_at_ms": observed_at_ms,
         },
@@ -117,37 +125,87 @@ def parse_claude_auth_status(
     return validate_provider_identity(record)
 
 
+def _stop_process_group(process: Any) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _bounded_output(
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    timeout: float,
+    popen: Callable[..., Any],
+) -> bytes:
+    """Read a child's stdout while enforcing the size cap and the deadline."""
+
+    try:
+        process = popen(
+            arguments,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise ContractError("provider observation is unavailable") from exc
+    chunks: list[bytes] = []
+    received = 0
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise ContractError("provider observation timed out")
+                chunk = os.read(process.stdout.fileno(), 65_536)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > MAX_OBSERVATION_BYTES:
+                    raise ContractError("provider observation output is too large")
+                chunks.append(chunk)
+        try:
+            returncode = process.wait(timeout=max(deadline - time.monotonic(), 0.1))
+        except subprocess.TimeoutExpired as exc:
+            raise ContractError("provider observation timed out") from exc
+    except BaseException:
+        _stop_process_group(process)
+        raise
+    finally:
+        process.stdout.close()
+    if returncode != 0:
+        raise ContractError("provider observation failed")
+    return b"".join(chunks)
+
+
 def observe_claude(
     *,
     digest_key: bytes,
     observed_at_ms: int,
     environ: Mapping[str, str] | None = None,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    popen: Callable[..., Any] = subprocess.Popen,
+    timeout: float = OBSERVATION_TIMEOUT_SECONDS,
 ) -> list[dict[str, Any]]:
     environment = dict(os.environ if environ is None else environ)
     _require_no_api_keys(environment)
     executable = shutil.which("claude", path=environment.get("PATH"))
     if executable is None:
         raise ContractError("Claude client is unavailable")
-    try:
-        completed = runner(
-            [executable, "auth", "status", "--json"],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=OBSERVATION_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ContractError("Claude auth status is unavailable") from exc
-    output = completed.stdout
-    if (
-        completed.returncode != 0
-        or not isinstance(output, bytes)
-        or len(output) > MAX_OBSERVATION_BYTES
-    ):
-        raise ContractError("Claude auth status is unavailable")
+    output = _bounded_output(
+        [executable, "auth", "status", "--json"],
+        environment=environment,
+        timeout=timeout,
+        popen=popen,
+    )
     return [
         parse_claude_auth_status(
             output, digest_key=digest_key, observed_at_ms=observed_at_ms
@@ -321,7 +379,7 @@ def parse_codex_rate_limits(
             "logged_in": True,
             "auth_method": None,
             "subscription_type": None,
-            "plan_type": _label(field("planType")),
+            "plan_type": _allowed(field("planType"), CODEX_PLAN_TYPES),
             "observed_at_ms": observed_at_ms,
         })),
         validate_provider_headroom(_record("provider_headroom", {
@@ -336,6 +394,7 @@ def parse_codex_rate_limits(
             "ordinary_usage_allowed": ordinary if isinstance(ordinary, bool) else None,
             "is_using_overage": None,
             "overage_status": None,
+            "overage_disabled_reason": None,
             "observed_at_ms": observed_at_ms,
         })),
     ]
@@ -401,7 +460,7 @@ def claude_rate_limit_records(
             raise ContractError("Claude utilization must be a fraction")
         if entry.get("status") == "rejected":
             status = "rejected"
-        label = _label(scope)
+        label = _scope(scope)
         windows.append({
             "window_minutes": CLAUDE_WINDOW_MINUTES.get(label or ""),
             "scope": label,
@@ -411,13 +470,16 @@ def claude_rate_limit_records(
     using = rate_limit_info.get("isUsingOverage")
     using = using if isinstance(using, bool) else None
     overage = rate_limit_info.get("overageStatus")
-    if overage not in {"allowed", "allowed_warning", "rejected"}:
-        overage = "disabled" if rate_limit_info.get("overageDisabledReason") else None
-    # Overage is unusable only when it is off and not in use; anything else
-    # is either usable or unknown, and both deny admission.
+    overage = overage if overage in {"allowed", "allowed_warning", "rejected"} else None
+    reason = _allowed(
+        rate_limit_info.get("overageDisabledReason"), CLAUDE_OVERAGE_DISABLED_REASONS
+    )
+    # Overage counts as unusable only on exact evidence: not in use, rejected,
+    # and an allow-listed reason. Anything else is usable or unknown, and both
+    # deny admission.
     if using is True or overage in {"allowed", "allowed_warning"}:
         paid_usable: bool | None = True
-    elif using is False and overage in {"rejected", "disabled"}:
+    elif using is False and overage == "rejected" and reason is not None:
         paid_usable = False
     else:
         paid_usable = None
@@ -435,6 +497,7 @@ def claude_rate_limit_records(
             "ordinary_usage_allowed": None,
             "is_using_overage": using,
             "overage_status": overage,
+            "overage_disabled_reason": reason,
             "observed_at_ms": observed_at_ms,
         })),
     ]
@@ -448,19 +511,18 @@ def record_claude_rate_limit_event(
     rate_limit_info: dict[str, Any],
     observed_at_ms: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Record a run's Claude rate-limit event against its admitted identity."""
+    """Record a run's Claude rate-limit event against its admitted identity.
 
-    decision = ledger.host_run_admission(project_id, run_handle)
-    if decision["provider"] != "claude":
-        raise ContractError("rate-limit event does not belong to a Claude run")
-    timestamp = observed_at_ms if observed_at_ms is not None else time.time_ns() // 1_000_000
-    records = claude_rate_limit_records(
-        rate_limit_info,
-        account_fingerprint=decision["account_fingerprint"],
-        observed_at_ms=timestamp,
+    The trusted bridge calls this; the ledger derives the fingerprint from the
+    run's stored admission, so callers never supply one.
+    """
+
+    return ledger.record_claude_rate_limit_event(
+        project_id,
+        run_handle=run_handle,
+        rate_limit_info=rate_limit_info,
+        now_ms=observed_at_ms,
     )
-    ledger.record_provider_observations(project_id, records, now_ms=timestamp)
-    return records
 
 
 def billing_attestation_record(grant: Any) -> dict[str, Any]:
@@ -538,7 +600,7 @@ def evaluate_admission(
     if provider == "claude" and not (
         identity["logged_in"]
         and identity["auth_method"] == "claude.ai"
-        and identity["subscription_type"] is not None
+        and identity["subscription_type"] in CLAUDE_SUBSCRIPTION_TYPES
     ):
         return decision("claude_subscription_missing", fingerprint, evidence)
     own = [

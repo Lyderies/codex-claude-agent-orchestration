@@ -42,6 +42,7 @@ from tests.learning_support import (
     event_record,
     full_usage,
     admit_provider,
+    fake_provider_tools,
     generate_test_owner_key,
     sign_owner_payload,
     result,
@@ -71,10 +72,15 @@ class LearningCliTests(unittest.TestCase):
         )
         self.project_id = ledger.register_project(self.project, now_ms=1)
         # Host runs are admitted only with a fresh identity and an owner attestation.
-        admit_provider(
-            ledger, self.project_id, self.owner_private_key,
-            observed_at_ms=time.time_ns() // 1_000_000,
-        )
+        self.tools = base / "fake-tools"
+        fake_provider_tools(self.tools)
+        # Collector sessions here bind on a small fixed clock and host runs on the
+        # real clock, so the identity is observed at both.
+        for observed_at_ms in (1, time.time_ns() // 1_000_000):
+            admit_provider(
+                ledger, self.project_id, self.owner_private_key, tools=self.tools,
+                observed_at_ms=observed_at_ms,
+            )
         self.fixture_task = {
             "id": "cli-fixture", "objective": "Verify one fixed fixture",
             "family": "verification", "complexity": "low", "risk": "low",
@@ -950,19 +956,38 @@ class LearningCliTests(unittest.TestCase):
         )
 
     def test_provider_observation_and_billing_attestation_commands(self) -> None:
-        fixtures = Path(__file__).resolve().parent / "fixtures" / "providers"
-        tools = Path(self.temporary.name) / "fake-tools"
-        tools.mkdir()
-        # A stand-in `claude` that prints the recorded auth status; nothing is spent.
-        claude = tools / "claude"
-        claude.write_text(f"#!/bin/sh\nexec /bin/cat {fixtures / 'claude-auth-status.json'}\n")
-        claude.chmod(0o755)
+        # The fake `claude` prints the recorded auth status; nothing is spent.
+        tools = self.tools
         observed = self._run(
             "provider-observe", "--provider", "claude", env={"PATH": str(tools)}
         )
         identity = observed["records"][0]
         self.assertEqual("provider_identity", identity["record_type"])
         self.assertNotIn("example.invalid", json.dumps(observed))
+        # Identifiers placed in label fields never reach records or output.
+        status = json.loads((tools / "claude-status.json").read_text())
+        (tools / "claude-status.json").write_text(
+            json.dumps({**status, "subscriptionType": status["orgId"]})
+        )
+        codex = json.loads((tools / "codex-result.json").read_text())
+        codex["rateLimits"]["planType"] = codex["accountId"]
+        (tools / "codex-result.json").write_text(json.dumps(codex))
+        for provider, raw in (("claude", status["orgId"]), ("codex", codex["accountId"])):
+            completed = subprocess.run(
+                [
+                    sys.executable, str(ORCHESTRATION_ROOT / "cli.py"),
+                    "provider-observe", "--provider", provider,
+                    "--state-root", str(self.state_root),
+                    "--project-root", str(self.project),
+                ],
+                text=True, capture_output=True, check=False,
+                env=self._environment(PATH=str(tools)),
+            )
+            self.assertEqual(0, completed.returncode, completed.stdout)
+            self.assertNotIn(raw, completed.stdout + completed.stderr)
+            self.assertIsNone(json.loads(completed.stdout)["records"][0][
+                "subscription_type" if provider == "claude" else "plan_type"
+            ])
         refused = self._run(
             "provider-observe", "--provider", "claude", expected=2,
             env={"PATH": str(tools), "ANTHROPIC_API_KEY": "test-only"},

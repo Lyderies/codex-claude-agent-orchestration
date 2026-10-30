@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -81,8 +80,6 @@ from codex_agents.learning_store import (  # noqa: E402
 from codex_agents.providers import (  # noqa: E402
     AdmissionDenied,
     billing_attestation_record,
-    observe_claude,
-    observe_codex,
 )
 from codex_agents.routing import (  # noqa: E402
     PolicyError,
@@ -1323,13 +1320,8 @@ def main() -> int:
                     route=route,
                     parent_grant=_json_input(args.parent_grant),
                 )
-                # Admission is evaluated once, here; later steps read the stored
-                # decision. A verifier is admitted when its own run is opened.
-                admission = ledger.evaluate_admission(
-                    project_id,
-                    provider=route.get("provider", "codex"),
-                    environ=os.environ,
-                )
+                # The ledger admits the run itself as it opens it; later steps read
+                # the stored decision. A verifier is admitted when its run opens.
                 report = {
                     "ready": True,
                     **ledger.open_host_run(
@@ -1341,29 +1333,17 @@ def main() -> int:
                         client_version=TRUSTED_HOST_CLIENT,
                         orchestration_handle=args.orchestration_handle,
                         fallback_receipt=args.fallback_receipt,
-                        admission=admission,
                     ),
-                    "admission": admission["reason_code"],
                 }
             finally:
                 _close_ledger(ledger)
         elif args.command == "provider-observe":
             ledger, project_id = _learning_ledger(args)
             try:
-                observed_at_ms = time.time_ns() // 1_000_000
-                if args.provider == "claude":
-                    records = observe_claude(
-                        digest_key=ledger.state.digest_key(),
-                        observed_at_ms=observed_at_ms,
-                    )
-                else:
-                    records = observe_codex(
-                        args.project_root.resolve(),
-                        digest_key=ledger.state.digest_key(),
-                        observed_at_ms=observed_at_ms,
-                    )
-                ledger.record_provider_observations(
-                    project_id, records, now_ms=observed_at_ms
+                records = ledger.observe_provider(
+                    project_id,
+                    args.provider,
+                    project_root=args.project_root.resolve(),
                 )
                 report = {"ready": True, "records": records}
             finally:
