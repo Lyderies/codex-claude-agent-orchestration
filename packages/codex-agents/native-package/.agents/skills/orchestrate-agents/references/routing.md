@@ -79,7 +79,13 @@ native Claude open is also denied `claude_model_override_present` when a model o
 effort override is set, and it returns `native_spawn` (agent, model alias and effort)
 computed from the route. Claude's billing evidence for native children comes from
 `provider-observe --provider claude --billing-probe`, one minimal locked Haiku turn
-whose rate-limit event is the only thing recorded. The markers only catch accidental
+whose rate-limit event is the only thing recorded. The probe spends a little, so it is
+admitted like a run first (no API key or alternate backend, a fresh identity, a
+`claude.ai` subscription, an owner attestation, no paid usage and no exhausted window),
+its decision is stored, it shares the single bootstrap allowance with runs, and billing
+evidence under five minutes old is reused (`probe: "reused"`) instead of probing
+again. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
+constrained. The markers only catch accidental
 misuse; they are not proof of identity. Admission, the bridge flag and the read-only sandbox are the
 authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
 installed with this package.

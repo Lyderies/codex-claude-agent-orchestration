@@ -20,7 +20,7 @@ from unittest import mock
 from tests.support import FIXTURES_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 import cli
-from codex_agents import bridge, claude_host
+from codex_agents import bridge, claude_host, learning_store
 from codex_agents.bridge import (
     BridgeRefused,
     dispatch,
@@ -1244,28 +1244,152 @@ class ClaudeHostReviewTests(ClaudePrimaryCase):
                 {"model": "claude-other-1", "effort": "high", "agent_type": "x"}
             )
 
+    def launches(self) -> int:
+        return len([i for i in self.invocations("claude") if "-p" in i["argv"]])
+
+    def stale_evidence(self):
+        return mock.patch.object(learning_store, "PROBE_REUSE_SECONDS", 0)
+
     def test_billing_probe_admits_consecutive_native_children(self) -> None:
         self.admit("claude")
-        observed = self.probe(FAVOURABLE)
-        self.assertEqual(
-            ["provider_identity", "provider_headroom", "provider_billing"],
-            [record["record_type"] for record in observed["records"]],
+        with self.stale_evidence():
+            observed = self.probe(FAVOURABLE)
+            self.assertEqual("launched", observed["probe"])
+            self.assertEqual(
+                ["provider_identity", "provider_headroom", "provider_billing"],
+                [record["record_type"] for record in observed["records"]],
+            )
+            argv = [i for i in self.invocations("claude") if "-p" in i["argv"]][-1]["argv"]
+            self.assertEqual(
+                ("claude-haiku-5-5", "low", ""),
+                (argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1],
+                 argv[argv.index("--tools") + 1]),
+            )
+            self.assertNotIn("--bare", argv)
+            self.assertIn("run_handle", self.open_native())
+            self.probe(FAVOURABLE)
+            self.assertIn("run_handle", self.open_native())
+            self.probe(OVERAGE)
+            self.assertEqual(
+                "paid_usage_usable", self.open_native(expected=2)["reason_code"]
+            )
+
+    def test_probe_is_admitted_like_a_run(self) -> None:
+        # Without an owner attestation nothing is launched.
+        self.ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        self.ledger.observe_provider(
+            self.project_id, "claude", project_root=self.tools, environ=CLEAN
         )
-        argv = [i for i in self.invocations("claude") if "-p" in i["argv"]][-1]["argv"]
+        self.ledger.close()
+        denied = self.probe(FAVOURABLE, expected=2)
+        self.assertEqual("billing_attestation_missing", denied["reason_code"])
+        self.assertEqual(0, self.launches())
+        self.admit("claude")
+        for environment, reason in (
+            ({"ANTHROPIC_API_KEY": "key"}, "claude_backend_not_subscription"),
+            ({"CLAUDE_CODE_USE_BEDROCK": "1"}, "claude_backend_not_subscription"),
+        ):
+            with self.subTest(environment=environment), \
+                    mock.patch.dict(os.environ, environment):
+                self.assertEqual(reason, self.probe(FAVOURABLE, expected=2)["reason_code"])
+        self.assertEqual(0, self.launches())
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                decisions = repository.records("probe_admission")
+        finally:
+            ledger.close()
         self.assertEqual(
-            ("claude-haiku-5-5", "low", ""),
-            (argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1],
-             argv[argv.index("--tools") + 1]),
+            ["billing_attestation_missing", "claude_backend_not_subscription",
+             "claude_backend_not_subscription"],
+            [record["reason_code"] for record in decisions],
         )
-        self.assertNotIn("--bare", argv)
+
+    def test_probe_denials_from_existing_evidence(self) -> None:
+        self.admit("claude")
+        future = (time.time_ns() // 1_000_000 + 3_600_000) // 1000
+        cases = (
+            (OVERAGE, "paid_usage_usable"),
+            ({**RATE_LIMIT, "rate_limit_info": {
+                **RATE_LIMIT["rate_limit_info"], "status": "rejected",
+                "rateLimitType": "seven_day", "resetsAt": future}},
+             "provider_exhausted"),
+        )
+        for event, reason in cases:
+            with self.subTest(reason=reason):
+                self.setUp_fresh_project()
+                with self.stale_evidence():
+                    self.assertEqual("launched", self.probe(event)["probe"])
+                    before = self.launches()
+                    denied = self.probe(FAVOURABLE, expected=2)
+                self.assertEqual(reason, denied["reason_code"])
+                self.assertEqual(before, self.launches())
+
+    def setUp_fresh_project(self) -> None:
+        # Each case needs its own account history, so use a new project.
+        project = Path(tempfile.mkdtemp(dir=self.temporary.name))
+        git(project, "init", "-q")
+        git(project, "config", "user.email", "tests@example.invalid")
+        git(project, "config", "user.name", "Bridge Tests")
+        (project / "readme.txt").write_text("x\n")
+        git(project, "add", ".")
+        git(project, "commit", "-qm", "project")
+        self.project = project
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            self.project_id = ledger.register_project(project, now_ms=1)
+        finally:
+            ledger.close()
+        self.admit("claude")
+
+    def test_exhausted_window_blocks_probes_at_ninety_percent(self) -> None:
+        self.admit("claude")
+        future = (time.time_ns() // 1_000_000 + 3_600_000) // 1000
+        busy = {**RATE_LIMIT, "rate_limit_info": {
+            **RATE_LIMIT["rate_limit_info"], "utilization": 0.9, "resetsAt": future,
+        }}
+        with self.stale_evidence():
+            self.probe(busy)
+            self.assertEqual(
+                "provider_exhausted", self.probe(FAVOURABLE, expected=2)["reason_code"]
+            )
+
+    def test_bootstrap_allows_exactly_one_probe(self) -> None:
+        self.admit("claude")
+        with self.stale_evidence():
+            # The bootstrap probe runs but reports no rate-limit event.
+            self.frames("claude", [PROBE_INIT, result_frame("OK")])
+            failed = self.cli(
+                "provider-observe", "--provider", "claude", "--billing-probe", expected=2
+            )
+            self.assertIn("no rate-limit event", failed["reason"])
+            self.assertEqual(1, self.launches())
+            denied = self.probe(FAVOURABLE, expected=2)
+        self.assertEqual("billing_unverified", denied["reason_code"])
+        self.assertEqual(1, self.launches())
+        # A run cannot take the spent bootstrap either.
+        self.assertEqual("billing_unverified", self.open_native(expected=2)["reason_code"])
+
+    def test_a_bootstrap_run_spends_the_probe_allowance(self) -> None:
+        self.admit("claude")
         self.assertIn("run_handle", self.open_native())
-        self.probe(FAVOURABLE)
-        self.assertIn("run_handle", self.open_native())
-        self.probe(OVERAGE)
-        self.assertEqual("paid_usage_usable", self.open_native(expected=2)["reason_code"])
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "1"}):
-            refused = self.probe(FAVOURABLE, expected=2)
-        self.assertEqual("claude_backend_not_subscription", refused["reason_code"])
+        with self.stale_evidence():
+            denied = self.probe(FAVOURABLE, expected=2)
+        self.assertEqual("billing_unverified", denied["reason_code"])
+        self.assertEqual(0, self.launches())
+
+    def test_fresh_evidence_is_reused_and_stale_evidence_is_refreshed(self) -> None:
+        self.admit("claude")
+        self.assertEqual("launched", self.probe(FAVOURABLE)["probe"])
+        reused = self.probe(OVERAGE)
+        self.assertEqual("reused", reused["probe"])
+        self.assertEqual(1, self.launches())
+        self.assertEqual(
+            "provider_billing", reused["records"][-1]["record_type"]
+        )
+        with self.stale_evidence():
+            self.assertEqual("launched", self.probe(FAVOURABLE)["probe"])
+        self.assertEqual(2, self.launches())
 
     def test_explicit_host_client_matches_implicit_routing(self) -> None:
         task = self.write("b.json", self.bounded())

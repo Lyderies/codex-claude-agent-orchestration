@@ -1528,15 +1528,18 @@ def main() -> int:
             try:
                 if args.billing_probe and args.provider != "claude":
                     raise ContractError("the billing probe is for Claude only")
-                records = (
-                    ledger.observe_claude_billing(project_id)
-                    if args.billing_probe
-                    else ledger.observe_provider(
+                probe = None
+                if args.billing_probe:
+                    observed = ledger.observe_claude_billing(
+                        project_id, project_root=args.project_root.resolve()
+                    )
+                    probe, records = observed["probe"], observed["records"]
+                else:
+                    records = ledger.observe_provider(
                         project_id,
                         args.provider,
                         project_root=args.project_root.resolve(),
                     )
-                )
                 # The local client path stays in the ledger and is never printed.
                 report = {
                     "ready": True,
@@ -1544,6 +1547,7 @@ def main() -> int:
                         {key: value for key, value in record.items() if key != "client_path"}
                         for record in records
                     ],
+                    **({"probe": probe} if probe is not None else {}),
                 }
             finally:
                 _close_ledger(ledger)

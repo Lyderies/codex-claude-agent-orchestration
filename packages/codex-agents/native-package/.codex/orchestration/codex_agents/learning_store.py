@@ -126,6 +126,8 @@ PRODUCER_AUTHORITY = {
     "lifecycle": {"promotion"},
 }
 # Only ledger methods that run the observation themselves may write these.
+# Billing evidence younger than this is reused instead of probing again.
+PROBE_REUSE_SECONDS = 300
 PROVIDER_OBSERVATION_TYPES = {"provider_identity", "provider_headroom", "provider_billing"}
 SOURCE_BY_PRODUCER = {
     "hook": "hook",
@@ -2081,7 +2083,7 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile",
+            "host_run_profile", "probe_admission",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -3560,30 +3562,103 @@ class LearningLedger:
         return records
 
     def observe_claude_billing(
-        self, project_id: str, *, environ: Any = None
-    ) -> list[dict[str, Any]]:
+        self,
+        project_id: str,
+        *,
+        project_root: Path,
+        environ: Any = None,
+    ) -> dict[str, Any]:
         """Observe the Claude identity, then probe billing and headroom once.
 
         Native Claude children emit no rate-limit event, so this probe is the
-        billing evidence for a Claude primary. Only its rate-limit event is kept.
+        billing evidence for a Claude primary. It is a real, small request, so
+        it passes the same admission rules as a run first, shares the single
+        bootstrap allowance, and reuses evidence younger than five minutes.
+        Only its rate-limit event is kept.
         """
 
         from .bridge import claude_billing_probe
-        from .providers import claude_rate_limit_records
+        from .claude_host import ClaudeHostDenied, check_backend
+        from .providers import AdmissionDenied, claude_rate_limit_records
 
         environ = os.environ if environ is None else environ
+
+        def deny(reason: str, timestamp: int, decision: dict[str, Any] | None = None):
+            record = decision or {
+                "provider": "claude", "decision": "deny", "reason_code": reason,
+                "admission_basis": None, "account_fingerprint": None,
+                "evidence_digests": [], "observed_at_ms": timestamp,
+            }
+            with self._lock, self._connection:
+                self._store_probe_admission_locked(project_id, record, timestamp=timestamp)
+            self.state.harden_database_files()
+
+        try:
+            check_backend(environ, project_root)
+        except ClaudeHostDenied as exc:
+            deny(exc.reason_code, self._clock_ms())
+            raise
         identity = self.observe_provider(
-            project_id, "claude", project_root=Path("."), environ=environ
+            project_id, "claude", project_root=project_root, environ=environ
         )[0]
-        info = claude_billing_probe(environ)
+        fingerprint = identity["account_fingerprint"]
         timestamp = self._clock_ms()
+        with self._lock, self._connection:
+            billing = [
+                record for record, _ in self._provider_records_locked(
+                    project_id, "provider_billing", "claude"
+                )
+                if record["account_fingerprint"] == fingerprint
+            ]
+            latest = max(billing, key=lambda record: record["observed_at_ms"], default=None)
+            if latest is not None and 0 <= timestamp - latest["observed_at_ms"] < (
+                PROBE_REUSE_SECONDS * 1000
+            ):
+                # Fresh evidence bounds the spend when children open back to back.
+                headroom = [
+                    record for record, _ in self._provider_records_locked(
+                        project_id, "provider_headroom", "claude"
+                    )
+                    if record["account_fingerprint"] == fingerprint
+                ]
+                return {
+                    "probe": "reused",
+                    "records": [identity, *headroom[-1:], latest],
+                }
+            decision = self._evaluate_admission_locked(
+                project_id, provider="claude", environ=environ, timestamp=timestamp
+            )
+            if decision["decision"] == "pass":
+                # Stored before launch, in the same transaction as the decision,
+                # so a crash or a repeat cannot take the bootstrap twice.
+                self._store_probe_admission_locked(
+                    project_id, decision, timestamp=timestamp
+                )
+        if decision["decision"] != "pass":
+            deny(decision["reason_code"], timestamp, decision)
+            raise AdmissionDenied(decision["reason_code"])
+        self.state.harden_database_files()
+        info = claude_billing_probe(environ)
+        observed = self._clock_ms()
         records = claude_rate_limit_records(
-            info,
-            account_fingerprint=identity["account_fingerprint"],
-            observed_at_ms=timestamp,
+            info, account_fingerprint=fingerprint, observed_at_ms=observed
         )
-        self._store_provider_observations(project_id, records, timestamp=timestamp)
-        return [identity, *records]
+        self._store_provider_observations(project_id, records, timestamp=observed)
+        return {"probe": "launched", "records": [identity, *records]}
+
+    def _store_probe_admission_locked(
+        self, project_id: str, decision: dict[str, Any], *, timestamp: int
+    ) -> None:
+        material = {"schema_version": 1, "record_type": "probe_admission", **decision}
+        try:
+            record = validate_learning_record(
+                {**material, "record_id": f"probe_admission:{content_digest(material)}"}
+            )
+        except ContractError as exc:
+            raise LedgerError("probe admission decision is invalid") from exc
+        self._append_checked_locked(
+            project_id, record, producer="lifecycle", timestamp=timestamp
+        )
 
     def record_claude_rate_limit_event(
         self,
@@ -3695,7 +3770,8 @@ class LearningLedger:
                 str(row[0])
                 for row in self._connection.execute(
                     "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint') "
-                    "FROM records WHERE project_id=? AND record_type='admission_decision' "
+                    "FROM records WHERE project_id=? "
+                    "AND record_type IN ('admission_decision','probe_admission') "
                     "AND json_extract(CAST(content AS TEXT),'$.provider')='claude' "
                     "AND json_extract(CAST(content AS TEXT),'$.decision')='pass'",
                     (project_id,),

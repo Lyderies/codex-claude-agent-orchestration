@@ -643,9 +643,15 @@ def _headroom_state(provider: str, record: dict[str, Any], now_ms: int) -> str |
         if any(value >= CODEX_CONSTRAINED_PERCENT for value in used):
             return "constrained"
         return "ample"
-    if record["status"] == "rejected" or any(value >= 100 for value in used):
+    # Under a Claude primary, Claude children spend the primary's own allowance,
+    # so Claude windows use the same thresholds as Codex.
+    if record["status"] == "rejected" or any(
+        value >= CODEX_EXHAUSTED_PERCENT for value in used
+    ):
         return "exhausted"
-    if record["status"] == "allowed_warning":
+    if record["status"] == "allowed_warning" or any(
+        value >= CODEX_CONSTRAINED_PERCENT for value in used
+    ):
         return "constrained"
     return "ample"
 

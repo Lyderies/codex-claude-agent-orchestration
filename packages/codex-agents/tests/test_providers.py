@@ -391,6 +391,34 @@ class ProviderObservationTests(unittest.TestCase):
                 AppServerSession(root, environ={**environ, "OPENAI_API_KEY": "x"})
 
 
+class HeadroomThresholdTests(unittest.TestCase):
+    def test_claude_windows_use_the_codex_thresholds(self) -> None:
+        from codex_agents.providers import _headroom_state
+
+        def rate(used: float | None, status: str = "allowed") -> str | None:
+            record = {
+                "status": status, "observed_at_ms": NOW,
+                "windows": [{"window_minutes": 300, "scope": "five_hour",
+                             "used_percent": used, "resets_at": NOW + 1000}],
+            }
+            return _headroom_state("claude", record, NOW)
+
+        for used, expected in (
+            (74.9, "ample"), (75, "constrained"), (89.9, "constrained"),
+            (90, "exhausted"), (100, "exhausted"), (None, "ample"),
+        ):
+            with self.subTest(used=used):
+                self.assertEqual(expected, rate(used))
+        self.assertEqual("exhausted", rate(10, "rejected"))
+        self.assertEqual("constrained", rate(10, "allowed_warning"))
+        record = {
+            "status": "rejected", "observed_at_ms": NOW,
+            "windows": [{"window_minutes": 300, "scope": "five_hour",
+                         "used_percent": 95, "resets_at": NOW - 1}],
+        }
+        self.assertIsNone(_headroom_state("claude", record, NOW))
+
+
 class AdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)

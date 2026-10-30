@@ -48,6 +48,7 @@ RECORD_TYPES = {
     "admission_decision",
     "dispatch_intent",
     "host_run_profile",
+    "probe_admission",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -1884,6 +1885,25 @@ def validate_host_run_profile(data: Any) -> dict[str, Any]:
     return data
 
 
+PROBE_ADMISSION_FIELDS = ADMISSION_DECISION_FIELDS - {"run_id"}
+
+
+def validate_probe_admission(data: Any) -> dict[str, Any]:
+    """The admission decision for one Claude billing probe, which spends a little."""
+
+    data = _closed(data, PROBE_ADMISSION_FIELDS, "probe_admission")
+    if data.get("provider") != "claude":
+        raise ContractError("only Claude billing is probed")
+    validate_admission_decision({
+        **data,
+        "record_type": "admission_decision",
+        # A probe has no run; stand in a placeholder so the shared rules apply.
+        "run_id": "probe" if data["decision"] == "pass" else None,
+    })
+    _base(data, "probe_admission")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -1907,6 +1927,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "admission_decision": validate_admission_decision,
     "dispatch_intent": validate_dispatch_intent,
     "host_run_profile": validate_host_run_profile,
+    "probe_admission": validate_probe_admission,
 }
 
 

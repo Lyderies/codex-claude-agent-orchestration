@@ -23,7 +23,8 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
    child the returned template.
 4. **Observe and open.** Run `provider-observe --provider <route provider>`; before a
    native Claude child run `provider-observe --provider claude --billing-probe`
-   instead, because native children report no billing of their own. Then run
+   instead, because native children report no billing of their own; it reuses recent
+   evidence and is refused, like a run, when admission would fail. Then run
    `learning-open-host-run` with the task, route, assignment, parent grant and
    orchestration handle. A denial returns a `reason_code`, for example
    `claude_backend_not_subscription` or `claude_model_override_present`: report it to
