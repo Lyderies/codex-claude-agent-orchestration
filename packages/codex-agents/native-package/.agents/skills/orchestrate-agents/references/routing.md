@@ -51,7 +51,10 @@ only Codex is enabled, so every route is Codex with `native` dispatch. A Codex p
 reaches Claude only when that file sets `codex_primary_may_bridge_to_claude`. Each route
 records its `provider`, its `dispatch` (`native` or `bridge`) and the digest of the
 provider configuration it used. The verifier prefers the other provider, then the
-worker's own. Learning candidates cannot move a route to another provider.
+worker's own. A verification task that sets `verification_for_provider` to the worker's
+provider is routed by the same rule, so it matches the advertised verifier. Deleting a
+committed provider configuration without committing the deletion blocks routing.
+Learning candidates cannot move a route to another provider.
 
 The account catalog of the policy's `validated_client` recognizes `low`, `medium`,
 `high`, `xhigh`, and `max` for active models, while initial routes use medium or high.

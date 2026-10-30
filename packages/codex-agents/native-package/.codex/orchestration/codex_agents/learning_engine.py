@@ -29,6 +29,7 @@ from typing import Any
 
 import tomllib
 
+from .catalog import CLAUDE_READ_ONLY_TOOLS, CatalogError, parse_claude_agent
 from .contracts import (
     ContractError,
     result_axes,
@@ -226,8 +227,6 @@ def _installed_managed_files(root: Path) -> tuple[list[str], dict[str, bytes]]:
     return paths, contents
 
 
-CLAUDE_AGENT_KEYS = {"name", "description", "tools", "model", "maxTurns"}
-CLAUDE_READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
 CLAUDE_SKILL_PATH = ".claude/skills/claude-agents/SKILL.md"
 # Mirrors the router's default; only a committed project configuration changes it.
 DEFAULT_PROVIDER_CONFIG_DIGEST = content_digest(
@@ -240,40 +239,15 @@ DEFAULT_PROVIDER_CONFIG_DIGEST = content_digest(
 
 
 def _claude_agent_definition(raw: bytes) -> tuple[dict[str, Any], str]:
-    """Parse the closed front matter and prompt body of one Claude agent file."""
+    """Parse one Claude agent with the discovery parser and require read-only tools."""
 
     try:
-        text = raw.decode("utf-8")
-    except UnicodeError as exc:
-        raise ContractError("installed Claude agent is not UTF-8") from exc
-    end = text.find("\n---\n", 4)
-    if not text.startswith("---\n") or end < 0:
-        raise ContractError("installed Claude agent front matter is invalid")
-    metadata: dict[str, Any] = {}
-    for line in text[4:end].splitlines():
-        if not line.strip():
-            continue
-        key, separator, value = line.partition(":")
-        key = key.strip()
-        if (
-            not separator
-            or line.startswith((" ", "\t"))
-            or key not in CLAUDE_AGENT_KEYS
-            or key in metadata
-            or not value.strip()
-        ):
-            raise ContractError("installed Claude agent front matter is invalid")
-        metadata[key] = value.strip()
-    if not {"name", "description", "tools"} <= metadata.keys():
-        raise ContractError("installed Claude agent front matter is incomplete")
-    tools = [item.strip() for item in metadata["tools"].split(",") if item.strip()]
-    if not tools or not set(tools) <= CLAUDE_READ_ONLY_TOOLS:
+        metadata, prompt = parse_claude_agent(raw)
+    except CatalogError as exc:
+        raise ContractError(f"installed Claude agent is invalid: {exc}") from exc
+    if not set(metadata["tools"]) <= CLAUDE_READ_ONLY_TOOLS:
         raise ContractError("installed Claude agent must use read-only tools")
-    metadata["tools"] = tools
-    turns = metadata.get("maxTurns")
-    if turns is not None and re.fullmatch(r"[1-9][0-9]{0,3}", turns) is None:
-        raise ContractError("installed Claude agent turn limit is invalid")
-    return metadata, text[end + 5:].strip()
+    return metadata, prompt
 
 
 def _claude_agent_artifacts(

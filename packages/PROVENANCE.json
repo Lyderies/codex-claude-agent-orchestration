@@ -139,7 +139,10 @@
         "native-package/.codex/orchestration/schemas/learning-outcome.schema.json": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "tests/learning_support.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "tests/test_catalog.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
-        "tests/test_learning_contracts.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)"
+        "tests/test_learning_contracts.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
+        "native-package/.codex/orchestration/codex_agents/contracts.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
+        "native-package/.codex/orchestration/schemas/task.schema.json": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
+        "tests/test_validation.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)"
       }
     },
     "claude-agents": {

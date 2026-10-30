@@ -1119,6 +1119,165 @@ class ProviderRoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(PolicyError, "not a regular file"):
                 load_effective_policy(*arguments)
 
+    def git_commit(self, root: Path, message: str) -> None:
+        if not (root / ".git").exists():
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Routing Tests"],
+                check=True,
+            )
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", message], check=True)
+
+    def test_deleted_committed_provider_configuration_fails_closed(self) -> None:
+        config = {
+            "version": 1,
+            "providers": {"codex": {"enabled": False}, "claude": {"enabled": True}},
+            "codex_primary_may_bridge_to_claude": False,
+        }
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            path = root / ".codex/orchestration/provider-routing.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(config))
+            self.git_commit(root, "provider config")
+            arguments = (
+                root,
+                ORCHESTRATION_ROOT / "config/routing-policy.json",
+                ORCHESTRATION_ROOT / "config/discovery-policy.json",
+            )
+            with self.assertRaisesRegex(ContractError, "no provider candidate"):
+                route_task(self.exploratory(), load_effective_policy(*arguments))
+            path.unlink()
+            with self.assertRaisesRegex(ContractError, "committed but missing"):
+                load_effective_policy(*arguments)
+            # A committed deletion is a deliberate return to the defaults.
+            self.git_commit(root, "remove provider config")
+            policy = load_effective_policy(*arguments)
+            self.assertNotIn("provider_routing", policy)
+
+    def test_verification_task_matches_the_advertised_verifier(self) -> None:
+        cases = (
+            (self.provider_policy(), "claude"),
+            (self.provider_policy(bridge=True), "codex"),
+            (self.provider_policy(codex={"enabled": False}), "claude"),
+        )
+        for policy, primary in cases:
+            for worker_task in (self.task(), self.exploratory()):
+                try:
+                    worker = route_task(worker_task, policy, primary_provider=primary)
+                except ContractError:
+                    continue
+                with self.subTest(primary=primary, worker=worker["provider"]):
+                    verification = route_task(
+                        self.task(
+                            id="verify-1",
+                            family="verification",
+                            operation="review",
+                            acceptance_strength="independent_judgment",
+                            deterministic_validation=False,
+                            verification_for_family="coding",
+                            verification_for_provider=worker["provider"],
+                        ),
+                        policy,
+                        primary_provider=primary,
+                    )
+                    advertised = worker["verifier"]
+                    self.assertEqual(
+                        (advertised["provider"], advertised["model"],
+                         advertised["effort"], advertised["dispatch"]),
+                        (verification["provider"], verification["model"],
+                         verification["effort"], verification["dispatch"]),
+                    )
+                    self.assertEqual(advertised["role"], verification["role"])
+        # Both directions are covered: Claude work gets Codex, Codex work gets Claude.
+        claude_primary = self.provider_policy()
+        self.assertEqual(
+            "codex",
+            route_task(self.exploratory(), claude_primary, primary_provider="claude")[
+                "verifier"
+            ]["provider"],
+        )
+        self.assertEqual(
+            "claude",
+            route_task(self.task(), claude_primary, primary_provider="claude")[
+                "verifier"
+            ]["provider"],
+        )
+
+    def test_verification_task_without_provider_uses_the_verification_table(self) -> None:
+        verification = self.task(
+            family="verification",
+            operation="review",
+            acceptance_strength="independent_judgment",
+            deterministic_validation=False,
+        )
+        self.assertEqual("codex", route_task(verification, self.policy)["provider"])
+        route = route_task(
+            verification,
+            self.provider_policy(codex={"enabled": False}),
+            primary_provider="claude",
+        )
+        self.assertEqual(
+            ("claude", "claude-opus-5-5", "high", "claude_agents_verification_worker"),
+            (route["provider"], route["model"], route["effort"], route["role"]),
+        )
+        with self.assertRaisesRegex(ContractError, "only for verification tasks"):
+            route_task(self.task(verification_for_provider="codex"), self.policy)
+        with self.assertRaisesRegex(ContractError, "verification_for_provider"):
+            route_task({**verification, "verification_for_provider": "gemini"}, self.policy)
+
+    def test_provider_configuration_type_checks_before_hashing(self) -> None:
+        config = {
+            "version": 1,
+            "providers": {
+                "codex": {"enabled": True, "models": [{}]},
+                "claude": {"enabled": False},
+            },
+            "codex_primary_may_bridge_to_claude": False,
+        }
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            with self.assertRaisesRegex(PolicyError, "models for codex"):
+                validate_provider_routing(
+                    Path(directory), json.dumps(config).encode(), self.policy
+                )
+        policy = deepcopy(self.policy)
+        policy["providers"]["claude"]["models"]["claude-opus-5-5"] = [{}]
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            with self.assertRaisesRegex(PolicyError, "own models to efforts"):
+                load_policy(self.write_policy(directory, policy))
+
+    def test_mapped_claude_agent_needs_the_installed_front_matter_form(self) -> None:
+        for front_matter in (
+            'name: "project_reader"\ndescription: Reads\ntools: Read, Grep\n',
+            "name: project_reader\ndescription: Reads\ntools: [Read, Grep]\n",
+        ):
+            with self.subTest(front_matter=front_matter), tempfile.TemporaryDirectory(
+                dir=TEMP_ROOT
+            ) as directory:
+                root = Path(directory)
+                agents = root / ".claude/agents"
+                orchestration = root / ".codex/orchestration"
+                agents.mkdir(parents=True)
+                orchestration.mkdir(parents=True)
+                (agents / "project_reader.md").write_text(
+                    "---\n" + front_matter + "---\n\nRead the question.\n"
+                )
+                (orchestration / "project-agent-routing.json").write_text(
+                    json.dumps({"version": 1, "roles": {"research": "project_reader"}})
+                )
+                self.git_commit(root, "claude agent")
+                with self.assertRaisesRegex(PolicyError, "not executable"):
+                    load_effective_policy(
+                        root,
+                        ORCHESTRATION_ROOT / "config/routing-policy.json",
+                        ORCHESTRATION_ROOT / "config/discovery-policy.json",
+                    )
+
     def test_mapped_claude_agent_with_write_tools_is_ineligible(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)

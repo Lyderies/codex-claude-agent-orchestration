@@ -171,6 +171,32 @@ def _bind_committed_project_bytes(
         )
 
 
+def _committed_in_head(root: Path, relative: str) -> bool:
+    """Return whether HEAD tracks a project file; a project without commits does not."""
+
+    git_executable = shutil.which("git", path=os.defpath)
+    if git_executable is None:
+        raise ContractError("project provider routing trust is unavailable")
+    environment = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+
+    def run(arguments: list[str]) -> int:
+        return subprocess.run(
+            [git_executable, "-C", str(root), *arguments],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+
+    try:
+        if run(["rev-parse", "--verify", "HEAD^{commit}"]) != 0:
+            return False
+        return run(["cat-file", "-e", f"HEAD:./{relative}"]) == 0
+    except OSError as exc:
+        raise ContractError("project provider routing trust is unavailable") from exc
+
+
 def validate_project_agent_mapping(
     root: Path,
     raw: bytes,
@@ -486,9 +512,11 @@ def validate_provider_routing(
         if "models" in settings:
             models = settings["models"]
             known = _provider_models(policy, provider)
+            # Check types before hashing, so malformed entries fail as policy errors.
             if (
                 not isinstance(models, list)
                 or not models
+                or not all(isinstance(model, str) for model in models)
                 or len(models) != len(set(models))
                 or any(model not in known for model in models)
             ):
@@ -523,6 +551,13 @@ def load_effective_policy(
     provider_path = resolved_root / PROVIDER_ROUTING
     if provider_path.is_symlink():
         raise PolicyError("project provider routing is not a regular file")
+    if not provider_path.exists() and _committed_in_head(
+        resolved_root, PROVIDER_ROUTING.as_posix()
+    ):
+        # Deleting a committed configuration must not silently restore defaults.
+        raise ContractError(
+            "project provider routing is committed but missing from the worktree"
+        )
     if provider_path.exists():
         try:
             provider_raw = _read_project_regular(
@@ -756,8 +791,8 @@ def _validate_providers(policy: dict[str, Any]) -> None:
                     provider_for_model(model) != provider
                     or not isinstance(efforts, list)
                     or not efforts
-                    or len(efforts) != len(set(efforts))
                     or not all(isinstance(effort, str) for effort in efforts)
+                    or len(efforts) != len(set(efforts))
                     for model, efforts in models.items()
                 )
             ):
@@ -1166,9 +1201,36 @@ def _route_task(
     # The task-shape route stays the Codex baseline; provider candidates only
     # reorder providers, and the first eligible one wins. None eligible denies.
     picked: tuple[str, dict[str, Any], dict[str, Any] | None] | None = None
-    for entry in _provider_candidate_list(
-        policy, *_route_key(policy, routed_family, candidate)
-    ):
+    verification_for_provider = task.get("verification_for_provider")
+    if verification_for_provider is not None:
+        # A verification task for known work follows the same rule as the worker
+        # route's advertised verifier, so both name the same provider and model.
+        rule = _select_verifier(
+            policy,
+            task.get("verification_for_family", "verification"),
+            worker_provider=verification_for_provider,
+            primary_provider=primary_provider,
+            use_legacy_fallback=False,
+        )
+        rule_agent = None
+        if rule["provider"] == "claude":
+            rule_agent = {
+                field: rule[field]
+                for field in ("role", "agent_type", "agent_path", "sandbox_mode")
+            }
+        picked = (
+            rule["provider"],
+            {"model": rule["model"], "effort": rule["effort"]},
+            rule_agent,
+        )
+    candidate_entries = (
+        []
+        if picked is not None
+        else _provider_candidate_list(
+            policy, *_route_key(policy, routed_family, candidate)
+        )
+    )
+    for entry in candidate_entries:
         provider = entry["provider"]
         source = candidate if entry == CODEX_POLICY_CANDIDATE else entry
         model_effort = {"model": source["model"], "effort": source["effort"]}

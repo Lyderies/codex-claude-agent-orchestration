@@ -94,6 +94,33 @@ class CatalogTests(unittest.TestCase):
                 "unreviewed Claude agent keys: color", claude["writer"]["warnings"]
             )
 
+    def test_claude_front_matter_matches_the_installed_form(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / ".claude/agents"
+            agents.mkdir(parents=True)
+            (agents / "quoted.md").write_text(
+                '---\nname: "quoted"\ndescription: Reads\ntools: Read\n---\n\nRead.\n'
+            )
+            (agents / "array.md").write_text(
+                "---\nname: array\ndescription: Reads\ntools: [Read, Glob]\n---\n\nRead.\n"
+            )
+            (agents / "installed.md").write_text(
+                "---\nname: installed\ndescription: Reads\ntools: Read, Glob\n"
+                "maxTurns: 8\n---\n\nRead.\n"
+            )
+            outside = Path(directory).parent / "outside-claude-agent.md"
+            (agents / "linked.md").symlink_to(outside)
+            report = discover(root, self.policy())
+            self.assertTrue(report["ready"])
+            warnings = {
+                item["name"]: item["warnings"] for item in report["candidates"]
+            }
+            self.assertIn("name must be unquoted plain text", warnings["quoted"][0])
+            self.assertIn("tools must be unquoted plain text", warnings["array"][0])
+            self.assertEqual(["Claude agent is a symlink"], warnings["linked"])
+            self.assertEqual([], warnings["installed"])
+
     def test_duplicate_name_fails_without_resolution(self) -> None:
         policy = self.policy()
         policy["sources"] = [

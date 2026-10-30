@@ -303,6 +303,57 @@ def _markdown_candidate(
     }
 
 
+def parse_claude_agent(raw: bytes) -> tuple[dict[str, Any], str]:
+    """Parse one Claude agent in the exact form the Claude package installs.
+
+    Discovery and execution share this parser, so an agent that a mapping
+    accepts is one that execution can bind. Values are plain text: quoted
+    strings and YAML arrays or objects are rejected rather than reinterpreted.
+    """
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise CatalogError("Claude agent is not UTF-8") from exc
+    end = text.find("\n---\n", 4)
+    if not text.startswith("---\n") or end < 0:
+        raise CatalogError("Claude agent front matter is missing")
+    metadata: dict[str, Any] = {}
+    for line in text[4:end].splitlines():
+        if not line.strip():
+            continue
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not separator or line.startswith((" ", "\t")):
+            raise CatalogError("Claude agent front matter is not flat key: value text")
+        if key not in CLAUDE_AGENT_ALLOWED_KEYS:
+            raise CatalogError(f"unreviewed Claude agent keys: {key}")
+        if key in metadata:
+            raise CatalogError(f"Claude agent key is repeated: {key}")
+        if not value or value[0] in "\"'[{":
+            raise CatalogError(f"Claude agent {key} must be unquoted plain text")
+        metadata[key] = value
+    missing = sorted({"name", "description", "tools"} - metadata.keys())
+    if missing:
+        raise CatalogError(f"Claude agent is missing: {', '.join(missing)}")
+    if not NAME_RE.match(metadata["name"]):
+        raise CatalogError(
+            "name must use lowercase letters, numbers, underscore, or hyphen"
+        )
+    tools = [item.strip() for item in metadata["tools"].split(",")]
+    if not all(tools) or len(tools) != len(set(tools)):
+        raise CatalogError("Claude agent tools must be a comma-separated list")
+    metadata["tools"] = tools
+    turns = metadata.get("maxTurns")
+    if turns is not None and re.fullmatch(r"[1-9][0-9]{0,3}", turns) is None:
+        raise CatalogError("Claude agent maxTurns must be a positive integer")
+    prompt = text[end + 5:].strip()
+    if not prompt:
+        raise CatalogError("Claude agent prompt is empty")
+    return metadata, prompt
+
+
 def _claude_agent_candidate(
     path: Path,
     source_id: str,
@@ -310,70 +361,53 @@ def _claude_agent_candidate(
 ) -> dict[str, Any]:
     """Describe a Claude agent definition without granting it any authority.
 
-    Claude definitions are inert: their issues are reported as warnings so that
-    unrelated Claude files never block Codex readiness. A project mapping that
-    names one re-checks it strictly before it can be routed.
+    Claude definitions are inert: every problem, including a symlink or a file
+    outside the project, is reported as a warning so that unrelated Claude files
+    never block Codex readiness. A project mapping that names one rejects any
+    warning before it can be routed.
     """
 
-    warnings: list[str] = []
-    try:
-        raw = path.read_bytes()
-        text = raw.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
-        return {
-            "source": source_id,
-            "kind": "agent",
-            "name": path.stem,
-            "format": "claude-md",
-            "path": str(path.relative_to(source_root)),
-            "requested_tools": [],
-            "requested_mcps": [],
-            "requested_skills": [],
-            "content_sha256": None,
-            "sandbox_mode": None,
-            "configured_model": None,
-            "configured_effort": None,
-            "errors": [],
-            "warnings": [f"unreadable Claude agent: {exc}"],
-        }
-    metadata = _frontmatter(text)
-    if not metadata:
-        warnings.append("missing Claude agent front matter")
-    name = metadata.get("name", path.stem)
-    if not isinstance(name, str) or not NAME_RE.match(name):
-        warnings.append("name must use lowercase letters, numbers, underscore, or hyphen")
-        name = path.stem
-    if name != path.stem:
-        warnings.append("file stem differs from agent name")
-    description = metadata.get("description")
-    if not isinstance(description, str) or not description.strip():
-        warnings.append("missing description")
-    unknown = sorted(metadata.keys() - CLAUDE_AGENT_ALLOWED_KEYS)
-    if unknown:
-        warnings.append(f"unreviewed Claude agent keys: {', '.join(unknown)}")
-    tools = metadata.get("tools")
-    if isinstance(tools, str):
-        tools = [part.strip() for part in tools.split(",") if part.strip()]
-    if not isinstance(tools, list) or not tools:
-        warnings.append("Claude agent tools must be listed explicitly")
-        tools = []
-    read_only = bool(tools) and set(tools) <= CLAUDE_READ_ONLY_TOOLS
-    return {
+    candidate: dict[str, Any] = {
         "source": source_id,
         "kind": "agent",
-        "name": name,
+        "name": path.stem,
         "format": "claude-md",
         "path": str(path.relative_to(source_root)),
-        "requested_tools": sorted(set(tools)),
+        "requested_tools": [],
         "requested_mcps": [],
         "requested_skills": [],
-        "content_sha256": hashlib.sha256(raw).hexdigest(),
-        "sandbox_mode": "read-only" if read_only else None,
-        "configured_model": metadata.get("model"),
+        "content_sha256": None,
+        "sandbox_mode": None,
+        "configured_model": None,
         "configured_effort": None,
         "errors": [],
-        "warnings": warnings,
+        "warnings": [],
     }
+    try:
+        if path.is_symlink():
+            candidate["warnings"].append("Claude agent is a symlink")
+            return candidate
+        path.resolve().relative_to(source_root)
+        raw = path.read_bytes()
+    except (OSError, ValueError) as exc:
+        candidate["warnings"].append(f"Claude agent is unavailable: {exc}")
+        return candidate
+    candidate["content_sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        metadata, _ = parse_claude_agent(raw)
+    except CatalogError as exc:
+        candidate["warnings"].append(str(exc))
+        return candidate
+    if metadata["name"] != path.stem:
+        candidate["warnings"].append("file stem differs from agent name")
+    tools = metadata["tools"]
+    candidate.update(
+        name=metadata["name"],
+        requested_tools=sorted(tools),
+        sandbox_mode="read-only" if set(tools) <= CLAUDE_READ_ONLY_TOOLS else None,
+        configured_model=metadata.get("model"),
+    )
+    return candidate
 
 
 def _group_key(candidate: dict[str, Any]) -> str:
@@ -412,7 +446,7 @@ def discover(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
                 )
             )
         for path in sorted((source_root / ".claude" / "agents").glob("*.md")):
-            _require_contained_file(path, source_root)
+            # Containment is checked inside, as an inert warning.
             candidates.append(
                 _claude_agent_candidate(path, source["id"], source_root)
             )

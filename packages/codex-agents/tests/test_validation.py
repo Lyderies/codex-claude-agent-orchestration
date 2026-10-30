@@ -113,6 +113,55 @@ class PackageValidationTests(unittest.TestCase):
                     report,
                 )
 
+    def test_deleted_committed_provider_configuration_blocks_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "target"
+            shutil.copytree(BUNDLE_ROOT, root)
+            path = root / ".codex/orchestration/provider-routing.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "providers": {"codex": {"enabled": False}, "claude": {"enabled": False}},
+                "codex_primary_may_bridge_to_claude": False,
+            }))
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Validation Tests"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "provider config"], check=True
+            )
+            path.unlink()
+            report = validate_package(root)
+            self.assertFalse(report["project_ready"], report)
+            self.assertIn(
+                "project provider routing is committed but missing from the worktree",
+                report["project_errors"],
+            )
+
+    def test_outside_claude_symlink_does_not_block_codex_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "target"
+            shutil.copytree(BUNDLE_ROOT, root)
+            shared = Path(directory) / "shared-agent.md"
+            shared.write_text(
+                "---\nname: shared\ndescription: Shared\ntools: Read\n---\n\nRead.\n"
+            )
+            agents = root / ".claude/agents"
+            agents.mkdir(parents=True)
+            (agents / "shared.md").symlink_to(shared)
+            report = validate_package(root)
+            self.assertTrue(report["package_ready"], report)
+            self.assertFalse(
+                any("claude" in error.lower() for error in report["errors"]), report
+            )
+            self.assertIn("agent:shared: Claude agent is a symlink", report["warnings"])
+
     def test_project_agents_and_skills_can_coexist_with_package(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "target"

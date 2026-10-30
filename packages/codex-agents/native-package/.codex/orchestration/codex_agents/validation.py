@@ -620,7 +620,7 @@ def validate_package(root: Path) -> dict[str, Any]:
         )
     except CatalogError as exc:
         project_errors.append(str(exc))
-    except PolicyError as exc:
+    except (ContractError, PolicyError) as exc:
         project_errors.append(str(exc))
 
     smoke_tasks = [
