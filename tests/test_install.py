@@ -107,6 +107,17 @@ class UmbrellaInstallTests(unittest.TestCase):
         after = {path: digest for path, digest in inventory(self.target).items() if path not in PROJECT_CONFIG}
         self.assertEqual(after, before)
 
+    def test_existing_install_is_adopted_without_changes(self) -> None:
+        self.install(apply=True)
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "install packages")
+        before = inventory(self.target)
+        again = installer.operate("install", self.target, apply=True)
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(again["codex"]["action"], "update")
+        self.assertEqual(again["claude"]["changed_paths"], [])
+        self.assertEqual(inventory(self.target), before)
+
     def test_merge_in_progress_is_refused(self) -> None:
         git(self.target, "switch", "-q", "-c", "other")
         (self.target / "README.md").write_text("# Other\n", encoding="utf-8")

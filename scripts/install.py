@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CODEX_INSTALLER = ROOT / "packages" / "codex-agents" / "scripts" / "install.py"
 CLAUDE_INSTALLER = ROOT / "packages" / "claude-agents" / "scripts" / "package.py"
 MANAGED_PATHS = (".codex", ".agents", ".claude")
+CODEX_MANIFEST = Path(".codex") / "orchestration" / "install-manifest.json"
 IN_PROGRESS = {
     "MERGE_HEAD": "a merge",
     "CHERRY_PICK_HEAD": "a cherry-pick",
@@ -91,16 +92,21 @@ def operate(operation: str, target: Path, *, apply: bool = False, codex_options:
         summary.update(codex=codex, claude=claude)
         summary["ready"] = codex.get("ready") is True and claude.get("result") == "verified"
         return summary
-    order = [(CODEX_INSTALLER, "codex", codex_options), (CLAUDE_INSTALLER, "claude", [])]
+    # An existing Codex install is adopted through its own update path; unchanged bytes are a no-op.
+    codex_operation = operation
+    if operation == "install" and (target / CODEX_MANIFEST).is_file():
+        codex_operation = "update"
+    order = [(CODEX_INSTALLER, "codex", codex_operation, codex_options),
+             (CLAUDE_INSTALLER, "claude", operation, [])]
     if operation == "remove":
         order.reverse()
-    previews = {name: _run(installer, operation, target, False, extra) for installer, name, extra in order}
+    previews = {name: _run(installer, op, target, False, extra) for installer, name, op, extra in order}
     summary.update(previews)
     if any(_failed(report) for report in previews.values()) or not apply:
         summary["ok"] = not any(_failed(report) for report in previews.values())
         return summary
-    for installer, name, extra in order:
-        summary[name] = _run(installer, operation, target, True, extra)
+    for installer, name, op, extra in order:
+        summary[name] = _run(installer, op, target, True, extra)
         if _failed(summary[name]):
             summary["ok"] = False
             summary["next_step"] = f"{name} failed after earlier packages were applied; rerun after fixing"
