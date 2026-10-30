@@ -33,6 +33,8 @@ API_KEY_VARIABLES = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 # The app-server also exposes methods that spend or change account state, so
 # only these two read-only requests may ever be sent.
 APP_SERVER_METHODS = ("initialize", "account/rateLimits/read")
+# The protocol handshake notification; it carries no request and changes nothing.
+APP_SERVER_NOTIFICATIONS = ("initialized",)
 IDENTITY_MAX_AGE_MS = 30 * 60 * 1000
 CODEX_EXHAUSTED_PERCENT = 90
 CLAUDE_WINDOW_MINUTES = {"five_hour": 300, "seven_day": 10_080}
@@ -202,6 +204,15 @@ class AppServerSession:
             raise ContractError(f"Codex app-server {method} failed")
         return response["result"]
 
+    def notify(self, method: str) -> None:
+        if method not in APP_SERVER_NOTIFICATIONS:
+            raise ContractError(f"app-server notification is not allow-listed: {method}")
+        try:
+            self._process.stdin.write((json.dumps({"method": method}) + "\n").encode())
+            self._process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise ContractError("Codex app-server notification failed") from exc
+
     def _response(self, identifier: int) -> dict[str, Any]:
         deadline = time.monotonic() + self._timeout
         stdout = self._process.stdout
@@ -352,6 +363,7 @@ def observe_codex(
                 "version": "0.2.0",
             }},
         )
+        session.notify("initialized")
         result = session.request("account/rateLimits/read", {})
     finally:
         session.close()

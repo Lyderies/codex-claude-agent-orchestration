@@ -145,7 +145,9 @@
         "tests/test_validation.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "native-package/.codex/orchestration/codex_agents/learning_store.py": "G2 S2a provider admission and observations",
         "native-package/.codex/orchestration/config/learning-clients.json": "G2 S2a provider admission and observations",
-        "native-package/.codex/orchestration/config/learning-producers.json": "G2 S2a provider admission and observations"
+        "native-package/.codex/orchestration/config/learning-producers.json": "G2 S2a provider admission and observations",
+        "native-package/.codex/orchestration/codex_agents/providers.py": "G2 provider admission and observations",
+        "tests/test_providers.py": "G2 provider admission and observations"
       }
     },
     "claude-agents": {

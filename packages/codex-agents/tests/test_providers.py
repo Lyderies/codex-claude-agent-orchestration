@@ -22,6 +22,7 @@ from codex_agents.learning_store import (
 )
 from codex_agents.providers import (
     APP_SERVER_METHODS,
+    APP_SERVER_NOTIFICATIONS,
     IDENTITY_MAX_AGE_MS,
     AdmissionDenied,
     AppServerSession,
@@ -66,6 +67,8 @@ for line in sys.stdin:
     message = json.loads(line)
     log.write(message["method"] + "\\n")
     log.flush()
+    if "id" not in message:
+        continue
     if message["method"] == "initialize":
         result = {"userAgent": "fake"}
     elif message["method"] == "account/rateLimits/read":
@@ -218,6 +221,7 @@ class ProviderObservationTests(unittest.TestCase):
 
     def test_app_server_sends_only_allow_listed_methods(self) -> None:
         self.assertEqual(("initialize", "account/rateLimits/read"), APP_SERVER_METHODS)
+        self.assertEqual(("initialized",), APP_SERVER_NOTIFICATIONS)
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             environ, log = fake_codex(root)
@@ -229,7 +233,7 @@ class ProviderObservationTests(unittest.TestCase):
                 [record["record_type"] for record in records],
             )
             self.assertEqual(
-                ["initialize", "account/rateLimits/read"], log.read_text().split()
+                ["initialize", "initialized", "account/rateLimits/read"], log.read_text().split()
             )
             session = AppServerSession(root, environ=environ)
             try:
@@ -238,10 +242,15 @@ class ProviderObservationTests(unittest.TestCase):
                         ContractError, "not allow-listed"
                     ):
                         session.request(method, {})
+                for method in ("account/logout", "initialize"):
+                    with self.subTest(notification=method), self.assertRaisesRegex(
+                        ContractError, "not allow-listed"
+                    ):
+                        session.notify(method)
             finally:
                 session.close()
             self.assertEqual(
-                ["initialize", "account/rateLimits/read"], log.read_text().split()
+                ["initialize", "initialized", "account/rateLimits/read"], log.read_text().split()
             )
             with self.assertRaisesRegex(ContractError, "API key"):
                 AppServerSession(root, environ={**environ, "OPENAI_API_KEY": "x"})
