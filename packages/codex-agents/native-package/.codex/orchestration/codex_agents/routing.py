@@ -172,29 +172,47 @@ def _bind_committed_project_bytes(
 
 
 def _committed_in_head(root: Path, relative: str) -> bool:
-    """Return whether HEAD tracks a project file; a project without commits does not."""
+    """Return whether HEAD tracks a project file, failing closed when git is unsure.
 
+    Only an unborn branch or a clean listing without the path allows defaults;
+    any other git outcome, including a missing repository, raises.
+    """
+
+    unavailable = "project provider routing trust is unavailable"
     git_executable = shutil.which("git", path=os.defpath)
     if git_executable is None:
-        raise ContractError("project provider routing trust is unavailable")
+        raise ContractError(unavailable)
     environment = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 
-    def run(arguments: list[str]) -> int:
+    def run(arguments: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
             [git_executable, "-C", str(root), *arguments],
             env=environment,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
             check=False,
-        ).returncode
+        )
 
     try:
-        if run(["rev-parse", "--verify", "HEAD^{commit}"]) != 0:
+        head = run(["rev-parse", "--verify", "--quiet", "HEAD"])
+        if head.returncode == 1:
             return False
-        return run(["cat-file", "-e", f"HEAD:./{relative}"]) == 0
-    except OSError as exc:
-        raise ContractError("project provider routing trust is unavailable") from exc
+        if head.returncode != 0:
+            raise ContractError(unavailable)
+        listing = run(["ls-tree", "--name-only", "HEAD", "--", relative])
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ContractError(unavailable) from exc
+    if listing.returncode != 0:
+        raise ContractError(unavailable)
+    names = listing.stdout.splitlines()
+    if not names:
+        return False
+    if names == [relative]:
+        return True
+    raise ContractError(unavailable)
 
 
 def validate_project_agent_mapping(
@@ -1210,7 +1228,7 @@ def _route_task(
             task.get("verification_for_family", "verification"),
             worker_provider=verification_for_provider,
             primary_provider=primary_provider,
-            use_legacy_fallback=False,
+            use_legacy_fallback=use_legacy_fallback,
         )
         rule_agent = None
         if rule["provider"] == "claude":
@@ -1260,7 +1278,16 @@ def _route_task(
     if use_legacy_fallback:
         if provider != "codex":
             raise ContractError("legacy fallback applies only to Codex routes")
-        selected = deepcopy(policy["legacy_fallback"])
+        if verification_for_provider is not None:
+            # The verifier rule already applied the fallback model, exactly as the
+            # worker route advertises it; record the usual verifier as the source.
+            selected = deepcopy(primary)
+            primary = {
+                "model": policy["verification"]["model"],
+                "effort": policy["verification"]["effort"],
+            }
+        else:
+            selected = deepcopy(policy["legacy_fallback"])
         if selected == primary:
             raise ContractError("selected route is already the legacy fallback")
         if not _provider_admitted(

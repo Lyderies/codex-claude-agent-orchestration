@@ -117,7 +117,7 @@
         "tests/support.py": "portable temp directory; skip marker for macOS-only sandbox tests",
         "tests/test_contracts.py": "portable temp directory instead of macOS-only /private/tmp; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "tests/test_installer.py": "portable temp directory; operational-sandbox tests skipped off macOS",
-        "tests/test_learning_cli.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_learning_cli.py": "portable temp directory instead of macOS-only /private/tmp; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "tests/test_learning_engine.py": "portable temp directory; operational-sandbox tests skipped off macOS; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "tests/test_learning_hook.py": "portable temp directory instead of macOS-only /private/tmp",
         "tests/test_learning_store.py": "portable temp directory instead of macOS-only /private/tmp; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",

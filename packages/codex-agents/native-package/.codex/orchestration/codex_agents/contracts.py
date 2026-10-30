@@ -200,7 +200,9 @@ def validate_task(data: Any) -> dict[str, Any]:
             raise ContractError(
                 "verification_for_provider is valid only for verification tasks"
             )
-        if verification_for_provider not in {"codex", "claude"}:
+        if not isinstance(verification_for_provider, str) or (
+            verification_for_provider not in {"codex", "claude"}
+        ):
             raise ContractError("verification_for_provider is unsupported")
     if not isinstance(data["complexity"], str) or data["complexity"] not in COMPLEXITIES:
         raise ContractError(f"unsupported complexity: {data['complexity']}")

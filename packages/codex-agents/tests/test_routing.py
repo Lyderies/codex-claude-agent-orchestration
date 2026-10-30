@@ -443,6 +443,7 @@ class RoutingTests(unittest.TestCase):
     def test_project_agent_mapping_rejects_workspace_write_researcher(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"
             agents.mkdir(parents=True)
@@ -511,6 +512,7 @@ class RoutingTests(unittest.TestCase):
     def test_project_agent_mapping_rejects_model_override(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"
             agents.mkdir(parents=True)
@@ -559,6 +561,7 @@ class RoutingTests(unittest.TestCase):
     def test_dangling_project_agent_mapping_symlink_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
             orchestration = root / ".codex/orchestration"
             orchestration.mkdir(parents=True)
             (orchestration / "project-agent-routing.json").symlink_to(
@@ -1208,6 +1211,97 @@ class ProviderRoutingTests(unittest.TestCase):
                 "verifier"
             ]["provider"],
         )
+
+    def verification_task(self, provider: str) -> dict:
+        return self.task(
+            id="verify-1",
+            family="verification",
+            operation="review",
+            acceptance_strength="independent_judgment",
+            deterministic_validation=False,
+            verification_for_family="coding",
+            verification_for_provider=provider,
+        )
+
+    def test_verification_task_matches_the_advertised_verifier_under_fallback(
+        self,
+    ) -> None:
+        worker = _route_task_legacy_fallback(self.exploratory(), self.policy)
+        verification = _route_task_legacy_fallback(
+            self.verification_task(worker["provider"]), self.policy
+        )
+        advertised = worker["verifier"]
+        self.assertEqual(("codex", "gpt-5.6-sol", "high"), (
+            advertised["provider"], advertised["model"], advertised["effort"]
+        ))
+        self.assertEqual(
+            (advertised["provider"], advertised["model"], advertised["effort"]),
+            (verification["provider"], verification["model"], verification["effort"]),
+        )
+        self.assertEqual(
+            {"model": "gpt-6.1-sol", "effort": "high"},
+            verification["fallback"]["from"],
+        )
+        # A Claude verifier is unaffected by a Codex host fallback, so the
+        # verification task needs no fallback of its own to agree with it.
+        bridged = self.provider_policy(bridge=True)
+        worker = _route_task_legacy_fallback(self.task(), bridged)
+        self.assertEqual("claude", worker["verifier"]["provider"])
+        verification = route_task(self.verification_task("codex"), bridged)
+        self.assertEqual(
+            (worker["verifier"]["provider"], worker["verifier"]["model"]),
+            (verification["provider"], verification["model"]),
+        )
+
+    def test_verification_for_provider_must_be_a_string(self) -> None:
+        for value in ([], {}):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ContractError, "verification_for_provider is unsupported"
+            ):
+                route_task(self.verification_task(value), self.policy)
+
+    def test_provider_trust_classifies_git_outcomes(self) -> None:
+        arguments = (
+            ORCHESTRATION_ROOT / "config/routing-policy.json",
+            ORCHESTRATION_ROOT / "config/discovery-policy.json",
+        )
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ContractError, "trust is unavailable"):
+                load_effective_policy(root, *arguments)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            self.assertNotIn(
+                "provider_routing", load_effective_policy(root, *arguments)
+            )
+            (root / "README").write_text("project\n")
+            self.git_commit(root, "first commit")
+            self.assertNotIn(
+                "provider_routing", load_effective_policy(root, *arguments)
+            )
+            original_run = subprocess.run
+
+            def failing(status: int):
+                def run(arguments: list[str], **kwargs: object):
+                    if "ls-tree" in arguments:
+                        return subprocess.CompletedProcess(arguments, status, "", "")
+                    return original_run(arguments, **kwargs)
+                return run
+
+            for side_effect in (
+                failing(128),
+                failing(-9),
+                OSError("git unavailable"),
+                subprocess.TimeoutExpired("git", 10),
+            ):
+                with self.subTest(side_effect=side_effect), patch(
+                    "codex_agents.routing.subprocess.run", side_effect=side_effect
+                ), self.assertRaisesRegex(ContractError, "trust is unavailable"):
+                    load_effective_policy(root, *arguments)
+            with patch(
+                "codex_agents.routing.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 128, "", ""),
+            ), self.assertRaisesRegex(ContractError, "trust is unavailable"):
+                load_effective_policy(root, *arguments)
 
     def test_verification_task_without_provider_uses_the_verification_table(self) -> None:
         verification = self.task(
