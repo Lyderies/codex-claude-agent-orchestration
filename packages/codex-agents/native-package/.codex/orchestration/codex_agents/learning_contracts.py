@@ -41,8 +41,16 @@ RECORD_TYPES = {
     "owner_grant",
     "promotion",
     "learning_export",
+    "provider_identity",
+    "provider_headroom",
+    "provider_billing",
+    "billing_attestation",
+    "admission_decision",
 }
-SOURCES = {"hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle"}
+SOURCES = {
+    "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
+    "provider",
+}
 EVENT_CODES = {
     "session_started",
     "session_ended",
@@ -1634,6 +1642,193 @@ def validate_learning_export(data: Any) -> dict[str, Any]:
     return data
 
 
+PROVIDER_NAMES = {"codex", "claude"}
+PROVIDER_IDENTITY_FIELDS = {
+    "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
+    "logged_in", "auth_method", "subscription_type", "plan_type", "client_path",
+    "client_sha256", "observed_at_ms",
+}
+PROVIDER_HEADROOM_FIELDS = {
+    "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
+    "windows", "status", "run_id", "observed_at_ms",
+}
+HEADROOM_WINDOW_FIELDS = {"window_minutes", "scope", "used_percent", "resets_at"}
+PROVIDER_BILLING_FIELDS = {
+    "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
+    "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
+    "is_using_overage", "overage_status", "overage_disabled_reason", "run_id",
+    "observed_at_ms",
+}
+BILLING_ATTESTATION_FIELDS = {
+    "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
+    "no_paid_overage", "no_usage_credits", "issued_at", "observed_at_ms",
+}
+BILLING_GRANT_FIELDS = {
+    "version", "provider", "account_fingerprint", "no_paid_overage",
+    "no_usage_credits", "issued_at",
+}
+ADMISSION_DECISION_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "provider", "decision",
+    "reason_code", "admission_basis", "account_fingerprint", "evidence_digests",
+    "observed_at_ms",
+}
+ADMISSION_REASON_CODES = {
+    "admitted",
+    "provider_api_key_present",
+    "provider_identity_missing",
+    "billing_attestation_missing",
+    "claude_subscription_missing",
+    "paid_usage_usable",
+    "billing_unverified",
+    "provider_exhausted",
+}
+CLAUDE_HEADROOM_STATUSES = {"allowed", "allowed_warning", "rejected"}
+CLAUDE_OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected"}
+CLAUDE_AUTH_METHODS = frozenset({"claude.ai"})
+CLAUDE_SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
+# The app-server PlanType enum, without its catch-all unknown value.
+CODEX_PLAN_TYPES = frozenset({
+    "free", "go", "plus", "pro", "prolite", "promax", "team",
+    "self_serve_business_prolite", "self_serve_business_usage_based", "business", "ent26",
+    "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise",
+    "edu", "edu_plus", "edu_pro", "sci", "sci_plus",
+})
+# Reasons that mean paid overage is switched off. Credit exhaustion, fetch
+# errors, unknown and "no limits configured" do not prove that, so they stay out.
+CLAUDE_OVERAGE_DISABLED_REASONS = frozenset({
+    "overage_not_provisioned", "org_level_disabled", "org_level_disabled_until",
+    "org_service_level_disabled", "seat_tier_level_disabled", "member_level_disabled",
+    "seat_tier_zero_credit_limit", "group_zero_credit_limit", "member_zero_credit_limit",
+})
+CLAUDE_WINDOW_SCOPES = {
+    "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+    "seven_day_overage_included", "overage",
+}
+
+
+def _observation_base(data: dict[str, Any], record_type: str) -> None:
+    _base(data, record_type)
+    _enum(data["provider"], PROVIDER_NAMES, "provider")
+    _digest(data["account_fingerprint"], "account_fingerprint")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+
+
+def validate_provider_identity(data: Any) -> dict[str, Any]:
+    data = _closed(data, PROVIDER_IDENTITY_FIELDS, "provider_identity")
+    _observation_base(data, "provider_identity")
+    _boolean(data["logged_in"], "logged_in")
+    _enum(data["auth_method"], set(CLAUDE_AUTH_METHODS), "auth_method", nullable=True)
+    _enum(
+        data["subscription_type"], set(CLAUDE_SUBSCRIPTION_TYPES), "subscription_type",
+        nullable=True,
+    )
+    _enum(data["plan_type"], set(CODEX_PLAN_TYPES), "plan_type", nullable=True)
+    # The local client path is kept for audit only and is never printed.
+    if (
+        not isinstance(data["client_path"], str)
+        or not data["client_path"].startswith("/")
+        or not 1 < len(data["client_path"]) <= 1024
+        or "\x00" in data["client_path"]
+    ):
+        raise ContractError("client_path must be an absolute path")
+    _digest(data["client_sha256"], "client_sha256")
+    return data
+
+
+def validate_provider_headroom(data: Any) -> dict[str, Any]:
+    data = _closed(data, PROVIDER_HEADROOM_FIELDS, "provider_headroom")
+    _observation_base(data, "provider_headroom")
+    windows = data["windows"]
+    if not isinstance(windows, list) or len(windows) > 16:
+        raise ContractError("provider_headroom windows must be a bounded array")
+    for window in windows:
+        window = _closed(window, HEADROOM_WINDOW_FIELDS, "headroom window")
+        _integer(window["window_minutes"], "window_minutes", minimum=1, nullable=True)
+        _enum(window["scope"], CLAUDE_WINDOW_SCOPES, "scope", nullable=True)
+        _number(
+            window["used_percent"], "used_percent", minimum=0, maximum=100,
+            nullable=True,
+        )
+        _integer(window["resets_at"], "resets_at", nullable=True)
+    _enum(data["status"], CLAUDE_HEADROOM_STATUSES, "status", nullable=True)
+    _identifier(data["run_id"], "run_id", nullable=True)
+    return data
+
+
+def validate_provider_billing(data: Any) -> dict[str, Any]:
+    data = _closed(data, PROVIDER_BILLING_FIELDS, "provider_billing")
+    _observation_base(data, "provider_billing")
+    for field in (
+        "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
+        "is_using_overage",
+    ):
+        if data[field] is not None:
+            _boolean(data[field], field)
+    _enum(data["overage_status"], CLAUDE_OVERAGE_STATUSES, "overage_status", nullable=True)
+    _enum(
+        data["overage_disabled_reason"], set(CLAUDE_OVERAGE_DISABLED_REASONS),
+        "overage_disabled_reason", nullable=True,
+    )
+    _identifier(data["run_id"], "run_id", nullable=True)
+    return data
+
+
+def validate_billing_grant(data: Any) -> dict[str, Any]:
+    """Validate the closed owner billing grant before it is signed or stored."""
+
+    data = _closed(data, BILLING_GRANT_FIELDS, "billing grant")
+    if data["version"] != 1:
+        raise ContractError("billing grant version is unsupported")
+    _enum(data["provider"], PROVIDER_NAMES, "provider")
+    _digest(data["account_fingerprint"], "account_fingerprint")
+    if data["no_paid_overage"] is not True or data["no_usage_credits"] is not True:
+        raise ContractError("billing grant must attest no paid overage and no usage credits")
+    _integer(data["issued_at"], "issued_at")
+    return data
+
+
+def validate_billing_attestation(data: Any) -> dict[str, Any]:
+    data = _closed(data, BILLING_ATTESTATION_FIELDS, "billing_attestation")
+    _observation_base(data, "billing_attestation")
+    validate_billing_grant(
+        {"version": 1, **{field: data[field] for field in BILLING_GRANT_FIELDS - {"version"}}}
+    )
+    if data["observed_at_ms"] != data["issued_at"]:
+        raise ContractError("billing attestation time must equal its issue time")
+    return data
+
+
+def validate_admission_decision(data: Any) -> dict[str, Any]:
+    data = _closed(data, ADMISSION_DECISION_FIELDS, "admission_decision")
+    _base(data, "admission_decision")
+    _identifier(data["run_id"], "run_id", nullable=True)
+    _enum(data["provider"], PROVIDER_NAMES, "provider")
+    _enum(data["decision"], {"pass", "deny"}, "decision")
+    _enum(data["reason_code"], ADMISSION_REASON_CODES, "reason_code")
+    if (data["decision"] == "pass") != (data["reason_code"] == "admitted"):
+        raise ContractError("admission decision and reason disagree")
+    _enum(
+        data["admission_basis"], {"evidence", "bootstrap"}, "admission_basis",
+        nullable=True,
+    )
+    if (data["decision"] == "pass") != (data["admission_basis"] is not None):
+        raise ContractError("an admission basis belongs only to a pass")
+    if data["admission_basis"] == "bootstrap" and data["provider"] != "claude":
+        raise ContractError("only Claude admissions may bootstrap")
+    if data["decision"] == "pass" and (
+        data["run_id"] is None
+        or data["account_fingerprint"] is None
+        or not data["evidence_digests"]
+    ):
+        raise ContractError(
+            "an admitted decision needs a run, an account fingerprint, and evidence"
+        )
+    _digest(data["account_fingerprint"], "account_fingerprint", nullable=True)
+    _digest_list(data["evidence_digests"], "evidence_digests")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -1650,6 +1845,11 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "owner_grant": validate_owner_grant,
     "promotion": validate_promotion,
     "learning_export": validate_learning_export,
+    "provider_identity": validate_provider_identity,
+    "provider_headroom": validate_provider_headroom,
+    "provider_billing": validate_provider_billing,
+    "billing_attestation": validate_billing_attestation,
+    "admission_decision": validate_admission_decision,
 }
 
 

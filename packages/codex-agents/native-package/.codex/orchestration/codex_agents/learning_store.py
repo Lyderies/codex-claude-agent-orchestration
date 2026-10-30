@@ -120,9 +120,13 @@ PRODUCER_AUTHORITY = {
         "comparison", "canary_report",
     },
     "verifier": {"outcome", "qa_evidence", "evidence_review"},
-    "owner": {"feedback", "owner_grant", "grader_calibration"},
+    "owner": {
+        "feedback", "owner_grant", "grader_calibration", "billing_attestation",
+    },
     "lifecycle": {"promotion"},
 }
+# Only ledger methods that run the observation themselves may write these.
+PROVIDER_OBSERVATION_TYPES = {"provider_identity", "provider_headroom", "provider_billing"}
 SOURCE_BY_PRODUCER = {
     "hook": "hook",
     "app_server": "app_server",
@@ -131,6 +135,7 @@ SOURCE_BY_PRODUCER = {
     "verifier": "verifier",
     "owner": "owner",
     "lifecycle": "lifecycle",
+    "provider": "provider",
 }
 HOOK_EVENT_CODES = tuple(value[0] for value in HOOK_EVENTS.values())
 HOOK_REJECTION_CODES = {
@@ -2019,14 +2024,34 @@ class LearningLedger:
                 "INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)",
                 (project_id, session_digest, producer, timestamp),
             )
-            self._connection.execute(
+            new_run = self._connection.execute(
                 "INSERT OR IGNORE INTO run_provenance VALUES(?,?,?,?,?,?)",
                 (
                     project_id, root_run_id, producer, client_version,
                     session_digest, timestamp,
                 ),
-            )
+            ).rowcount == 1
+        if new_run:
+            self._admit_session_run(project_id, root_run_id, timestamp=self._clock_ms())
         return project_id, session_digest, root_run_id
+
+    def _admit_session_run(self, project_id: str, run_id: str, *, timestamp: int) -> None:
+        """Decide admission once for a collector-bound Codex session run.
+
+        These sessions never pass through open_host_run, so their admission is
+        taken when they first bind. Only a pass is stored: a denied session can
+        still record events, but its result can never be committed.
+        """
+
+        with self._lock, self._connection:
+            decision = self._evaluate_admission_locked(
+                project_id, provider="codex", environ=os.environ, timestamp=timestamp
+            )
+            if decision["decision"] == "pass":
+                self._store_admission_locked(
+                    project_id, decision, run_id=run_id, timestamp=timestamp
+                )
+        self.state.harden_database_files()
 
     def append(
         self,
@@ -2054,6 +2079,10 @@ class LearningLedger:
             raise LedgerError("outcomes require atomic host result admission")
         if checked["record_type"] in {"qa_evidence", "evidence_review"}:
             raise LedgerError("verification evidence requires controlled admission")
+        if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
+            "admission_decision", "billing_attestation",
+        }:
+            raise LedgerError("provider evidence requires ledger-run observation")
         if (
             checked["record_type"] == "promotion"
             and checked["action"] in {"canary_started", "promoted"}
@@ -3235,7 +3264,11 @@ class LearningLedger:
         fallback_receipt: str | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Persist a trusted assigned-run start and return a single-use opaque handle."""
+        """Persist a trusted assigned-run start and return a single-use opaque handle.
+
+        Admission is always evaluated here, from ledger-held evidence and this
+        process's environment; a denial is stored and raised before any binding.
+        """
 
         checked_assignment = validate_assignment_shape(assignment)
         checked_task = validate_task(task)
@@ -3262,6 +3295,15 @@ class LearningLedger:
         ):
             raise LedgerError("route observation deadline is invalid")
         observation_deadline_at_ms = timestamp + observation_seconds * 1000
+        from .providers import AdmissionDenied
+
+        provider = route.get("provider", "codex")
+        # Admission runs on the ledger's clock, so a caller-chosen time cannot
+        # make evidence look reset or stale.
+        admitted_at = self._clock_ms()
+        admission = self.evaluate_admission(
+            project_id, provider=provider, environ=os.environ, now_ms=admitted_at
+        )
         run_handle = f"hrn_{secrets.token_hex(24)}"
         handle_digest = keyed_digest(self.state.digest_key(), run_handle)
         run_id = external_id(self.state.digest_key(), "run", run_handle)
@@ -3401,15 +3443,301 @@ class LearningLedger:
             self._append_checked_locked(
                 project_id, event, producer="host", timestamp=timestamp
             )
+            # Re-check under the write lock, so two opens cannot both use the
+            # same Claude bootstrap or race past newer evidence.
+            admission = self._evaluate_admission_locked(
+                project_id, provider=provider, environ=os.environ, timestamp=admitted_at
+            )
+            if admission["decision"] != "pass":
+                raise AdmissionDenied(admission["reason_code"])
+            self._store_admission_locked(
+                project_id, admission, run_id=run_id, timestamp=admitted_at
+            )
         self.state.harden_database_files()
         return {
             "run_handle": run_handle,
+            "admission": admission["reason_code"],
             "status": "started",
             "coverage": "lifecycle_partial",
             "usage": empty_usage(),
             "observation_started_at_ms": timestamp,
             "observation_deadline_at_ms": observation_deadline_at_ms,
         }
+
+    def _clock_ms(self) -> int:
+        """The ledger's own time for evidence it stamps; callers never supply it."""
+
+        return time.time_ns() // 1_000_000
+
+    def _store_provider_observations(
+        self,
+        project_id: str,
+        records: list[dict[str, Any]],
+        *,
+        timestamp: int,
+    ) -> list[dict[str, Any]]:
+        try:
+            checked = [validate_learning_record(record) for record in records]
+        except ContractError as exc:
+            raise LedgerError("record admission rejected") from exc
+        if any(record["record_type"] not in PROVIDER_OBSERVATION_TYPES for record in checked):
+            raise LedgerError("provider observation type is unsupported")
+        with self._lock, self._connection:
+            project = self._connection.execute(
+                "SELECT status FROM projects WHERE project_id=?", (project_id,)
+            ).fetchone()
+            if not project or project["status"] != "active":
+                raise LedgerError("project binding is not active")
+            results = [
+                self._append_checked_locked(
+                    project_id, record, producer="provider", timestamp=timestamp
+                )
+                for record in checked
+            ]
+        self.state.harden_database_files()
+        return results
+
+    def observe_provider(
+        self,
+        project_id: str,
+        provider: str,
+        *,
+        project_root: Path,
+        environ: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Run one non-spending observation and store it under a keyed fingerprint.
+
+        The ledger runs the provider client itself and derives the fingerprint
+        with its own key, so no caller can supply observation records.
+        """
+
+        from .providers import observe_claude, observe_codex
+
+        timestamp = self._clock_ms()
+        if provider == "claude":
+            records = observe_claude(
+                digest_key=self.state.digest_key(),
+                observed_at_ms=timestamp,
+                environ=environ,
+            )
+        elif provider == "codex":
+            records = observe_codex(
+                project_root,
+                digest_key=self.state.digest_key(),
+                observed_at_ms=timestamp,
+                environ=environ,
+            )
+        else:
+            raise LedgerError("provider is unsupported")
+        self._store_provider_observations(project_id, records, timestamp=timestamp)
+        return records
+
+    def record_claude_rate_limit_event(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        rate_limit_info: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Record the single rate-limit event of an open, admitted Claude run.
+
+        The fingerprint comes from the run's stored admission and the time from
+        the ledger's clock. A run may record one event, and only before its
+        result is committed, so a caller cannot replay favourable evidence.
+        """
+
+        from .providers import claude_rate_limit_records
+
+        timestamp = self._clock_ms()
+        handle_digest = keyed_digest(self.state.digest_key(), run_handle)
+        with self._lock, self._connection:
+            binding = self._connection.execute(
+                "SELECT run_id,binding_state,consumed_at_ms FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("host run is unavailable")
+            if binding["binding_state"] != "pending" or binding["consumed_at_ms"] is not None:
+                raise LedgerError("host run is no longer open for observations")
+            run_id = str(binding["run_id"])
+            decision = self._run_admission_locked(project_id, run_id)
+            if decision["provider"] != "claude":
+                raise ContractError("rate-limit event does not belong to a Claude run")
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? "
+                "AND record_type IN ('provider_headroom','provider_billing') "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("host run already recorded its rate-limit event")
+            records = claude_rate_limit_records(
+                rate_limit_info,
+                account_fingerprint=decision["account_fingerprint"],
+                observed_at_ms=timestamp,
+                run_id=run_id,
+            )
+            try:
+                checked = [validate_learning_record(record) for record in records]
+            except ContractError as exc:
+                raise LedgerError("record admission rejected") from exc
+            for record in checked:
+                self._append_checked_locked(
+                    project_id, record, producer="provider", timestamp=timestamp
+                )
+        self.state.harden_database_files()
+        return records
+
+    def _provider_records_locked(
+        self, project_id: str, record_type: str, provider: str
+    ) -> list[tuple[dict[str, Any], str]]:
+        rows = self._connection.execute(
+            "SELECT content,content_digest,source FROM records "
+            "WHERE project_id=? AND record_type=? "
+            "AND json_extract(CAST(content AS TEXT),'$.provider')=? "
+            "ORDER BY source_sequence",
+            (project_id, record_type, provider),
+        ).fetchall()
+        result = []
+        for row in rows:
+            record = json.loads(bytes(row["content"]))
+            # Attestations count only when an owner signature was verified.
+            if record_type == "billing_attestation" and (
+                row["source"] != "owner"
+                or self._connection.execute(
+                    "SELECT 1 FROM owner_attestations "
+                    "WHERE project_id=? AND subject_record_id=?",
+                    (project_id, record["record_id"]),
+                ).fetchone() is None
+            ):
+                continue
+            result.append((record, str(row["content_digest"])))
+        return result
+
+    def _evaluate_admission_locked(
+        self, project_id: str, *, provider: str, environ: Any, timestamp: int
+    ) -> dict[str, Any]:
+        from .providers import evaluate_admission
+
+        project = self._connection.execute(
+            "SELECT status FROM projects WHERE project_id=?", (project_id,)
+        ).fetchone()
+        if not project or project["status"] != "active":
+            raise LedgerError("project binding is not active")
+        return evaluate_admission(
+            provider=provider,
+            identities=self._provider_records_locked(
+                project_id, "provider_identity", provider
+            ),
+            attestations=self._provider_records_locked(
+                project_id, "billing_attestation", provider
+            ),
+            billing=self._provider_records_locked(
+                project_id, "provider_billing", provider
+            ),
+            headroom=self._provider_records_locked(
+                project_id, "provider_headroom", provider
+            ),
+            prior_claude_admissions={
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint') "
+                    "FROM records WHERE project_id=? AND record_type='admission_decision' "
+                    "AND json_extract(CAST(content AS TEXT),'$.provider')='claude' "
+                    "AND json_extract(CAST(content AS TEXT),'$.decision')='pass'",
+                    (project_id,),
+                ).fetchall()
+                if row[0] is not None
+            },
+            environ=environ,
+            now_ms=timestamp,
+        )
+
+    def evaluate_admission(
+        self,
+        project_id: str,
+        *,
+        provider: str,
+        environ: Any,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate admission from stored evidence; a denial is stored and raised.
+
+        The returned decision is informational: only the ledger binds a decision
+        to a run, inside open_host_run or a session binding.
+        """
+
+        from .providers import AdmissionDenied
+
+        timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
+        with self._lock, self._connection:
+            decision = self._evaluate_admission_locked(
+                project_id, provider=provider, environ=environ, timestamp=timestamp
+            )
+            if decision["decision"] == "deny":
+                self._store_admission_locked(
+                    project_id, decision, run_id=None, timestamp=timestamp
+                )
+        self.state.harden_database_files()
+        if decision["decision"] == "deny":
+            raise AdmissionDenied(decision["reason_code"])
+        return decision
+
+    def _store_admission_locked(
+        self,
+        project_id: str,
+        decision: dict[str, Any],
+        *,
+        run_id: str | None,
+        timestamp: int,
+    ) -> dict[str, Any]:
+        from .providers import admission_record
+
+        try:
+            record = admission_record(decision, run_id)
+        except ContractError as exc:
+            raise LedgerError("admission decision is invalid") from exc
+        for digest in record["evidence_digests"]:
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND content_digest=?",
+                (project_id, digest),
+            ).fetchone() is None:
+                raise LedgerError("admission evidence is unavailable")
+        self._append_checked_locked(
+            project_id, record, producer="lifecycle", timestamp=timestamp
+        )
+        return record
+
+    def _run_admission_locked(self, project_id: str, run_id: str) -> dict[str, Any]:
+        rows = self._connection.execute(
+            "SELECT content,source FROM records WHERE project_id=? "
+            "AND record_type='admission_decision' "
+            "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+            (project_id, run_id),
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["source"] != "lifecycle":
+            raise LedgerError("host run has no stored admission decision")
+        try:
+            decision = validate_learning_record(json.loads(bytes(rows[0]["content"])))
+        except (ContractError, TypeError, ValueError) as exc:
+            raise LedgerError("host run admission is invalid") from exc
+        if decision["record_type"] != "admission_decision" or decision["decision"] != "pass":
+            raise LedgerError("host run admission is not a pass")
+        return decision
+
+    def host_run_admission(self, project_id: str, run_handle: str) -> dict[str, Any]:
+        """Return the stored admission for a run; time-varying facts are not re-read."""
+
+        handle_digest = keyed_digest(self.state.digest_key(), run_handle)
+        with self._lock:
+            binding = self._connection.execute(
+                "SELECT run_id FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("host run is unavailable")
+            return self._run_admission_locked(project_id, str(binding["run_id"]))
 
     def observe_host_run(
         self,
@@ -3582,6 +3910,10 @@ class LearningLedger:
                 ),
                 "usage_source": "client_observed",
             }
+        # Every result path needs the run's stored passing admission, including
+        # collector-bound sessions, whose admission is decided when they bind.
+        with self._lock:
+            self._run_admission_locked(project_id, checked_observation["run_id"])
         from .learning_engine import build_host_result_records
 
         evaluation_candidate_digest = None
@@ -4248,7 +4580,9 @@ class LearningLedger:
             checked = validate_learning_record(record)
         except ContractError as exc:
             raise LedgerError("record admission rejected") from exc
-        if checked["record_type"] not in {"feedback", "grader_calibration"}:
+        if checked["record_type"] not in {
+            "feedback", "grader_calibration", "billing_attestation"
+        }:
             raise LedgerError("authenticated owner record type is unsupported")
         from .learning_engine import OwnerGrantAuthority
 
@@ -5156,6 +5490,7 @@ class LearningLedger:
             in {
                 "evaluation_case", "qa_evidence", "evidence_review", "evaluation_trial", "candidate", "comparison", "canary_report",
                 "grader_calibration", "owner_grant", "promotion", "learning_export",
+                "billing_attestation",
             }
             else timestamp + DEFAULT_RETENTION_MS
         )

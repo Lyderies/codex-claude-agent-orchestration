@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import base64
+import os
 import subprocess
 import sys
 import tempfile
@@ -30,6 +33,7 @@ from codex_agents.learning_store import (
     authorized_collector_runtime,
 )
 from cli import _RestartingLedger, _close_ledger
+from cli import main as cli_main
 from codex_agents.learning_engine import generate_candidate, runtime_fixture_digest
 from tests.learning_support import (
     DIGEST_A,
@@ -40,7 +44,10 @@ from tests.learning_support import (
     champion_configuration,
     event_record,
     full_usage,
+    admit_provider,
+    fake_provider_tools,
     generate_test_owner_key,
+    trusted_tools,
     sign_owner_payload,
     result,
     routing_fields,
@@ -68,6 +75,16 @@ class LearningCliTests(unittest.TestCase):
             ),
         )
         self.project_id = ledger.register_project(self.project, now_ms=1)
+        # Host runs are admitted only with a fresh identity and an owner attestation.
+        self.tools = base / "fake-tools"
+        fake_provider_tools(self.tools)
+        # Collector sessions here bind on a small fixed clock and host runs on the
+        # real clock, so the identity is observed at both.
+        for observed_at_ms in (1, time.time_ns() // 1_000_000):
+            admit_provider(
+                ledger, self.project_id, self.owner_private_key, tools=self.tools,
+                observed_at_ms=observed_at_ms,
+            )
         self.fixture_task = {
             "id": "cli-fixture", "objective": "Verify one fixed fixture",
             "family": "verification", "complexity": "low", "risk": "low",
@@ -234,7 +251,13 @@ class LearningCliTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         return path
 
-    def _run(self, command: str, *arguments: str, expected: int = 0) -> dict:
+    def _run(
+        self,
+        command: str,
+        *arguments: str,
+        expected: int = 0,
+        env: dict[str, str] | None = None,
+    ) -> dict:
         completed = subprocess.run(
             [
                 sys.executable,
@@ -248,10 +271,43 @@ class LearningCliTests(unittest.TestCase):
             ],
             text=True,
             capture_output=True,
+            env=self._environment(**(env or {})),
             check=False,
         )
         self.assertEqual(expected, completed.returncode, completed.stderr or completed.stdout)
         return json.loads(completed.stdout)
+
+    def _observe(
+        self,
+        provider: str,
+        *,
+        expected: int = 0,
+        env: dict[str, str] | None = None,
+        raw_output: bool = False,
+    ):
+        """Run provider-observe in-process with the fake clients as trusted ones."""
+
+        stdout = io.StringIO()
+        arguments = [
+            "cli.py", "provider-observe", "--provider", provider,
+            "--state-root", str(self.state_root), "--project-root", str(self.project),
+        ]
+        with trusted_tools(self.tools), mock.patch.object(sys, "argv", arguments), \
+                mock.patch.dict(os.environ, env or {}), \
+                contextlib.redirect_stdout(stdout):
+            code = cli_main()
+        self.assertEqual(expected, code, stdout.getvalue())
+        return stdout.getvalue() if raw_output else json.loads(stdout.getvalue())
+
+    @staticmethod
+    def _environment(**overrides: str) -> dict[str, str]:
+        # Admission denies API-key environments, so tests never inherit them.
+        environment = {
+            key: value for key, value in os.environ.items()
+            if key not in {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
+        }
+        environment.update(overrides)
+        return environment
 
     def _run_state(self, command: str, *arguments: str, expected: int = 0) -> dict:
         completed = subprocess.run(
@@ -925,6 +981,63 @@ class LearningCliTests(unittest.TestCase):
             generated["record"]["champion_configuration"],
         )
 
+    def test_provider_observation_and_billing_attestation_commands(self) -> None:
+        # The fake clients answer from recorded fixtures; nothing is spent. The
+        # command runs in-process so the trusted search path can name them.
+        tools = self.tools
+        observed = self._observe("claude")
+        identity = observed["records"][0]
+        self.assertEqual("provider_identity", identity["record_type"])
+        self.assertNotIn("example.invalid", json.dumps(observed))
+        self.assertNotIn("client_path", identity)
+        self.assertNotIn(str(tools), json.dumps(observed))
+        # Identifiers placed in label fields never reach records or output.
+        status = json.loads((tools / "claude-status.json").read_text())
+        (tools / "claude-status.json").write_text(
+            json.dumps({**status, "subscriptionType": status["orgId"]})
+        )
+        codex = json.loads((tools / "codex-result.json").read_text())
+        codex["rateLimits"]["planType"] = codex["accountId"]
+        (tools / "codex-result.json").write_text(json.dumps(codex))
+        for provider, raw in (("claude", status["orgId"]), ("codex", codex["accountId"])):
+            output = self._observe(provider, raw_output=True)
+            self.assertNotIn(raw, output)
+            self.assertIsNone(json.loads(output)["records"][0][
+                "subscription_type" if provider == "claude" else "plan_type"
+            ])
+        refused = self._observe(
+            "claude", expected=2, env={"ANTHROPIC_API_KEY": "test-only"}
+        )
+        self.assertEqual("input validation failed", refused["error"])
+
+        grant = self._write("billing-grant.json", {
+            "version": 1, "provider": "claude",
+            "account_fingerprint": identity["account_fingerprint"],
+            "no_paid_overage": True, "no_usage_credits": True, "issued_at": 7,
+        })
+        request = self._run(
+            "learning-record-billing-attestation",
+            "--provider", "claude", "--grant", str(grant),
+        )
+        self.assertTrue(request["requires_signature"])
+        mismatched = self._run(
+            "learning-record-billing-attestation",
+            "--provider", "codex", "--grant", str(grant), expected=2,
+        )
+        self.assertEqual("input validation failed", mismatched["error"])
+        signature = sign_owner_payload(
+            self.owner_private_key,
+            base64.b64decode(request["signing_payload_b64"]),
+            "billing-attestation-payload",
+        )
+        stored = self._run(
+            "learning-record-billing-attestation",
+            "--provider", "claude", "--grant", str(grant),
+            "--signature", str(signature),
+        )
+        self.assertTrue(stored["stored"])
+        self.assertEqual("billing_attestation", stored["record"]["record_type"])
+
     def test_trusted_host_lifecycle_opens_and_records_exact_assignment(self) -> None:
         task = {
             "id": "task-1", "objective": "Read one fixture", "family": "research",
@@ -965,7 +1078,7 @@ class LearningCliTests(unittest.TestCase):
             expected=2,
         )
         self.assertEqual("input validation failed", rejected_route["error"])
-        opened = self._run(
+        open_arguments = (
             "learning-open-host-run",
             "--task", str(task_path),
             "--route", str(route_path),
@@ -973,7 +1086,16 @@ class LearningCliTests(unittest.TestCase):
             "--parent-grant", str(parent_path),
             "--orchestration-handle", orchestration["orchestration_handle"],
         )
+        denied = self._run(
+            *open_arguments, expected=2, env={"OPENAI_API_KEY": "test-only"}
+        )
+        self.assertEqual(
+            ("provider admission denied", "provider_api_key_present"),
+            (denied["error"], denied["reason_code"]),
+        )
+        opened = self._run(*open_arguments)
         self.assertRegex(opened["run_handle"], r"^hrn_[0-9a-f]{48}$")
+        self.assertEqual("admitted", opened["admission"])
         self._run(
             "learning-bind-host-agent",
             "--run-handle", opened["run_handle"],

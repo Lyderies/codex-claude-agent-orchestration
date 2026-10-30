@@ -34,7 +34,7 @@ from .learning_engine import (
     load_operational_check_configuration,
     operational_sandbox_preflight,
 )
-from .learning_store import PRODUCER_AUTHORITY
+from .learning_store import PRODUCER_AUTHORITY, PROVIDER_OBSERVATION_TYPES
 from .routing import PolicyError, load_effective_policy, load_policy, route_task
 
 EXPECTED_ROLE_MAP = {
@@ -416,6 +416,12 @@ def _validate_learning_producers(root: Path, errors: list[str]) -> None:
         else None
     )
     expected = {key: sorted(value) for key, value in PRODUCER_AUTHORITY.items()}
+    # Provider evidence is written only by ledger-run observations and admission.
+    if any(
+        set(value) & (PROVIDER_OBSERVATION_TYPES | {"admission_decision"})
+        for value in PRODUCER_AUTHORITY.values()
+    ) or "provider" in PRODUCER_AUTHORITY:
+        errors.append("a producer may not append provider evidence")
     if (
         not isinstance(data, dict)
         or data.get("version") != 1

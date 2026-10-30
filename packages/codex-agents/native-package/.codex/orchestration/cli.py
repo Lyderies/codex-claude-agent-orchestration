@@ -77,6 +77,10 @@ from codex_agents.learning_store import (  # noqa: E402
     require_authorized_collector_runtime,
     validate_collector_runtime,
 )
+from codex_agents.providers import (  # noqa: E402
+    AdmissionDenied,
+    billing_attestation_record,
+)
 from codex_agents.routing import (  # noqa: E402
     PolicyError,
     _route_task_legacy_fallback,
@@ -531,6 +535,26 @@ def main() -> int:
     _add_assignment_context(learning_open_host, allow_policy_override=False)
     learning_open_host.add_argument("--route", required=True)
     learning_open_host.add_argument("--orchestration-handle", required=True)
+
+    provider_observe = subparsers.add_parser(
+        "provider-observe",
+        help="record a non-spending provider identity, headroom and billing observation",
+    )
+    _add_learning_project(provider_observe)
+    provider_observe.add_argument(
+        "--provider", required=True, choices=("codex", "claude")
+    )
+
+    learning_billing_attestation = subparsers.add_parser(
+        "learning-record-billing-attestation",
+        help="record an owner-signed billing attestation for one provider account",
+    )
+    _add_learning_project(learning_billing_attestation)
+    learning_billing_attestation.add_argument(
+        "--provider", required=True, choices=("codex", "claude")
+    )
+    learning_billing_attestation.add_argument("--grant", required=True)
+    learning_billing_attestation.add_argument("--signature", type=Path)
 
     learning_open_orchestration = subparsers.add_parser(
         "learning-open-orchestration",
@@ -1296,6 +1320,8 @@ def main() -> int:
                     route=route,
                     parent_grant=_json_input(args.parent_grant),
                 )
+                # The ledger admits the run itself as it opens it; later steps read
+                # the stored decision. A verifier is admitted when its run opens.
                 report = {
                     "ready": True,
                     **ledger.open_host_run(
@@ -1309,6 +1335,51 @@ def main() -> int:
                         fallback_receipt=args.fallback_receipt,
                     ),
                 }
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "provider-observe":
+            ledger, project_id = _learning_ledger(args)
+            try:
+                records = ledger.observe_provider(
+                    project_id,
+                    args.provider,
+                    project_root=args.project_root.resolve(),
+                )
+                # The local client path stays in the ledger and is never printed.
+                report = {
+                    "ready": True,
+                    "records": [
+                        {key: value for key, value in record.items() if key != "client_path"}
+                        for record in records
+                    ],
+                }
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "learning-record-billing-attestation":
+            ledger, project_id = _learning_ledger(args)
+            try:
+                record = billing_attestation_record(_json_input(args.grant))
+                if record["provider"] != args.provider:
+                    raise ContractError("billing grant provider does not match")
+                authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+                payload = authority.owner_record_payload(project_id, record)
+                if args.signature is None:
+                    report = {
+                        "ready": True,
+                        "requires_signature": True,
+                        "record": record,
+                        "signing_payload_b64": base64.b64encode(payload).decode("ascii"),
+                    }
+                else:
+                    report = {
+                        "ready": True,
+                        **ledger.commit_owner_record(
+                            project_id,
+                            record=record,
+                            signature=args.signature.read_bytes(),
+                        ),
+                        "record": record,
+                    }
             finally:
                 _close_ledger(ledger)
         elif args.command == "learning-open-orchestration":
@@ -1483,6 +1554,11 @@ def main() -> int:
                         route=route,
                         parent_grant=_json_input(args.parent_grant),
                     )
+                    admitted = ledger.host_run_admission(
+                        project_id, observation["run_handle"]
+                    )
+                    if admitted["provider"] != route.get("provider", "codex"):
+                        raise ContractError("host run admission differs from its route")
                     trusted_now_ms = time.time_ns() // 1_000_000
                     committed = ledger.commit_host_result(
                         project_id,
@@ -2352,6 +2428,13 @@ def main() -> int:
             raise ContractError("unsupported command")
     except OSError:
         _print({"ready": False, "error": "filesystem operation failed"})
+        return 2
+    except AdmissionDenied as exc:
+        _print({
+            "ready": False,
+            "error": "provider admission denied",
+            "reason_code": exc.reason_code,
+        })
         return 2
     except ContractError:
         _print({"ready": False, "error": "input validation failed"})
