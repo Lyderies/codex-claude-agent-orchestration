@@ -52,14 +52,20 @@ CLAUDE_DISABLED_PLUGINS = (
 CODEX_REROUTE_EVENTS = {"model/rerouted", "model_rerouted", "model.rerouted"}
 # Codex features switched off for every child. `code_mode_host` must stay enabled:
 # disabling it breaks Codex's own tool invocation.
+# These disables plus `--ephemeral` are the pre-dispatch denial, and they are only
+# demonstrated on codex-cli 0.164.0: under `--ephemeral`, `spawn_agent` fails before
+# any sub-agent run because no rollout exists, and no item event is emitted for the
+# attempt. The reviewed Codex range in config/routing-policy.json is therefore
+# pinned to that build; widening it requires a live containment check on the new build.
 CODEX_DISABLED_FEATURES = (
     "apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2",
     "image_generation", "goals", "browser_use", "browser_use_external",
     "computer_use", "in_app_browser", "hooks",
 )
 CODEX_WEB_SEARCH_SETTING = 'web_search="disabled"'
-# Collaboration tools cannot be switched off by configuration, so the event stream
-# is the enforcement: anything outside these allowlists stops the child.
+# Collaboration tools cannot be switched off by configuration. This allowlist only
+# detects emitted, typed events: anything outside it stops the child, but it does not
+# prevent a call and cannot see one that emits no event.
 CODEX_ALLOWED_EVENTS = frozenset({
     "thread.started", "turn.started", "turn.completed", "turn.failed", "error",
     "item.started", "item.updated", "item.completed",
@@ -832,6 +838,8 @@ def run_codex(
 
     def on_frame(frame: dict[str, Any]) -> None:
         kind = frame.get("type")
+        if not isinstance(kind, str):
+            raise _Abort("codex_tool_not_allowed:unknown")
         if kind in CODEX_REROUTE_EVENTS:
             state["rerouted"] = True
         elif kind not in CODEX_ALLOWED_EVENTS:
@@ -839,7 +847,7 @@ def run_codex(
         elif kind in CODEX_ITEM_EVENTS:
             item = frame.get("item")
             item_type = item.get("type") if isinstance(item, dict) else None
-            if item_type not in CODEX_ALLOWED_ITEMS:
+            if not isinstance(item_type, str) or item_type not in CODEX_ALLOWED_ITEMS:
                 raise _Abort(f"codex_tool_not_allowed:{_event_label(item_type)}")
         for key in ("model", "to_model"):
             value = frame.get(key)

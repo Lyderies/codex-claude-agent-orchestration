@@ -1138,7 +1138,7 @@ class ProviderRoutingTests(unittest.TestCase):
             loaded = load_policy(self.write_policy(directory, uncapped))
         self.assertEqual(
             {
-                "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+                "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.164.1"},
                 "max_admissions_per_window": None,
             },
             admission_settings(loaded, "codex"),

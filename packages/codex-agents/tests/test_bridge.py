@@ -1218,6 +1218,11 @@ class CodexBridgeTests(BridgeTestCase):
             "unknown": [{"type": "item.started", "item": {}}],
             "thread.surprise": [{"type": "thread.surprise"}],
         }
+        for name, bad in (("list", []), ("object", {})):
+            cases[f"unknown#item-{name}"] = [
+                {"type": "item.completed", "item": {"type": bad}}
+            ]
+            cases[f"unknown#top-{name}"] = [{"type": bad}]
         for reason, frames in cases.items():
             with self.subTest(reason=reason):
                 route, assigned, handle = self.codex_run()
@@ -1231,8 +1236,15 @@ class CodexBridgeTests(BridgeTestCase):
                 )
                 output = self.dispatch(route, assigned, handle)
                 self.assertEqual(
-                    f"codex_tool_not_allowed:{reason}",
+                    f"codex_tool_not_allowed:{reason.split('#')[0]}",
                     output["bridge_report"]["outcome"],
+                )
+                report = output["bridge_report"]
+                self.assertEqual("recorded", report["observation_after"])
+                self.assertFalse(report["usage_recorded"])
+                self.assertIn(
+                    {"phase": "after", "reason_code": "usage_unavailable"},
+                    report["observations_unavailable"],
                 )
                 self.assertEqual("failed", output["result"]["status"])
                 self.assertEqual("not-applicable", output["result"]["semantic_verdict"])
