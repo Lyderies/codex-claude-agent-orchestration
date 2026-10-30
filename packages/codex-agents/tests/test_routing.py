@@ -55,16 +55,16 @@ class RoutingTests(unittest.TestCase):
         task.update(overrides)
         return task
 
-    def test_bounded_deterministic_code_prefers_luna_high(self) -> None:
+    def test_bounded_deterministic_code_prefers_sol_medium(self) -> None:
         route = route_task(
             self.task(complexity="low", risk="low", deterministic_validation=True),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
         self.assertEqual("bounded_executable_work", route["reason"])
         self.assertEqual("execution", route["stage"])
         self.assertEqual(
-            {"model": "gpt-6-luna", "effort": "high"},
+            {"model": "gpt-6.1-sol", "effort": "medium"},
             route["selection"]["selected"],
         )
         self.assertEqual(
@@ -86,7 +86,7 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(10_800, coding["observation_deadline_seconds"])
         self.assertEqual("host_observation_only", research["deadline_semantics"])
 
-    def test_bounded_executable_code_prefers_luna_without_deterministic_flag(self) -> None:
+    def test_bounded_executable_code_prefers_sol_without_deterministic_flag(self) -> None:
         route = route_task(
             self.task(
                 acceptance_strength="executable",
@@ -94,7 +94,7 @@ class RoutingTests(unittest.TestCase):
             ),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
 
     def test_exploratory_code_routes_to_gpt6_sol(self) -> None:
         route = route_task(
@@ -106,7 +106,7 @@ class RoutingTests(unittest.TestCase):
             ),
             self.policy,
         )
-        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "high"), (route["model"], route["effort"]))
 
     def test_planning_routes_to_sol(self) -> None:
         route = route_task(self.task(family="planning"), self.policy)
@@ -121,7 +121,7 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(("codex", "native"), (route["provider"], route["dispatch"]))
         self.assertEqual("security_judgment", route["reason"])
 
-    def test_only_evidenced_hard_end_to_end_work_uses_astra_medium(self) -> None:
+    def test_only_evidenced_hard_end_to_end_work_uses_astra_high(self) -> None:
         evidence = "outcome:" + "a" * 64
         route = route_task(
             self.task(
@@ -135,7 +135,7 @@ class RoutingTests(unittest.TestCase):
             self.policy,
             trusted_routing_evidence_refs=frozenset({evidence}),
         )
-        self.assertEqual(("gpt-6-astra", "medium"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6-astra", "high"), (route["model"], route["effort"]))
         self.assertEqual("hard_end_to_end_evidence", route["reason"])
 
     def test_unresolved_end_to_end_evidence_does_not_use_astra(self) -> None:
@@ -153,15 +153,15 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(("gpt-6.1-sol", "high"), (route["model"], route["effort"]))
         self.assertEqual("cross_system_synthesis", route["reason"])
 
-    def test_high_complexity_alone_keeps_bounded_luna_route(self) -> None:
+    def test_high_complexity_alone_keeps_bounded_sol_route(self) -> None:
         route = route_task(self.task(complexity="high"), self.policy)
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
 
     def test_missing_route_facts_select_bounded_reconnaissance(self) -> None:
         route = route_task(
             self.task(ambiguity="unknown", context_breadth="unknown"), self.policy
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "low"), (route["model"], route["effort"]))
         self.assertEqual("reconnaissance", route["stage"])
         self.assertEqual("research", route["routed_family"])
         self.assertEqual("codex_agents_researcher", route["role"])
@@ -212,7 +212,7 @@ class RoutingTests(unittest.TestCase):
             ),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
 
     def test_one_semantic_failure_does_not_escalate(self) -> None:
         route = route_task(
@@ -228,7 +228,7 @@ class RoutingTests(unittest.TestCase):
             ),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
 
     def test_claimed_reasoning_failures_do_not_escalate(self) -> None:
         route = route_task(
@@ -249,7 +249,7 @@ class RoutingTests(unittest.TestCase):
             ),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
 
     def test_critical_risk_does_not_raise_model_or_authority(self) -> None:
         common = {
@@ -262,7 +262,7 @@ class RoutingTests(unittest.TestCase):
             self.task(risk="critical", **common),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "medium"), (route["model"], route["effort"]))
         self.assertEqual("parallel", route["topology"])
         self.assertEqual(3, route["max_parallel"])
         self.assertEqual(
@@ -285,7 +285,7 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(route["verification_required"])
         self.assertIsNone(route["verifier"])
 
-    def test_bounded_deterministic_verification_prefers_gpt6_luna(self) -> None:
+    def test_bounded_deterministic_verification_prefers_sol_high(self) -> None:
         route = route_task(
             self.task(
                 family="verification",
@@ -295,7 +295,7 @@ class RoutingTests(unittest.TestCase):
             ),
             self.policy,
         )
-        self.assertEqual(("gpt-6-luna", "high"), (route["model"], route["effort"]))
+        self.assertEqual(("gpt-6.1-sol", "high"), (route["model"], route["effort"]))
         self.assertEqual("bounded_deterministic_verification", route["reason"])
 
     def test_judgment_verification_uses_gpt6_sol(self) -> None:
@@ -419,7 +419,7 @@ class RoutingTests(unittest.TestCase):
                 route["verifier"]["agent_path"],
             )
             self.assertEqual("read-only", route["verifier"]["sandbox_mode"])
-            self.assertEqual(("gpt-6.1-sol", "medium"),
+            self.assertEqual(("gpt-6.1-sol", "high"),
                              (route["model"], route["effort"]))
             verifier_route = route_task(
                 self.task(
@@ -868,7 +868,7 @@ class ProviderRoutingTests(unittest.TestCase):
                 )
         exploratory = route_task(self.exploratory(), self.policy)
         self.assertEqual(
-            ("gpt-6.1-sol", "medium"), (exploratory["model"], exploratory["effort"])
+            ("gpt-6.1-sol", "high"), (exploratory["model"], exploratory["effort"])
         )
 
     def test_claude_primary_picks_native_claude_and_bridged_codex(self) -> None:
@@ -898,7 +898,7 @@ class ProviderRoutingTests(unittest.TestCase):
 
         bounded = route_task(self.task(), policy, primary_provider="claude")
         self.assertEqual(
-            ("codex", "bridge", "gpt-6-luna", "high"),
+            ("codex", "bridge", "gpt-6.1-sol", "medium"),
             (bounded["provider"], bounded["dispatch"], bounded["model"], bounded["effort"]),
         )
         self.assertEqual("codex_agents_implementation_worker", bounded["role"])
@@ -925,13 +925,63 @@ class ProviderRoutingTests(unittest.TestCase):
         route = route_task(self.task(), policy, primary_provider="claude")
         self.assertEqual("codex", route["provider"])
         policy = self.provider_policy(
-            codex={"enabled": True, "models": ["gpt-6.1-sol"]},
-            claude={"enabled": True, "models": ["claude-haiku-5-5"]},
+            codex={"enabled": False},
+            claude={"enabled": True, "models": ["claude-haiku-5-5", "claude-opus-5-5"]},
         )
         route = route_task(self.task(), policy, primary_provider="claude")
         self.assertEqual(
             ("claude", "claude-haiku-5-5", "high"),
             (route["provider"], route["model"], route["effort"]),
+        )
+
+    def test_provider_candidates_match_the_approved_routing_table(self) -> None:
+        sol, opus = "gpt-6.1-sol", "claude-opus-5-5"
+        haiku, sonnet = "claude-haiku-5-5", "claude-sonnet-5-5"
+
+        def codex(model: str, effort: str) -> dict:
+            return {"provider": "codex", "model": model, "effort": effort}
+
+        def claude(model: str, effort: str) -> dict:
+            return {"provider": "claude", "model": model, "effort": effort}
+
+        cheap = [claude(haiku, "medium"), codex(sol, "low")]
+        expected: dict[tuple[str, str | None], list[dict]] = {
+            ("coding", "bounded"): [
+                codex(sol, "medium"), claude(sonnet, "medium"), claude(haiku, "high")
+            ],
+            ("research", "bounded"): cheap,
+            ("verification", "bounded"): [codex(sol, "high"), claude(opus, "high")],
+            ("reconnaissance", None): cheap,
+            ("hard_end_to_end", None): [
+                claude(opus, "high"), codex("gpt-6-astra", "high")
+            ],
+        }
+        for key in ("default", "exploratory", "judgment", "synthesis"):
+            expected[("coding", key)] = [claude(opus, "medium"), codex(sol, "high")]
+            expected[("research", key)] = [claude(opus, "high"), codex(sol, "high")]
+        for key in ("bounded", "default", "exploratory", "judgment", "synthesis"):
+            expected[("inventory", key)] = cheap
+        table = self.policy["provider_candidates"]
+        for (name, key), candidates in expected.items():
+            with self.subTest(route=name, key=key):
+                actual = table[name] if key is None else table[name][key]
+                self.assertEqual(candidates, actual)
+        # Rows the table already matched stay as they were.
+        self.assertEqual(
+            [{"provider": "codex", "model": "gpt-6-astra", "effort": "high"}, claude(opus, "high")],
+            table["security"]["default"],
+        )
+        self.assertEqual(
+            [{"provider": "codex", "route": "codex_policy"}, claude(opus, "high")],
+            table["verification"]["default"],
+        )
+        self.assertEqual(
+            [claude(opus, "medium"), {"provider": "codex", "route": "codex_policy"}],
+            table["planning"]["synthesis"],
+        )
+        self.assertEqual(
+            [{"provider": "codex", "route": "codex_policy"}, claude(opus, "medium")],
+            table["planning"]["default"],
         )
 
     def test_no_eligible_candidate_denies_instead_of_falling_back(self) -> None:

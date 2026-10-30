@@ -158,7 +158,7 @@ def assignment() -> dict:
         "objective": "Read one fixture",
         "role": "codex_agents_researcher",
         "model": "gpt-6.1-sol",
-        "effort": "medium",
+        "effort": "high",
         "attempt": 1,
         "meaningful": True,
         "owned_paths": [],

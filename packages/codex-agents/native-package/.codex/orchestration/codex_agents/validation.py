@@ -726,14 +726,14 @@ def validate_package(root: Path) -> dict[str, Any]:
                 ),
             ),
         ]
-        if (routes[0]["model"], routes[0]["effort"]) != ("gpt-6-luna", "high"):
-            package_errors.append("bounded inventory smoke task did not prefer Luna/high")
+        if (routes[0]["model"], routes[0]["effort"]) != ("gpt-6.1-sol", "low"):
+            package_errors.append("bounded inventory smoke task did not prefer Sol/low")
         if (routes[1]["model"], routes[1]["effort"]) != ("gpt-6.1-sol", "high"):
             package_errors.append("critical risk changed the evidence-based planning route")
         if routes[1]["topology"] != "parallel" or not routes[1]["verification_required"]:
             package_errors.append("critical risk changed topology or bypassed verification")
-        if (routes[2]["model"], routes[2]["effort"]) != ("gpt-6-astra", "medium"):
-            package_errors.append("evidenced hard end-to-end task did not route to Astra/medium")
+        if (routes[2]["model"], routes[2]["effort"]) != ("gpt-6-astra", "high"):
+            package_errors.append("evidenced hard end-to-end task did not route to Astra/high")
         if any(
             (route["provider"], route["dispatch"]) != ("codex", "native")
             or (route["verifier"] or {}).get("provider", "codex") != "codex"

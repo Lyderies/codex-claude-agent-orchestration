@@ -215,47 +215,47 @@
   "provider_candidates": {
     "inventory": {
       "bounded": [
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
       "exploratory": [
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
       "judgment": [
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
       "synthesis": [
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
       "default": [
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ]
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ]
     },
     "research": {
       "bounded": [
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
       "exploratory": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
       "judgment": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
       "synthesis": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
       "default": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
-        {"provider": "codex", "route": "codex_policy"}
-      ]
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ]
     },
     "planning": {
       "synthesis": [
@@ -269,26 +269,26 @@
     },
     "coding": {
       "bounded": [
-        {"provider": "codex", "route": "codex_policy"},
-        {"provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium"},
-        {"provider": "claude", "model": "claude-haiku-5-5", "effort": "high"}
-      ],
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "medium"},
+          {"provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium"},
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "high"}
+        ],
       "exploratory": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
       "judgment": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
       "synthesis": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ],
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
       "default": [
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
-        {"provider": "codex", "route": "codex_policy"}
-      ]
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ]
     },
     "security": {
       "default": [
@@ -298,9 +298,9 @@
     },
     "verification": {
       "bounded": [
-        {"provider": "codex", "route": "codex_policy"},
-        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"}
-      ],
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"},
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"}
+        ],
       "default": [
         {"provider": "codex", "route": "codex_policy"},
         {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"}
@@ -308,11 +308,11 @@
     },
     "reconnaissance": [
       {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
-      {"provider": "codex", "route": "codex_policy"}
+      {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
     ],
     "hard_end_to_end": [
       {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
-      {"provider": "codex", "route": "codex_policy"}
+      {"provider": "codex", "model": "gpt-6-astra", "effort": "high"}
     ]
   },
   "verification": {
