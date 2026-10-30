@@ -21,6 +21,14 @@ from codex_agents import bridge, workspace
 from codex_agents.workspace import WorkspaceRefused
 
 
+GIT_NO_LAZY_FETCH = subprocess.run(
+    ["git", "--no-lazy-fetch", "version"], capture_output=True, check=False
+).returncode == 0
+NEEDS_GIT = unittest.skipUnless(
+    GIT_NO_LAZY_FETCH, "the workspace refuses a Git without --no-lazy-fetch (needs Git 2.44 or later)"
+)
+
+
 def git(root: Path, *arguments: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True
@@ -35,8 +43,37 @@ def write(path: Path, content: bytes | str, mode: int | None = None) -> None:
         os.chmod(path, mode)
 
 
+def case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.write_text("x")
+    try:
+        return (directory / "caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+def hand_patch(source_commit: str, changes: list[dict]) -> dict:
+    entries = []
+    for change in changes:
+        content = change.get("content")
+        entries.append({
+            "path": change["path"], "op": change["op"], "old_blob": change.get("old_blob"),
+            "old_mode": change.get("old_mode"),
+            "new_sha256": None if content is None else hashlib.sha256(content).hexdigest(),
+            "mode": change.get("mode", None if content is None else "100644"),
+            "content_b64": None if content is None else base64.b64encode(content).decode(),
+        })
+    return {
+        "schema_version": 1, "source_commit": source_commit, "manifest_digest": "0" * 64,
+        "changes": sorted(entries, key=lambda item: item["path"]),
+    }
+
+
+@NEEDS_GIT
 class WorkspaceTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        previous_umask = os.umask(0o022)
+        self.addCleanup(os.umask, previous_umask)
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
@@ -62,7 +99,7 @@ class WorkspaceTestCase(unittest.TestCase):
 
     def export(self, read=("src", "docs"), write_set=("src",)):
         layout = workspace.create_layout(self.runs)
-        self.addCleanup(workspace.cleanup_layout, layout)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
         manifest = workspace.export_workspace(self.project, layout, read, write_set)
         return layout, manifest
 
@@ -165,7 +202,7 @@ class ExportTest(WorkspaceTestCase):
             return result
 
         layout = workspace.create_layout(self.runs)
-        self.addCleanup(workspace.cleanup_layout, layout)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
         with mock.patch.object(bridge, "_git", side_effect=racing):
             manifest = workspace.export_workspace(self.project, layout, ["docs", "src"], ["src"])
         self.assertTrue(landed)
@@ -177,7 +214,7 @@ class ExportTest(WorkspaceTestCase):
         os.symlink("app.py", self.project / "src" / "link.py")
         self.commit("link")
         layout = workspace.create_layout(self.runs)
-        self.addCleanup(workspace.cleanup_layout, layout)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
         self.assertRefused("export_symlink", workspace.export_workspace, self.project, layout, ["src"], [])
 
     def test_submodule_is_refused(self) -> None:
@@ -185,14 +222,14 @@ class ExportTest(WorkspaceTestCase):
         git(self.project, "update-index", "--add", "--cacheinfo", f"160000,{commit},src/sub")
         git(self.project, "commit", "-qm", "submodule")
         layout = workspace.create_layout(self.runs)
-        self.addCleanup(workspace.cleanup_layout, layout)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
         self.assertRefused("export_submodule", workspace.export_workspace, self.project, layout, ["src"], [])
 
     def test_missing_read_path_refuses_but_missing_write_path_is_allowed(self) -> None:
         layout, manifest = self.export(read=("src",), write_set=("new/module.py",))
         self.assertEqual(manifest["write_set"], ["new/module.py"])
         layout = workspace.create_layout(self.runs)
-        self.addCleanup(workspace.cleanup_layout, layout)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
         self.assertRefused(
             "path_not_committed", workspace.export_workspace, self.project, layout, ["absent"], []
         )
@@ -214,7 +251,7 @@ class ExportTest(WorkspaceTestCase):
 
     def test_protected_write_set_refuses_export(self) -> None:
         layout = workspace.create_layout(self.runs)
-        self.addCleanup(workspace.cleanup_layout, layout)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
         self.assertRefused(
             "write_path_protected", workspace.export_workspace, self.project, layout, ["src"],
             ["src/AGENTS.md"],
@@ -238,7 +275,7 @@ class OwnershipTest(WorkspaceTestCase):
         ops = {change["path"]: (change["op"], change["mode"]) for change in patch["changes"]}
         self.assertEqual(ops, {
             "src/app.py": ("modify", "100755"),
-            "src/nested/deep.txt": ("delete", "100644"),
+            "src/nested/deep.txt": ("delete", None),
             "src/pkg/new.py": ("add", "100644"),
         })
 
@@ -351,7 +388,7 @@ class OwnershipTest(WorkspaceTestCase):
         os.chmod(layout.workspace / "src" / "app.py", 0o644 | stat.S_ISGID)
         if not os.stat(layout.workspace / "src" / "app.py").st_mode & stat.S_ISGID:
             os.chmod(layout.workspace / "src" / "app.py", 0o644 | stat.S_ISVTX)
-        if not os.stat(layout.workspace / "src" / "app.py").st_mode & workspace.SPECIAL_MODE_BITS:
+        if not os.stat(layout.workspace / "src" / "app.py").st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
             self.skipTest("filesystem drops special mode bits")
         workspace.snapshot_workspace(layout)
         self.assertRefused("mode_change", workspace.collect_patch, layout, manifest)
@@ -412,12 +449,12 @@ class SnapshotTest(WorkspaceTestCase):
 
     def test_portable_copy_matches_clone(self) -> None:
         inventories = []
-        for clone in (workspace._CLONEFILEAT, None):
+        for clone in (workspace._FCLONEFILEAT, None):
             layout, _ = self.export(write_set=("src",))
             write(layout.workspace / "src" / "app.py", "print('child')\n")
             os.chmod(layout.workspace / "src" / "app.py", 0o755)
             os.mkfifo(layout.workspace / "src" / "pipe")
-            with mock.patch.object(workspace, "_CLONEFILEAT", clone):
+            with mock.patch.object(workspace, "_FCLONEFILEAT", clone):
                 workspace.snapshot_workspace(layout)
             inventories.append(workspace.inventory_snapshot(layout))
         self.assertEqual(inventories[0], inventories[1])
@@ -437,7 +474,7 @@ class SnapshotTest(WorkspaceTestCase):
 
     def test_replaced_workspace_symlink_is_refused(self) -> None:
         layout, _ = self.export(write_set=("src",))
-        workspace._remove_path(layout.workspace)
+        workspace.remove_quiescent_tree(layout.workspace)
         os.symlink(self.project, layout.workspace)
         self.assertRefused("workspace_not_directory", workspace.snapshot_workspace, layout)
 
@@ -472,7 +509,8 @@ class PatchTest(WorkspaceTestCase):
              manifest["source_commit"]],
             check=True, capture_output=True,
         )
-        workspace.apply_patch_to_tree(patch, target)
+        verified = workspace.verify_tree_at_commit(target, manifest["source_commit"])
+        workspace.apply_patch_to_tree(patch, target, verified=verified)
         self.assertEqual((target / "src" / "app.py").read_bytes(), b"print('changed')\n\x00\xff")
         self.assertTrue(os.stat(target / "src" / "pkg" / "new.py").st_mode & stat.S_IXUSR)
         self.assertFalse((target / "src" / "nested").exists())
@@ -485,7 +523,9 @@ class PatchTest(WorkspaceTestCase):
         target = self.base / "tree"
         write(target / "src" / "app.py", "something else\n")
         write(target / "src" / "nested" / "deep.txt", "deep\n")
-        self.assertRefused("apply_blob_mismatch", workspace.apply_patch_to_tree, patch, target)
+        self.assertRefused(
+            "apply_blob_mismatch", workspace.apply_patch_to_tree, patch, target, base_verified_by_caller=True
+        )
         # Nothing was written before the refusal.
         self.assertEqual((target / "src" / "app.py").read_text(), "something else\n")
         self.assertFalse((target / "src" / "pkg").exists())
@@ -499,18 +539,22 @@ class PatchTest(WorkspaceTestCase):
             check=True, capture_output=True,
         )
         write(target / "src" / "pkg" / "new.py", "occupied\n")
-        self.assertRefused("apply_path_exists", workspace.apply_patch_to_tree, patch, target)
+        self.assertRefused(
+            "apply_path_exists", workspace.apply_patch_to_tree, patch, target, base_verified_by_caller=True
+        )
         os.unlink(target / "src" / "pkg" / "new.py")
         os.unlink(target / "src" / "app.py")
         os.symlink("run.sh", target / "src" / "app.py")
-        self.assertRefused("apply_entry_not_file", workspace.apply_patch_to_tree, patch, target)
+        self.assertRefused(
+            "apply_entry_not_file", workspace.apply_patch_to_tree, patch, target, base_verified_by_caller=True
+        )
         os.unlink(target / "src" / "app.py")
         os.rmdir(target / "src" / "pkg")
         outside = self.base / "elsewhere"
         outside.mkdir()
         os.symlink(outside, target / "src" / "pkg")
         with self.assertRaises(WorkspaceRefused):
-            workspace.apply_patch_to_tree(patch, target)
+            workspace.apply_patch_to_tree(patch, target, base_verified_by_caller=True)
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_tampered_patch_is_refused(self) -> None:
@@ -533,7 +577,7 @@ class EnvelopeAndCleanupTest(WorkspaceTestCase):
         os.unlink(layout.workspace / "src" / "nested" / "deep.txt")
         patch = self.collect(layout, manifest)
         binding = {"run_id": "run-1", "admission_id": "admission-1", "attempt": 1}
-        envelope = workspace.build_verifier_envelope(patch, binding)
+        envelope = workspace.build_verifier_envelope(patch, manifest, binding)
         self.assertEqual(envelope["patch_digest"], workspace.patch_digest(patch))
         self.assertEqual(envelope["source_commit"], manifest["source_commit"])
         self.assertEqual(envelope["manifest_digest"], workspace.manifest_digest(manifest))
@@ -542,11 +586,25 @@ class EnvelopeAndCleanupTest(WorkspaceTestCase):
         self.assertEqual(
             base64.b64decode(envelope["resulting_files"][0]["content_b64"]), b"print('changed')\n"
         )
-        again = workspace.build_verifier_envelope(copy.deepcopy(patch), dict(reversed(binding.items())))
+        again = workspace.build_verifier_envelope(
+            copy.deepcopy(patch), copy.deepcopy(manifest), dict(reversed(binding.items()))
+        )
         self.assertEqual(workspace.envelope_digest(again), workspace.envelope_digest(envelope))
-        changed = workspace.build_verifier_envelope(patch, {**binding, "attempt": 2})
+        changed = workspace.build_verifier_envelope(patch, manifest, {**binding, "attempt": 2})
         self.assertNotEqual(workspace.envelope_digest(changed), workspace.envelope_digest(envelope))
-        self.assertRefused("run_binding_invalid", workspace.build_verifier_envelope, patch, {"x": [1]})
+        self.assertRefused(
+            "run_binding_invalid", workspace.build_verifier_envelope, patch, manifest, {"x": [1]}
+        )
+        self.assertEqual(envelope["manifest"], manifest)
+        other = {**manifest, "write_set": ["docs"]}
+        self.assertRefused(
+            "envelope_manifest_mismatch", workspace.build_verifier_envelope, patch, other, binding
+        )
+        # The envelope is detached from the caller's patch and manifest.
+        before = workspace.envelope_digest(envelope)
+        patch["changes"][0]["path"] = "src/tampered.py"
+        manifest["write_set"].append("docs")
+        self.assertEqual(workspace.envelope_digest(envelope), before)
 
     def test_cleanup_is_idempotent_and_does_not_follow(self) -> None:
         outside = self.base / "outside"
@@ -558,10 +616,10 @@ class EnvelopeAndCleanupTest(WorkspaceTestCase):
         os.chmod(locked, 0o500)
         workspace.snapshot_workspace(layout)
         os.chmod(locked, 0o000)
-        workspace.cleanup_layout(layout)
+        workspace.cleanup_layout(layout, quiescent=True)
         self.assertFalse(os.path.lexists(layout.root))
         self.assertEqual((outside / "keep.txt").read_text(), "keep\n")
-        workspace.cleanup_layout(layout)
+        workspace.cleanup_layout(layout, quiescent=True)
 
     def test_cleanup_of_deep_tree(self) -> None:
         layout = workspace.create_layout(self.runs)
@@ -578,7 +636,7 @@ class EnvelopeAndCleanupTest(WorkspaceTestCase):
         limit = sys.getrecursionlimit()
         sys.setrecursionlimit(250)
         try:
-            workspace.cleanup_layout(layout)
+            workspace.cleanup_layout(layout, quiescent=True)
         finally:
             sys.setrecursionlimit(limit)
         self.assertFalse(os.path.lexists(layout.root))
@@ -587,11 +645,400 @@ class EnvelopeAndCleanupTest(WorkspaceTestCase):
         outside = self.base / "outside"
         write(outside / "keep.txt", "keep\n")
         layout = workspace.create_layout(self.runs)
-        workspace.cleanup_layout(layout)
+        workspace.cleanup_layout(layout, quiescent=True)
         os.symlink(outside, layout.root)
-        workspace.cleanup_layout(layout)
+        workspace.cleanup_layout(layout, quiescent=True)
         self.assertFalse(os.path.lexists(layout.root))
         self.assertTrue((outside / "keep.txt").exists())
+
+
+class GitHardeningTest(WorkspaceTestCase):
+    def test_git_without_no_lazy_fetch_is_refused(self) -> None:
+        original = bridge._git
+
+        def old_git(root, *arguments, text=False):
+            if "--no-lazy-fetch" in arguments:
+                return subprocess.CompletedProcess(arguments, 129, b"", b"")
+            return original(root, *arguments, text=text)
+
+        layout = workspace.create_layout(self.runs)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
+        with mock.patch.object(workspace, "_LAZY_FETCH_SUPPORTED", None), \
+                mock.patch.object(bridge, "_git", side_effect=old_git):
+            self.assertRefused(
+                "git_unsupported", workspace.export_workspace, self.project, layout, ["src"], ["src"]
+            )
+
+    def partial_clone(self, *, extension: bool) -> Path:
+        marker = self.base / "remote-command-ran"
+        blob = git(self.project, "rev-parse", "HEAD:src/app.py")
+        os.unlink(self.project / ".git" / "objects" / blob[:2] / blob[2:])
+        git(self.project, "remote", "add", "origin", "ssh://example.invalid/repo.git")
+        git(self.project, "config", "remote.origin.promisor", "true")
+        git(self.project, "config", "core.sshCommand", f"touch {marker}; false")
+        if extension:
+            git(self.project, "config", "core.repositoryformatversion", "1")
+            git(self.project, "config", "extensions.partialClone", "origin")
+            git(self.project, "config", "--unset", "remote.origin.promisor")
+        return marker
+
+    def test_partial_clone_is_refused_without_running_remote_configuration(self) -> None:
+        for extension in (True, False):
+            with self.subTest(extension=extension):
+                self.setUp()
+                marker = self.partial_clone(extension=extension)
+                layout = workspace.create_layout(self.runs)
+                self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
+                self.assertRefused(
+                    "partial_clone", workspace.export_workspace, self.project, layout, ["src"], ["src"]
+                )
+                self.assertFalse(marker.exists())
+                self.assertEqual(list(layout.workspace.iterdir()), [])
+
+    def test_missing_object_never_fetches_even_past_the_partial_clone_check(self) -> None:
+        marker = self.partial_clone(extension=True)
+        layout = workspace.create_layout(self.runs)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
+        original = bridge._git
+
+        def without_partial_config(root, *arguments, text=False):
+            if "config" in arguments:
+                return subprocess.CompletedProcess(arguments, 1, b"", b"")
+            return original(root, *arguments, text=text)
+
+        with mock.patch.object(bridge, "_git", side_effect=without_partial_config):
+            self.assertRefused(
+                "export_blob_unavailable", workspace.export_workspace, self.project, layout, ["src"], ["src"]
+            )
+        self.assertFalse(marker.exists())
+
+
+class ReviewFixesTest(WorkspaceTestCase):
+    # Cleanup (finding 2)
+
+    def test_cleanup_without_quiescence_only_fences(self) -> None:
+        layout, _ = self.export()
+        fenced = workspace.cleanup_layout(layout)
+        self.assertFalse(os.path.lexists(layout.root))
+        self.assertEqual(fenced.parent, layout.root.parent)
+        self.assertTrue(fenced.name.startswith(layout.root.name + workspace.FENCED_MARKER))
+        self.assertTrue((fenced / "workspace" / "src" / "app.py").exists())
+        self.assertIsNone(workspace.cleanup_layout(layout))
+        workspace.remove_quiescent_tree(fenced)
+        self.assertFalse(os.path.lexists(fenced))
+        workspace.remove_quiescent_tree(fenced)
+
+    def test_cleanup_stops_before_unlinking_in_a_relocated_directory(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir()
+        layout = workspace.create_layout(self.runs)
+        write(layout.workspace / "a" / "b" / "keep.txt", "keep\n")
+        write(layout.workspace / "a" / "sibling.txt", "keep\n")
+        status = os.stat(layout.workspace / "a")
+        target = (status.st_dev, status.st_ino)
+        original = workspace._verified_parent
+        moved = []
+
+        def relocating(current, place):
+            here = os.fstat(current)
+            if (here.st_dev, here.st_ino) == target and not moved:
+                os.rename(layout.workspace / "a", outside / "a")
+                moved.append(True)
+            return original(current, place)
+
+        with mock.patch.object(workspace, "_verified_parent", side_effect=relocating):
+            self.assertRefused("cleanup_relocated", workspace.cleanup_layout, layout, quiescent=True)
+        self.assertTrue(moved)
+        self.assertEqual((outside / "a" / "b" / "keep.txt").read_text(), "keep\n")
+        self.assertEqual((outside / "a" / "sibling.txt").read_text(), "keep\n")
+        workspace.remove_quiescent_tree(layout.root)
+
+    # Snapshot (finding 3)
+
+    def test_file_changing_during_snapshot_is_unstable(self) -> None:
+        for clone in (workspace._FCLONEFILEAT, None):
+            with self.subTest(clone=clone is not None):
+                layout, _ = self.export()
+                original = workspace._transfer
+
+                def growing(source_fd, target_dir_fd, name, limit, layout=layout):
+                    original(source_fd, target_dir_fd, name, limit)
+                    if name == "app.py":
+                        with open(layout.workspace / "src" / "app.py", "ab") as handle:
+                            handle.write(b"more\n")
+
+                with mock.patch.object(workspace, "_FCLONEFILEAT", clone), \
+                        mock.patch.object(workspace, "_transfer", side_effect=growing):
+                    self.assertRefused("snapshot_unstable", workspace.snapshot_workspace, layout)
+
+    def swap_before_open(self, layout, replace):
+        real_open = os.open
+        swapped = []
+
+        def swapping(path, flags, *arguments, **keywords):
+            if path == "app.py" and flags & os.O_NONBLOCK and not swapped:
+                swapped.append(True)
+                replace(layout.workspace / "src" / "app.py")
+            return real_open(path, flags, *arguments, **keywords)
+
+        return mock.patch.object(workspace.os, "open", side_effect=swapping), swapped
+
+    def test_file_swapped_for_symlink_before_open_is_recorded_as_symlink(self) -> None:
+        layout, manifest = self.export()
+
+        def to_symlink(path):
+            path.unlink()
+            os.symlink("/etc/passwd", path)
+
+        patcher, swapped = self.swap_before_open(layout, to_symlink)
+        with patcher:
+            workspace.snapshot_workspace(layout)
+        self.assertTrue(swapped)
+        self.assertEqual(workspace.inventory_snapshot(layout)["src/app.py"]["type"], "symlink")
+        self.assertRefused("symlink_entry", workspace.collect_patch, layout, manifest)
+
+    def test_file_swapped_for_directory_is_never_cloned(self) -> None:
+        layout, _ = self.export()
+
+        def to_directory(path):
+            path.unlink()
+            path.mkdir()
+            (path / "inner.txt").write_text("x")
+
+        patcher, swapped = self.swap_before_open(layout, to_directory)
+        with patcher:
+            self.assertRefused("snapshot_unstable", workspace.snapshot_workspace, layout)
+        self.assertTrue(swapped)
+        self.assertFalse(os.path.lexists(layout.snapshot / "src" / "app.py"))
+
+    def test_hard_link_count_comes_from_the_pinned_descriptor(self) -> None:
+        layout, manifest = self.export()
+        os.link(layout.workspace / "src" / "app.py", self.base / "outside-link")
+        workspace.snapshot_workspace(layout)
+        self.assertEqual(workspace.inventory_snapshot(layout)["src/app.py"]["nlink"], 2)
+        self.assertRefused("hard_link", workspace.collect_patch, layout, manifest)
+
+    # Streaming caps (finding 4)
+
+    def test_listing_stops_at_the_budget_before_full_enumeration(self) -> None:
+        directory = self.base / "many"
+        directory.mkdir()
+        for index in range(100):
+            (directory / f"f{index}").write_text("x")
+        real_scandir = os.scandir
+        consumed = []
+
+        class Counting:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *details):
+                self.inner.close()
+
+            def __iter__(self):
+                for entry in self.inner:
+                    consumed.append(entry.name)
+                    yield entry
+
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with mock.patch.object(workspace.os, "scandir", side_effect=lambda fd: Counting(real_scandir(fd))):
+                self.assertRefused("inventory_too_many_entries", workspace._list_names, descriptor, 5)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(len(consumed), 6)
+
+    # Base verification (finding 5)
+
+    def worktree(self, name="checkout", commit=None) -> Path:
+        target = self.base / name
+        git(self.project, "worktree", "add", "-q", "--detach", str(target), commit or "HEAD")
+        return target
+
+    def test_verify_tree_at_commit(self) -> None:
+        commit = git(self.project, "rev-parse", "HEAD")
+        target = self.worktree()
+        verified = workspace.verify_tree_at_commit(target, commit)
+        self.assertEqual(verified.commit, commit)
+        write(target / "src" / "untracked.py", "x\n")
+        self.assertRefused("tree_not_clean", workspace.verify_tree_at_commit, target, commit)
+        os.unlink(target / "src" / "untracked.py")
+        write(target / "src" / "app.py", "edited\n")
+        self.assertRefused("tree_not_clean", workspace.verify_tree_at_commit, target, commit)
+        git(target, "add", "src/app.py")
+        self.assertRefused("tree_index_dirty", workspace.verify_tree_at_commit, target, commit)
+        git(target, "reset", "-q", "--hard")
+        os.chmod(target / "src" / "app.py", 0o755)
+        self.assertRefused("tree_not_clean", workspace.verify_tree_at_commit, target, commit)
+        os.chmod(target / "src" / "app.py", 0o644)
+        write(self.project / "src" / "app.py", "next\n")
+        later = self.commit("later")
+        self.assertRefused("tree_not_at_commit", workspace.verify_tree_at_commit, target, later)
+        workspace.verify_tree_at_commit(target, commit)
+
+    def test_apply_requires_an_established_base(self) -> None:
+        commit = git(self.project, "rev-parse", "HEAD")
+        patch = hand_patch(commit, [{"path": "src/new.py", "op": "add", "content": b"x\n"}])
+        target = self.worktree()
+        self.assertRefused("apply_base_unverified", workspace.apply_patch_to_tree, patch, target)
+        write(self.project / "src" / "app.py", "next\n")
+        later = self.commit("later")
+        other = self.worktree("other", later)
+        stale = workspace.verify_tree_at_commit(other, later)
+        self.assertRefused("apply_base_mismatch", workspace.apply_patch_to_tree, patch, target, verified=stale)
+        wrong_root = workspace.verify_tree_at_commit(target, commit)
+        self.assertRefused(
+            "apply_base_mismatch", workspace.apply_patch_to_tree, patch, other,
+            verified=workspace.VerifiedTree(other, commit, wrong_root.identity),
+        )
+        workspace.apply_patch_to_tree(patch, target, verified=wrong_root)
+        self.assertEqual((target / "src" / "new.py").read_text(), "x\n")
+
+    def test_apply_refuses_old_mode_mismatch(self) -> None:
+        commit = git(self.project, "rev-parse", "HEAD")
+        blob = git(self.project, "rev-parse", "HEAD:src/app.py")
+        patch = hand_patch(commit, [{
+            "path": "src/app.py", "op": "modify", "old_blob": blob, "old_mode": "100644", "content": b"y\n",
+        }])
+        target = self.worktree()
+        os.chmod(target / "src" / "app.py", 0o755)
+        self.assertRefused(
+            "apply_mode_mismatch", workspace.apply_patch_to_tree, patch, target, base_verified_by_caller=True
+        )
+        self.assertEqual((target / "src" / "app.py").read_text(), "print('app')\n")
+        delete = hand_patch(commit, [{"path": "src/app.py", "op": "delete", "old_blob": blob, "old_mode": None}])
+        self.assertRefused("patch_invalid", workspace.validate_patch, delete)
+
+    # Export aliasing (finding 6)
+
+    def commit_paths(self, *paths: str) -> None:
+        for path in paths:
+            blob = subprocess.run(
+                ["git", "-C", str(self.project), "hash-object", "-w", "--stdin"],
+                input=path.encode(), capture_output=True, check=True,
+            ).stdout.decode().strip()
+            git(self.project, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        git(self.project, "commit", "-qm", "aliases")
+
+    def test_export_refuses_case_aliased_directories(self) -> None:
+        self.commit_paths("src/A/x.txt", "src/a/y.txt")
+        layout = workspace.create_layout(self.runs)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
+        self.assertRefused(
+            "export_path_collision", workspace.export_workspace, self.project, layout, ["src"], []
+        )
+
+    def test_export_refuses_aliased_directory_identities(self) -> None:
+        if not case_insensitive(self.base):
+            self.skipTest("needs a case-insensitive filesystem to alias two directory names")
+        self.commit_paths("src/A/x.txt", "src/a/y.txt")
+        layout = workspace.create_layout(self.runs)
+        self.addCleanup(workspace.cleanup_layout, layout, quiescent=True)
+        with mock.patch.object(workspace, "_alias_check"):
+            self.assertRefused(
+                "export_path_collision", workspace.export_workspace, self.project, layout, ["src"], []
+            )
+
+    # Apply aliasing and exclusive adds (finding 7)
+
+    def test_apply_refuses_folded_aliases_in_the_patch(self) -> None:
+        commit = git(self.project, "rev-parse", "HEAD")
+        for paths in (("src/Pkg/a.py", "src/pkg/b.py"), ("src/NEW.py", "src/new.py"),
+                      ("src/café.py", "src/café.py")):
+            with self.subTest(paths=paths):
+                patch = hand_patch(commit, [{"path": p, "op": "add", "content": b"x"} for p in paths])
+                target = Path(tempfile.mkdtemp(dir=self.base))
+                self.assertRefused(
+                    "apply_path_collision", workspace.apply_patch_to_tree, patch, target,
+                    base_verified_by_caller=True,
+                )
+                self.assertEqual(list(target.iterdir()), [])
+
+    def test_add_created_between_preflight_and_write_is_not_overwritten(self) -> None:
+        commit = git(self.project, "rev-parse", "HEAD")
+        patch = hand_patch(commit, [{"path": "src/new.py", "op": "add", "content": b"patch\n"}])
+        target = self.base / "tree"
+        (target / "src").mkdir(parents=True)
+        original = workspace._install_file
+
+        def racing(parent, name, content, mode, *, replace):
+            write(target / "src" / name, "racer\n")
+            return original(parent, name, content, mode, replace=replace)
+
+        with mock.patch.object(workspace, "_install_file", side_effect=racing):
+            self.assertRefused(
+                "apply_path_exists", workspace.apply_patch_to_tree, patch, target, base_verified_by_caller=True
+            )
+        self.assertEqual((target / "src" / "new.py").read_text(), "racer\n")
+        self.assertEqual(sorted(p.name for p in (target / "src").iterdir()), ["new.py"])
+
+    def test_apply_refuses_case_alias_of_an_existing_file(self) -> None:
+        target = self.base / "tree"
+        write(target / "src" / "readme.txt", "existing\n")
+        if not case_insensitive(target):
+            self.skipTest("needs a case-insensitive filesystem")
+        commit = git(self.project, "rev-parse", "HEAD")
+        patch = hand_patch(commit, [{"path": "src/README.txt", "op": "add", "content": b"new\n"}])
+        self.assertRefused(
+            "apply_path_exists", workspace.apply_patch_to_tree, patch, target, base_verified_by_caller=True
+        )
+        self.assertEqual((target / "src" / "readme.txt").read_text(), "existing\n")
+
+    # Full permission bits (finding 8)
+
+    def refused_mode(self, change, write_set=("src",)):
+        layout, manifest = self.export(write_set=write_set)
+        change(layout.workspace)
+        workspace.snapshot_workspace(layout)
+        self.assertRefused("mode_change", workspace.collect_patch, layout, manifest)
+
+    def test_manifest_records_full_permission_bits(self) -> None:
+        _, manifest = self.export(write_set=("src/app.py",))
+        self.assertEqual(manifest["files"]["src/app.py"]["perm"], 0o644)
+        self.assertEqual(manifest["files"]["src/run.sh"]["perm"], 0o555)
+        self.assertEqual(manifest["files"]["docs/guide.md"]["perm"], 0o444)
+        self.assertEqual(manifest["directories"], {"docs": 0o700, "src": 0o700, "src/nested": 0o700})
+
+    def test_permission_changes_other_than_the_execute_toggle_refuse(self) -> None:
+        cases = {
+            "group write on owned file": lambda w: os.chmod(w / "src" / "app.py", 0o664),
+            "owner-only execute": lambda w: os.chmod(w / "src" / "app.py", 0o744),
+            "owner write on read-only file": lambda w: os.chmod(w / "docs" / "guide.md", 0o644),
+            "read-only protected file": lambda w: os.chmod(w / "src" / "AGENTS.md", 0o555),
+            "baseline directory": lambda w: os.chmod(w / "src" / "nested", 0o755),
+            "new file 0600": lambda w: write(w / "src" / "new.py", "x\n", 0o600),
+            "new directory 0777": lambda w: (write(w / "src" / "pkg" / "a.py", "x\n"),
+                                             os.chmod(w / "src" / "pkg", 0o777)),
+        }
+        for label, change in cases.items():
+            with self.subTest(label):
+                self.refused_mode(change)
+
+    def test_execute_toggle_on_owned_file_is_allowed(self) -> None:
+        layout, manifest = self.export(write_set=("src",))
+        os.chmod(layout.workspace / "src" / "run.sh", 0o644)
+        patch = self.collect(layout, manifest)
+        self.assertEqual(
+            [(c["path"], c["op"], c["old_mode"], c["mode"]) for c in patch["changes"]],
+            [("src/run.sh", "modify", "100755", "100644")],
+        )
+
+    # Long names (finding 11)
+
+    def test_255_byte_basename_round_trip(self) -> None:
+        name = "n" * 252 + ".py"
+        self.assertEqual(len(name.encode()), 255)
+        layout, manifest = self.export(write_set=("src",))
+        write(layout.workspace / "src" / name, "long\n")
+        patch = self.collect(layout, manifest)
+        target = self.worktree()
+        verified = workspace.verify_tree_at_commit(target, manifest["source_commit"])
+        workspace.apply_patch_to_tree(patch, target, verified=verified)
+        self.assertEqual((target / "src" / name).read_text(), "long\n")
+        self.assertEqual([p for p in os.listdir(target / "src") if p.endswith(".tmp")], [])
 
 
 if __name__ == "__main__":
