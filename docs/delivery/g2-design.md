@@ -168,6 +168,23 @@ table also chooses the Codex model there. `routes` remains the fallback for a fa
 candidates. Rows with no task family (documentation, mechanical edits, non-agentic transforms),
 escalation steps and context-size conditions are not expressible yet; they belong to G4.
 
+### S4b: Codex child tool lockdown
+
+A live spike found that `codex exec`, even with user configuration ignored, exposes the account's
+connector tools: GitHub writes, site deployment and environment variables. It also exposes web
+search, image generation, goals and agent spawning. Connector calls run server-side, outside any
+local sandbox. The bridge therefore:
+
+- passes pinned feature disables, which remove the connectors, web search, image generation and
+  goals;
+- relies on `--ephemeral`, under which agent spawning fails before any sub-agent run;
+- stops a child on any event or item type outside a short allowlist.
+
+The allowlist only detects emitted, typed events. Pre-dispatch denial comes from the disables
+and ephemeral mode, which were shown live only on codex-cli 0.164.0, so the reviewed Codex range
+is pinned to that build. Widening it requires the live containment check to pass on the new
+build.
+
 ### S4: security review, pilot install and exit
 
 - An independent security review covers admission, the bridge, profiles, scoped directories and
