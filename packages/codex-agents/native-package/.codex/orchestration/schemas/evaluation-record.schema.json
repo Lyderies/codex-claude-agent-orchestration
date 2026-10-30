@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/evaluation-record.schema.json",
+  "title": "Evaluation record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "family",
+    "model",
+    "effort",
+    "baseline",
+    "passed",
+    "quality_score",
+    "repairs",
+    "latency_ms",
+    "tool_calls"
+  ],
+  "properties": {
+    "task_id": {"type": "string"},
+    "family": {"type": "string"},
+    "model": {"type": "string"},
+    "effort": {"type": "string"},
+    "baseline": {"type": "boolean"},
+    "passed": {"type": "boolean"},
+    "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+    "repairs": {"type": "integer", "minimum": 0},
+    "latency_ms": {"type": "integer", "minimum": 0},
+    "tool_calls": {"type": "integer", "minimum": 0},
+    "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+    "cached_tokens": {"type": ["integer", "null"], "minimum": 0},
+    "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+    "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+    "cost": {"type": ["number", "null"], "minimum": 0},
+    "notes": {"type": "string"}
+  }
+}

@@ -1,0 +1,4 @@
+name = "reader"
+description = "Reads one fixture."
+sandbox_mode = "read-only"
+developer_instructions = "Read only the assigned fixture and return evidence."

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "client": "codex-hooks-v1",
+  "derivation": "Each limit is at least five times the first accepted p95 measurement, rounded up with a 1 ms in-process floor, a 5 ms durable-operation floor, and a 250 ms cold-process floor.",
+  "baseline_p95_ms": {
+    "normalize": 0.009,
+    "ledger_commit": 0.177,
+    "collector_round_trip": 0.498,
+    "cold_hook_process": 46.552
+  },
+  "p95_ms": {
+    "normalize": 1,
+    "ledger_commit": 5,
+    "collector_round_trip": 5,
+    "cold_hook_process": 250
+  }
+}

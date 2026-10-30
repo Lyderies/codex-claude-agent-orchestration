@@ -1,0 +1,14 @@
+{
+  "description": "Observational, redacted codex-agents learning telemetry.",
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "async": true, "timeout": 3}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "timeout": 3}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "async": true, "timeout": 3}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "timeout": 3}]}],
+    "Interrupt": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "timeout": 3}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "async": true, "timeout": 3}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "timeout": 3}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "async": true, "timeout": 3}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py\" --client-version codex-hooks-v1", "async": true, "timeout": 3}]}]
+  }
+}
