@@ -109,6 +109,38 @@ def _read(root: int, relative: str) -> bytes | None:
         os.close(parent)
 
 
+_GIT_HEAD = re.compile(rb"(?:ref: refs/heads/[A-Za-z0-9_./-]+|[0-9a-f]{40}|[0-9a-f]{64})\n")
+_GIT_LINK = re.compile(rb"gitdir: ([^\0\r\n]{1,4096})\n?")
+
+
+def _linked_git_dir_exists(target: Path, pointer: bytes) -> bool:
+    """Check, without opening it, that a linked worktree points at a Git directory with a HEAD."""
+    git_dir = Path(os.fsdecode(pointer))
+    if not git_dir.is_absolute():
+        git_dir = target / git_dir
+    try:
+        return (stat.S_ISDIR(os.lstat(git_dir).st_mode)
+                and stat.S_ISREG(os.lstat(git_dir / "HEAD").st_mode))
+    except OSError:
+        return False
+
+
+def _is_git_target(root: int, target: Path) -> bool:
+    """Accept a Git directory or a linked-worktree marker file; never follow either."""
+    try:
+        info = os.stat(".git", dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISDIR(info.st_mode):
+        head = _read(root, ".git/HEAD")
+        return head is not None and _GIT_HEAD.fullmatch(head) is not None
+    if stat.S_ISREG(info.st_mode):
+        marker = _read(root, ".git")
+        match = _GIT_LINK.fullmatch(marker) if marker is not None else None
+        return match is not None and _linked_git_dir_exists(target, match.group(1))
+    return False
+
+
 def _write_all(descriptor: int, content: bytes) -> None:
     view = memoryview(content)
     while view:
@@ -297,10 +329,7 @@ def package_operation(source_root: Path, target: Path, operation: str, *,
     lock_owned = False
     try:
         root = _root(target)
-        head = _read(root, ".git/HEAD")
-        if head is None or not re.fullmatch(
-            rb"(?:ref: refs/heads/[A-Za-z0-9_./-]+|[0-9a-f]{40}|[0-9a-f]{64})\n", head
-        ):
+        if not _is_git_target(root, target):
             _fail("git_target_required")
         changes = _plan(root, bundle, previous, operation)
         report = {
