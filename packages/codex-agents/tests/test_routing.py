@@ -1125,14 +1125,15 @@ class ProviderRoutingTests(unittest.TestCase):
     def git_commit(self, root: Path, message: str) -> None:
         if not (root / ".git").exists():
             subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "config", "user.name", "Routing Tests"],
-                check=True,
-            )
+        # CI runners have no global identity, so set it even when the test created the repo.
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.name", "Routing Tests"],
+            check=True,
+        )
         subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(root), "commit", "-qm", message], check=True)
 
