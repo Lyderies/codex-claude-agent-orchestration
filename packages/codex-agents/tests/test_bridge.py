@@ -1117,6 +1117,9 @@ class ChildTerminationTests(unittest.TestCase):
                 os.killpg(group, 0)
             except ProcessLookupError:
                 return True
+            except PermissionError:
+                # macOS answers EPERM once only exited, unreaped members remain.
+                return True
             time.sleep(0.1)
         return False
 
@@ -1136,7 +1139,7 @@ class ChildTerminationTests(unittest.TestCase):
             try:
                 self.assertTrue(self.wait_gone(group, 20))
             finally:
-                with contextlib.suppress(ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(group, signal.SIGKILL)
 
 
