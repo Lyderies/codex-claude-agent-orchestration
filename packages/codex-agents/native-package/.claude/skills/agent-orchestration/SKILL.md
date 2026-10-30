@@ -1,6 +1,6 @@
 ---
 name: agent-orchestration
-description: Route and supervise subagents from a Claude Code primary through the installed orchestration lifecycle, spawning native Claude children or bridging read-only Codex children; keep simple sequential work in one agent.
+description: Route and supervise subagents from a Claude Code primary through the installed orchestration lifecycle, spawning native read-only Claude children, bridging read-only Codex children, or bridging contained Claude write children that return a patch; keep simple sequential work in one agent.
 ---
 
 # Agent orchestration (Claude primary)
@@ -37,9 +37,21 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
      `learning-bind-host-agent --run-handle <handle> --agent-id <returned agent ID>`.
      Native children run with this session's permissions, so their reads are
      `read_containment: advisory`; state that in any report.
-   - `dispatch: bridge` (a Codex child): do not spawn. Run `dispatch` once with the task,
-     route, assignment, parent grant and the exact `--run-handle`, and use its
-     `result`. Never dispatch a handle twice or retry a fenced outcome.
+   - `dispatch: bridge` (a Codex child, or any write child): do not spawn. Run
+     `dispatch` once with the task, route, assignment, parent grant and the exact
+     `--run-handle`, and use its `result`. Never dispatch a handle twice or retry a
+     fenced outcome.
+   - A route with `sandbox_mode: workspace-write` is always `dispatch: bridge`, even to a
+     Claude child; never give a native child write tools. Its assignment must own the
+     paths it may change and grant them as `<path>:write`, with exactly the tools
+     `Read`, `Glob`, `Grep`, `Edit` and `Write`. The child edits a contained copy of the
+     committed files, never this checkout. A successful `bridge_report` has
+     `ownership: passed`, `changes`, `patch_digest` and `envelope_digest`; the patch and
+     verifier envelope are stored by the ledger. Do not apply the patch yourself: the
+     integration step is not available yet. Any other `ownership` value is a failed run
+     with no patch. Write routes run only on macOS and only to Claude children; a
+     denial says `write_children_unsupported_platform` or
+     `codex_write_children_unavailable`.
 6. **Validate and record.** Run `validate-result` on the child's result, allowing at
    most one structural repair with the returned receipt. Always finish with
    `learning-record-host-result`, even for a failed or timed-out child. For a bridged

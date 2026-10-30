@@ -2197,7 +2197,7 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile", "probe_admission",
+            "host_run_profile", "probe_admission", "write_result",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -3821,6 +3821,105 @@ class LearningLedger:
             )
         self.state.harden_database_files()
         return record
+
+    def record_write_result(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        bridge_run_id: str,
+        result: dict[str, Any],
+        patch: bytes | None,
+        envelope: bytes | None,
+    ) -> dict[str, Any]:
+        """Persist a bridged write child's outcome once, with its patch and envelope.
+
+        The ledger record holds only digests, counts and codes (`write_result`,
+        ledger-only). The patch and envelope bytes go to owner-only files in the
+        project's artifact partition, registered to that record, and only when
+        their SHA-256 matches the recorded digests.
+        """
+
+        timestamp = self._clock_ms()
+        with self._lock:
+            with self._connection:
+                binding = self._connection.execute(
+                    "SELECT run_id FROM host_run_bindings WHERE project_id=? AND handle_digest=?",
+                    (project_id, keyed_digest(self.state.digest_key(), run_handle)),
+                ).fetchone() if isinstance(run_handle, str) else None
+                if binding is None:
+                    raise LedgerError("host run is unavailable")
+                run_id = str(binding["run_id"])
+                if self._connection.execute(
+                    "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_intent' "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=? "
+                    "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?",
+                    (project_id, run_id, bridge_run_id),
+                ).fetchone() is None:
+                    raise LedgerError("only a dispatched write run records its result")
+                if self._connection.execute(
+                    "SELECT 1 FROM records WHERE project_id=? AND record_type='write_result' "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                    (project_id, run_id),
+                ).fetchone() is not None:
+                    raise LedgerError("host run already recorded its write result")
+                material = {
+                    **result,
+                    "schema_version": 1,
+                    "record_type": "write_result",
+                    "run_id": run_id,
+                    "bridge_run_id": bridge_run_id,
+                    "observed_at_ms": timestamp,
+                }
+                material.pop("record_id", None)
+                try:
+                    record = validate_learning_record({
+                        **material, "record_id": f"write_result:{content_digest(material)}",
+                    })
+                except ContractError as exc:
+                    raise LedgerError("write result is invalid") from exc
+                files = {"patch": (patch, record["patch_digest"]),
+                         "envelope": (envelope, record["envelope_digest"])}
+                for content, digest in files.values():
+                    if (content is None) != (digest is None) or (
+                        content is not None
+                        and not secrets.compare_digest(hashlib.sha256(content).hexdigest(), digest)
+                    ):
+                        raise LedgerError("write result artifact does not match its digest")
+                self._append_checked_locked(
+                    project_id, record, producer="lifecycle", timestamp=timestamp
+                )
+            written: list[Path] = []
+            try:
+                for kind, (content, digest) in files.items():
+                    if content is None:
+                        continue
+                    file_id = f"write_{kind}_{bridge_run_id}"
+                    path = self._write_owner_file("artifact", project_id, file_id, content)
+                    written.append(path)
+                    self._register_stored_file(
+                        project_id, file_id=file_id, kind="artifact", path=path,
+                        digest=digest, source_record_id=record["record_id"],
+                    )
+            except Exception:
+                for path in written:
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                raise
+        self.state.harden_database_files()
+        return record
+
+    def write_result_artifact(self, project_id: str, bridge_run_id: str, kind: str) -> Path | None:
+        """The registered patch or envelope file of a bridged write run, if any."""
+
+        if kind not in {"patch", "envelope"}:
+            raise LedgerError("write result artifact kind is invalid")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT relative_path FROM stored_files WHERE project_id=? AND file_id=?",
+                (project_id, f"write_{kind}_{bridge_run_id}"),
+            ).fetchone()
+        return None if row is None else self.state.root / str(row["relative_path"])
 
     def launch_recheck(
         self, project_id: str, *, run_handle: str, identity: dict[str, Any]

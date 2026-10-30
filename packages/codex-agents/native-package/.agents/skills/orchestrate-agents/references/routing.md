@@ -7,7 +7,9 @@ observable task fields. Model labels are not evidence that a task will pass.
 Use a single-agent route for simple or sequential work. Use parallel workers only when
 assignments are independent. Packaged children are read-only. Explicit project
 mappings may select workspace-write coding and verification agents within the active
-parent grant. Use the primary agent as manager when one owner must preserve requirements
+parent grant. Every workspace-write route is `dispatch: bridge`, whatever the primary,
+because a native write child would write straight into the primary's checkout (see
+[Write children](#write-children)). Use the primary agent as manager when one owner must preserve requirements
 and synthesize results.
 
 The accepted version 5 routing policy is:
@@ -168,7 +170,8 @@ Every project, including a Codex-only one, needs an attestation before host runs
 
 `dispatch` runs one opened, admitted host run whose route has `dispatch: bridge` as a
 read-only child of the route's provider, and prints the child's `result` with a
-separate `bridge_report`. It refuses a native route, a writable sandbox or grant, an
+separate `bridge_report`. It refuses a native route, a writable sandbox or grant
+outside a write route (see [Write children](#write-children)), an
 assignment that does not validate, a run handle without a passing admission for the
 route's provider, a route, task or assignment that differs from the opened run, a
 provider API key, and a run handle that was already dispatched.
@@ -237,4 +240,41 @@ provider API key, and a run handle that was already dispatched.
   sandbox, so `read_containment` is `advisory`.
 - Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
   typed codes, never prompts or file contents.
+
+## Write children
+
+A route with `sandbox_mode: workspace-write` is always `dispatch: bridge`, including
+Claude to Claude and Codex to Codex.
+
+- Only Claude write children exist so far. A writable Codex candidate is skipped, and a
+  route with no other eligible candidate is denied with
+  `codex_write_children_unavailable`. Off macOS every write candidate is skipped the same
+  way, with `write_children_unsupported_platform`. The bridge repeats both checks.
+- Claude agent discovery maps an agent whose tools are `Read`, `Glob`, `Grep` plus
+  `Edit` and/or `Write` to `workspace-write`; any other tool leaves it ineligible. A
+  project mapping may select such an agent for `coding` only, and never as a verifier.
+- The effective write set is the assignment's `owned_paths` intersected, by whole path
+  components, with its `<path>:write` permissions; it must not be empty
+  (`write_set_empty`). The tool grant must be exactly `Read`, `Glob`, `Grep`, `Edit` and
+  `Write` (`write_profile_mismatch`); it is never widened.
+- The bridge resolves one commit and exports the granted read and write paths from it
+  into a contained workspace, with a sibling control directory holding the baseline
+  manifest and the generated settings. The settings carry the read profile's lockdown
+  and exactly one `Edit(<path>)` and one `Write(<path>)` allow rule per write path
+  (`<path>/**` for a directory). The child runs with those five tools, `dontAsk`,
+  `--setting-sources project`, `--strict-mcp-config`, no session persistence, stdin
+  closed, umask 022 and the workspace as its working directory. Its init frame must
+  report exactly the five tools.
+- After the child exits or is stopped its process group is killed and a bounded `lsof`
+  must show no process with its working directory or an open file under the workspace.
+  Then the workspace is snapshotted, checked for ownership against the manifest, and
+  turned into a patch and a verifier envelope. The ledger stores both as owner-only
+  artifacts and records a `write_result` with their digests, the source commit, the
+  change count and the ownership result. The bridge report adds `ownership`,
+  `changes`, `patch_digest` and `envelope_digest`.
+- Any ownership refusal, an unproved quiescence (`quiescence_unproved`) or a snapshot
+  failure is a failed run with that reason and no patch. Without proved quiescence the
+  workspace is renamed to a fenced leftover instead of being removed.
+- The primary does not apply the patch yet: integration and mandatory verification by
+  the other provider come in later slices.
 

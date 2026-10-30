@@ -51,6 +51,7 @@ RECORD_TYPES = {
     "probe_admission",
     "observation_unavailable",
     "provider_usage",
+    "write_result",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -2019,6 +2020,52 @@ def validate_provider_usage(data: Any) -> dict[str, Any]:
     return data
 
 
+WRITE_RESULT_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "source_commit", "manifest_digest", "patch_digest", "envelope_digest", "changes",
+    "ownership", "quiescence", "observed_at_ms",
+}
+MAX_WRITE_CHANGES = 200
+
+
+def validate_write_result(data: Any) -> dict[str, Any]:
+    """The outcome of one bridged write child: digests and counts, never file contents.
+
+    `ownership` is `passed` or the contained workspace's stable refusal code;
+    a patch and envelope digest exist exactly when it passed.
+    """
+
+    data = _closed(data, WRITE_RESULT_FIELDS, "write_result")
+    _base(data, "write_result")
+    _identifier(data["run_id"], "run_id")
+    if not isinstance(data["bridge_run_id"], str) or re.fullmatch(
+        r"brg_[0-9a-f]{32}", data["bridge_run_id"]
+    ) is None:
+        raise ContractError("bridge_run_id is invalid")
+    commit = data["source_commit"]
+    if commit is not None and (
+        not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None
+    ):
+        raise ContractError("write_result source_commit is invalid")
+    _enum(data["quiescence"], {"proved", "unproved", "not_reached"}, "quiescence")
+    ownership = data["ownership"]
+    if not isinstance(ownership, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", ownership) is None:
+        raise ContractError("write_result ownership is invalid")
+    passed = ownership == "passed"
+    for field in ("patch_digest", "envelope_digest"):
+        _digest(data[field], field, nullable=True)
+        if (data[field] is not None) != passed:
+            raise ContractError(f"write_result {field} must exist exactly when ownership passed")
+    _digest(data["manifest_digest"], "manifest_digest", nullable=True)
+    if passed and (commit is None or data["manifest_digest"] is None):
+        raise ContractError("a passed write_result binds its source commit and manifest")
+    _integer(data["changes"], "changes")
+    if data["changes"] > MAX_WRITE_CHANGES or (not passed and data["changes"] != 0):
+        raise ContractError("write_result changes are invalid")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -2045,6 +2092,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "probe_admission": validate_probe_admission,
     "observation_unavailable": validate_observation_unavailable,
     "provider_usage": validate_provider_usage,
+    "write_result": validate_write_result,
 }
 
 
