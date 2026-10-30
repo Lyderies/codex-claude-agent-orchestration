@@ -120,6 +120,22 @@ The Codex skill (`.agents/skills/orchestrate-agents`) and a new Claude skill
 - spawn natively when `dispatch` is `native`, and call the bridge when it is `bridge`;
 - keep the existing lifecycle: open, admission, bind, validate, verify, operational QA, record.
 
+### S3b: eligibility and observation gaps
+
+A read-only audit of S1 and S2 against the plan found gaps that S4 would otherwise inherit:
+
+- **Client version:** each identity observation records the client version. Admission denies a
+  version outside the reviewed range committed in policy.
+- **Codex plan:** admission requires an observed subscription plan type; absent, unknown and free
+  plans are denied.
+- **Claude limits:** every restrictive `rate_limit_event` in a run is recorded, so a rejection late
+  in one run blocks the next admission until its reset.
+- **Run-count backstop:** a per-provider cap on admissions per usage window, counted for the same
+  account inside the admission transaction.
+- **Run-bound observations:** headroom, billing and usage observations carry their run and phase
+  (before or after). A failed reading is recorded as unavailable instead of being dropped.
+- **Policy matches the table:** routine planning uses GPT-6.1 Sol at high effort.
+
 ### S4: security review, pilot install and exit
 
 - An independent security review covers admission, the bridge, profiles, scoped directories and
