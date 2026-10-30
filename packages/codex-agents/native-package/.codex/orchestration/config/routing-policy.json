@@ -208,7 +208,7 @@
       "max_admissions_per_window": 40
     },
     "codex": {
-      "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+      "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.164.1"},
       "max_admissions_per_window": 60
     }
   },

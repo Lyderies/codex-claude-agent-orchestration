@@ -1189,6 +1189,86 @@ class CodexBridgeTests(BridgeTestCase):
         )
         self.assertEqual([], self.workspace_entries())
 
+    def test_launch_arguments_pin_the_disabled_features(self) -> None:
+        route, assigned, handle = self.codex_run()
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 1}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        self.dispatch(route, assigned, handle)
+        argv = [i for i in self.invocations("codex") if "exec" in i["argv"]][0]["argv"]
+        disabled = [argv[i + 1] for i, part in enumerate(argv) if part == "--disable"]
+        self.assertEqual(list(bridge.CODEX_DISABLED_FEATURES), disabled)
+        for feature in ("apps", "plugins", "remote_plugin", "multi_agent",
+                        "multi_agent_v2", "image_generation", "goals", "browser_use",
+                        "browser_use_external", "computer_use", "in_app_browser",
+                        "hooks"):
+            self.assertIn(feature, disabled)
+        self.assertNotIn("code_mode_host", disabled)
+        self.assertNotIn("code_mode_host", " ".join(argv))
+        self.assertIn('web_search="disabled"', argv)
+
+    def test_disallowed_codex_events_abort_the_child(self) -> None:
+        cases = {
+            "mcp_tool_call": [{"type": "item.started", "item": {"type": "mcp_tool_call"}}],
+            "web_search": [{"type": "item.completed", "item": {"type": "web_search"}}],
+            "collab_tool_call": [
+                {"type": "item.updated", "item": {"type": "collab_tool_call"}}
+            ],
+            "unknown": [{"type": "item.started", "item": {}}],
+            "thread.surprise": [{"type": "thread.surprise"}],
+        }
+        for name, bad in (("list", []), ("object", {})):
+            cases[f"unknown#item-{name}"] = [
+                {"type": "item.completed", "item": {"type": bad}}
+            ]
+            cases[f"unknown#top-{name}"] = [{"type": bad}]
+        for reason, frames in cases.items():
+            with self.subTest(reason=reason):
+                route, assigned, handle = self.codex_run()
+                self.frames("codex", [
+                    {"type": "thread.started", "thread_id": "t1"},
+                    *frames,
+                    {"type": "turn.completed", "usage": {"input_tokens": 1}},
+                ])
+                (self.tools / "codex-last-message.json").write_text(
+                    json.dumps(null_filled(result()))
+                )
+                output = self.dispatch(route, assigned, handle)
+                self.assertEqual(
+                    f"codex_tool_not_allowed:{reason.split('#')[0]}",
+                    output["bridge_report"]["outcome"],
+                )
+                report = output["bridge_report"]
+                self.assertEqual("recorded", report["observation_after"])
+                self.assertFalse(report["usage_recorded"])
+                self.assertIn(
+                    {"phase": "after", "reason_code": "usage_unavailable"},
+                    report["observations_unavailable"],
+                )
+                self.assertEqual("failed", output["result"]["status"])
+                self.assertEqual("not-applicable", output["result"]["semantic_verdict"])
+                self.assertEqual([], output["result"]["artifacts"])
+                self.assertEqual([], self.workspace_entries())
+
+    def test_a_normal_codex_stream_is_allowed(self) -> None:
+        route, assigned, handle = self.codex_run()
+        self.frames("codex", [
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "reasoning", "text": "x"}},
+            {"type": "item.started", "item": {"type": "command_execution"}},
+            {"type": "item.completed", "item": {"type": "command_execution"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "{}"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        ])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        output = self.dispatch(route, assigned, handle)
+        self.assertEqual("result", output["bridge_report"]["outcome"])
+        self.assertEqual(result(), output["result"])
+
     def test_observations_and_usage_are_bound_to_the_run(self) -> None:
         route, assigned, handle = self.codex_run()
         self.frames("codex", [
