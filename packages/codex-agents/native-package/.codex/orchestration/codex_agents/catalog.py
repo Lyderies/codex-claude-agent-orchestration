@@ -24,6 +24,10 @@ AGENT_ALLOWED_KEYS = {
 }
 
 
+CLAUDE_AGENT_ALLOWED_KEYS = {"name", "description", "tools", "model", "maxTurns"}
+CLAUDE_READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
+
+
 class CatalogError(ValueError):
     """Raised for invalid discovery policy or irreconcilable candidates."""
 
@@ -299,6 +303,87 @@ def _markdown_candidate(
     }
 
 
+def _claude_agent_candidate(
+    path: Path,
+    source_id: str,
+    source_root: Path,
+) -> dict[str, Any]:
+    """Describe a Claude agent definition without granting it any authority.
+
+    Claude definitions are inert: their issues are reported as warnings so that
+    unrelated Claude files never block Codex readiness. A project mapping that
+    names one re-checks it strictly before it can be routed.
+    """
+
+    warnings: list[str] = []
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        return {
+            "source": source_id,
+            "kind": "agent",
+            "name": path.stem,
+            "format": "claude-md",
+            "path": str(path.relative_to(source_root)),
+            "requested_tools": [],
+            "requested_mcps": [],
+            "requested_skills": [],
+            "content_sha256": None,
+            "sandbox_mode": None,
+            "configured_model": None,
+            "configured_effort": None,
+            "errors": [],
+            "warnings": [f"unreadable Claude agent: {exc}"],
+        }
+    metadata = _frontmatter(text)
+    if not metadata:
+        warnings.append("missing Claude agent front matter")
+    name = metadata.get("name", path.stem)
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        warnings.append("name must use lowercase letters, numbers, underscore, or hyphen")
+        name = path.stem
+    if name != path.stem:
+        warnings.append("file stem differs from agent name")
+    description = metadata.get("description")
+    if not isinstance(description, str) or not description.strip():
+        warnings.append("missing description")
+    unknown = sorted(metadata.keys() - CLAUDE_AGENT_ALLOWED_KEYS)
+    if unknown:
+        warnings.append(f"unreviewed Claude agent keys: {', '.join(unknown)}")
+    tools = metadata.get("tools")
+    if isinstance(tools, str):
+        tools = [part.strip() for part in tools.split(",") if part.strip()]
+    if not isinstance(tools, list) or not tools:
+        warnings.append("Claude agent tools must be listed explicitly")
+        tools = []
+    read_only = bool(tools) and set(tools) <= CLAUDE_READ_ONLY_TOOLS
+    return {
+        "source": source_id,
+        "kind": "agent",
+        "name": name,
+        "format": "claude-md",
+        "path": str(path.relative_to(source_root)),
+        "requested_tools": sorted(set(tools)),
+        "requested_mcps": [],
+        "requested_skills": [],
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+        "sandbox_mode": "read-only" if read_only else None,
+        "configured_model": metadata.get("model"),
+        "configured_effort": None,
+        "errors": [],
+        "warnings": warnings,
+    }
+
+
+def _group_key(candidate: dict[str, Any]) -> str:
+    # Claude definitions are grouped apart, so they never conflict with a Codex
+    # agent of the same name that a project already relies on.
+    if candidate["format"] == "claude-md":
+        return f"{candidate['kind']}:claude-md:{candidate['name']}"
+    return f"{candidate['kind']}:{candidate['name']}"
+
+
 def discover(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
     root = root.resolve()
     allowed_tools = set(policy.get("allowed_legacy_tools", []))
@@ -326,6 +411,11 @@ def discover(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
                     allowed_tools,
                 )
             )
+        for path in sorted((source_root / ".claude" / "agents").glob("*.md")):
+            _require_contained_file(path, source_root)
+            candidates.append(
+                _claude_agent_candidate(path, source["id"], source_root)
+            )
         for path in sorted((source_root / ".github" / "agents").glob("*.agent.md")):
             _require_contained_file(path, source_root)
             candidates.append(
@@ -341,7 +431,7 @@ def discover(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for candidate in candidates:
-        grouped.setdefault(f"{candidate['kind']}:{candidate['name']}", []).append(candidate)
+        grouped.setdefault(_group_key(candidate), []).append(candidate)
     selected: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
     resolutions = policy.get("resolutions", {})
@@ -358,7 +448,7 @@ def discover(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
                 {"key": key, "sources": sorted(item["source"] for item in items)}
             )
     errors = [
-        {"key": f"{item['kind']}:{item['name']}", "messages": item["errors"]}
+        {"key": _group_key(item), "messages": item["errors"]}
         for item in candidates
         if item["errors"]
     ]

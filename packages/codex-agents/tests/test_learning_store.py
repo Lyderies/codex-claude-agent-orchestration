@@ -1532,7 +1532,7 @@ class LearningStoreTests(unittest.TestCase):
             "current_active": 0, "native_agent_bound": 1,
             "deadlines_observed": 0,
         }, report["runs"])
-        self.assertEqual({"gpt-6-sol": 1}, report["by_model"])
+        self.assertEqual({"gpt-6.1-sol": 1}, report["by_model"])
         self.assertEqual({"technology_researcher": 1}, report["by_agent_type"])
         self.assertEqual(321, report["usage"]["goal_total_tokens"])
         self.assertEqual("unknown", report["usage"]["child_attribution"])

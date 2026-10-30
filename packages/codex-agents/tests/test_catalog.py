@@ -58,6 +58,42 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(report["ready"])
         self.assertIn("requires explicit translation", report["selected"][0]["warnings"][0])
 
+    def test_claude_agents_are_discovered_inert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / ".claude/agents"
+            agents.mkdir(parents=True)
+            (agents / "claude_agents_researcher.md").write_bytes(
+                (FIXTURES_ROOT / "claude/claude_agents_researcher.md").read_bytes()
+            )
+            (agents / "writer.md").write_text(
+                "---\nname: writer\ndescription: Edits files\n"
+                "tools: Read, Edit, Bash\ncolor: blue\n---\n\nEdit things.\n"
+            )
+            codex_agents = root / ".codex/agents"
+            codex_agents.mkdir(parents=True)
+            (codex_agents / "writer.toml").write_text(
+                'name = "writer"\ndescription = "Codex writer"\n'
+                'developer_instructions = "Write."\n'
+            )
+            report = discover(root, self.policy())
+            # Claude definitions never block readiness or conflict with Codex agents.
+            self.assertTrue(report["ready"])
+            claude = {
+                item["name"]: item
+                for item in report["selected"]
+                if item["format"] == "claude-md"
+            }
+            self.assertEqual({"claude_agents_researcher", "writer"}, set(claude))
+            reader = claude["claude_agents_researcher"]
+            self.assertEqual(["Glob", "Grep", "Read"], reader["requested_tools"])
+            self.assertEqual("read-only", reader["sandbox_mode"])
+            self.assertEqual([], reader["warnings"])
+            self.assertIsNone(claude["writer"]["sandbox_mode"])
+            self.assertIn(
+                "unreviewed Claude agent keys: color", claude["writer"]["warnings"]
+            )
+
     def test_duplicate_name_fails_without_resolution(self) -> None:
         policy = self.policy()
         policy["sources"] = [

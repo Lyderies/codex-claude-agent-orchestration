@@ -45,6 +45,14 @@ EXPECTED_ROLE_MAP = {
     "security": "codex_agents_security_reviewer",
     "verification": "codex_agents_verification_worker",
 }
+EXPECTED_CLAUDE_ROLE_MAP = {
+    "inventory": "claude_agents_researcher",
+    "research": "claude_agents_researcher",
+    "planning": "claude_agents_planner",
+    "coding": "claude_agents_implementation_worker",
+    "security": "claude_agents_security_reviewer",
+    "verification": "claude_agents_verification_worker",
+}
 EXPECTED_AGENTS = set(EXPECTED_ROLE_MAP.values())
 EXPECTED_VERIFICATION_ROLE = "codex_agents_verification_worker"
 RESULT_TEMPLATE_MARKER = '{"assignment_id":"<assignment_id>"'
@@ -192,6 +200,10 @@ def _validate_agents(root: Path, policy: dict[str, Any], errors: list[str]) -> N
         errors.append("verification role does not exist")
     if policy["roles"] != EXPECTED_ROLE_MAP:
         errors.append("routing policy role mapping must match package policy")
+    if policy.get("providers", {}).get("claude", {}).get("roles") != (
+        EXPECTED_CLAUDE_ROLE_MAP
+    ):
+        errors.append("routing policy Claude role mapping must match package policy")
     if verification["role"] != EXPECTED_VERIFICATION_ROLE:
         errors.append("verification role must match package verifier")
 
@@ -667,13 +679,20 @@ def validate_package(root: Path) -> dict[str, Any]:
             "failure_events": [],
         },
     ]
+    # The smoke routes check the package policy, so a project that enables
+    # another provider does not change what they expect.
+    smoke_policy = {
+        key: value
+        for key, value in effective_policy.items()
+        if key not in {"provider_routing", "provider_config_digest"}
+    }
     try:
         routes = [
-            route_task(smoke_tasks[0], effective_policy),
-            route_task(smoke_tasks[1], effective_policy),
+            route_task(smoke_tasks[0], smoke_policy),
+            route_task(smoke_tasks[1], smoke_policy),
             route_task(
                 smoke_tasks[2],
-                effective_policy,
+                smoke_policy,
                 trusted_routing_evidence_refs=frozenset(
                     smoke_tasks[2]["routing_evidence_refs"]
                 ),
@@ -681,12 +700,18 @@ def validate_package(root: Path) -> dict[str, Any]:
         ]
         if (routes[0]["model"], routes[0]["effort"]) != ("gpt-6-luna", "high"):
             package_errors.append("bounded inventory smoke task did not prefer Luna/high")
-        if (routes[1]["model"], routes[1]["effort"]) != ("gpt-6-sol", "high"):
+        if (routes[1]["model"], routes[1]["effort"]) != ("gpt-6.1-sol", "high"):
             package_errors.append("critical risk changed the evidence-based planning route")
         if routes[1]["topology"] != "parallel" or not routes[1]["verification_required"]:
             package_errors.append("critical risk changed topology or bypassed verification")
         if (routes[2]["model"], routes[2]["effort"]) != ("gpt-6-astra", "medium"):
             package_errors.append("evidenced hard end-to-end task did not route to Astra/medium")
+        if any(
+            (route["provider"], route["dispatch"]) != ("codex", "native")
+            or (route["verifier"] or {}).get("provider", "codex") != "codex"
+            for route in routes
+        ):
+            package_errors.append("default routing selected a provider other than Codex")
     except (PolicyError, ValueError) as exc:
         package_errors.append(f"routing smoke test failed: {exc}")
     package_ready = not package_errors

@@ -16,7 +16,12 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tests.support import ORCHESTRATION_ROOT, MACOS_SANDBOX_ONLY, TEMP_ROOT
+from tests.support import (
+    FIXTURES_ROOT,
+    MACOS_SANDBOX_ONLY,
+    ORCHESTRATION_ROOT,
+    TEMP_ROOT,
+)
 
 from codex_agents.contracts import ContractError
 from codex_agents.learning_contracts import (
@@ -2188,6 +2193,159 @@ class InstalledEvidenceTests(unittest.TestCase):
                 hashlib.sha256(agent.read_bytes()).hexdigest(),
                 configuration["agent_digest"],
             )
+
+    def test_claude_route_binds_claude_agent_definition(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            bundle = Path(directory) / "bundle"
+            shutil.copytree(ORCHESTRATION_ROOT.parent.parent, bundle)
+            agent = bundle / ".claude/agents/claude_agents_researcher.md"
+            agent.parent.mkdir(parents=True)
+            # Installed Claude agents carry the packager's turn limit.
+            agent.write_text(
+                (FIXTURES_ROOT / "claude/claude_agents_researcher.md")
+                .read_text()
+                .replace("\n---\n", "\nmaxTurns: 8\n---\n", 1)
+            )
+            config = {
+                "version": 1,
+                "providers": {
+                    "codex": {"enabled": True},
+                    "claude": {"enabled": True},
+                },
+                "codex_primary_may_bridge_to_claude": False,
+            }
+            policy = load_policy(
+                bundle / ".codex/orchestration/config/routing-policy.json"
+            )
+            policy["provider_routing"] = config
+            policy["provider_config_digest"] = content_digest(config)
+            task = {
+                "id": "claude-research",
+                "objective": "Research one bounded question",
+                "family": "research",
+                "complexity": "medium",
+                "risk": "low",
+                **routing_fields(acceptance_strength="independent_judgment"),
+                "meaningful": True,
+                "deterministic_validation": False,
+                "independent_parts": 1,
+                "parallel_safe": False,
+                "failed_attempts": 0,
+                "failure_events": [],
+            }
+            route = route_task(task, policy, primary_provider="claude")
+            self.assertEqual(
+                ("claude", "claude-opus-5-5", "claude_agents_researcher"),
+                (route["provider"], route["model"], route["agent_type"]),
+            )
+
+            configuration = installed_execution_configuration(
+                bundle, route, client_capability=END_TO_END_CAPABILITY
+            )
+            self.assertEqual("claude_agents_researcher", configuration["role"])
+            self.assertEqual(
+                hashlib.sha256(agent.read_bytes()).hexdigest(),
+                configuration["agent_digest"],
+            )
+            self.assertEqual([], configuration["skill_digests"])
+            body = agent.read_text().split("\n---\n", 1)[1].strip()
+            self.assertEqual(
+                hashlib.sha256(body.encode()).hexdigest(),
+                configuration["prompt_digest"],
+            )
+
+            skill = bundle / ".claude/skills/claude-agents/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("---\nname: claude-agents\ndescription: Fixture.\n---\n")
+            with_skill = installed_execution_configuration(
+                bundle, route, client_capability=END_TO_END_CAPABILITY
+            )
+            self.assertEqual(
+                [hashlib.sha256(skill.read_bytes()).hexdigest()],
+                with_skill["skill_digests"],
+            )
+
+            agent.write_text(agent.read_text().replace(
+                "name: claude_agents_researcher", "name: another_agent"
+            ))
+            with self.assertRaisesRegex(ContractError, "identity does not match"):
+                installed_execution_configuration(
+                    bundle, route, client_capability=END_TO_END_CAPABILITY
+                )
+            agent.write_text(agent.read_text().replace(
+                "name: another_agent", "name: claude_agents_researcher"
+            ).replace("tools: Read, Glob, Grep", "tools: Read, Edit"))
+            with self.assertRaisesRegex(ContractError, "read-only tools"):
+                installed_execution_configuration(
+                    bundle, route, client_capability=END_TO_END_CAPABILITY
+                )
+            target = Path(directory) / "outside-agent.md"
+            shutil.copyfile(FIXTURES_ROOT / "claude/claude_agents_researcher.md", target)
+            agent.unlink()
+            agent.symlink_to(target)
+            with self.assertRaises(ContractError):
+                installed_execution_configuration(
+                    bundle, route, client_capability=END_TO_END_CAPABILITY
+                )
+
+    def test_learning_candidate_cannot_switch_provider_or_leave_allowlist(self) -> None:
+        policy = load_policy(ORCHESTRATION_ROOT / "config/routing-policy.json")
+        champion = champion_configuration()
+        base_route = {
+            "model": "gpt-6-sol",
+            "effort": "medium",
+            "role": "codex_agents_implementation_worker",
+            "topology": "single",
+            "max_parallel": 1,
+            "bounds": {},
+            "reason": "fixture",
+            "provider": "codex",
+        }
+        claude_after = {"model": "claude-opus-5-5", "effort": "medium"}
+        with self.assertRaisesRegex(ContractError, "different providers"):
+            generate_candidate(
+                digest_key=DIGEST_KEY,
+                scope="general",
+                task_slice="coding-medium-low",
+                target="model_effort",
+                effect="optimize",
+                base_digest=candidate_base_digest(champion),
+                champion_configuration=champion,
+                change_manifest=[{
+                    "path_code": "routing.model_effort",
+                    "before_digest": content_digest(
+                        {"model": champion["model"], "effort": champion["effort"]}
+                    ),
+                    "after_digest": content_digest(claude_after),
+                    "before_value": {
+                        "model": champion["model"], "effort": champion["effort"]
+                    },
+                    "after_value": claude_after,
+                }],
+                evidence_digests=[DIGEST_C],
+            )
+        # The routed provider is authoritative even if a record names a Codex model.
+        with self.assertRaisesRegex(ContractError, "another provider"):
+            apply_candidate_to_route(
+                {**base_route, "provider": "claude"}, candidate(), champion, policy
+            )
+        config = {
+            "version": 1,
+            "providers": {
+                "codex": {"enabled": True, "models": ["gpt-6-sol"]},
+                "claude": {"enabled": False},
+            },
+            "codex_primary_may_bridge_to_claude": False,
+        }
+        restricted = deepcopy(policy)
+        restricted["provider_routing"] = config
+        restricted["provider_config_digest"] = content_digest(config)
+        with self.assertRaisesRegex(ContractError, "project provider configuration"):
+            apply_candidate_to_route(base_route, candidate(), champion, restricted)
+        self.assertEqual(
+            "gpt-6-luna",
+            apply_candidate_to_route(base_route, candidate(), champion, policy)["model"],
+        )
 
     def test_package_digest_ignores_unmanaged_files_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
