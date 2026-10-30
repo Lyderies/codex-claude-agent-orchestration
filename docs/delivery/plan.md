@@ -288,6 +288,8 @@ tests, and a changelog of every change with its evidence.
 ## Parking lot (not needed for the objective)
 
 - Native Windows support and a Windows CI job.
+- Operational QA on Linux. The Codex package runs operational checks inside macOS Seatbelt
+  (`sandbox-exec`) and fails closed elsewhere, so those tests are skipped off macOS.
 - Moving more of the learning ledger's internals into smaller modules.
 - Contributor documentation beyond the README.
 

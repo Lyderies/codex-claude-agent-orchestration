@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Agents Grader Calibration Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "record_type", "record_id", "configuration", "labels",
+    "labels_digest", "label_count", "agreement_micros", "swap_stability_micros",
+    "disagreements", "ready", "observed_at_ms"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "grader_calibration"},
+    "record_id": {"type": "string", "pattern": "^calibration:[0-9a-f]{64}$"},
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort", "prompt_digest", "rubric_digest", "masking", "drift_digest", "owner_override_digest"],
+      "properties": {
+        "model": {"enum": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]},
+        "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]},
+        "prompt_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "rubric_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "masking": {"const": true},
+        "drift_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "owner_override_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "labels": {
+      "type": "array", "maxItems": 1000,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["owner", "grader", "swapped"],
+        "properties": {
+          "owner": {"enum": ["a", "b", "tie"]},
+          "grader": {"enum": ["a", "b", "tie"]},
+          "swapped": {"enum": ["a", "b", "tie"]}
+        }
+      }
+    },
+    "labels_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "label_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+    "agreement_micros": {"type": "integer", "minimum": 0, "maximum": 1000000},
+    "swap_stability_micros": {"type": "integer", "minimum": 0, "maximum": 1000000},
+    "disagreements": {"type": "integer", "minimum": 0, "maximum": 1000},
+    "ready": {"type": "boolean"},
+    "observed_at_ms": {"type": "integer", "minimum": 0}
+  }
+}

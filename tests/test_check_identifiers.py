@@ -18,7 +18,7 @@ HOME_LINUX = "/" + "home" + "/alice/project"
 HOME_WINDOWS = "C:" + "\\Users" + "\\alice\\project"
 HOSTNAME = "alices-laptop" + ".local"
 LAPTOP = "Alices-" + "MacBook" + "-Pro"
-EMAIL = "alice" + "@" + "mail.test"
+EMAIL = "alice" + "@" + "mailhost.io"
 NOREPLY = "123+someone" + "@" + "users.noreply.github.com"
 
 
@@ -42,6 +42,17 @@ class ScanTextTests(unittest.TestCase):
     def test_personal_email_is_flagged_but_noreply_is_allowed(self) -> None:
         self.assertEqual(categories(f"mail {EMAIL}"), ["email"])
         self.assertEqual(categories(f"mail {NOREPLY}"), [])
+
+    def test_reserved_test_domains_and_protocol_names_are_allowed(self) -> None:
+        for sample in ("tests" + "@" + "example.invalid", "t" + "@" + "example.test",
+                       "sk-ssh-ed25519" + "@" + "openssh.com"):
+            with self.subTest(sample=sample):
+                self.assertEqual(categories(f"value {sample}"), [])
+
+    def test_local_file_names_and_package_namespaces_are_allowed(self) -> None:
+        self.assertEqual(categories("edit settings" + ".local" + ".json"), [])
+        self.assertEqual(categories("https://codex-agents" + ".local" + "/schemas/x.json"), [])
+        self.assertEqual(categories("ping build-box" + ".local" + " now"), ["hostname"])
 
     def test_denylisted_terms_match_case_insensitively(self) -> None:
         self.assertEqual(categories("Written by Jane Example", ("jane example",)), ["denylisted-term"])

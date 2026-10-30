@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning evaluation case v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "source_outcome_id", "supersedes_case_id", "task_slice", "corpus_state", "fixture_digest", "criteria_digest", "lineage_digest", "similarity_group_digest", "reviewed", "review_digest", "frozen"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "evaluation_case"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "source_outcome_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "supersedes_case_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "task_slice": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "corpus_state": {"enum": ["development", "promotion_holdout", "canary"]},
+    "fixture_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "criteria_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "lineage_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "similarity_group_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "reviewed": {"type": "boolean"},
+    "review_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "frozen": {"type": "boolean"}
+  }
+}

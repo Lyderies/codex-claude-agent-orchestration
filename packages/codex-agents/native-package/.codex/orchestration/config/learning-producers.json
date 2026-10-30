@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "producers": {
+    "hook": ["event"],
+    "app_server": ["event"],
+    "host": ["event", "learning_export"],
+    "evaluator": ["outcome", "evaluation_case", "evaluation_assignment", "evaluation_trial", "candidate", "comparison", "canary_report"],
+    "verifier": ["outcome", "qa_evidence", "evidence_review"],
+    "owner": ["feedback", "owner_grant", "grader_calibration"],
+    "lifecycle": ["promotion"]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/agent-state.schema.json",
+  "title": "Observed agent state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "assignment_id",
+    "state",
+    "attempt",
+    "steers",
+    "no_progress_events",
+    "last_event"
+  ],
+  "properties": {
+    "assignment_id": {"type": "string", "minLength": 1},
+    "state": {
+      "enum": ["pending", "active", "waiting", "blocked", "completed", "failed", "interrupted", "cancelled", "stale"]
+    },
+    "attempt": {"type": "integer", "minimum": 1},
+    "steers": {"type": "integer", "minimum": 0},
+    "no_progress_events": {"type": "integer", "minimum": 0},
+    "last_event": {"type": "string"},
+    "dependency": {"type": ["string", "null"]}
+  }
+}

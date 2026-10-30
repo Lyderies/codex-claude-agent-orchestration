@@ -1,0 +1,336 @@
+{
+  "families": {
+    "coding": {
+      "baseline": {
+        "cached_tokens": 0,
+        "cost": null,
+        "input_tokens": 14888,
+        "latency_ms": 13142,
+        "output_tokens": 242,
+        "pass_rate": 1.0,
+        "quality_score": 1.0,
+        "reasoning_tokens": 192,
+        "repair_rate": 0.0,
+        "repairs": 0,
+        "task_ids": [
+          "coding-1",
+          "coding-2"
+        ],
+        "tool_calls": 0,
+        "trials": 2
+      },
+      "baseline_ready": true,
+      "candidates": [
+        {
+          "accepted": true,
+          "cached_tokens": 12032,
+          "cost": null,
+          "effort": "medium",
+          "input_tokens": 12458,
+          "latency_ms": 16830,
+          "model": "gpt-5.6-luna",
+          "output_tokens": 566,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 516,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "coding-1",
+            "coding-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        },
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "medium",
+          "input_tokens": 14026,
+          "latency_ms": 7282,
+          "model": "gpt-5.6-terra",
+          "output_tokens": 132,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 82,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "coding-1",
+            "coding-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        },
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "high",
+          "input_tokens": 14890,
+          "latency_ms": 10768,
+          "model": "gpt-6-astra",
+          "output_tokens": 190,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 140,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "coding-1",
+            "coding-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        }
+      ],
+      "ready": true
+    },
+    "planning": {
+      "baseline": {
+        "cached_tokens": 11648,
+        "cost": null,
+        "input_tokens": 14854,
+        "latency_ms": 7536,
+        "output_tokens": 62,
+        "pass_rate": 1.0,
+        "quality_score": 1.0,
+        "reasoning_tokens": 0,
+        "repair_rate": 0.0,
+        "repairs": 0,
+        "task_ids": [
+          "planning-1",
+          "planning-2"
+        ],
+        "tool_calls": 0,
+        "trials": 2
+      },
+      "baseline_ready": true,
+      "candidates": [
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "medium",
+          "input_tokens": 13990,
+          "latency_ms": 5656,
+          "model": "gpt-5.6-sol",
+          "output_tokens": 62,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 0,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "planning-1",
+            "planning-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        },
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "high",
+          "input_tokens": 14854,
+          "latency_ms": 6962,
+          "model": "gpt-6-astra",
+          "output_tokens": 62,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 0,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "planning-1",
+            "planning-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        }
+      ],
+      "ready": true
+    },
+    "research": {
+      "baseline": {
+        "cached_tokens": 0,
+        "cost": null,
+        "input_tokens": 14884,
+        "latency_ms": 7322,
+        "output_tokens": 72,
+        "pass_rate": 1.0,
+        "quality_score": 1.0,
+        "reasoning_tokens": 22,
+        "repair_rate": 0.0,
+        "repairs": 0,
+        "task_ids": [
+          "research-1",
+          "research-2"
+        ],
+        "tool_calls": 0,
+        "trials": 2
+      },
+      "baseline_ready": true,
+      "candidates": [
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "medium",
+          "input_tokens": 12456,
+          "latency_ms": 5674,
+          "model": "gpt-5.6-luna",
+          "output_tokens": 110,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 62,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "research-1",
+            "research-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        },
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "medium",
+          "input_tokens": 14022,
+          "latency_ms": 8932,
+          "model": "gpt-5.6-terra",
+          "output_tokens": 104,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 54,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "research-1",
+            "research-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        },
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "high",
+          "input_tokens": 14880,
+          "latency_ms": 7352,
+          "model": "gpt-6-astra",
+          "output_tokens": 88,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 40,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "research-1",
+            "research-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        }
+      ],
+      "ready": true
+    },
+    "security": {
+      "baseline": {
+        "cached_tokens": 0,
+        "cost": null,
+        "input_tokens": 14854,
+        "latency_ms": 8466,
+        "output_tokens": 92,
+        "pass_rate": 1.0,
+        "quality_score": 1.0,
+        "reasoning_tokens": 26,
+        "repair_rate": 0.0,
+        "repairs": 0,
+        "task_ids": [
+          "security-1",
+          "security-2"
+        ],
+        "tool_calls": 0,
+        "trials": 2
+      },
+      "baseline_ready": true,
+      "candidates": [
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "high",
+          "input_tokens": 13992,
+          "latency_ms": 8464,
+          "model": "gpt-5.6-sol",
+          "output_tokens": 110,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 44,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "security-1",
+            "security-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        }
+      ],
+      "ready": true
+    },
+    "verification": {
+      "baseline": {
+        "cached_tokens": 0,
+        "cost": null,
+        "input_tokens": 14850,
+        "latency_ms": 6772,
+        "output_tokens": 76,
+        "pass_rate": 1.0,
+        "quality_score": 1.0,
+        "reasoning_tokens": 22,
+        "repair_rate": 0.0,
+        "repairs": 0,
+        "task_ids": [
+          "verification-1",
+          "verification-2"
+        ],
+        "tool_calls": 0,
+        "trials": 2
+      },
+      "baseline_ready": true,
+      "candidates": [
+        {
+          "accepted": true,
+          "cached_tokens": 0,
+          "cost": null,
+          "effort": "high",
+          "input_tokens": 13990,
+          "latency_ms": 8240,
+          "model": "gpt-5.6-terra",
+          "output_tokens": 120,
+          "pass_rate": 1.0,
+          "quality_score": 1.0,
+          "reasoning_tokens": 68,
+          "repair_rate": 0.0,
+          "repairs": 0,
+          "task_ids": [
+            "verification-1",
+            "verification-2"
+          ],
+          "tool_calls": 0,
+          "trials": 2
+        }
+      ],
+      "ready": true
+    }
+  },
+  "ready": true,
+  "record_count": 30
+}

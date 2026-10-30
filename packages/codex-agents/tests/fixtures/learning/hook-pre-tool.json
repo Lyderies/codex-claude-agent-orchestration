@@ -1,0 +1,14 @@
+{
+  "session_id": "fixture-session",
+  "transcript_path": "/private/TEST_SECRET_TRANSCRIPT.jsonl",
+  "cwd": "/private/TEST_SECRET_PROJECT",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "exec_command",
+  "tool_input": {
+    "cmd": "printf TEST_SECRET_TOOL_INPUT"
+  },
+  "tool_use_id": "fixture-tool-use",
+  "turn_id": "fixture-turn",
+  "model": "gpt-6-luna"
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning owner grant v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "grant_kind", "project_id", "candidate_digest", "champion_digest", "review_digest", "bounds_digest", "issued_at_ms", "expires_at_ms", "nonce_digest", "signature_b64"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "owner_grant"},
+    "record_id": {"type": "string", "pattern": "^grant:[0-9a-f]{64}$"},
+    "grant_kind": {"enum": ["canary", "promotion"]},
+    "project_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "candidate_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "champion_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "review_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "bounds_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "issued_at_ms": {"type": "integer", "minimum": 0},
+    "expires_at_ms": {"type": "integer", "minimum": 0},
+    "nonce_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "signature_b64": {"type": "string", "minLength": 1, "maxLength": 24000, "pattern": "^[A-Za-z0-9+/=]+$"}
+  }
+}
