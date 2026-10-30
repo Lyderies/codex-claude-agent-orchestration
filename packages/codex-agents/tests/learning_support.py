@@ -472,41 +472,85 @@ def provider_fixture(name: str) -> bytes:
 # Stand-ins for the provider clients: each answers from a JSON file in its own
 # directory, so a test changes an observation by rewriting that file. They never
 # contact a provider.
-FAKE_CODEX = """\
-import json, sys
-directory = sys.argv[1]
-log = open(directory + "/methods.log", "a")
-for line in sys.stdin:
-    message = json.loads(line)
-    log.write(message["method"] + "\\n")
-    log.flush()
-    if "id" not in message:
-        continue
-    if message["method"] == "initialize":
-        result = {"userAgent": "fake"}
-    elif message["method"] == "account/rateLimits/read":
-        result = json.load(open(directory + "/codex-result.json"))
-    else:
-        print(json.dumps({"id": message["id"], "error": {"code": -1}}), flush=True)
-        continue
-    print(json.dumps({"id": message["id"], "result": result}), flush=True)
+# Child mode replays frames from `<name>-frames.jsonl`: a {"sleep": s} line
+# pauses, a {"raw": text} line prints text as is, and every invocation (arguments, working directory, environment
+# names and the files it can see) is logged for the test to inspect.
+FAKE_CHILD = """\
+import json, os, sys, time
+
+
+def child(directory, name):
+    with open(os.path.join(directory, name + "-invocations.jsonl"), "a") as log:
+        log.write(json.dumps({
+            "argv": sys.argv[2:],
+            "cwd": os.getcwd(),
+            "env": sorted(os.environ),
+            "pid": os.getpid(),
+            "pgid": os.getpgid(0),
+            "files": sorted(
+                os.path.relpath(os.path.join(base, item), os.getcwd())
+                for base, _, items in os.walk(os.getcwd()) for item in items
+            ),
+        }) + "\\n")
+    frames = os.path.join(directory, name + "-frames.jsonl")
+    for line in open(frames) if os.path.exists(frames) else []:
+        frame = json.loads(line)
+        if "sleep" in frame:
+            time.sleep(frame["sleep"])
+            continue
+        print(frame["raw"] if "raw" in frame else json.dumps(frame), flush=True)
+    last = os.path.join(directory, name + "-last-message.json")
+    if "-o" in sys.argv and os.path.exists(last):
+        with open(sys.argv[sys.argv.index("-o") + 1], "w") as handle:
+            handle.write(open(last).read())
+    code = os.path.join(directory, name + "-exit-code")
+    sys.exit(int(open(code).read()) if os.path.exists(code) else 0)
+
+
+directory, name = sys.argv[1], sys.argv[2]
+arguments = sys.argv[3:]
+if name == "claude" and arguments[:2] == ["auth", "status"]:
+    sys.stdout.write(open(os.path.join(directory, "claude-status.json")).read())
+elif name == "codex" and arguments[:1] == ["app-server"]:
+    log = open(os.path.join(directory, "methods.log"), "a")
+    for line in sys.stdin:
+        message = json.loads(line)
+        log.write(message["method"] + "\\n")
+        log.flush()
+        if "id" not in message:
+            continue
+        if message["method"] == "initialize":
+            result = {"userAgent": "fake"}
+        elif message["method"] == "account/rateLimits/read":
+            result = json.load(open(os.path.join(directory, "codex-result.json")))
+        else:
+            print(json.dumps({"id": message["id"], "error": {"code": -1}}), flush=True)
+            continue
+        print(json.dumps({"id": message["id"], "result": result}), flush=True)
+else:
+    sys.argv = [sys.argv[0], *sys.argv[2:]]
+    child(directory, name)
 """
 
 
 def fake_provider_tools(directory: Path) -> dict[str, str]:
-    """Install fake `codex` and `claude` clients; return an environment using them."""
+    """Install fake `codex` and `claude` clients; return an environment using them.
+
+    They answer observations from rewritable JSON files and replay recorded
+    child frames. They never contact a provider.
+    """
 
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "codex-result.json").write_bytes(provider_fixture("codex-rate-limits.json"))
     (directory / "claude-status.json").write_bytes(provider_fixture("claude-auth-status.json"))
-    (directory / "fake_codex.py").write_text(FAKE_CODEX)
-    scripts = {
-        "codex": f"#!/bin/sh\nexec {sys.executable} {directory / 'fake_codex.py'} {directory}\n",
-        "claude": f"#!/bin/sh\nexec /bin/cat {directory / 'claude-status.json'}\n",
-    }
-    for name, body in scripts.items():
-        (directory / name).write_text(body)
-        (directory / name).chmod(0o755)
+    (directory / "fake_child.py").write_text(FAKE_CHILD)
+    for name in ("codex", "claude"):
+        script = directory / name
+        script.write_text(
+            f"#!/bin/sh\nexec {sys.executable} {directory / 'fake_child.py'} "
+            f"{directory} {name} \"$@\"\n"
+        )
+        script.chmod(0o755)
     return {"PATH": str(directory)}
 
 

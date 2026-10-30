@@ -126,8 +126,11 @@ Keep the primary agent as the decision owner and final synthesizer.
    escalation from verifier history remains unavailable until the router can resolve
    the references to actual independent verifier records. Eligible alternatives are
    evaluation candidates, not permission to substitute them during live work. Each
-   route names its `provider` and `dispatch`; spawn only `native` Codex routes, and
-   report a `bridge` route as blocked until the dispatch bridge exists.
+   route names its `provider` and `dispatch`; spawn only `native` routes. For a `bridge`
+   route, open the host run as usual and then run `dispatch` once with its run handle
+   instead of spawning. Validate and record the returned `result`; when
+   `bridge_report.terminal_state` is set, pass it as the observation's `terminal_state`.
+   Never dispatch the same run handle twice or retry a fenced outcome.
    Stop after the configured attempts; do not retry by silently raising model, effort,
    permissions, tools, network, or spend.
 10. After each completed worker-verifier QA pair and before an intended pause, read the

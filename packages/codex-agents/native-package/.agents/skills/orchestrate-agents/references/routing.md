@@ -100,3 +100,36 @@ and the identity record keeps the client's real path and SHA-256 locally for aud
 client can append them. Identities are stored only as keyed fingerprints, and labels
 such as plan and subscription are allow-listed, so anything else is stored as null.
 Every project, including a Codex-only one, needs an attestation before host runs open.
+
+## Bridge dispatch
+
+`dispatch` runs one opened, admitted host run whose route has `dispatch: bridge` as a
+read-only child of the route's provider, and prints the child's `result` with a
+separate `bridge_report`. It refuses a native route, a writable sandbox or grant, an
+assignment that does not validate, a run handle without a passing admission for the
+route's provider, a route, task or assignment that differs from the opened run, a
+provider API key, and a run handle that was already dispatched.
+
+- The child never runs in the repository. The committed `HEAD` bytes of the
+  assignment's `context` and `owned_paths` are exported into a private directory under
+  the state root, which is removed afterwards. Symlinks, submodules, missing paths,
+  traversal, absolute paths and oversize exports refuse the dispatch.
+- The account is observed again immediately before launch and must match the admitted
+  fingerprint. A durable `dispatch_intent` is then written, and the bridge run ID is
+  bound as the run's agent; there is no second launch for that run.
+- The child runs in its own session with the route's `timeout_seconds` as a hard
+  deadline. Its process group is killed on timeout, on a contract violation and after
+  it exits. Any outcome the bridge cannot prove (timeout, crash, a broken stream or no
+  parseable result) returns a failed or timed-out result, never success.
+- Claude children run with only Read, Glob and Grep, `dontAsk` permissions, generated
+  settings with hooks and built-in plugins off and the model pinned, no MCP servers and
+  no session persistence. The run fails closed unless the init frame reports no API
+  key, the requested model, no plugins, no MCP servers and only those tools. The first
+  `rate_limit_event` is recorded for the run. `read_containment` is `enforced`.
+- Codex children run `codex exec` read-only and ephemeral with the result schema,
+  between non-spending observations taken before and after. A reroute or a different
+  model marks the result unreviewed with an unknown verdict. Codex reads are not contained by the
+  sandbox, so `read_containment` is `advisory`.
+- Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
+  typed codes, never prompts or file contents.
+
