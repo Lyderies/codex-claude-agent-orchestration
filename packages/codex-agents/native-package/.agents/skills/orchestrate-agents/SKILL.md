@@ -61,7 +61,8 @@ Keep the primary agent as the decision owner and final synthesizer.
    the validated project definition and active parent grant both permit it. Other mapped
    roles remain read-only. Send every completed change to independent verification.
 6. Before each open, run `cli.py provider-observe --project-root <exact-root>
-   --provider <route provider>`. Then call `learning-open-host-run` with the exact task,
+   --provider <route provider>`; for a Claude route add `--billing-probe`, because Claude
+   admission needs billing from the last 30 minutes and the probe reuses recent evidence. Then call `learning-open-host-run` with the exact task,
    route, assignment, parent grant, project root, and orchestration handle. Do not
    spawn if this command fails. It runs provider admission; a denial returns a
    `reason_code`. Report it to the owner instead of retrying, and never set a provider

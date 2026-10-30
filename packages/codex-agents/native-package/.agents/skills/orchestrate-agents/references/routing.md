@@ -79,12 +79,15 @@ native Claude open is also denied `claude_model_override_present` when a model o
 effort override is set, and it returns `native_spawn` (agent, model alias and effort)
 computed from the route. Claude's billing evidence for native children comes from
 `provider-observe --provider claude --billing-probe`, one minimal locked Haiku turn
-whose rate-limit event is the only thing recorded. The probe spends a little, so it is
-admitted like a run first (no API key or alternate backend, a fresh identity, a
-`claude.ai` subscription, an owner attestation, no paid usage and no exhausted window),
-its decision is stored, it shares the single bootstrap allowance with runs, and billing
-evidence under five minutes old is reused (`probe: "reused"`) instead of probing
-again. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
+whose rate-limit events are the only thing recorded, merged into one conservative
+reading (highest status, latest reset, billing at its most restrictive). The probe spends
+a little, so it is admitted like a run first (no API key or alternate backend, a fresh
+identity, a `claude.ai` subscription, an owner attestation, no paid usage and no
+exhausted window; older clean billing is enough, since the probe refreshes it), its
+decision is stored, and it shares the single per-account bootstrap allowance with runs.
+Account billing evidence under five minutes old is reused (`probe: "reused"`) instead of
+probing again; otherwise a probe for the same account in the last five minutes, in any
+project and whatever it returned, refuses with `probe_cooldown`. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
 constrained. The markers only catch accidental
 misuse; they are not proof of identity. Admission, the bridge flag and the read-only sandbox are the
 authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
@@ -111,10 +114,12 @@ first failure denies with a stable `reason_code`:
    unknown, `free`, or a usage-based or consumption-priced plan.
 7. `paid_usage_usable` or `billing_unverified`: any billing observation in the last day
    shows paid usage usable or overage in use, or the latest cannot show it is off.
-   Codex needs a billing read from the last 30 minutes. Claude has no non-spending
-   billing source, so one bootstrap run per account may open on the identity and
-   attestation alone; no other Claude run is admitted until that run records its
-   rate-limit event.
+   Both providers need a billing reading from the last 30 minutes. Claude has no
+   non-spending billing source, so one bootstrap run per account (across every
+   project) may open on the identity and attestation alone; after that, Claude needs a
+   recent run's rate-limit event or a billing probe. Billing, headroom and the bootstrap
+   are the account's, read from every project of the ledger; a decision cites only its
+   own project's records, and attestations stay per project.
 8. `provider_exhausted`: the most restrictive headroom that has not reset yet is
    exhausted. That is Codex at 90 percent or more on any window, or ordinary usage not
    allowed, and Claude with a rejected or full window. A later favourable observation
@@ -165,19 +170,28 @@ provider API key, and a run handle that was already dispatched.
   assignment's `context` and `owned_paths` are exported into a private directory under
   the resolved system temp directory, which is removed afterwards. Paths must be plain
   literals: pathspec magic (a leading `:`, or any of `*?[\`) refuses, git runs with
-  literal pathspecs, and a listed path outside the request refuses. Symlinks,
-  submodules, missing paths, traversal, absolute paths and oversize exports refuse.
+  literal pathspecs, and a listed path outside the request refuses. Every exported path
+  must be covered by an assignment filesystem permission (`<path>:read` or
+  `<path>:write`, covering that path and anything beneath it by whole path components);
+  otherwise `export_path_not_granted` refuses. Symlinks, submodules, missing paths,
+  traversal, absolute paths and oversize exports refuse.
 - `CLAUDE.md`, `CLAUDE.local.md`, `.claude/` and `.mcp.json` are never exported: naming
   one refuses, and directory exports drop them. A Claude child is refused with
   `context_boundary_violation` if any directory from its workspace up to `/` holds
   `CLAUDE.md`, `CLAUDE.local.md` or `.claude`; there is no exception for `~/.claude`,
-  which is why exports live outside home. Enterprise managed settings refuse a Claude
-  launch with `managed_settings_present`, because they apply despite
-  `--setting-sources project` and the init frame cannot show them.
+  which is why exports live outside home. Enterprise managed settings, and on macOS the
+  Claude Code managed-preference plists under `/Library/Managed Preferences` (global or
+  for the account), refuse a Claude launch with `managed_settings_present`, because they
+  apply despite `--setting-sources project` and the init frame cannot show them; the
+  plists also refuse Claude-host opens and probes.
 - The account is observed again immediately before launch and must match the admitted
   fingerprint and the admitted client version, which must still be in the reviewed
-  range; the child is launched from the client that re-check read. A durable `dispatch_intent` is then written, and the bridge run ID is
-  bound as the run's agent; there is no second launch for that run.
+  range; the child is launched from the client that re-check read. Billing, headroom
+  and the Codex plan are re-checked account-wide too, including that fresh reading
+  (`launch denied: <reason_code>`, stored as a denial); the run cap is not counted
+  again. A durable `dispatch_intent` is then written, and the bridge run ID is bound as
+  the run's agent; there is no second launch for that run. A bridged run binds no other
+  agent ID, and its result cannot be committed without that `dispatch_intent`.
 - The child runs in its own session. The tighter of the route's and the assignment's
   `timeout_seconds` is a hard deadline, and the tighter `max_tool_calls` sets Claude's
   `--max-turns`. Its process group is killed on timeout, on a contract violation, on
@@ -189,7 +203,9 @@ provider API key, and a run handle that was already dispatched.
   settings with hooks and built-in plugins off and the model pinned, no MCP servers and
   no session persistence. The run fails closed unless the init frame reports no API
   key, the requested model, no plugins, no MCP servers and only those tools. Every
-  `rate_limit_event` goes to the ledger, which keeps the more restrictive ones. Any model other than the requested one
+  `rate_limit_event` goes to the ledger, which keeps the more restrictive ones. A kept
+  reading showing paid usage or overage stops the child (`paid_usage_observed`), and so
+  does a rejected status (`provider_rejected`). Any model other than the requested one
   in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
   unreviewed with an unknown verdict. `read_containment` is `enforced`.
 - Codex children run `codex exec` read-only and ephemeral, between non-spending

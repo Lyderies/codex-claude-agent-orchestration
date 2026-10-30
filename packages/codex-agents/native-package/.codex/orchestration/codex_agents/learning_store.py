@@ -127,7 +127,11 @@ PRODUCER_AUTHORITY = {
 }
 # Only ledger methods that run the observation themselves may write these.
 # Billing evidence younger than this is reused instead of probing again.
+# Runs opened with this client are bridged: only `dispatch` may run their child.
+BRIDGE_CLIENT_VERSION = "bridge-v1"
 PROBE_REUSE_SECONDS = 300
+# A launched probe reserves its account for this long, whatever it returned.
+PROBE_COOLDOWN_SECONDS = 300
 PROVIDER_OBSERVATION_TYPES = {
     "provider_identity", "provider_headroom", "provider_billing",
     "observation_unavailable", "provider_usage",
@@ -2717,8 +2721,8 @@ class LearningLedger:
         handle_digest = keyed_digest(self.state.digest_key(), run_handle)
         with self._lock, self._connection:
             row = self._connection.execute(
-                "SELECT native_assignment_id,consumed_at_ms,binding_state "
-                "FROM host_run_bindings "
+                "SELECT native_assignment_id,consumed_at_ms,binding_state,run_id,"
+                "client_version FROM host_run_bindings "
                 "WHERE project_id=? AND handle_digest=?",
                 (project_id, handle_digest),
             ).fetchone()
@@ -2728,6 +2732,17 @@ class LearningLedger:
                 or row["binding_state"] != "pending"
             ):
                 raise LedgerError("host run handle is unavailable")
+            if str(row["client_version"]) == BRIDGE_CLIENT_VERSION and (
+                self._connection.execute(
+                    "SELECT 1 FROM records WHERE project_id=? "
+                    "AND record_type='dispatch_intent' AND source='lifecycle' "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=? "
+                    "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?",
+                    (project_id, str(row["run_id"]), agent_id),
+                ).fetchone() is None
+            ):
+                # A bridged run's only agent is its own dispatched child.
+                raise LedgerError("a bridged run binds only its dispatched child")
             if row["native_assignment_id"] not in {None, native_assignment_id}:
                 raise LedgerError("host run is already bound to another native agent")
             self._connection.execute(
@@ -3807,6 +3822,60 @@ class LearningLedger:
         self.state.harden_database_files()
         return record
 
+    def launch_recheck(
+        self, project_id: str, *, run_handle: str, identity: dict[str, Any]
+    ) -> str | None:
+        """Re-check an open, admitted run's billing, headroom and plan before launch.
+
+        `identity` must be this project's stored before-launch observation. The
+        account's billing and headroom from every project, including that
+        reading, are evaluated on the ledger's clock under the writer lock. The
+        run cap is not counted again. A denial is stored like any other and
+        its reason returned; None means the launch may proceed.
+        """
+
+        from .providers import evaluate_launch
+
+        denied = None
+        with self._lock, self._connection:
+            timestamp = self._clock_ms()
+            run_id = self._open_run_for_provider_locked(
+                project_id, run_handle, identity.get("provider")
+            )
+            admission = self._run_admission_locked(project_id, run_id)
+            digest = content_digest(identity)
+            if (
+                identity.get("record_type") != "provider_identity"
+                or identity.get("account_fingerprint") != admission["account_fingerprint"]
+                or self._connection.execute(
+                    "SELECT 1 FROM records WHERE project_id=? AND content_digest=? "
+                    "AND record_type='provider_identity' AND source='provider'",
+                    (project_id, digest),
+                ).fetchone() is None
+            ):
+                raise LedgerError("launch identity is not this run's stored observation")
+            provider = admission["provider"]
+            billing, _ = self._account_records_locked(project_id, "provider_billing", provider)
+            headroom, _ = self._account_records_locked(
+                project_id, "provider_headroom", provider
+            )
+            reason = evaluate_launch(
+                provider=provider, identity=identity, billing=billing,
+                headroom=headroom, now_ms=timestamp,
+            )
+            if reason is not None:
+                denied = {
+                    "provider": provider, "decision": "deny", "reason_code": reason,
+                    "admission_basis": None,
+                    "account_fingerprint": admission["account_fingerprint"],
+                    "evidence_digests": [digest], "observed_at_ms": timestamp,
+                }
+                self._store_admission_locked(
+                    project_id, denied, run_id=None, timestamp=timestamp
+                )
+        self.state.harden_database_files()
+        return None if denied is None else denied["reason_code"]
+
     def admitted_client(self, project_id: str, run_handle: str) -> dict[str, Any]:
         """The identity a run was admitted on: its account and the client it saw.
 
@@ -3860,9 +3929,13 @@ class LearningLedger:
 
         Native Claude children emit no rate-limit event, so this probe is the
         billing evidence for a Claude primary. It is a real, small request, so
-        it passes the same admission rules as a run first, shares the single
-        bootstrap allowance, and reuses evidence younger than five minutes.
-        Only its rate-limit event is kept.
+        it passes the same admission rules as a run first (except that stale
+        billing may be refreshed), shares the single per-account bootstrap
+        allowance, and reuses account evidence younger than five minutes.
+        Otherwise a probe for the same account in the last five minutes, in any
+        project and whatever its outcome, refuses with `probe_cooldown`, so a
+        probe that records nothing cannot be repeated. Every rate-limit event
+        it reports is kept as one conservative merge.
         """
 
         from .bridge import claude_billing_probe
@@ -3894,9 +3967,9 @@ class LearningLedger:
             # Read under the lock that orders admission decisions.
             timestamp = self._clock_ms()
             billing = [
-                record for record, _ in self._provider_records_locked(
+                record for record, _ in self._account_records_locked(
                     project_id, "provider_billing", "claude"
-                )
+                )[0]
                 if record["account_fingerprint"] == fingerprint
             ]
             latest = max(billing, key=lambda record: record["observed_at_ms"], default=None)
@@ -3905,18 +3978,36 @@ class LearningLedger:
             ):
                 # Fresh evidence bounds the spend when children open back to back.
                 headroom = [
-                    record for record, _ in self._provider_records_locked(
+                    record for record, _ in self._account_records_locked(
                         project_id, "provider_headroom", "claude"
-                    )
+                    )[0]
                     if record["account_fingerprint"] == fingerprint
                 ]
                 return {
                     "probe": "reused",
                     "records": [identity, *headroom[-1:], latest],
                 }
-            decision = self._evaluate_admission_locked(
-                project_id, provider="claude", environ=environ, timestamp=timestamp
-            )
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE record_type='probe_admission' "
+                "AND source='lifecycle' "
+                "AND json_extract(CAST(content AS TEXT),'$.decision')='pass' "
+                "AND json_extract(CAST(content AS TEXT),'$.account_fingerprint')=? "
+                "AND observed_at_ms>?",
+                (fingerprint, timestamp - PROBE_COOLDOWN_SECONDS * 1000),
+            ).fetchone() is not None:
+                # The reservation is durable and account-wide; a probe stamped
+                # after now also counts, so a clock step never reopens it.
+                decision = {
+                    "provider": "claude", "decision": "deny",
+                    "reason_code": "probe_cooldown", "admission_basis": None,
+                    "account_fingerprint": fingerprint, "evidence_digests": [],
+                    "observed_at_ms": timestamp,
+                }
+            else:
+                decision = self._evaluate_admission_locked(
+                    project_id, provider="claude", environ=environ, timestamp=timestamp,
+                    probe=True,
+                )
             if decision["decision"] == "pass":
                 # Stored before launch, in the same transaction as the decision,
                 # so a crash or a repeat cannot take the bootstrap twice.
@@ -3927,11 +4018,25 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        info = claude_billing_probe(environ)
+        infos = claude_billing_probe(environ)
         observed = self._clock_ms()
-        records = claude_rate_limit_records(
-            info, account_fingerprint=fingerprint, observed_at_ms=observed
-        )
+        headroom: list[dict[str, Any]] = []
+        billing_records: list[dict[str, Any]] = []
+        for info in infos:
+            event_headroom, event_billing = claude_rate_limit_records(
+                info, account_fingerprint=fingerprint, observed_at_ms=observed
+            )
+            headroom.append(event_headroom)
+            billing_records.append(event_billing)
+        # One conservative merge: the highest status, per window the highest
+        # use and latest effective reset, and billing at its highest rank.
+        records = [
+            _merged_restriction(headroom, observed_at_ms=observed),
+            max(
+                reversed(billing_records),
+                key=lambda record: BILLING_RANK[record["paid_usage_usable"]],
+            ),
+        ]
         self._store_provider_observations(project_id, records, timestamp=observed)
         return {"probe": "launched", "records": [identity, *records]}
 
@@ -4124,29 +4229,57 @@ class LearningLedger:
         ).fetchall()
         return [(str(row[0]), int(row[1])) for row in rows if row[0] is not None]
 
-    def _window_headroom_locked(
-        self, provider: str, timestamp: int
-    ) -> list[tuple[dict[str, Any], str]]:
-        """Headroom readings from every project that can place the cap window.
+    def _account_records_locked(
+        self, project_id: str, record_type: str, provider: str
+    ) -> tuple[list[tuple[dict[str, Any], str]], set[str]]:
+        """A provider's observations of one type from every project, and this
+        project's digests among them.
 
-        The cap belongs to the account, so its window is placed from every
-        project's readings, like the count. A five-hour reset still ahead was
-        observed less than five hours ago, so older readings cannot matter.
+        Billing, headroom and the run cap belong to the account, which several
+        projects can share, so they are read ledger-wide. Fingerprints use the
+        ledger-wide key and compare across projects. A decision cites only the
+        records its own project holds.
         """
 
-        from .providers import FIVE_HOURS_MS
-
         rows = self._connection.execute(
-            "SELECT content,content_digest FROM records WHERE "
-            "record_type='provider_headroom' AND source='provider' "
+            "SELECT project_id,content,content_digest FROM records WHERE "
+            "record_type=? AND source='provider' "
             "AND json_extract(CAST(content AS TEXT),'$.provider')=? "
-            "AND observed_at_ms>=? ORDER BY observed_at_ms",
-            (provider, timestamp - FIVE_HOURS_MS),
+            "ORDER BY observed_at_ms,ingested_at_ms,project_id,source_sequence",
+            (record_type, provider),
         ).fetchall()
-        return [(json.loads(bytes(row["content"])), str(row["content_digest"])) for row in rows]
+        records = [
+            (json.loads(bytes(row["content"])), str(row["content_digest"])) for row in rows
+        ]
+        local = {str(row["content_digest"]) for row in rows if row["project_id"] == project_id}
+        return records, local
+
+    def _prior_claude_admissions_locked(self) -> set[str]:
+        """Accounts that already had a passing Claude run or probe, in any project.
+
+        The single Claude bootstrap is per account, not per project.
+        """
+
+        return {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint') "
+                "FROM records WHERE source='lifecycle' "
+                "AND record_type IN ('admission_decision','probe_admission') "
+                "AND json_extract(CAST(content AS TEXT),'$.provider')='claude' "
+                "AND json_extract(CAST(content AS TEXT),'$.decision')='pass'",
+            ).fetchall()
+            if row[0] is not None
+        }
 
     def _evaluate_admission_locked(
-        self, project_id: str, *, provider: str, environ: Any, timestamp: int
+        self,
+        project_id: str,
+        *,
+        provider: str,
+        environ: Any,
+        timestamp: int,
+        probe: bool = False,
     ) -> dict[str, Any]:
         from .providers import evaluate_admission
 
@@ -4155,37 +4288,35 @@ class LearningLedger:
         ).fetchone()
         if not project or project["status"] != "active":
             raise LedgerError("project binding is not active")
+        identities = self._provider_records_locked(project_id, "provider_identity", provider)
+        attestations = self._provider_records_locked(
+            project_id, "billing_attestation", provider
+        )
+        billing, local_billing = self._account_records_locked(
+            project_id, "provider_billing", provider
+        )
+        headroom, local_headroom = self._account_records_locked(
+            project_id, "provider_headroom", provider
+        )
         return evaluate_admission(
             admission_policy=self._admission_settings(provider),
             prior_run_admissions=self._prior_run_admissions_locked(provider, timestamp),
             provider=provider,
-            identities=self._provider_records_locked(
-                project_id, "provider_identity", provider
-            ),
-            attestations=self._provider_records_locked(
-                project_id, "billing_attestation", provider
-            ),
-            billing=self._provider_records_locked(
-                project_id, "provider_billing", provider
-            ),
-            headroom=self._provider_records_locked(
-                project_id, "provider_headroom", provider
-            ),
-            window_headroom=self._window_headroom_locked(provider, timestamp),
-            prior_claude_admissions={
-                str(row[0])
-                for row in self._connection.execute(
-                    "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint') "
-                    "FROM records WHERE project_id=? "
-                    "AND record_type IN ('admission_decision','probe_admission') "
-                    "AND json_extract(CAST(content AS TEXT),'$.provider')='claude' "
-                    "AND json_extract(CAST(content AS TEXT),'$.decision')='pass'",
-                    (project_id,),
-                ).fetchall()
-                if row[0] is not None
+            identities=identities,
+            attestations=attestations,
+            billing=billing,
+            headroom=headroom,
+            window_headroom=headroom,
+            prior_claude_admissions=self._prior_claude_admissions_locked(),
+            cited_digests={
+                *(digest for _, digest in identities),
+                *(digest for _, digest in attestations),
+                *local_billing,
+                *local_headroom,
             },
             environ=environ,
             now_ms=timestamp,
+            probe=probe,
         )
 
     def evaluate_admission(
@@ -4592,6 +4723,14 @@ class LearningLedger:
         # collector-bound sessions, whose admission is decided when they bind.
         with self._lock:
             self._run_admission_locked(project_id, checked_observation["run_id"])
+            if client_version == BRIDGE_CLIENT_VERSION and self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? "
+                "AND record_type='dispatch_intent' AND source='lifecycle' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, checked_observation["run_id"]),
+            ).fetchone() is None:
+                # A bridged run's result can only come from its dispatched child.
+                raise LedgerError("a bridged run must be dispatched before its result")
         from .learning_engine import build_host_result_records
 
         evaluation_candidate_digest = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: I001 -- tests.support bootstraps the native package import path.
 
+import contextlib
 import functools
 import hashlib
 import json
@@ -512,6 +513,21 @@ class AdmissionTests(unittest.TestCase):
                 run_handle=run["run_handle"], rate_limit_info=info,
             )
 
+    def clean_claude_billing(self, at_ms: int) -> None:
+        """Fresh, clean Claude billing at a given time, as a probe would record.
+
+        Claude admission needs billing from the last 30 minutes, so tests that
+        jump past a reset record it again at the new time.
+        """
+
+        identity = self.observe("claude", now_ms=at_ms)[0]
+        _, billing = claude_rate_limit_records(
+            {"status": "allowed", "isUsingOverage": False, "overageStatus": "rejected",
+             "overageDisabledReason": "org_level_disabled"},
+            account_fingerprint=identity["account_fingerprint"], observed_at_ms=at_ms,
+        )
+        self.ledger._store_provider_observations(self.project_id, [billing], timestamp=at_ms)
+
     def attest(self, provider: str, fingerprint: str) -> None:
         attest_provider(
             self.ledger, self.project_id, self.owner_private_key, provider, fingerprint
@@ -691,7 +707,7 @@ class AdmissionTests(unittest.TestCase):
             overageDisabledReason="org_level_disabled",
         ))
         self.clock += 3_600_000
-        self.observe("claude")
+        self.clean_claude_billing(self.tick())
         self.assertEqual("pass", self.admit("claude")["decision"])
 
     def test_committed_or_closed_runs_cannot_record_events(self) -> None:
@@ -1131,6 +1147,32 @@ class AdmissionTests(unittest.TestCase):
         self.assertIn("e" * 64, denied["evidence_digests"])
         admission_record(denied, None)
 
+    def test_restrictive_evidence_stamped_after_now_still_counts(self) -> None:
+        identity, headroom, billing = parse_codex(
+            json.loads(provider_fixture("codex-rate-limits.json")),
+            digest_key=KEY, observed_at_ms=NOW, client_version="0.164.0",
+        )
+        attestation = {"provider": "codex", "account_fingerprint": identity["account_fingerprint"],
+                       "observed_at_ms": 1}
+        ahead = NOW + 60_000
+
+        def decide(more_billing=(), more_headroom=()):
+            return evaluate_admission(
+                provider="codex", identities=[(identity, DIGEST_A)],
+                attestations=[(attestation, DIGEST_B)],
+                billing=[(billing, DIGEST_C), *more_billing],
+                headroom=[(headroom, DIGEST_C), *more_headroom],
+                prior_claude_admissions=set(), environ={}, now_ms=NOW + 1, **CODEX_LIMITS,
+            )["reason_code"]
+
+        self.assertEqual("admitted", decide())
+        paid = {**billing, "paid_usage_usable": True, "observed_at_ms": ahead}
+        self.assertEqual("paid_usage_usable", decide(more_billing=[(paid, "a" * 64)]))
+        full = {**headroom, "observed_at_ms": ahead, "windows": [
+            {**headroom["windows"][0], "used_percent": 95.0, "resets_at": ahead + 60_000},
+        ]}
+        self.assertEqual("provider_exhausted", decide(more_headroom=[(full, "b" * 64)]))
+
     def test_billing_probe_admissions_do_not_count_toward_the_cap(self) -> None:
         self.limit("claude", max_admissions_per_window=2)
         fingerprint = self.observe("claude")[0]["account_fingerprint"]
@@ -1231,11 +1273,11 @@ class AdmissionTests(unittest.TestCase):
             ]))
         # After the earlier reset the merged restriction still applies...
         after_first = first_reset * 1000 + 1
-        self.observe("claude", now_ms=after_first)
+        self.clean_claude_billing(after_first)
         self.assert_denied("provider_exhausted", "claude", now_ms=after_first + 1)
         # ...and it lifts at the later reset.
         after_later = later_reset * 1000 + 1
-        self.observe("claude", now_ms=after_later)
+        self.clean_claude_billing(after_later)
         self.assertEqual("pass", self.admit("claude", now_ms=after_later + 1)["decision"])
 
     def test_a_rejection_is_not_covered_by_a_longer_allowed_reading(self) -> None:
@@ -1254,7 +1296,7 @@ class AdmissionTests(unittest.TestCase):
                           utilization=1.0, resetsAt=later_reset, **quiet)
         self.assertEqual(["provider_headroom"], [item["record_type"] for item in kept])
         after_first = first_reset * 1000 + 1
-        self.observe("claude", now_ms=after_first)
+        self.clean_claude_billing(after_first)
         self.assert_denied("provider_exhausted", "claude", now_ms=after_first + 1)
 
     def test_a_later_reset_reading_cannot_free_counted_admissions(self) -> None:
@@ -1361,8 +1403,90 @@ class AdmissionTests(unittest.TestCase):
         # The reset-less rejection lasts its day, not the allowed readings' hour.
         self.assertEqual(rejected_at + 24 * 3_600_000, merged["windows"][0]["resets_at"])
         after_reset = reset * 1000 + 1
-        self.observe("claude", now_ms=after_reset)
+        self.clean_claude_billing(after_reset)
         self.assert_denied("provider_exhausted", "claude", now_ms=after_reset + 1)
+
+    @contextlib.contextmanager
+    def other_project(self):
+        """Run the block in a second project of the same ledger and account."""
+
+        root = Path(self.temporary.name) / f"project-{self.tick()}"
+        root.mkdir()
+        first = self.project_id
+        self.project_id = self.ledger.register_project(root, now_ms=1)
+        try:
+            fingerprint = self.observe("claude")[0]["account_fingerprint"]
+            self.attest("claude", fingerprint)
+            yield
+        finally:
+            self.project_id = first
+
+    def test_overage_in_one_project_denies_another(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        self.event(run, status="allowed", rateLimitType="five_hour", utilization=0.1,
+                   isUsingOverage=True)
+        with self.other_project():
+            self.assert_denied("paid_usage_usable", "claude")
+            with self.ledger.repository(self.project_id) as repository:
+                cited = repository.records("admission_decision")[-1]["evidence_digests"]
+            with self.ledger._lock:
+                rows = self.ledger._connection.execute(
+                    "SELECT content_digest,record_type FROM records WHERE project_id=?",
+                    (self.project_id,),
+                ).fetchall()
+            own = {str(row[0]) for row in rows}
+            billing_here = {str(row[0]) for row in rows if row[1] == "provider_billing"}
+            # The other project's billing decides, but only this project's
+            # records are cited, and this project holds no billing at all.
+            self.assertTrue(cited and set(cited) <= own)
+            self.assertEqual(set(), billing_here)
+
+    def test_the_bootstrap_is_once_per_account(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        stored = self.ledger.host_run_admission(
+            self.project_id, self.open_run("claude")["run_handle"]
+        )
+        self.assertEqual("bootstrap", stored["admission_basis"])
+        with self.other_project():
+            with self.assertRaises(AdmissionDenied) as raised:
+                self.open_run("claude")
+            self.assertEqual("billing_unverified", raised.exception.reason_code)
+
+    def test_a_rejection_in_one_project_blocks_another_until_reset(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        reset = (self.clock + 3_600_000) // 1000
+        self.event(run, status="rejected", rateLimitType="five_hour", utilization=1.0,
+                   resetsAt=reset, isUsingOverage=False, overageStatus="rejected",
+                   overageDisabledReason="org_level_disabled")
+        with self.other_project():
+            self.assert_denied("provider_exhausted", "claude")
+            after = reset * 1000 + 1
+            self.clean_claude_billing(after)
+            self.assertEqual("pass", self.admit("claude", now_ms=after + 1)["decision"])
+
+    def test_claude_billing_must_be_fresh_except_for_the_bootstrap(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        self.event(run, **json.loads(provider_fixture("claude-rate-limit-event.json")))
+        self.assertEqual("pass", self.admit("claude")["decision"])
+        day_later = self.clock + 24 * 60 * 60 * 1000
+        self.observe("claude", now_ms=day_later)
+        self.assert_denied("billing_unverified", "claude", now_ms=day_later + 1)
+        # A probe is still admitted on that older clean evidence, to refresh it.
+        with self.ledger._lock:
+            probe = self.ledger._evaluate_admission_locked(
+                self.project_id, provider="claude", environ=CLEAN,
+                timestamp=day_later + 2, probe=True,
+            )
+        self.assertEqual("pass", probe["decision"])
+        self.clean_claude_billing(day_later + 3)
+        self.assertEqual("pass", self.admit("claude", now_ms=day_later + 4)["decision"])
 
     def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
         identity = self.observe()[0]

@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -37,7 +38,7 @@ from codex_agents.learning_store import (
     LedgerError,
     authorize_collector_runtime,
 )
-from codex_agents.providers import AdmissionDenied
+from codex_agents.providers import AdmissionDenied, claude_rate_limit_records
 from codex_agents.routing import load_policy, route_task
 from tests.learning_support import (
     assignment,
@@ -141,6 +142,10 @@ class BridgeTestCase(unittest.TestCase):
             ("MANAGED_SETTINGS_PATHS", {
                 "darwin": (str(self.managed),),
                 "linux": (str(self.managed),),
+            }),
+            ("MANAGED_PREFERENCE_PATHS", {
+                "darwin": (str(base / "managed-preferences" / "{user}" / "claude.plist"),),
+                "linux": (str(base / "managed-preferences" / "{user}" / "claude.plist"),),
             }),
         ):
             patcher = mock.patch.object(bridge, name, value)
@@ -296,7 +301,20 @@ class CliTestCase(BridgeTestCase):
 
 
 class ClaudeBridgeTests(BridgeTestCase):
-    def test_happy_path_runs_contained_and_a_late_rejection_blocks_until_reset(self) -> None:
+    def test_happy_path_returns_the_result_and_usage(self) -> None:
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [init_frame(), RATE_LIMIT, result_frame()])
+        output = self.dispatch(route, assigned, handle)
+        self.assertEqual(result(), output["result"])
+        report = output["bridge_report"]
+        self.assertEqual(("result", None), (report["outcome"], report["terminal_state"]))
+        self.assertEqual(0.42, report["usage"]["api_equivalent_cost_usd_estimate"])
+        self.assertEqual({"count": 1, "tools": ["Read"]}, report["permission_denials"])
+        self.assertNotIn("/x", json.dumps(output))
+
+    def test_run_is_contained_and_a_late_rejection_stops_it_and_blocks_until_reset(
+        self,
+    ) -> None:
         route, assigned, handle = self.claude_run()
         resets = int(time.time()) + 3600
         rejected = {**RATE_LIMIT, "uuid": "rate-2", "rate_limit_info": {
@@ -304,23 +322,20 @@ class ClaudeBridgeTests(BridgeTestCase):
             "resetsAt": resets,
         }}
         self.frames("claude", [
-            init_frame(), RATE_LIMIT, rejected,
-            # A favourable event after the rejection is not kept.
-            {**RATE_LIMIT, "uuid": "rate-3"},
-            result_frame(),
+            init_frame(), RATE_LIMIT, rejected, {"sleep": 30}, result_frame(),
         ])
         output = self.dispatch(route, assigned, handle)
-        self.assertEqual(result(), output["result"])
         report = output["bridge_report"]
+        # The rejection stops the child; the result is fenced, never success.
         self.assertEqual(
-            ("claude", "claude-opus-5-5", "claude-opus-5-5", "enforced", "result", 1),
+            ("claude", "claude-opus-5-5", "claude-opus-5-5", "enforced",
+             "provider_rejected", 1, "failed"),
             (report["provider"], report["requested_model"], report["observed_model"],
-             report["read_containment"], report["outcome"], report["export_file_count"]),
+             report["read_containment"], report["outcome"], report["export_file_count"],
+             report["terminal_state"]),
         )
-        self.assertIsNone(report["terminal_state"])
-        self.assertEqual(0.42, report["usage"]["api_equivalent_cost_usd_estimate"])
-        self.assertEqual({"count": 1, "tools": ["Read"]}, report["permission_denials"])
-        self.assertNotIn("/x", json.dumps(output))
+        self.assertEqual("failed", output["result"]["execution_state"])
+        self.assertLess(report["wall_seconds"], 20)
         invocation = [item for item in self.invocations("claude") if "-p" in item["argv"]][0]
         argv = invocation["argv"]
         for flag in ("--strict-mcp-config", "--no-session-persistence", "--verbose"):
@@ -350,7 +365,7 @@ class ClaudeBridgeTests(BridgeTestCase):
             [("allowed", "during"), ("rejected", "during")],
             [(record["status"], record["phase"]) for record in run_events],
         )
-        self.assertEqual((3, 3), (report["rate_limit_events"], report["rate_limit_records_kept"]))
+        self.assertEqual((2, 3), (report["rate_limit_events"], report["rate_limit_records_kept"]))
         self.assertEqual(
             [report["bridge_run_id"]], [intent["bridge_run_id"] for intent in intents]
         )
@@ -361,11 +376,20 @@ class ClaudeBridgeTests(BridgeTestCase):
         with self.assertRaises(AdmissionDenied) as raised:
             self.open(route, self.assignment_for(route))
         self.assertEqual("provider_exhausted", raised.exception.reason_code)
-        # ...until its window resets.
+        # ...until its window resets (with fresh billing, as a probe records).
         after_reset = (resets + 1) * 1000
         with mock.patch.object(self.ledger, "_clock_ms", return_value=after_reset):
-            self.ledger.observe_provider(
+            identity = self.ledger.observe_provider(
                 self.project_id, "claude", project_root=self.tools, environ=CLEAN
+            )[0]
+            self.ledger._store_provider_observations(
+                self.project_id,
+                claude_rate_limit_records(
+                    RATE_LIMIT["rate_limit_info"],
+                    account_fingerprint=identity["account_fingerprint"],
+                    observed_at_ms=after_reset,
+                )[1:],
+                timestamp=after_reset,
             )
             reopened = self.open(route, self.assignment_for(route))
         self.assertEqual(
@@ -624,7 +648,11 @@ class DispatchRefusalTests(BridgeTestCase):
             (["missing.txt"], "not committed"),
         ):
             with self.subTest(context=context):
-                changed = {**assigned, "context": context}
+                # Granted, so the export checks themselves refuse.
+                changed = {**assigned, "context": context, "permissions": {
+                    **assigned["permissions"],
+                    "filesystem": [f"{item}:read" for item in context],
+                }}
                 with mock.patch(
                     "codex_agents.bridge.validate_assignment", return_value=changed
                 ), self.assertRaisesRegex(BridgeRefused, message), mock.patch.object(
@@ -640,6 +668,158 @@ class DispatchRefusalTests(BridgeTestCase):
             bridge.export_committed_paths(
                 self.project, ["source.txt"], Path(directory), max_bytes=3
             )
+
+
+class SecurityReviewFixTests(BridgeTestCase):
+    """S4 security-review fixes on the bridge side (A, C, G, H)."""
+
+    def codex_ready(self) -> tuple[dict, dict, str]:
+        self.admit("codex")
+        route = self.bridged_route("codex")
+        assigned = self.assignment_for(route)
+        handle = self.open(route, assigned)
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 1}}])
+        (self.tools / "codex-last-message.json").write_text(json.dumps(null_filled(result())))
+        return route, assigned, handle
+
+    def codex_launches(self) -> int:
+        return len([i for i in self.invocations("codex") if "exec" in i["argv"]])
+
+    def test_launch_is_refused_when_billing_or_headroom_changes_after_open(self) -> None:
+        fixture = json.loads((self.tools / "codex-result.json").read_text())
+        soon = int(time.time()) + 3600
+        for change, reason in (
+            ({"credits": {"hasCredits": True, "unlimited": False}}, "paid_usage_usable"),
+            ({"planType": "free"}, "codex_plan_not_subscription"),
+            ({"secondary": {"usedPercent": 95, "windowDurationMins": 300,
+                            "resetsAt": soon}}, "provider_exhausted"),
+        ):
+            with self.subTest(reason=reason):
+                self.setUp_account(len(reason))
+                route, assigned, handle = self.codex_ready()
+                launches = self.codex_launches()
+                with self.ledger.repository(self.project_id) as repository:
+                    intents = len(repository.records("dispatch_intent"))
+                changed = deepcopy(fixture)
+                changed["accountId"] = f"fixture-account-{len(reason)}"
+                changed["rateLimits"].update(change)
+                (self.tools / "codex-result.json").write_text(json.dumps(changed))
+                with self.assertRaisesRegex(BridgeRefused, f"launch denied: {reason}"):
+                    self.dispatch(route, assigned, handle)
+                self.assertEqual(launches, self.codex_launches())
+                with self.ledger.repository(self.project_id) as repository:
+                    stored = repository.records("admission_decision")[-1]
+                    self.assertEqual(intents, len(repository.records("dispatch_intent")))
+                self.assertEqual(("deny", reason), (stored["decision"], stored["reason_code"]))
+                (self.tools / "codex-result.json").write_text(json.dumps(fixture))
+
+    def setUp_account(self, number: int) -> None:
+        # Each case uses its own Codex account, so earlier cases do not deny it.
+        fixture = json.loads((self.tools / "codex-result.json").read_text())
+        fixture["accountId"] = f"fixture-account-{number}"
+        (self.tools / "codex-result.json").write_text(json.dumps(fixture))
+
+    def test_in_run_overage_stops_the_child(self) -> None:
+        self.admit("claude")
+        route = self.bridged_route("claude")
+        seed = self.open(route, self.assignment_for(route))
+        self.ledger.record_claude_rate_limit_event(
+            self.project_id, run_handle=seed, rate_limit_info=RATE_LIMIT["rate_limit_info"],
+        )
+        assigned = self.assignment_for(route)
+        handle = self.open(route, assigned)
+        overage = {**RATE_LIMIT, "uuid": "rate-2", "rate_limit_info": {
+            **RATE_LIMIT["rate_limit_info"], "isUsingOverage": True,
+        }}
+        self.frames("claude", [init_frame(), RATE_LIMIT, overage, {"sleep": 30}, result_frame()])
+        output = self.dispatch(route, assigned, handle)
+        report = output["bridge_report"]
+        self.assertEqual(("paid_usage_observed", "failed"),
+                         (report["outcome"], report["terminal_state"]))
+        self.assertLess(report["wall_seconds"], 20)
+        child = [i for i in self.invocations("claude") if "-p" in i["argv"]][-1]
+        self.assert_process_gone(child)
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open(route, self.assignment_for(route))
+        self.assertEqual("paid_usage_usable", raised.exception.reason_code)
+
+    def test_only_granted_paths_are_exported(self) -> None:
+        def paths(context: list[str], filesystem: list[str]) -> list[str]:
+            return bridge.assignment_read_paths({
+                "context": context, "owned_paths": [],
+                "permissions": {"filesystem": filesystem},
+            })
+
+        self.assertEqual(["src/a.txt"], paths(["src/a.txt"], ["src:read"]))
+        self.assertEqual(["src"], paths(["src"], ["src/:read"]))
+        self.assertEqual(["src/a.txt"], paths(["src/a.txt"], ["src:write"]))
+        for context, filesystem in (
+            (["secret.txt"], ["source.txt:read"]),
+            (["src2/x"], ["src:read"]),
+            (["src"], ["src/a.txt:read"]),
+            (["source.txt"], ["source.txt"]),
+            (["source.txt"], ["source.txt:execute"]),
+            (["source.txt"], []),
+        ):
+            with self.subTest(context=context, filesystem=filesystem), \
+                    self.assertRaisesRegex(BridgeRefused, "export_path_not_granted"):
+                paths(context, filesystem)
+        # The run validates and opens: context is not checked against grants
+        # anywhere else, so only the export check stands between it and secret.txt.
+        route, _, _ = self.claude_run()
+        changed = self.assignment_for(route, context=["secret.txt"])
+        handle = self.open(route, changed)
+        self.frames("claude", [init_frame(), result_frame()])
+        with self.assertRaisesRegex(BridgeRefused, "export_path_not_granted"):
+            self.dispatch(route, changed, handle)
+        self.assertFalse([i for i in self.invocations("claude") if "-p" in i["argv"]])
+        self.assertEqual([], self.workspace_entries())
+
+    def test_managed_preferences_refuse_claude_launches_and_opens(self) -> None:
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [init_frame(), result_frame()])
+        user = pwd.getpwuid(os.getuid()).pw_name
+        plist = Path(self.temporary.name) / "managed-preferences" / user / "claude.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_bytes(b"<plist/>")
+        self.assertIn(str(plist), bridge.managed_preference_paths())
+        with self.assertRaisesRegex(BridgeRefused, "managed_settings_present"):
+            self.dispatch(route, assigned, handle)
+        with self.assertRaises(claude_host.ClaudeHostDenied) as raised:
+            claude_host.check_backend({}, self.project)
+        self.assertEqual("claude_backend_not_subscription", raised.exception.reason_code)
+        self.assertFalse([i for i in self.invocations("claude") if "-p" in i["argv"]])
+        plist.unlink()
+        claude_host.check_backend({}, self.project)
+
+    def test_a_bridged_run_binds_and_commits_only_its_dispatch(self) -> None:
+        route, assigned, handle = self.claude_run()
+        with self.assertRaisesRegex(LedgerError, "binds only its dispatched child"):
+            self.ledger.bind_host_agent(
+                self.project_id, run_handle=handle, agent_id="agent-native-1"
+            )
+        with self.assertRaisesRegex(LedgerError, "binds only its dispatched child"):
+            self.ledger.bind_host_agent(
+                self.project_id, run_handle=handle, agent_id="brg_" + "0" * 32
+            )
+        observation = {
+            "run_handle": handle,
+            "result_attempts": [{"status": "accepted", "reason_code": None, "receipt_id": None}],
+        }
+        with self.assertRaisesRegex(LedgerError, "must be dispatched"):
+            self.ledger.commit_host_result(
+                self.project_id, assignment=assigned, task=self.task(), route=route,
+                result=result(), observation=observation,
+                execution_configuration=route["execution_configuration"],
+            )
+        self.frames("claude", [init_frame(), RATE_LIMIT, result_frame()])
+        output = self.dispatch(route, assigned, handle)
+        committed = self.ledger.commit_host_result(
+            self.project_id, assignment=assigned, task=self.task(), route=route,
+            result=output["result"], observation=observation,
+            execution_configuration=route["execution_configuration"],
+        )
+        self.assertEqual("claude-opus-5-5", committed["outcome"]["model"])
 
 
 class StrictSchemaTests(unittest.TestCase):
@@ -750,9 +930,13 @@ class ReviewHardeningTests(BridgeTestCase):
                 self.refused_export(context, "Claude context files")
         route = self.bridged_route("claude")
         changed = self.assignment_for(route, context=["docs"])
+        changed["permissions"] = {**changed["permissions"], "filesystem": ["docs:read"]}
         handle = self.open(route, changed)
         self.frames("claude", [init_frame(), result_frame()])
-        output = self.dispatch(route, changed, handle)
+        output = self.dispatch(
+            route, changed, handle,
+            parent_grant={**PARENT_GRANT, "filesystem": ["docs:read"]},
+        )
         self.assertEqual(1, output["bridge_report"]["export_file_count"])
         invocation = [i for i in self.invocations("claude") if "-p" in i["argv"]][0]
         self.assertEqual(["docs/readme.txt"], invocation["files"])
@@ -1500,8 +1684,12 @@ class ClaudeHostReviewTests(ClaudePrimaryCase):
     def launches(self) -> int:
         return len([i for i in self.invocations("claude") if "-p" in i["argv"]])
 
+    @contextlib.contextmanager
     def stale_evidence(self):
-        return mock.patch.object(learning_store, "PROBE_REUSE_SECONDS", 0)
+        # Neither reuse nor the per-account cooldown applies, so each call probes.
+        with mock.patch.object(learning_store, "PROBE_REUSE_SECONDS", 0), \
+                mock.patch.object(learning_store, "PROBE_COOLDOWN_SECONDS", 0):
+            yield
 
     def test_billing_probe_admits_consecutive_native_children(self) -> None:
         self.admit("claude")
@@ -1578,8 +1766,65 @@ class ClaudeHostReviewTests(ClaudePrimaryCase):
                 self.assertEqual(reason, denied["reason_code"])
                 self.assertEqual(before, self.launches())
 
-    def setUp_fresh_project(self) -> None:
-        # Each case needs its own account history, so use a new project.
+    def test_probe_keeps_every_event_as_one_conservative_merge(self) -> None:
+        self.admit("claude")
+        self.frames("claude", [PROBE_INIT, FAVOURABLE, OVERAGE, result_frame("OK")])
+        observed = self.cli("provider-observe", "--provider", "claude", "--billing-probe")
+        self.assertEqual("launched", observed["probe"])
+        billing = observed["records"][-1]
+        self.assertEqual(
+            ("provider_billing", True, True),
+            (billing["record_type"], billing["is_using_overage"], billing["paid_usage_usable"]),
+        )
+        self.assertEqual("paid_usage_usable", self.open_native(expected=2)["reason_code"])
+
+    def test_a_probe_reserves_its_account_for_five_minutes(self) -> None:
+        self.admit("claude")
+        # A probe that reports nothing cannot be repeated straight away.
+        self.frames("claude", [PROBE_INIT, result_frame("OK")])
+        failed = self.cli(
+            "provider-observe", "--provider", "claude", "--billing-probe", expected=2
+        )
+        self.assertIn("no rate-limit event", failed["reason"])
+        self.assertEqual(1, self.launches())
+        self.assertEqual("probe_cooldown", self.probe(FAVOURABLE, expected=2)["reason_code"])
+        self.assertEqual(1, self.launches())
+        # Nor from another project of the same account.
+        self.setUp_fresh_project(new_account=False)
+        self.assertEqual("probe_cooldown", self.probe(FAVOURABLE, expected=2)["reason_code"])
+        self.assertEqual(1, self.launches())
+
+    def test_a_second_project_reuses_or_waits_instead_of_probing(self) -> None:
+        self.admit("claude")
+        self.assertEqual("launched", self.probe(FAVOURABLE)["probe"])
+        self.setUp_fresh_project(new_account=False)
+        self.assertEqual("reused", self.probe(FAVOURABLE)["probe"])
+        with mock.patch.object(learning_store, "PROBE_REUSE_SECONDS", 0):
+            self.assertEqual(
+                "probe_cooldown", self.probe(FAVOURABLE, expected=2)["reason_code"]
+            )
+        self.assertEqual(1, self.launches())
+
+    def test_day_old_claude_billing_is_denied_until_a_fresh_probe(self) -> None:
+        self.admit("claude")
+        self.assertEqual("launched", self.probe(FAVOURABLE)["probe"])
+        self.assertIn("run_handle", self.open_native())
+        later = time.time_ns() // 1_000_000 + 24 * 60 * 60 * 1000
+        with mock.patch.object(learning_store.LearningLedger, "_clock_ms", return_value=later):
+            self.cli("provider-observe", "--provider", "claude")
+            self.assertEqual("billing_unverified", self.open_native(expected=2)["reason_code"])
+            self.assertEqual("launched", self.probe(FAVOURABLE)["probe"])
+            self.assertIn("run_handle", self.open_native())
+
+    def setUp_fresh_project(self, new_account: bool = True) -> None:
+        # Each case needs its own account history. Billing and headroom are
+        # account-wide across projects, so use a new account and a new project.
+        if new_account:
+            status_path = self.tools / "claude-status.json"
+            status = json.loads(status_path.read_text())
+            self.accounts = getattr(self, "accounts", 0) + 1
+            status["email"] = f"fixture-account-{self.accounts}@example.invalid"
+            status_path.write_text(json.dumps(status))
         project = Path(tempfile.mkdtemp(dir=self.temporary.name))
         git(project, "init", "-q")
         git(project, "config", "user.email", "tests@example.invalid")
