@@ -120,10 +120,12 @@ first failure denies with a stable `reason_code`:
    allowed, and Claude with a rejected or full window. A later favourable observation
    never clears a restriction that still applies.
 9. `window_run_cap_reached`: the account already has `max_admissions_per_window`
-   passing run admissions for the provider in the current five-hour window. The window
-   starts five hours before the latest recorded five-hour reset, or is the last five
-   hours when no reset in the next five hours is known. Billing probes do not count.
-   The count is taken under the ledger's write lock with the decision.
+   passing run admissions for the provider in the current five-hour window, counted
+   across every project in the ledger. The window starts five hours before a recorded
+   five-hour reset still ahead (the earliest such start among live readings, so a later
+   reading never frees places), or is the last five hours when no reset in the next
+   five hours is known. Billing probes do not count. The count and the decision are
+   taken under the ledger's write lock, on the ledger's clock read under that lock.
 
 The ledger evaluates admission itself, from its own records and its own environment,
 and stores the decision and the digests of the records it used with the run. No caller
@@ -135,7 +137,10 @@ Observations are written only by `provider-observe`, which runs the provider cli
 itself, and by the bridge. The bridge's rate-limit event recorder accepts events only
 while a Claude run is open, stamps them with the ledger's clock, and keeps each one that
 is more restrictive than the run's earlier events, so a rejection late in a run blocks
-the next admission until it resets. The bridge's own observations carry the run and a
+the next admission until it resets. Only an earlier event at least as restrictive in
+status can cover a window. At 64 records the run's restriction is merged into one
+record (the highest status with the latest reset), the run is stopped, and later
+events are refused. A failed event is recorded as unavailable. The bridge's own observations carry the run and a
 phase (`before` or `after` launch; in-run events are `during`), a reading that fails is
 stored as `observation_unavailable`, and the run's client-observed usage is stored as
 `provider_usage`. Provider clients are found only

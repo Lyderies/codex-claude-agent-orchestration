@@ -1190,23 +1190,148 @@ class AdmissionTests(unittest.TestCase):
         run = self.open_run("claude")
         quiet = {"isUsingOverage": False, "overageStatus": "rejected",
                  "overageDisabledReason": "org_level_disabled"}
-        recorded = 0
+        first_reset = (self.clock + 3_600_000) // 1000
+        later_reset = (self.clock + 7_200_000) // 1000
+        recorded = len(self.event(run, status="rejected", rateLimitType="five_hour",
+                                  utilization=1.0, resetsAt=first_reset, **quiet))
+        # Allowed readings that run longer than the rejection keep arriving
+        # until the run reaches the cap.
         with self.assertRaisesRegex(ContractError, "too many rate-limit events"):
             for step in range(200):
                 recorded += len(self.event(
                     run, status="allowed", rateLimitType="five_hour",
-                    utilization=step / 1000, **quiet,
+                    utilization=step / 1000, resetsAt=later_reset, **quiet,
                 ))
-        self.assertEqual(64, recorded)
-        # Past the cap a rejection still escalates, so it is kept, not lost.
-        later = (self.clock + 3_600_000) // 1000
-        kept = self.event(run, status="rejected", rateLimitType="five_hour",
-                          utilization=1.0, resetsAt=later, **quiet)
-        self.assertEqual(["provider_headroom"], [item["record_type"] for item in kept])
-        self.assert_denied("provider_exhausted", "claude")
+        with self.ledger.repository(self.project_id) as repository:
+            stored = [
+                record for kind in ("provider_headroom", "provider_billing")
+                for record in repository.records(kind) if record["phase"] == "during"
+            ]
+            merged = [record for record in repository.records("provider_headroom")
+                      if record["phase"] == "during"][-1]
+        self.assertEqual(63, recorded)
+        self.assertEqual(64, len(stored))
+        # At the cap the run's whole restriction is merged: the highest status
+        # with the latest reset.
+        self.assertEqual(
+            ("rejected", 100.0, later_reset * 1000),
+            (merged["status"], merged["windows"][0]["used_percent"],
+             merged["windows"][0]["resets_at"]),
+        )
+        # The run is fenced: later events are refused and nothing is stored.
         with self.assertRaisesRegex(ContractError, "too many rate-limit events"):
             self.event(run, status="rejected", rateLimitType="five_hour",
-                       utilization=1.0, resetsAt=later + 60, **quiet)
+                       utilization=1.0, resetsAt=later_reset + 60, **quiet)
+        with self.ledger.repository(self.project_id) as repository:
+            self.assertEqual(64, len([
+                record for kind in ("provider_headroom", "provider_billing")
+                for record in repository.records(kind) if record["phase"] == "during"
+            ]))
+        # After the earlier reset the merged restriction still applies...
+        after_first = first_reset * 1000 + 1
+        self.observe("claude", now_ms=after_first)
+        self.assert_denied("provider_exhausted", "claude", now_ms=after_first + 1)
+        # ...and it lifts at the later reset.
+        after_later = later_reset * 1000 + 1
+        self.observe("claude", now_ms=after_later)
+        self.assertEqual("pass", self.admit("claude", now_ms=after_later + 1)["decision"])
+
+    def test_a_rejection_is_not_covered_by_a_longer_allowed_reading(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        quiet = {"isUsingOverage": False, "overageStatus": "rejected",
+                 "overageDisabledReason": "org_level_disabled"}
+        first_reset = (self.clock + 3_600_000) // 1000
+        later_reset = (self.clock + 7_200_000) // 1000
+        self.event(run, status="rejected", rateLimitType="five_hour", utilization=1.0,
+                   resetsAt=first_reset, **quiet)
+        self.event(run, status="allowed", rateLimitType="five_hour", utilization=0.5,
+                   resetsAt=later_reset, **quiet)
+        kept = self.event(run, status="rejected", rateLimitType="five_hour",
+                          utilization=1.0, resetsAt=later_reset, **quiet)
+        self.assertEqual(["provider_headroom"], [item["record_type"] for item in kept])
+        after_first = first_reset * 1000 + 1
+        self.observe("claude", now_ms=after_first)
+        self.assert_denied("provider_exhausted", "claude", now_ms=after_first + 1)
+
+    def test_a_later_reset_reading_cannot_free_counted_admissions(self) -> None:
+        self.limit("codex", max_admissions_per_window=1)
+        first = {"rateLimits.secondary.resetsAt": (self.clock + 3_600_000) // 1000}
+        identity = self.observe(**first)[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.open_run()
+        # A later reading reports a reset five hours away, which alone would
+        # start the window now; the earlier window is still live, so it counts.
+        self.observe(**{"rateLimits.secondary.resetsAt": (self.clock + 5 * 3_600_000) // 1000})
+        self.assert_denied("window_run_cap_reached")
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open_run()
+        self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+        headroom = [
+            ({"provider": "codex", "account_fingerprint": DIGEST_A, "observed_at_ms": NOW,
+              "windows": [{"window_minutes": 300, "scope": None, "used_percent": 1.0,
+                           "resets_at": reset}]}, digest)
+            for reset, digest in ((NOW + 3_600_000, DIGEST_B), (NOW + 5 * 3_600_000, DIGEST_C))
+        ]
+        self.assertEqual(
+            (NOW + 3_600_000 - 5 * 3_600_000, DIGEST_B),
+            window_start_ms("codex", DIGEST_A, headroom, NOW),
+        )
+        # Once the earlier window resets, the later reading places the window.
+        self.assertEqual(
+            (NOW, DIGEST_C), window_start_ms("codex", DIGEST_A, headroom, NOW + 3_600_000 + 1)
+        )
+
+    def test_the_run_cap_counts_the_account_across_projects(self) -> None:
+        self.limit("codex", max_admissions_per_window=1)
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.open_run()
+        other_root = Path(self.temporary.name) / "other-project"
+        other_root.mkdir()
+        first_project = self.project_id
+        self.project_id = self.ledger.register_project(other_root, now_ms=1)
+        try:
+            other = self.observe()[0]
+            self.assertEqual(identity["account_fingerprint"], other["account_fingerprint"])
+            self.attest("codex", other["account_fingerprint"])
+            with self.assertRaises(AdmissionDenied) as raised:
+                self.open_run()
+            self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+        finally:
+            self.project_id = first_project
+
+    def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        orchestration = self.ledger.open_orchestration(
+            self.project_id, client_version="codex-host-v1", now_ms=NOW
+        )
+        fresh = self.clock + 1
+        # The opener passes its first check, then waits for the lock past the
+        # point where the identity is too old to admit.
+        stale = identity["observed_at_ms"] + IDENTITY_MAX_AGE_MS + 1
+        times = iter([fresh, stale])
+        with mock.patch.object(self.ledger, "_clock_ms", side_effect=lambda: next(times)), \
+                self.assertRaises(AdmissionDenied) as raised:
+            self._open_run("codex", orchestration, fresh)
+        self.assertEqual("provider_identity_missing", raised.exception.reason_code)
+        with self.ledger.repository(self.project_id) as repository:
+            stored = repository.records("admission_decision")[-1]
+        self.assertEqual(
+            ("provider_identity_missing", stale), (stored["reason_code"], stored["observed_at_ms"])
+        )
+        # A pass is stamped with the time the lock was held, too.
+        self.observe()
+        later = self.clock + 5
+        times = iter([self.clock + 1, later])
+        with mock.patch.object(self.ledger, "_clock_ms", side_effect=lambda: next(times)):
+            opened = self._open_run("codex", orchestration, self.clock + 1)
+        self.assertEqual(
+            later,
+            self.ledger.host_run_admission(self.project_id, opened["run_handle"])["observed_at_ms"],
+        )
 
     def test_database_never_stores_raw_identity_values(self) -> None:
         for provider in ("codex", "claude"):

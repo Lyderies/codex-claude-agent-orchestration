@@ -1106,8 +1106,11 @@ def _more_restrictive(record: dict[str, Any], prior: list[dict[str, Any]]) -> bo
     """Whether a run's new rate-limit record restricts more than its earlier ones.
 
     Billing is ranked usable over unknown over unusable, and only a higher rank
-    is kept, because admission reads the latest billing record. Headroom is kept
-    for a higher status, or for any window that no earlier window covers.
+    is kept, because admission reads the latest billing record. A headroom
+    record is kept for a higher status, or for any window that no earlier
+    record covers. Only an earlier record at least as restrictive in status can
+    cover a window, so a rejection is never hidden behind an allowed reading
+    that happened to last longer.
     """
 
     if not prior:
@@ -1116,37 +1119,47 @@ def _more_restrictive(record: dict[str, Any], prior: list[dict[str, Any]]) -> bo
         return BILLING_RANK[record["paid_usage_usable"]] > max(
             BILLING_RANK[item["paid_usage_usable"]] for item in prior
         )
-    if CLAUDE_STATUS_RANK[record["status"]] > max(
-        CLAUDE_STATUS_RANK[item["status"]] for item in prior
-    ):
+    status = CLAUDE_STATUS_RANK[record["status"]]
+    covering = [item for item in prior if CLAUDE_STATUS_RANK[item["status"]] >= status]
+    if not covering:
         return True
-    earlier = [window for item in prior for window in item["windows"]]
+    earlier = [window for item in covering for window in item["windows"]]
     return any(
         not any(_window_covered(window, other) for other in earlier)
         for window in record["windows"]
     )
 
 
-def _escalates(record: dict[str, Any], prior: list[dict[str, Any]], now_ms: int) -> bool:
-    """Whether a record raises the run's status, admission rating or billing rank."""
+def _merged_restriction(
+    records: list[dict[str, Any]], *, observed_at_ms: int
+) -> dict[str, Any]:
+    """One headroom record as restrictive as all of a run's: the highest status,
+    and per window the highest use and the latest reset."""
 
-    from .providers import _headroom_state
+    from .providers import headroom_record
 
-    if not prior:
-        return True
-    if record["record_type"] == "provider_billing":
-        return _more_restrictive(record, prior)
-    ratings = {None: 0, "ample": 0, "constrained": 1, "exhausted": 2}
-
-    def rank(item: dict[str, Any]) -> tuple[int, int]:
-        return (
-            CLAUDE_STATUS_RANK[item["status"]],
-            ratings[_headroom_state("claude", item, now_ms)],
-        )
-
-    statuses, rated = zip(*(rank(item) for item in prior))
-    new_status, new_rating = rank(record)
-    return new_status > max(statuses) or new_rating > max(rated)
+    status = max((item["status"] for item in records), key=CLAUDE_STATUS_RANK.__getitem__)
+    windows: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for item in records:
+        for window in item["windows"]:
+            key = (window["scope"], window["window_minutes"])
+            merged = windows.setdefault(key, dict(window))
+            used = [value for value in (merged["used_percent"], window["used_percent"])
+                    if value is not None]
+            resets = [value for value in (merged["resets_at"], window["resets_at"])
+                      if value is not None]
+            merged["used_percent"] = max(used) if used else None
+            merged["resets_at"] = max(resets) if resets else None
+    last = records[-1]
+    return headroom_record(
+        provider=last["provider"],
+        account_fingerprint=last["account_fingerprint"],
+        windows=[windows[key] for key in sorted(windows, key=repr)],
+        status=status,
+        run_id=last["run_id"],
+        phase=last["phase"],
+        observed_at_ms=observed_at_ms,
+    )
 
 
 class _RecheckDenied(Exception):
@@ -2119,10 +2132,10 @@ class LearningLedger:
                 ),
             ).rowcount == 1
         if new_run:
-            self._admit_session_run(project_id, root_run_id, timestamp=self._clock_ms())
+            self._admit_session_run(project_id, root_run_id)
         return project_id, session_digest, root_run_id
 
-    def _admit_session_run(self, project_id: str, run_id: str, *, timestamp: int) -> None:
+    def _admit_session_run(self, project_id: str, run_id: str) -> None:
         """Decide admission once for a collector-bound Codex session run.
 
         These sessions never pass through open_host_run, so their admission is
@@ -2131,6 +2144,8 @@ class LearningLedger:
         """
 
         with self._lock, self._connection:
+            # The ledger's clock is read under the lock that orders decisions.
+            timestamp = self._clock_ms()
             decision = self._evaluate_admission_locked(
                 project_id, provider="codex", environ=os.environ, timestamp=timestamp
             )
@@ -3491,7 +3506,10 @@ class LearningLedger:
                     raise LedgerError("pending host run capacity is exhausted")
                 # Re-check under the write lock before anything is written, so two
                 # opens cannot both use the same Claude bootstrap, take the last
-                # place under the run cap, or race past newer evidence.
+                # place under the run cap, or race past newer evidence. The
+                # clock is read again here, so an opener that waited for the
+                # lock is judged, and its decision stamped, at the time it holds it.
+                admitted_at = self._clock_ms()
                 admission = self._evaluate_admission_locked(
                     project_id, provider=provider, environ=os.environ, timestamp=admitted_at
                 )
@@ -3573,7 +3591,8 @@ class LearningLedger:
             # The denial is stored like any other, after the open is abandoned.
             with self._lock, self._connection:
                 self._store_admission_locked(
-                    project_id, denied.decision, run_id=None, timestamp=admitted_at
+                    project_id, denied.decision, run_id=None,
+                    timestamp=denied.decision["observed_at_ms"],
                 )
             self.state.harden_database_files()
             raise AdmissionDenied(denied.decision["reason_code"]) from None
@@ -3861,8 +3880,9 @@ class LearningLedger:
             project_id, "claude", project_root=project_root, environ=environ
         )[0]
         fingerprint = identity["account_fingerprint"]
-        timestamp = self._clock_ms()
         with self._lock, self._connection:
+            # Read under the lock that orders admission decisions.
+            timestamp = self._clock_ms()
             billing = [
                 record for record, _ in self._provider_records_locked(
                     project_id, "provider_billing", "claude"
@@ -3966,6 +3986,10 @@ class LearningLedger:
                     (project_id, run_id),
                 ).fetchall()
             ]
+            if len(prior) >= MAX_RUN_RATE_LIMIT_RECORDS:
+                # The run is fenced: its restriction was merged when it reached
+                # the cap, and the bridge stopped it.
+                raise ContractError("host run recorded too many rate-limit events")
             records = claude_rate_limit_records(
                 rate_limit_info,
                 account_fingerprint=decision["account_fingerprint"],
@@ -3983,20 +4007,23 @@ class LearningLedger:
                     item for item in prior if item["record_type"] == record["record_type"]
                 ])
             ]
-            overflow = len(prior) + len(kept) > MAX_RUN_RATE_LIMIT_RECORDS
+            overflow = bool(kept) and len(prior) + len(kept) >= MAX_RUN_RATE_LIMIT_RECORDS
             if overflow:
-                # Past the cap only a rise in status, rating or billing rank is
-                # kept, which can happen a few times at most; the run is then
-                # stopped rather than lose a finer restriction silently.
-                escalations = [
-                    record for record in kept
-                    if _escalates(record, [
-                        item for item in prior
-                        if item["record_type"] == record["record_type"]
-                    ], timestamp)
+                # At the cap the run's whole restriction is merged into one
+                # record, the highest status with the latest reset, and the run
+                # is fenced: the bridge stops it and later events are refused.
+                headroom = [item for item in prior if item["record_type"] == "provider_headroom"]
+                new = [item for item in checked if item["record_type"] == "provider_headroom"]
+                try:
+                    merged = validate_learning_record(
+                        _merged_restriction([*headroom, *new], observed_at_ms=timestamp)
+                    )
+                except ContractError as exc:
+                    raise LedgerError("record admission rejected") from exc
+                kept = [
+                    merged,
+                    *(item for item in kept if item["record_type"] == "provider_billing"),
                 ]
-                overflow = len(escalations) != len(kept)
-                kept = escalations
             for record in kept:
                 self._append_checked_locked(
                     project_id, record, producer="provider", timestamp=timestamp
@@ -4062,26 +4089,28 @@ class LearningLedger:
         return minimum is not None and maximum is not None and minimum <= parsed < maximum
 
     def _prior_run_admissions_locked(
-        self, project_id: str, provider: str, timestamp: int
+        self, provider: str, timestamp: int
     ) -> list[tuple[str, int]]:
         """Passing run admissions for a provider since one window before `timestamp`.
 
-        Read under the writer lock with the decision that uses them, so two
-        opens cannot both take the last place under the cap. Probe admissions
-        are a separate record type and never count.
+        The cap belongs to the account, so admissions in every project of this
+        ledger count; fingerprints use the ledger-wide key and compare across
+        projects. Read under the writer lock with the decision that uses them,
+        so two opens cannot both take the last place under the cap. Probe
+        admissions are a separate record type and never count.
         """
 
         from .providers import FIVE_HOURS_MS
 
         rows = self._connection.execute(
             "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint'),"
-            "observed_at_ms FROM records WHERE project_id=? "
-            "AND record_type='admission_decision' AND source='lifecycle' "
+            "observed_at_ms FROM records WHERE "
+            "record_type='admission_decision' AND source='lifecycle' "
             "AND json_extract(CAST(content AS TEXT),'$.provider')=? "
             "AND json_extract(CAST(content AS TEXT),'$.decision')='pass' "
             "AND json_extract(CAST(content AS TEXT),'$.run_id') IS NOT NULL "
             "AND observed_at_ms>=?",
-            (project_id, provider, timestamp - FIVE_HOURS_MS),
+            (provider, timestamp - FIVE_HOURS_MS),
         ).fetchall()
         return [(str(row[0]), int(row[1])) for row in rows if row[0] is not None]
 
@@ -4097,9 +4126,7 @@ class LearningLedger:
             raise LedgerError("project binding is not active")
         return evaluate_admission(
             admission_policy=self._admission_settings(provider),
-            prior_run_admissions=self._prior_run_admissions_locked(
-                project_id, provider, timestamp
-            ),
+            prior_run_admissions=self._prior_run_admissions_locked(provider, timestamp),
             provider=provider,
             identities=self._provider_records_locked(
                 project_id, "provider_identity", provider

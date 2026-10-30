@@ -527,6 +527,29 @@ class ClaudeBridgeTests(BridgeTestCase):
                 self.project_id, run_handle=undispatched, provider="claude", usage={},
             )
 
+    def test_an_invalid_rate_limit_event_is_recorded_as_unavailable(self) -> None:
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [
+            init_frame(),
+            {**RATE_LIMIT, "rate_limit_info": {"status": "fixture-account-5c2e08"}},
+            {"sleep": 30}, result_frame(),
+        ])
+        output = self.dispatch(route, assigned, handle)
+        report = output["bridge_report"]
+        self.assertEqual("rate_limit_event_invalid", report["outcome"])
+        self.assertTrue(report["rate_limit_record_failed"])
+        self.assertLess(report["wall_seconds"], 20)
+        with self.ledger.repository(self.project_id) as repository:
+            run_id = repository.records("dispatch_intent")[-1]["run_id"]
+            unavailable = [
+                (item["phase"], item["reason_code"])
+                for item in repository.records("observation_unavailable")
+                if item["run_id"] == run_id
+            ]
+        self.assertEqual(
+            [("during", "observation_failed"), ("after", "usage_unavailable")], unavailable
+        )
+
     def test_a_run_without_readings_records_them_as_unavailable(self) -> None:
         route, assigned, handle = self.claude_run()
         self.frames("claude", [init_frame()])

@@ -590,7 +590,7 @@ def run_claude(
     ]
     state: dict[str, Any] = {
         "init": None, "result": None, "rate_limit_events": 0, "rate_limit_kept": 0,
-        "frames": 0,
+        "rate_limit_failed": False, "frames": 0,
         "models": set(),
         "helper_models": set(),
     }
@@ -617,6 +617,13 @@ def run_claude(
                     rate_limit_info=frame.get("rate_limit_info"),
                 )
             except (ContractError, LedgerError) as exc:
+                # The reading is lost, so say so in the ledger before stopping.
+                state["rate_limit_failed"] = True
+                with contextlib.suppress(ContractError, LedgerError):
+                    ledger.record_observation_unavailable(
+                        project_id, run_handle=run_handle, provider="claude",
+                        phase="during", reason_code="observation_failed",
+                    )
                 raise _Abort("rate_limit_event_invalid") from exc
             state["rate_limit_kept"] += len(kept)
         elif kind == "result":
@@ -659,6 +666,7 @@ def run_claude(
         "rate_limit_event_recorded": state["rate_limit_kept"] > 0,
         "rate_limit_events": state["rate_limit_events"],
         "rate_limit_records_kept": state["rate_limit_kept"],
+        "rate_limit_record_failed": state["rate_limit_failed"],
         "usage": None,
         "permission_denials": None,
     }
@@ -1016,7 +1024,11 @@ def dispatch(
                 deadline_seconds=deadline_seconds, max_turns=max_turns,
                 executable=executable,
             )
-            if report["rate_limit_events"] == 0:
+            if report["rate_limit_record_failed"]:
+                report.setdefault("observations_unavailable", []).append(
+                    {"phase": "during", "reason_code": "observation_failed"}
+                )
+            elif report["rate_limit_events"] == 0:
                 # Without an event the run left no headroom or billing reading.
                 _record_unavailable(
                     ledger, project_id, run_handle, provider, "during",

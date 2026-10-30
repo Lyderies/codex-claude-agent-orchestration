@@ -684,6 +684,25 @@ def claude_rate_limit_records(
     ]
 
 
+def headroom_record(
+    *,
+    provider: str,
+    account_fingerprint: str,
+    windows: list[dict[str, Any]],
+    status: str | None,
+    run_id: str | None,
+    phase: str | None,
+    observed_at_ms: int,
+) -> dict[str, Any]:
+    """A validated headroom record built by the ledger from its own records."""
+
+    return validate_provider_headroom(_record("provider_headroom", {
+        "provider": provider, "account_fingerprint": account_fingerprint,
+        "windows": windows, "status": status, "run_id": run_id, "phase": phase,
+        "observed_at_ms": observed_at_ms,
+    }))
+
+
 def record_claude_rate_limit_event(
     ledger: Any,
     project_id: str,
@@ -791,33 +810,26 @@ def window_start_ms(
 ) -> tuple[int, str | None]:
     """Where the current five-hour usage window began, and the record that says so.
 
-    The latest headroom record with a five-hour reset time places the window:
-    it began five hours before that reset. A reset already past, or further
-    away than one window, is not trusted; then the window is the last five
-    hours.
+    A recorded five-hour reset still ahead, and no more than one window away,
+    places a window that began five hours before it. The earliest such start
+    among every observation still live is used, so a later reading can never
+    move the start forward and free places while an earlier window has not
+    reset. With no such reset known, the window is the last five hours.
     """
 
-    timed = [
-        (record, digest) for record, digest in headroom
+    starts = [
+        (window["resets_at"] - FIVE_HOURS_MS, digest)
+        for record, digest in headroom
         if record["provider"] == provider
         and record["account_fingerprint"] == fingerprint
         and record["observed_at_ms"] <= now_ms
-        and any(
-            window["window_minutes"] == FIVE_HOUR_WINDOW_MINUTES
-            and window["resets_at"] is not None
-            for window in record["windows"]
-        )
+        for window in record["windows"]
+        if window["window_minutes"] == FIVE_HOUR_WINDOW_MINUTES
+        and window["resets_at"] is not None
+        and now_ms < window["resets_at"] <= now_ms + FIVE_HOURS_MS
     ]
-    latest = _latest(timed)
-    if latest is not None:
-        record, digest = latest
-        resets = max(
-            window["resets_at"] for window in record["windows"]
-            if window["window_minutes"] == FIVE_HOUR_WINDOW_MINUTES
-            and window["resets_at"] is not None
-        )
-        if now_ms < resets <= now_ms + FIVE_HOURS_MS:
-            return resets - FIVE_HOURS_MS, digest
+    if starts:
+        return min(starts, key=lambda item: item[0])
     return now_ms - FIVE_HOURS_MS + 1, None
 
 
