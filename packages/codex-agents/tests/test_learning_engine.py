@@ -1838,7 +1838,7 @@ class OutcomeAndCaseTests(unittest.TestCase):
     def test_analysis_reports_latency_delegation_no_progress_and_version_confounding(self) -> None:
         first = outcome()
         second = outcome(record_id="out_2")
-        second["effort"] = "high"
+        second["effort"] = "low"
         configuration = {
             key: second[key]
             for key in (
