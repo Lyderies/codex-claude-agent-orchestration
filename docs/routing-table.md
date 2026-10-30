@@ -54,8 +54,9 @@ These rows are cheap to test and could change soonest:
 3. **Routine planning:** GPT-6.1 Sol (high) against Opus 5.5 (medium), judged by the reviewer from
    the other vendor.
 4. **Documentation:** GPT-6.1 Sol (medium) against Sonnet 5.5 (high).
-5. **Claude session size:** read the Claude Code usage meter before and after each run. This
-   replaces the provisional Claude percentages.
+5. **Claude session size:** read Claude's five-hour window utilization from the rate-limit event
+   before and after each run. It has 1% granularity, so batch small runs. This replaces the
+   provisional Claude percentages.
 6. **Authority-sensitive implementation:** Opus 5.5 at medium against high effort on comparable
    changes. Medium has needed one or two review rounds per slice so far; the question is whether
    high effort cuts review rounds enough to pay for itself.
@@ -82,3 +83,4 @@ These rows are cheap to test and could change soonest:
 |---|---|---|---|
 | 2026-10-31 | All | Initial table, rebalanced towards Codex where quality is tied or unproven | Both research reports; owner review |
 | 2026-10-31 | Single scoped coding | Joint first choice becomes ordered: GPT-6.1 Sol (medium) first, Sonnet 5.5 (medium) second, until G4 adds headroom tie-breaking and paired evidence | G2 design review: headroom must not change a recorded route, so G2 routes by fixed order |
+| 2026-10-31 | First paired tests | Test 5 reads Claude's window utilization from the rate-limit event instead of the usage meter. No row changes | A live billing probe showed the event carries five-hour and seven-day utilization |
