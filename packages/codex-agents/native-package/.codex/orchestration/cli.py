@@ -16,6 +16,7 @@ BUNDLE_ROOT = ORCHESTRATION_ROOT.parent.parent
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
 from codex_agents.bridge import BridgeRefused  # noqa: E402
+from codex_agents.bridge import signal_guard as bridge_signal_guard  # noqa: E402
 from codex_agents.bridge import dispatch as dispatch_bridge  # noqa: E402
 from codex_agents.catalog import CatalogError, discover, load_discovery_policy  # noqa: E402
 from codex_agents.contracts import (  # noqa: E402
@@ -1368,23 +1369,26 @@ def main() -> int:
                 raise ContractError("route must be an object")
             ledger, project_id = _learning_ledger(args)
             try:
-                report = {
-                    "ready": True,
-                    **dispatch_bridge(
-                        ledger,
-                        project_id,
-                        project_root=args.project_root.resolve(),
-                        bundle_root=BUNDLE_ROOT,
-                        task=task,
-                        route=route,
-                        assignment=_json_input(args.assignment),
-                        parent_grant=_json_input(args.parent_grant),
-                        run_handle=args.run_handle,
-                        result_schema=(
-                            ORCHESTRATION_ROOT / "schemas" / "result.schema.json"
-                        ).read_bytes(),
-                    ),
-                }
+                # A termination signal kills the child's process group before
+                # this process exits, and the export is still removed.
+                with bridge_signal_guard():
+                    report = {
+                        "ready": True,
+                        **dispatch_bridge(
+                            ledger,
+                            project_id,
+                            project_root=args.project_root.resolve(),
+                            bundle_root=BUNDLE_ROOT,
+                            task=task,
+                            route=route,
+                            assignment=_json_input(args.assignment),
+                            parent_grant=_json_input(args.parent_grant),
+                            run_handle=args.run_handle,
+                            result_schema=(
+                                ORCHESTRATION_ROOT / "schemas" / "result.schema.json"
+                            ).read_bytes(),
+                        ),
+                    }
             finally:
                 _close_ledger(ledger)
         elif args.command == "provider-observe":

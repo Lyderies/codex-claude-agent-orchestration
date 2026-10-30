@@ -112,20 +112,34 @@ provider API key, and a run handle that was already dispatched.
 
 - The child never runs in the repository. The committed `HEAD` bytes of the
   assignment's `context` and `owned_paths` are exported into a private directory under
-  the state root, which is removed afterwards. Symlinks, submodules, missing paths,
-  traversal, absolute paths and oversize exports refuse the dispatch.
+  the resolved system temp directory, which is removed afterwards. Paths must be plain
+  literals: pathspec magic (a leading `:`, or any of `*?[\`) refuses, git runs with
+  literal pathspecs, and a listed path outside the request refuses. Symlinks,
+  submodules, missing paths, traversal, absolute paths and oversize exports refuse.
+- `CLAUDE.md`, `CLAUDE.local.md`, `.claude/` and `.mcp.json` are never exported: naming
+  one refuses, and directory exports drop them. A Claude child is refused with
+  `context_boundary_violation` if any directory from its workspace up to `/` holds
+  `CLAUDE.md`, `CLAUDE.local.md` or `.claude`; there is no exception for `~/.claude`,
+  which is why exports live outside home. Enterprise managed settings refuse a Claude
+  launch with `managed_settings_present`, because they apply despite
+  `--setting-sources project` and the init frame cannot show them.
 - The account is observed again immediately before launch and must match the admitted
   fingerprint. A durable `dispatch_intent` is then written, and the bridge run ID is
   bound as the run's agent; there is no second launch for that run.
-- The child runs in its own session with the route's `timeout_seconds` as a hard
-  deadline. Its process group is killed on timeout, on a contract violation and after
-  it exits. Any outcome the bridge cannot prove (timeout, crash, a broken stream or no
+- The child runs in its own session. The tighter of the route's and the assignment's
+  `timeout_seconds` is a hard deadline, and the tighter `max_tool_calls` sets Claude's
+  `--max-turns`. Its process group is killed on timeout, on a contract violation, on
+  an over-long line and after it exits. `dispatch` kills it on SIGTERM, SIGINT or
+  SIGHUP, and a detached watchdog kills it at the deadline even if the bridge itself
+  is killed. Any outcome the bridge cannot prove (timeout, crash, a broken stream or no
   parseable result) returns a failed or timed-out result, never success.
 - Claude children run with only Read, Glob and Grep, `dontAsk` permissions, generated
   settings with hooks and built-in plugins off and the model pinned, no MCP servers and
   no session persistence. The run fails closed unless the init frame reports no API
   key, the requested model, no plugins, no MCP servers and only those tools. The first
-  `rate_limit_event` is recorded for the run. `read_containment` is `enforced`.
+  `rate_limit_event` is recorded for the run. Any model other than the requested one
+  in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
+  unreviewed with an unknown verdict. `read_containment` is `enforced`.
 - Codex children run `codex exec` read-only and ephemeral, between non-spending
   observations taken before and after. Codex structured output needs every key
   required, so the bridge derives a strict variant of the installed result schema

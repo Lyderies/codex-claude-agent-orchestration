@@ -8,6 +8,7 @@ counts and typed codes; prompts and file contents never reach the ledger.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -42,6 +44,26 @@ CLAUDE_DISABLED_PLUGINS = (
     "cc-plugin-easel@builtin",
 )
 CODEX_REROUTE_EVENTS = {"model/rerouted", "model_rerouted", "model.rerouted"}
+# Claude Code reads these from its working directory and the directories above
+# it, so they are never exported and must not exist above the export.
+CLAUDE_CONTEXT_NAMES = {"claude.md", "claude.local.md", ".claude", ".mcp.json"}
+# Enterprise managed settings apply even with --setting-sources project and are
+# not visible in the init frame, so their presence refuses a Claude launch.
+MANAGED_SETTINGS_PATHS = {
+    "darwin": (
+        "/Library/Application Support/ClaudeCode/managed-settings.json",
+        "/Library/Application Support/ClaudeCode/managed-settings.d",
+    ),
+    "linux": (
+        "/etc/claude-code/managed-settings.json",
+        "/etc/claude-code/managed-settings.d",
+    ),
+}
+# Exports live under the resolved system temp directory, not under home, so no
+# user-level CLAUDE.md or .claude directory sits above them. None means that.
+WORKSPACE_PARENT: str | None = None
+WATCHDOG_GRACE_SECONDS = 2
+PATHSPEC_SPECIAL = set("*?[\\")
 
 
 class BridgeRefused(ContractError):
@@ -61,15 +83,25 @@ def assignment_read_paths(assignment: dict[str, Any]) -> list[str]:
 
     paths: set[str] = set()
     for value in (*assignment.get("context", []), *assignment.get("owned_paths", [])):
-        if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        if not isinstance(value, str) or not value or "\x00" in value:
             raise BridgeRefused("assignment read path is invalid")
+        # Git pathspec magic (":", globs) could widen the export to the whole
+        # repository, so only plain literal paths are accepted.
+        if value.startswith(":") or set(value) & PATHSPEC_SPECIAL:
+            raise BridgeRefused("assignment read path must be a plain literal path")
         path = PurePosixPath(value)
         if path.is_absolute() or any(part in {"", ".", "..", ".git"} for part in path.parts):
             raise BridgeRefused("assignment read path must stay inside the repository")
+        if _claude_context_path(path.as_posix()):
+            raise BridgeRefused("assignment read path names Claude context files")
         paths.add(path.as_posix())
     if not paths:
         raise BridgeRefused("assignment names no read paths to export")
     return sorted(paths)
+
+
+def _claude_context_path(relative: str) -> bool:
+    return any(part.lower() in CLAUDE_CONTEXT_NAMES for part in PurePosixPath(relative).parts)
 
 
 def _git(root: Path, *arguments: str, text: bool = False) -> subprocess.CompletedProcess:
@@ -78,8 +110,11 @@ def _git(root: Path, *arguments: str, text: bool = False) -> subprocess.Complete
         raise BridgeRefused("git is unavailable")
     try:
         return subprocess.run(
-            [executable, "-C", str(root), *arguments],
-            env={"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+            [executable, "--literal-pathspecs", "-C", str(root), *arguments],
+            env={
+                "PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                "GIT_LITERAL_PATHSPECS": "1",
+            },
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -101,7 +136,8 @@ def export_committed_paths(
 ) -> int:
     """Copy the committed bytes of each path from HEAD; return the file count.
 
-    Only regular blobs are exported. A symlink, submodule, missing path or an
+    Only regular blobs are exported, and Claude context files are dropped. A
+    symlink, submodule, missing path, a listing outside the request, or an
     export over the caps refuses the whole dispatch.
     """
 
@@ -124,6 +160,11 @@ def export_committed_paths(
                 relative = name.decode("utf-8", "strict")
             except ValueError as exc:
                 raise BridgeRefused("assignment read path is not exportable") from exc
+            # Every listed file must be the requested file or sit beneath it.
+            if relative != requested and not relative.startswith(requested + "/"):
+                raise BridgeRefused("git listed a path outside the requested paths")
+            if _claude_context_path(relative):
+                continue
             if mode == "120000":
                 raise BridgeRefused("assignment read paths must not contain symlinks")
             if kind != "blob" or mode not in {"100644", "100755"}:
@@ -150,6 +191,73 @@ def export_committed_paths(
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(blob.stdout)
     return len(entries)
+
+
+_ACTIVE_GROUPS: set[int] = set()
+# A detached watchdog enforces the deadline even if the bridge is SIGKILLed: it
+# polls the child's process group, kills it at the deadline, and exits as soon
+# as the group is gone.
+WATCHDOG_SOURCE = """
+import os, signal, sys, time
+group, deadline = int(sys.argv[1]), float(sys.argv[2])
+while True:
+    try:
+        os.killpg(group, 0)
+    except OSError:
+        sys.exit(0)
+    if time.time() >= deadline:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError:
+            pass
+        sys.exit(0)
+    time.sleep(0.2)
+"""
+
+
+def _start_watchdog(group: int, deadline_epoch: float) -> None:
+    try:
+        subprocess.Popen(
+            [sys.executable, "-I", "-c", WATCHDOG_SOURCE, str(group), repr(deadline_epoch)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env={"PATH": os.defpath},
+        )
+    except OSError as exc:
+        # Without the watchdog the deadline would rest on this process alone.
+        os.killpg(group, signal.SIGKILL)
+        raise _Abort("watchdog_unavailable") from exc
+
+
+class BridgeInterrupted(SystemExit):
+    """The bridge received a termination signal; children are already killed."""
+
+
+@contextlib.contextmanager
+def signal_guard():
+    """Kill every running child group on SIGTERM, SIGINT or SIGHUP, then exit.
+
+    Raising out of the wait lets each dispatch's own cleanup remove its export.
+    """
+
+    def handler(signum: int, _frame: Any) -> None:
+        for group in list(_ACTIVE_GROUPS):
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except OSError:
+                pass
+        raise BridgeInterrupted(128 + signum)
+
+    signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    previous = {signum: signal.signal(signum, handler) for signum in signals}
+    try:
+        yield
+    finally:
+        for signum, value in previous.items():
+            signal.signal(signum, value)
 
 
 def _stop_group(process: Any) -> None:
@@ -191,10 +299,14 @@ def run_child(
         )
     except OSError:
         return {"returncode": None, "abort": "launch_failed"}
+    _ACTIVE_GROUPS.add(process.pid)
     deadline = time.monotonic() + deadline_seconds
     buffer = b""
     received = 0
     try:
+        _start_watchdog(
+            process.pid, time.time() + deadline_seconds + WATCHDOG_GRACE_SECONDS
+        )
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
@@ -210,11 +322,15 @@ def run_child(
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
+                    if len(line) > MAX_LINE_BYTES:
+                        raise _Abort("stream_too_large")
                     if not line.strip():
                         continue
                     _deliver(line, on_frame)
                 if len(buffer) > MAX_LINE_BYTES:
                     raise _Abort("stream_too_large")
+            if len(buffer) > MAX_LINE_BYTES:
+                raise _Abort("stream_too_large")
             if buffer.strip():
                 _deliver(buffer, on_frame)
         try:
@@ -227,6 +343,7 @@ def run_child(
         outcome["abort"] = abort.reason
     finally:
         _stop_group(process)
+        _ACTIVE_GROUPS.discard(process.pid)
         process.stdout.close()
     return outcome
 
@@ -398,6 +515,7 @@ def run_claude(
     control: Path,
     environ: Mapping[str, str],
     deadline_seconds: float,
+    max_turns: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     model = route["model"]
     executable, _ = resolve_client("claude")
@@ -405,7 +523,6 @@ def run_claude(
         control / "settings.json", json.dumps(claude_settings(model)).encode()
     )
     system_prompt = _private_file(control / "role-prompt.md", role_prompt.encode())
-    max_turns = max(1, int(route["bounds"]["max_tool_calls"]))
     arguments = [
         executable, "-p",
         "--model", model,
@@ -424,6 +541,7 @@ def run_claude(
     ]
     state: dict[str, Any] = {
         "init": None, "result": None, "rate_limit_recorded": False, "frames": 0,
+        "models": set(),
     }
 
     def on_frame(frame: dict[str, Any]) -> None:
@@ -449,6 +567,14 @@ def run_claude(
                 raise _Abort("rate_limit_event_invalid") from exc
         elif kind == "result":
             state["result"] = frame
+            usage = frame.get("modelUsage")
+            if isinstance(usage, dict):
+                state["models"].update(str(name) for name in usage)
+        if kind == "assistant":
+            message = frame.get("message")
+            served = message.get("model") if isinstance(message, dict) else None
+            if served is not None:
+                state["models"].add(str(served))
 
     started = time.monotonic()
     outcome = run_child(
@@ -465,6 +591,9 @@ def run_claude(
         "effort": route["effort"],
         "wall_seconds": round(time.monotonic() - started, 3),
         "read_containment": "enforced",
+        # A fallback after a clean init serves another model; any model other
+        # than the requested one leaves the result unreviewed.
+        "rerouted": bool(state["models"] - {model}),
         "rate_limit_event_recorded": state["rate_limit_recorded"],
         "usage": None,
         "permission_denials": None,
@@ -604,6 +733,30 @@ def run_codex(
     return remove_optional_nulls(result, original_schema), {**report, "outcome": "result"}
 
 
+def managed_settings_paths() -> tuple[str, ...]:
+    platform = "darwin" if sys.platform == "darwin" else "linux"
+    return MANAGED_SETTINGS_PATHS[platform]
+
+
+def check_context_boundary(workspace: Path) -> None:
+    """Refuse when Claude would load context from a directory above the export.
+
+    The rule: no directory from the workspace up to `/` may hold CLAUDE.md,
+    CLAUDE.local.md or a .claude directory. There is no exception for the
+    user's own ~/.claude; exports live under the system temp directory, so a
+    workspace under home (an unusual TMPDIR) is refused rather than trusted.
+    """
+
+    current = workspace.resolve()
+    while True:
+        for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude"):
+            if os.path.lexists(current / name):
+                raise BridgeRefused("context_boundary_violation")
+        if current.parent == current:
+            return
+        current = current.parent
+
+
 def dispatch(
     ledger: Any,
     project_id: str,
@@ -652,13 +805,24 @@ def dispatch(
     role_prompt = ""
     if provider == "claude":
         role_prompt = _claude_role_prompt(bundle_root, route)
-    deadline_seconds = int(route["bounds"]["timeout_seconds"])
-    state_root = Path(ledger.state.root)
-    bridge_root = state_root / "bridge"
-    bridge_root.mkdir(mode=0o700, exist_ok=True)
-    workspace = Path(tempfile.mkdtemp(prefix="dispatch-", dir=bridge_root))
+    # The tighter of the route's and the assignment's bounds applies.
+    route_bounds, assigned_bounds = route["bounds"], assignment["bounds"]
+    deadline_seconds = max(1, min(
+        int(route_bounds["timeout_seconds"]), int(assigned_bounds["timeout_seconds"])
+    ))
+    max_turns = max(1, min(
+        int(route_bounds["max_tool_calls"]), int(assigned_bounds["max_tool_calls"])
+    ))
+    if provider == "claude":
+        managed = [path for path in managed_settings_paths() if os.path.lexists(path)]
+        if managed:
+            raise BridgeRefused("managed_settings_present")
+    parent = Path(os.path.realpath(WORKSPACE_PARENT or tempfile.gettempdir()))
+    workspace = Path(tempfile.mkdtemp(prefix="codex-agents-dispatch-", dir=parent))
     try:
         os.chmod(workspace, 0o700)
+        if provider == "claude":
+            check_context_boundary(workspace)
         export = workspace / "export"
         control = workspace / "control"
         export.mkdir(mode=0o700)
@@ -685,7 +849,7 @@ def dispatch(
                 ledger=ledger, project_id=project_id, run_handle=run_handle,
                 route=route, assignment=assignment, role_prompt=role_prompt,
                 export=export, control=control, environ=environ,
-                deadline_seconds=deadline_seconds,
+                deadline_seconds=deadline_seconds, max_turns=max_turns,
             )
         else:
             result, report = run_codex(
