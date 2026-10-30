@@ -33,3 +33,15 @@ for _name in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_SANDBOX"):
     os.environ.pop(_name, None)
 os.environ["CODEX_THREAD_ID"] = "tests-thread"
 os.environ["CODEX_SESSION_ID"] = "tests-session"
+
+# Claude-host opens deny metered backends and model overrides found in the
+# environment, so the tests never inherit those switches either.
+for _name in (
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_EFFORT_LEVEL",
+):
+    os.environ.pop(_name, None)
+for _name in [name for name in os.environ if name.startswith("CLAUDE_CODE_USE_")]:
+    os.environ.pop(_name, None)

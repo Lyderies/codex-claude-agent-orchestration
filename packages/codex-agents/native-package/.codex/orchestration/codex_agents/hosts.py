@@ -49,3 +49,9 @@ def resolve_host_client(environ: Mapping[str, str], explicit: str | None = None)
     if explicit is not None and explicit != detected:
         raise HostClientUnknown("host_client_unknown")
     return detected
+
+
+class HostClientMismatch(ContractError):
+    """The detected host is not the host that owns this orchestration or run."""
+
+    reason_code = "host_client_mismatch"

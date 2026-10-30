@@ -21,15 +21,18 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
 3. **Assign.** Write one bounded assignment with stable evidence IDs, then run
    `validate-assignment` and `result-preflight` with the task and parent grant. Give the
    child the returned template.
-4. **Observe and open.** Run `provider-observe --provider <route provider>`, then
+4. **Observe and open.** Run `provider-observe --provider <route provider>`; before a
+   native Claude child run `provider-observe --provider claude --billing-probe`
+   instead, because native children report no billing of their own. Then run
    `learning-open-host-run` with the task, route, assignment, parent grant and
-   orchestration handle. A denial returns a `reason_code`: report it to the owner, do
-   not retry around it.
+   orchestration handle. A denial returns a `reason_code`, for example
+   `claude_backend_not_subscription` or `claude_model_override_present`: report it to
+   the owner and do not retry around it. Every lifecycle step must run from the host
+   that opened the orchestration (`host_client_mismatch` otherwise).
 5. **Run the child.**
-   - `dispatch: native` (a Claude child): spawn with the Agent tool, using
-     `subagent_type` = the route's `agent_type`, `model` = the alias of the route's
-     model (`claude-opus-5-5` → `opus`, `claude-sonnet-5-5` → `sonnet`,
-     `claude-haiku-5-5` → `haiku`) and `effort` = the route's effort. Then run
+   - `dispatch: native` (a Claude child): spawn with the Agent tool using the open
+     result's `native_spawn` verbatim: `subagent_type`, `model` = `model_alias` and
+     `effort`. Never map or change these yourself. Then run
      `learning-bind-host-agent --run-handle <handle> --agent-id <returned agent ID>`.
      Native children run with this session's permissions, so their reads are
      `read_containment: advisory`; state that in any report.

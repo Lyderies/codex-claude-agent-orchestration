@@ -210,6 +210,24 @@ class InstallerTests(unittest.TestCase):
                 installer.install(target, apply=True, **self.project_inputs(directory))
             self.assertIn("Project owned", existing.read_text())
 
+    def test_identical_unmanaged_files_are_not_claimed(self) -> None:
+        for relative in (
+            ".claude/skills/agent-orchestration/SKILL.md",
+            ".agents/skills/plan-change/SKILL.md",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                target = self.target(directory)
+                existing = target / relative
+                existing.parent.mkdir(parents=True, exist_ok=True)
+                existing.write_bytes((installer.BUNDLE_ROOT / relative).read_bytes())
+                with self.assertRaisesRegex(
+                    installer.InstallError, f"existing unmanaged file: {relative}"
+                ):
+                    installer.install(
+                        target, apply=True, **self.project_inputs(directory)
+                    )
+                self.assertFalse((target / installer.MANIFEST_PATH).exists())
+
     def test_only_the_claude_skill_prefix_is_admitted_under_claude(self) -> None:
         installer._safe_relative(".claude/skills/agent-orchestration/SKILL.md")
         for path in (

@@ -47,6 +47,7 @@ RECORD_TYPES = {
     "billing_attestation",
     "admission_decision",
     "dispatch_intent",
+    "host_run_profile",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -1682,6 +1683,8 @@ ADMISSION_REASON_CODES = {
     "paid_usage_usable",
     "billing_unverified",
     "provider_exhausted",
+    "claude_backend_not_subscription",
+    "claude_model_override_present",
 }
 CLAUDE_HEADROOM_STATUSES = {"allowed", "allowed_warning", "rejected"}
 CLAUDE_OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected"}
@@ -1856,6 +1859,31 @@ def validate_dispatch_intent(data: Any) -> dict[str, Any]:
     return data
 
 
+HOST_RUN_PROFILE_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "host_client",
+    "backend_check", "model_pin", "subagent_type", "model_alias", "effort",
+    "observed_at_ms",
+}
+
+
+def validate_host_run_profile(data: Any) -> dict[str, Any]:
+    """The host-side checks an opened run passed, and how its model was pinned."""
+
+    data = _closed(data, HOST_RUN_PROFILE_FIELDS, "host_run_profile")
+    _base(data, "host_run_profile")
+    _identifier(data["run_id"], "run_id")
+    _enum(data["host_client"], {"codex-host-v1", "claude-host-v1"}, "host_client")
+    _enum(data["backend_check"], {"passed", "not_applicable"}, "backend_check")
+    _enum(data["model_pin"], {"alias"}, "model_pin", nullable=True)
+    _identifier(data["subagent_type"], "subagent_type", nullable=True)
+    _enum(data["model_alias"], {"opus", "sonnet", "haiku"}, "model_alias", nullable=True)
+    _enum(data["effort"], SUPPORTED_EFFORTS, "effort", nullable=True)
+    if (data["model_pin"] is None) != (data["model_alias"] is None):
+        raise ContractError("host run profile pin and alias disagree")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -1878,6 +1906,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "billing_attestation": validate_billing_attestation,
     "admission_decision": validate_admission_decision,
     "dispatch_intent": validate_dispatch_intent,
+    "host_run_profile": validate_host_run_profile,
 }
 
 

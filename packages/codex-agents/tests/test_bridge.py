@@ -20,7 +20,7 @@ from unittest import mock
 from tests.support import FIXTURES_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 import cli
-from codex_agents import bridge
+from codex_agents import bridge, claude_host
 from codex_agents.bridge import (
     BridgeRefused,
     dispatch,
@@ -127,11 +127,19 @@ class BridgeTestCase(unittest.TestCase):
         # settings never decide these tests.
         self.dispatch_parent = base / "dispatch"
         self.dispatch_parent.mkdir()
+        self.user_settings = base / "user-claude"
+        self.user_settings.mkdir()
+        settings_patch = mock.patch.object(
+            claude_host, "USER_SETTINGS_DIRECTORY", str(self.user_settings)
+        )
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
+        self.managed = base / "managed-settings.json"
         for name, value in (
             ("WORKSPACE_PARENT", str(self.dispatch_parent)),
             ("MANAGED_SETTINGS_PATHS", {
-                "darwin": (str(base / "no-managed-settings"),),
-                "linux": (str(base / "no-managed-settings"),),
+                "darwin": (str(self.managed),),
+                "linux": (str(self.managed),),
             }),
         ):
             patcher = mock.patch.object(bridge, name, value)
@@ -975,7 +983,7 @@ class BridgeLifecycleTests(CliTestCase):
 CLAUDE_HOST = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-session"}
 
 
-class ClaudePrimaryTests(CliTestCase):
+class ClaudePrimaryCase(CliTestCase):
     """A Claude Code primary: native Claude children and bridged Codex children."""
 
     def setUp(self) -> None:
@@ -1046,6 +1054,8 @@ class ClaudePrimaryTests(CliTestCase):
             "--observation", self.write("observation.json", observation),
         )
 
+
+class ClaudePrimaryTests(ClaudePrimaryCase):
     def test_routes_follow_the_claude_primary(self) -> None:
         exploratory = self.cli("learning-route", "--task", self.write("e.json", self.exploratory()))
         self.assertEqual(
@@ -1126,6 +1136,254 @@ class ClaudePrimaryTests(CliTestCase):
             dispatched["bridge_report"]["terminal_state"],
         )
         self.assertEqual("gpt-6-luna", recorded["outcome"]["model"])
+
+
+PROBE_INIT = init_frame(model="claude-haiku-5-5", tools=[])
+FAVOURABLE = RATE_LIMIT
+OVERAGE = {**RATE_LIMIT, "rate_limit_info": {
+    **RATE_LIMIT["rate_limit_info"], "isUsingOverage": True,
+}}
+
+
+class ClaudeHostReviewTests(ClaudePrimaryCase):
+    """Round-one review findings for a Claude primary."""
+
+    def open_native(self, expected: int = 0) -> dict:
+        _, _, context, route_path = self.lifecycle_inputs(self.exploratory())
+        orchestration = self.cli("learning-open-orchestration")
+        return self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration["orchestration_handle"],
+            expected=expected,
+        )
+
+    def probe(self, event: dict, expected: int = 0) -> dict:
+        self.frames("claude", [PROBE_INIT, event, result_frame("OK")])
+        return self.cli(
+            "provider-observe", "--provider", "claude", "--billing-probe",
+            expected=expected,
+        )
+
+    def test_alternate_backends_deny_native_claude_opens(self) -> None:
+        self.admit("claude")
+        project_settings = self.project / ".claude/settings.json"
+        cases = (
+            ("env", {"CLAUDE_CODE_USE_BEDROCK": "1"}),
+            ("env", {"CLAUDE_CODE_USE_FOUNDRY": "1"}),
+            ("env", {"ANTHROPIC_BASE_URL": "https://example.invalid"}),
+            ("env", {"ANTHROPIC_AUTH_TOKEN": "token"}),
+            ("env", {"AWS_BEARER_TOKEN_BEDROCK": "token"}),
+            ("env", {"CLAUDE_CONFIG_DIR": str(self.tools)}),
+            ("user", {"apiKeyHelper": "/bin/echo key"}),
+            ("project", {"env": {"CLAUDE_CODE_USE_VERTEX": "1"}}),
+            ("managed", {"awsAuthRefresh": "aws sso login"}),
+            ("managed", {"awsCredentialExport": "/bin/true"}),
+        )
+        for where, value in cases:
+            with self.subTest(where=where, value=value):
+                environment: dict[str, str] = {}
+                written: list[Path] = []
+                if where == "env":
+                    environment = value
+                else:
+                    path = {
+                        "user": self.user_settings / "settings.json",
+                        "project": project_settings,
+                        "managed": self.managed,
+                    }[where]
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(value))
+                    written.append(path)
+                try:
+                    with mock.patch.dict(os.environ, environment):
+                        denied = self.open_native(expected=2)
+                finally:
+                    for path in written:
+                        path.unlink()
+                self.assertEqual("claude_backend_not_subscription", denied["reason_code"])
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                reasons = [
+                    record["reason_code"]
+                    for record in repository.records("admission_decision")
+                ]
+        finally:
+            ledger.close()
+        self.assertEqual(len(cases), reasons.count("claude_backend_not_subscription"))
+        # The same session without those switches opens normally.
+        self.assertIn("run_handle", self.open_native())
+
+    def test_native_spawn_parameters_come_from_code(self) -> None:
+        self.admit("claude")
+        for name in claude_host.MODEL_OVERRIDE_VARIABLES:
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: "sonnet"}):
+                self.assertEqual(
+                    "claude_model_override_present",
+                    self.open_native(expected=2)["reason_code"],
+                )
+        opened = self.open_native()
+        self.assertEqual(
+            {"subagent_type": "claude_agents_implementation_worker",
+             "model_alias": "opus", "effort": "medium"},
+            opened["native_spawn"],
+        )
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                profile = repository.records("host_run_profile")[-1]
+        finally:
+            ledger.close()
+        self.assertEqual(
+            ("claude-host-v1", "passed", "alias", "opus"),
+            (profile["host_client"], profile["backend_check"], profile["model_pin"],
+             profile["model_alias"]),
+        )
+        with self.assertRaisesRegex(ContractError, "native Claude spawn"):
+            claude_host.native_spawn(
+                {"model": "claude-other-1", "effort": "high", "agent_type": "x"}
+            )
+
+    def test_billing_probe_admits_consecutive_native_children(self) -> None:
+        self.admit("claude")
+        observed = self.probe(FAVOURABLE)
+        self.assertEqual(
+            ["provider_identity", "provider_headroom", "provider_billing"],
+            [record["record_type"] for record in observed["records"]],
+        )
+        argv = [i for i in self.invocations("claude") if "-p" in i["argv"]][-1]["argv"]
+        self.assertEqual(
+            ("claude-haiku-5-5", "low", ""),
+            (argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1],
+             argv[argv.index("--tools") + 1]),
+        )
+        self.assertNotIn("--bare", argv)
+        self.assertIn("run_handle", self.open_native())
+        self.probe(FAVOURABLE)
+        self.assertIn("run_handle", self.open_native())
+        self.probe(OVERAGE)
+        self.assertEqual("paid_usage_usable", self.open_native(expected=2)["reason_code"])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "1"}):
+            refused = self.probe(FAVOURABLE, expected=2)
+        self.assertEqual("claude_backend_not_subscription", refused["reason_code"])
+
+    def test_explicit_host_client_matches_implicit_routing(self) -> None:
+        task = self.write("b.json", self.bounded())
+        implicit = self.cli("learning-route", "--task", task)
+        self.assertEqual("bridge", implicit["dispatch"])
+        for flag in ("--client-version", "--host-client"):
+            with self.subTest(flag=flag):
+                explicit = self.cli("learning-route", "--task", task, flag, "claude-host-v1")
+                self.assertEqual(implicit, explicit)
+        refused = self.cli(
+            "learning-route", "--task", task, "--client-version", "codex-host-v1",
+            expected=2,
+        )
+        self.assertEqual("host_client_unknown", refused["reason_code"])
+
+    def test_legacy_recording_is_codex_only(self) -> None:
+        _, _, context, _ = self.lifecycle_inputs(self.exploratory())
+        refused = self.cli(
+            "learning-record-host-result", *context,
+            "--result", self.write("r.json", result()),
+            "--observation", self.write("o.json", {
+                "run_id": "run:legacy", "client_version": "codex-cli-0.153.0",
+                "result_attempts": [
+                    {"status": "accepted", "reason_code": None, "receipt_id": None}
+                ],
+            }),
+            expected=2,
+        )
+        self.assertEqual("host_client_mismatch", refused["reason_code"])
+
+
+CODEX_HOST = {"CODEX_THREAD_ID": "tests-thread", "CODEX_SESSION_ID": "tests-session"}
+
+
+class HostOwnershipTests(CliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger.close()
+
+    def admit(self, provider: str) -> str:
+        self.ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            return super().admit(provider)
+        finally:
+            self.ledger.close()
+
+    def as_claude(self):
+        return mock.patch.dict(os.environ, {**CLAUDE_HOST, "CODEX_THREAD_ID": "",
+                                            "CODEX_SESSION_ID": ""})
+
+    def without_markers(self):
+        return mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CODEX_SESSION_ID": ""})
+
+    def test_every_mutation_refuses_another_or_missing_host(self) -> None:
+        self.admit("codex")
+        task = self.write("task.json", self.task())
+        route = self.cli("learning-route", "--task", task)
+        assigned = self.assignment_for(route)
+        context = (
+            "--task", task,
+            "--assignment", self.write("assignment.json", assigned),
+            "--parent-grant", self.write("grant.json", PARENT_GRANT),
+        )
+        route_path = self.write("route.json", route)
+        orchestration = self.cli("learning-open-orchestration")["orchestration_handle"]
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration,
+        )["run_handle"]
+        observation = self.write("observation.json", {
+            "run_handle": opened,
+            "result_attempts": [
+                {"status": "accepted", "reason_code": None, "receipt_id": None}
+            ],
+        })
+        commands = {
+            "open": ("learning-open-host-run", *context, "--route", route_path,
+                     "--orchestration-handle", orchestration),
+            "checkpoint": ("learning-checkpoint-orchestration", "--orchestration-handle",
+                           orchestration, "--goal-tokens-used", "1",
+                           "--goal-time-used-seconds", "1"),
+            "pause": ("learning-pause-orchestration", "--orchestration-handle",
+                      orchestration),
+            "resume": ("learning-resume-orchestration", "--orchestration-handle",
+                       orchestration),
+            "close": ("learning-close-orchestration", "--orchestration-handle",
+                      orchestration, "--status", "completed"),
+            "bind": ("learning-bind-host-agent", "--run-handle", opened,
+                     "--agent-id", "child-1"),
+            "observe": ("learning-observe-host-run", "--run-handle", opened,
+                        "--event", "progress"),
+            "abandon": ("learning-classify-host-run-abandoned", "--run-handle", opened,
+                        "--reason", "owner_cancelled"),
+            "dispatch": ("dispatch", *context, "--route", route_path,
+                         "--run-handle", opened),
+            "record": ("learning-record-host-result", *context,
+                       "--result", self.write("result.json", result()),
+                       "--observation", observation),
+        }
+        for name, command in commands.items():
+            with self.subTest(family=name, host="claude"), self.as_claude():
+                self.assertEqual(
+                    "host_client_mismatch", self.cli(*command, expected=2)["reason_code"]
+                )
+            with self.subTest(family=name, host="none"), self.without_markers():
+                self.assertEqual(
+                    "host_client_unknown", self.cli(*command, expected=2)["reason_code"]
+                )
+            with self.subTest(family=name, host="explicit"):
+                self.assertEqual(
+                    "host_client_unknown",
+                    self.cli(*command, "--host-client", "claude-host-v1",
+                             expected=2)["reason_code"],
+                )
+        # The owning host still binds and records the run it opened.
+        self.cli(*commands["bind"])
+        recorded = self.cli(*commands["record"])
+        self.assertEqual(route["model"], recorded["outcome"]["model"])
 
 
 if __name__ == "__main__":

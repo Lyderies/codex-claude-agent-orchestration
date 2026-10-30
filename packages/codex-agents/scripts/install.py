@@ -361,7 +361,9 @@ def _plan_install(target: Target, update: bool) -> tuple[dict[str, Path], dict |
         if relative in old_files:
             if current != old_files[relative]:
                 conflicts.append(f"modified installed file: {relative}")
-        elif current != _digest(source):
+        else:
+            # A file the previous manifest does not own is never claimed, even
+            # with identical bytes: it belongs to the project or another package.
             conflicts.append(f"existing unmanaged file: {relative}")
     if update:
         for relative, old_digest in old_files.items():

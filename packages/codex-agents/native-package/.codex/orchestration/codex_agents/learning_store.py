@@ -2081,6 +2081,7 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
+            "host_run_profile",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -3268,6 +3269,7 @@ class LearningLedger:
         client_version: str,
         orchestration_handle: str,
         fallback_receipt: str | None = None,
+        host_profile: dict[str, Any] | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
         """Persist a trusted assigned-run start and return a single-use opaque handle.
@@ -3459,6 +3461,25 @@ class LearningLedger:
             self._store_admission_locked(
                 project_id, admission, run_id=run_id, timestamp=admitted_at
             )
+            if host_profile is not None:
+                if host_profile.get("host_client") != orchestration["client_version"]:
+                    raise LedgerError("host run profile differs from the orchestration host")
+                material = {
+                    "schema_version": 1,
+                    "record_type": "host_run_profile",
+                    "run_id": run_id,
+                    **host_profile,
+                    "observed_at_ms": admitted_at,
+                }
+                try:
+                    profile = validate_learning_record(
+                        {**material, "record_id": f"host_run_profile:{content_digest(material)}"}
+                    )
+                except ContractError as exc:
+                    raise LedgerError("host run profile is invalid") from exc
+                self._append_checked_locked(
+                    project_id, profile, producer="lifecycle", timestamp=admitted_at
+                )
         self.state.harden_database_files()
         return {
             "run_handle": run_handle,
@@ -3537,6 +3558,32 @@ class LearningLedger:
             raise LedgerError("provider is unsupported")
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
+
+    def observe_claude_billing(
+        self, project_id: str, *, environ: Any = None
+    ) -> list[dict[str, Any]]:
+        """Observe the Claude identity, then probe billing and headroom once.
+
+        Native Claude children emit no rate-limit event, so this probe is the
+        billing evidence for a Claude primary. Only its rate-limit event is kept.
+        """
+
+        from .bridge import claude_billing_probe
+        from .providers import claude_rate_limit_records
+
+        environ = os.environ if environ is None else environ
+        identity = self.observe_provider(
+            project_id, "claude", project_root=Path("."), environ=environ
+        )[0]
+        info = claude_billing_probe(environ)
+        timestamp = self._clock_ms()
+        records = claude_rate_limit_records(
+            info,
+            account_fingerprint=identity["account_fingerprint"],
+            observed_at_ms=timestamp,
+        )
+        self._store_provider_observations(project_id, records, timestamp=timestamp)
+        return [identity, *records]
 
     def record_claude_rate_limit_event(
         self,
@@ -3819,6 +3866,60 @@ class LearningLedger:
             "account_fingerprint": admission["account_fingerprint"],
             "deadline_at_ms": record["deadline_at_ms"],
         }
+
+    def host_owner(
+        self,
+        project_id: str,
+        *,
+        orchestration_handle: str | None = None,
+        run_handle: str | None = None,
+    ) -> str:
+        """The host client that opened the orchestration owning this handle.
+
+        A run bound before orchestrations existed has no owner record; those were
+        only ever opened by the Codex host.
+        """
+
+        with self._lock:
+            if orchestration_handle is not None:
+                row = self._orchestration_for_handle_locked(project_id, orchestration_handle)
+                return str(row["client_version"])
+            if not isinstance(run_handle, str):
+                raise LedgerError("host run handle is invalid")
+            binding = self._connection.execute(
+                "SELECT orchestration_id FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, keyed_digest(self.state.digest_key(), run_handle)),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("host run is unavailable")
+            if binding["orchestration_id"] is None:
+                return "codex-host-v1"
+            row = self._connection.execute(
+                "SELECT client_version FROM orchestrations "
+                "WHERE project_id=? AND orchestration_id=?",
+                (project_id, str(binding["orchestration_id"])),
+            ).fetchone()
+        if row is None:
+            raise LedgerError("host run orchestration is unavailable")
+        return str(row["client_version"])
+
+    def record_host_denial(
+        self, project_id: str, *, provider: str, reason_code: str
+    ) -> None:
+        """Store a host-side open denial, as admission denials are stored."""
+
+        timestamp = self._clock_ms()
+        decision = {
+            "provider": provider, "decision": "deny", "reason_code": reason_code,
+            "admission_basis": None, "account_fingerprint": None,
+            "evidence_digests": [], "observed_at_ms": timestamp,
+        }
+        with self._lock, self._connection:
+            self._store_admission_locked(
+                project_id, decision, run_id=None, timestamp=timestamp
+            )
+        self.state.harden_database_files()
 
     def host_run_admission(self, project_id: str, run_handle: str) -> dict[str, Any]:
         """Return the stored admission for a run; time-varying facts are not re-read."""
