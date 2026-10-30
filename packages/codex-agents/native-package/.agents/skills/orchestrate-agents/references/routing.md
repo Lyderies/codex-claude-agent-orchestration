@@ -259,22 +259,43 @@ Claude to Claude and Codex to Codex.
   `Write` (`write_profile_mismatch`); it is never widened.
 - The bridge resolves one commit and exports the granted read and write paths from it
   into a contained workspace, with a sibling control directory holding the baseline
-  manifest and the generated settings. The settings carry the read profile's lockdown
-  and exactly one `Edit(<path>)` and one `Write(<path>)` allow rule per write path
-  (`<path>/**` for a directory). The child runs with those five tools, `dontAsk`,
+  manifest, the run's lease and the generated settings. The settings carry the read
+  profile's lockdown and exactly one `Edit(//<workspace>/<path>)` and one
+  `Write(//<workspace>/<path>)` allow rule per write path (`/**` for a directory),
+  absolute and anchored to the workspace's real path, plus deny rules for every
+  protected name (`.git`, `.codex`, `.agents`, `.claude`, `AGENTS.md`, `CLAUDE.md`,
+  `CLAUDE.local.md`, `.mcp.json` and the other Claude context names) at any depth, in
+  several letter cases. A write path or workspace path that the rule syntax would read
+  specially (a leading `~` or `/`, glob or bracket characters, backslashes,
+  parentheses, whitespace or control characters) is refused with
+  `write_path_not_rule_safe` before launch. The child runs with those five tools, `dontAsk`,
   `--setting-sources project`, `--strict-mcp-config`, no session persistence, stdin
   closed, umask 022 and the workspace as its working directory. Its init frame must
   report exactly the five tools.
 - After the child exits or is stopped its process group is killed and a bounded `lsof`
   must show no process with its working directory or an open file under the workspace.
+  The scanned directory must be the workspace itself (by identity, before and after),
+  and any `lsof` diagnostic, timeout or unexpected answer leaves quiescence unproved.
   Then the workspace is snapshotted, checked for ownership against the manifest, and
   turned into a patch and a verifier envelope. The ledger stores both as owner-only
   artifacts and records a `write_result` with their digests, the source commit, the
   change count and the ownership result. The bridge report adds `ownership`,
   `changes`, `patch_digest` and `envelope_digest`.
+- The ledger accepts a `write_result` only for a run opened with a Claude
+  workspace-write bridge route and dispatched to Claude. A `passed` result needs proved
+  quiescence and a patch and envelope that hash to its digests, validate and bind each
+  other, the manifest and the source commit; a failed one carries no artifacts. Both
+  files are staged durably before one transaction appends the record and registers
+  them, and the ledger's startup reconciliation removes any staged file without a
+  record. Artifacts are read back only through a pinned descriptor, and only when their
+  bytes match both the registration and the record.
 - Any ownership refusal, an unproved quiescence (`quiescence_unproved`) or a snapshot
   failure is a failed run with that reason and no patch. Without proved quiescence the
-  workspace is renamed to a fenced leftover instead of being removed.
+  workspace is renamed to a fenced leftover instead of being removed. Every `dispatch`
+  first sweeps leftover write layouts under the ledger writer lock: a layout is removed
+  only when its lease names a run of this ledger that is terminal or past its handle
+  expiry and quiescence is proved; anything else stays and is reported in
+  `bridge_report.layout_sweep`.
 - The primary does not apply the patch yet: integration and mandatory verification by
   the other provider come in later slices.
 

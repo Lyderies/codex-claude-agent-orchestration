@@ -6,14 +6,17 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
+from tests.support import TEMP_ROOT
 from tests.test_bridge import (
     CLEAN,
     RATE_LIMIT,
@@ -27,6 +30,7 @@ from codex_agents import bridge, routing, workspace
 from codex_agents.bridge import BridgeRefused, dispatch
 from codex_agents.learning_contracts import content_digest
 from codex_agents.learning_engine import installed_execution_configuration
+from codex_agents.learning_store import LearningLedger, LedgerError
 from codex_agents.routing import route_task
 
 WRITE_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]
@@ -71,6 +75,7 @@ class ClaudeWriteChildTests(BridgeTestCase):
                 patcher.start()
                 self.addCleanup(patcher.stop)
         self.seeded = False
+        self.task_owned_paths = ["src"]
         self.pidfile = Path(self.temporary.name) / "holder.pid"
         self.addCleanup(self.kill_holder)
 
@@ -83,7 +88,7 @@ class ClaudeWriteChildTests(BridgeTestCase):
 
     def write_task(self) -> dict:
         return {**self.task(), "objective": "Change one file", "family": "coding",
-                "owned_paths": ["src"]}
+                "owned_paths": getattr(self, "task_owned_paths", ["src"])}
 
     def write_route(self) -> dict:
         policy = deepcopy(self.policy)
@@ -198,18 +203,20 @@ class ClaudeWriteChildTests(BridgeTestCase):
              record["ownership"], record["quiescence"]),
         )
         self.assertEqual(report["source_commit"], record["source_commit"])
-        patch_path = self.ledger.write_result_artifact(self.project_id, report["bridge_run_id"], "patch")
-        envelope_path = self.ledger.write_result_artifact(
+        patch_bytes = self.ledger.write_result_artifact(
+            self.project_id, report["bridge_run_id"], "patch")
+        envelope_bytes = self.ledger.write_result_artifact(
             self.project_id, report["bridge_run_id"], "envelope")
-        for path, digest in ((patch_path, report["patch_digest"]),
-                             (envelope_path, report["envelope_digest"])):
-            self.assertEqual(digest, hashlib.sha256(path.read_bytes()).hexdigest())
+        for content, digest in ((patch_bytes, report["patch_digest"]),
+                                (envelope_bytes, report["envelope_digest"])):
+            self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+        for path in self.artifact_paths(report["bridge_run_id"]):
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
             self.assertEqual(0o700, path.parent.stat().st_mode & 0o777)
-        patch = json.loads(patch_path.read_bytes())
+        patch = json.loads(patch_bytes)
         self.assertEqual(["src/app.py", "src/pkg/new.py"], [c["path"] for c in patch["changes"]])
         self.assertEqual(b"print('changed')\n", base64.b64decode(patch["changes"][0]["content_b64"]))
-        envelope = json.loads(envelope_path.read_bytes())
+        envelope = json.loads(envelope_bytes)
         self.assertEqual(report["patch_digest"], envelope["patch_digest"])
         self.assertEqual(
             {"bridge_run_id", "project_id", "route_digest", "run_handle_sha256", "source_commit"},
@@ -236,10 +243,19 @@ class ClaudeWriteChildTests(BridgeTestCase):
         settings_path = Path(argv[argv.index("--settings") + 1])
         self.assertEqual("control", settings_path.parent.name)
         self.assertNotEqual(Path(invocation["cwd"]), settings_path.parent)
-        self.assertEqual(
-            {"defaultMode": "dontAsk", "allow": ["Edit(src/**)", "Write(src/**)"]},
-            invocation["settings"]["permissions"],
-        )
+        anchor = "//" + os.path.realpath(invocation["cwd"]).lstrip("/")
+        permissions = invocation["settings"]["permissions"]
+        self.assertEqual("dontAsk", permissions["defaultMode"])
+        self.assertEqual([f"Edit({anchor}/src/**)", f"Write({anchor}/src/**)"], permissions["allow"])
+        # Protected names are denied at any depth, for both tools, in several spellings.
+        for name in ("AGENTS.md", "agents.md", "CLAUDE.md", "claude.md", ".mcp.json", ".MCP.JSON",
+                     ".git", ".GIT", ".claude", ".codex", ".agents", "CLAUDE.local.md"):
+            for tool in ("Edit", "Write"):
+                with self.subTest(name=name, tool=tool):
+                    self.assertIn(f"{tool}({anchor}/**/{name})", permissions["deny"])
+                    self.assertIn(f"{tool}({anchor}/**/{name}/**)", permissions["deny"])
+        self.assertTrue(all(rule.split("(", 1)[1].startswith(anchor + "/")
+                            for rule in permissions["allow"] + permissions["deny"]))
         self.assertTrue(invocation["settings"]["disableAllHooks"])
         self.assertFalse(any(invocation["settings"]["enabledPlugins"].values()))
         # The workspace holds the granted paths only, without Claude context files.
@@ -247,16 +263,60 @@ class ClaudeWriteChildTests(BridgeTestCase):
             ["docs/guide.md", "src/app.py", "src/nested/deep.txt"], sorted(invocation["files"])
         )
 
-    def test_allow_rules_for_file_and_directory_grants(self) -> None:
+    def artifact_paths(self, bridge_run_id: str) -> list[Path]:
+        partition = self.state.artifacts / self.project_id
+        return sorted(partition.glob(f"write_*_{bridge_run_id}.json"))
+
+    def test_rules_are_absolute_and_anchored_to_the_workspace(self) -> None:
+        workspace_path = Path(self.temporary.name) / "rule-workspace"
+        workspace_path.mkdir()
+        anchor = "//" + os.path.realpath(workspace_path).lstrip("/")
         manifest = {"files": {"src/app.py": {}, "src/nested/deep.txt": {}}, "directories": {"src": 448}}
+        rules = bridge.claude_write_allow_rules(["src", "src/app.py", "new.py"], manifest, workspace_path)
         self.assertEqual(
-            ["Edit(src/**)", "Write(src/**)", "Edit(src/app.py)", "Write(src/app.py)",
-             "Edit(new.py)", "Write(new.py)"],
-            bridge.claude_write_allow_rules(["src", "src/app.py", "new.py"], manifest),
+            [f"Edit({anchor}/src/**)", f"Write({anchor}/src/**)",
+             f"Edit({anchor}/src/app.py)", f"Write({anchor}/src/app.py)",
+             # A bare filename is anchored, so it cannot match that name at another depth.
+             f"Edit({anchor}/new.py)", f"Write({anchor}/new.py)"],
+            rules,
         )
-        for unsafe in ("src/a(b).py", "src/a\nb"):
+        for rule in rules:
+            self.assertTrue(rule.split("(", 1)[1].startswith("//"))
+            self.assertNotIn("~", rule)
+        deny = bridge.claude_write_deny_rules(workspace_path)
+        self.assertIn(f"Write({anchor}/**/AGENTS.md)", deny)
+        self.assertIn(f"Edit({anchor}/**/.git/**)", deny)
+
+    def test_paths_the_rule_syntax_reads_specially_are_refused(self) -> None:
+        workspace_path = Path(self.temporary.name)
+        manifest = {"files": {}, "directories": {}}
+        for unsafe in (
+            "~/Code/primary/injected.py", "~", "~user/x", "src/a(b).py", "src/a\nb", "src/a*b",
+            "src/a?b", "src/[ab]", "src/{a,b}", "src\\a", "src/a b", "src/a!b", "src/a#b",
+        ):
             with self.subTest(unsafe=unsafe), self.assertRaisesRegex(BridgeRefused, "rule_safe"):
-                bridge.claude_write_allow_rules([unsafe], manifest)
+                bridge.claude_write_allow_rules([unsafe], manifest, workspace_path)
+        with self.assertRaisesRegex(BridgeRefused, "rule_safe"):
+            bridge.claude_write_allow_rules(["src"], manifest, workspace_path / "odd dir")
+
+    def test_tilde_owned_path_is_refused_before_launch(self) -> None:
+        route = self.write_route()
+        self.task_owned_paths = ["~/Code/primary/injected.py"]
+        route = self.write_route()
+        assigned = self.write_assignment(route)
+        assigned["owned_paths"] = ["~/Code/primary/injected.py"]
+        assigned["permissions"]["filesystem"] = ["~/Code/primary/injected.py:write", "docs:read"]
+        handle = self.open_write(route, assigned)
+        self.frames("claude", self.write_frames())
+        with self.assertRaisesRegex(BridgeRefused, "write_path_not_rule_safe"):
+            dispatch(
+                self.ledger, self.project_id, project_root=self.project, bundle_root=self.bundle,
+                task=self.write_task(),
+                route=route, assignment=assigned, parent_grant=self.grant(assigned),
+                run_handle=handle, result_schema=RESULT_SCHEMA, environ=CLEAN,
+            )
+        self.assertFalse([item for item in self.invocations("claude") if "-p" in item["argv"]])
+        self.assertEqual(([], []), self.leftovers())
 
     def test_each_ownership_refusal_leaves_no_patch(self) -> None:
         cases = {
@@ -379,6 +439,241 @@ class ClaudeWriteChildTests(BridgeTestCase):
             call(route)
         self.assertFalse([item for item in self.invocations("claude") if "-p" in item["argv"]])
         self.assertEqual(([], []), self.leftovers())
+
+
+    # --- recording (finding 4), staging (finding 6) and retrieval (finding 5) ---
+
+    def captured_write(self) -> tuple[dict, dict]:
+        """Run a passing child but capture, not record, the write result."""
+
+        captured: dict = {}
+
+        def capture(project_id, **arguments):
+            captured.update(deepcopy(arguments))
+            raise LedgerError("captured for the test")
+
+        with mock.patch.object(self.ledger, "record_write_result", side_effect=capture):
+            output = self.run_write(self.write_frames(
+                {"write": "src/app.py", "content": "print('changed')\n"}))
+        self.assertEqual("write_result_unrecorded", output["bridge_report"]["ownership"])
+        return captured, output
+
+    def record(self, captured: dict, **changes) -> dict:
+        return self.ledger.record_write_result(self.project_id, **{**captured, **changes})
+
+    def partition_files(self) -> list[str]:
+        partition = self.state.artifacts / self.project_id
+        return sorted(path.name for path in partition.iterdir()) if partition.exists() else []
+
+    def test_recording_requires_a_claude_write_route_and_verified_artifacts(self) -> None:
+        captured, _ = self.captured_write()
+        result = captured["result"]
+        codex_route = {**captured["route"], "provider": "codex", "model": "gpt-6.1-sol"}
+        with self.assertRaisesRegex(LedgerError, "route does not match"):
+            self.record(captured, route=codex_route)
+        with self.assertRaisesRegex(LedgerError, "proved quiescence"):
+            self.record(captured, result={**result, "quiescence": "unproved"})
+        junk = b'{"not":"a patch"}'
+        with self.assertRaisesRegex(LedgerError, "patch is invalid"):
+            self.record(captured, patch=junk,
+                        result={**result, "patch_digest": hashlib.sha256(junk).hexdigest()})
+        envelope = json.loads(captured["envelope"])
+        envelope["manifest"]["write_set"] = ["docs"]
+        tampered = workspace.canonical_json(envelope)
+        with self.assertRaisesRegex(LedgerError, "does not bind"):
+            self.record(captured, envelope=tampered,
+                        result={**result, "envelope_digest": hashlib.sha256(tampered).hexdigest()})
+        with self.assertRaisesRegex(LedgerError, "carries no artifacts"):
+            self.record(captured, result={
+                **result, "ownership": "outside_write_set", "patch_digest": None,
+                "envelope_digest": None, "changes": 0,
+            })
+        self.assertEqual([], self.write_records())
+        self.assertEqual([], self.partition_files())
+        record = self.record(captured)
+        self.assertEqual("passed", record["ownership"])
+        self.assertEqual(captured["patch"], self.ledger.write_result_artifact(
+            self.project_id, captured["bridge_run_id"], "patch"))
+
+    def test_failure_between_staging_and_commit_leaves_nothing(self) -> None:
+        captured, _ = self.captured_write()
+        with mock.patch.object(self.ledger, "_append_checked_locked", side_effect=RuntimeError("crash")), \
+                self.assertRaises(RuntimeError):
+            self.record(captured)
+        self.assertEqual(([], []), (self.write_records(), self.partition_files()))
+        original = self.ledger._insert_stored_file_locked
+        calls = []
+
+        def second_fails(*arguments, **keywords):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("crash between registrations")
+            return original(*arguments, **keywords)
+
+        with mock.patch.object(self.ledger, "_insert_stored_file_locked", side_effect=second_fails), \
+                self.assertRaises(RuntimeError):
+            self.record(captured)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(([], []), (self.write_records(), self.partition_files()))
+        with self.ledger.repository(self.project_id) as repository:
+            self.assertEqual([], [row for row in repository.records("write_result")])
+        self.assertIsNone(self.ledger.write_result_artifact(
+            self.project_id, captured["bridge_run_id"], "patch"))
+        # The run can still record once the failure is gone.
+        self.record(captured)
+        self.assertEqual(2, len(self.partition_files()))
+
+    def test_startup_reconciliation_removes_staged_files_without_a_record(self) -> None:
+        self.seed()
+        staged = self.ledger._stage_owner_file(self.project_id, "write_patch_brg_" + "0" * 32, b"{}")
+        self.assertTrue(staged.exists())
+        self.ledger.close()
+        self.ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        self.addCleanup(self.ledger.close)
+        self.assertFalse(staged.exists())
+
+    def test_replaced_artifact_is_refused(self) -> None:
+        output = self.run_write(self.write_frames({"write": "src/app.py", "content": "y\n"}))
+        bridge_run_id = output["bridge_report"]["bridge_run_id"]
+        patch_path = next(path for path in self.artifact_paths(bridge_run_id) if "patch" in path.name)
+        original = patch_path.read_bytes()
+        patch_path.write_bytes(original.replace(b"src/app.py", b"src/bad.py"))
+        with self.assertRaisesRegex(LedgerError, "does not match"):
+            self.ledger.write_result_artifact(self.project_id, bridge_run_id, "patch")
+        decoy = patch_path.with_name("decoy.json")
+        decoy.write_bytes(original)
+        os.chmod(decoy, 0o600)
+        patch_path.unlink()
+        os.symlink(decoy, patch_path)
+        with self.assertRaisesRegex(LedgerError, "unavailable"):
+            self.ledger.write_result_artifact(self.project_id, bridge_run_id, "patch")
+
+    # --- the layout sweep (finding 7) ---
+
+    def leased_layout(self, handle: str, *, fence: bool = True) -> Path:
+        layout = workspace.create_layout(self.dispatch_parent)
+        bridge._write_lease(layout, self.ledger.write_run_lease(self.project_id, handle))
+        (layout.workspace / "left.txt").write_text("x")
+        return workspace.fence_leftover(layout.root) if fence else layout.root
+
+    def test_sweep_removes_a_fenced_layout_only_after_its_run_expires(self) -> None:
+        route = self.write_route()
+        assigned = self.write_assignment(route)
+        handle = self.open_write(route, assigned)
+        fenced = self.leased_layout(handle)
+        unleased = workspace.create_layout(self.dispatch_parent).root
+        other = self.dispatch_parent / "unrelated-directory"
+        other.mkdir()
+        report = bridge.sweep_write_layouts(self.ledger, self.dispatch_parent)
+        self.assertEqual(0, report["removed"])
+        self.assertEqual("run_live", report["kept"][fenced.name])
+        self.assertEqual("lease_unreadable", report["kept"][unleased.name])
+        self.assertTrue(fenced.exists())
+        expires = self.ledger.write_run_lease(self.project_id, handle)["expires_at_ms"]
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=expires + 1):
+            report = bridge.sweep_write_layouts(self.ledger, self.dispatch_parent)
+        self.assertEqual(1, report["removed"])
+        self.assertFalse(os.path.lexists(fenced))
+        self.assertTrue(unleased.exists())
+        self.assertTrue(other.exists())
+
+    def test_sweep_keeps_layouts_it_cannot_attribute_or_prove(self) -> None:
+        route = self.write_route()
+        assigned = self.write_assignment(route)
+        handle = self.open_write(route, assigned)
+        foreign = workspace.create_layout(self.dispatch_parent)
+        bridge._write_lease(foreign, {
+            "project_id": "prj_unknown", "handle_digest": "0" * 64, "expires_at_ms": 1,
+        })
+        busy = self.leased_layout(handle)
+        expires = self.ledger.write_run_lease(self.project_id, handle)["expires_at_ms"]
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=expires + 1), \
+                mock.patch.object(bridge, "_processes_using", return_value=None):
+            report = bridge.sweep_write_layouts(self.ledger, self.dispatch_parent)
+        self.assertEqual(
+            {foreign.root.name: "run_unknown", busy.name: "quiescence_unproved"}, report["kept"])
+        self.assertTrue(foreign.root.exists() and busy.exists())
+
+    def test_dispatch_sweeps_before_it_creates_a_layout(self) -> None:
+        route = self.write_route()
+        assigned = self.write_assignment(route)
+        old_handle = self.open_write(route, assigned)
+        fenced = self.leased_layout(old_handle)
+        expires = self.ledger.write_run_lease(self.project_id, old_handle)["expires_at_ms"]
+        real_clock = self.ledger._clock_ms
+        with mock.patch.object(bridge, "sweep_write_layouts", wraps=bridge.sweep_write_layouts) as sweep:
+            output = self.run_write(self.write_frames())
+        sweep.assert_called_once()
+        self.assertIn(fenced.name, output["bridge_report"]["layout_sweep"]["kept"])
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=max(expires + 1, real_clock())):
+            bridge.sweep_write_layouts(self.ledger, self.dispatch_parent)
+        self.assertFalse(os.path.lexists(fenced))
+
+
+class QuiescenceTests(unittest.TestCase):
+    """The quiescence check's real subprocess and identity paths."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.workspace = self.base / "workspace"
+        self.workspace.mkdir()
+        status = os.lstat(self.workspace)
+        self.identity = (status.st_dev, status.st_ino)
+
+    def fake_lsof(self, body: str) -> None:
+        tools = self.base / "fake-lsof"
+        tools.mkdir(exist_ok=True)
+        script = tools / "lsof"
+        script.write_text("#!/bin/sh\n" + body + "\n")
+        script.chmod(0o755)
+        patcher = mock.patch.object(bridge, "LSOF_SEARCH_PATH", str(tools))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_or_substituted_directory_is_unproved(self) -> None:
+        missing = self.base / "missing"
+        self.assertEqual((False, 0), bridge.prove_quiescent(missing, self.identity))
+        self.assertEqual((False, 0), bridge.prove_quiescent(self.workspace, None))
+        self.assertEqual((False, 0), bridge.prove_quiescent(self.workspace, (0, 0)))
+        link = self.base / "link"
+        os.symlink(self.workspace, link)
+        self.assertEqual((False, 0), bridge.prove_quiescent(link, self.identity))
+
+    @unittest.skipUnless(shutil.which("lsof", path=bridge.LSOF_SEARCH_PATH), "needs lsof")
+    def test_real_lsof_on_a_missing_directory_never_proves(self) -> None:
+        missing = self.base / "missing"
+        # lsof itself reports nothing for a missing directory; the identity check refuses it.
+        self.assertIn(bridge._processes_using(missing), ([], None))
+        self.assertEqual((False, 0), bridge.prove_quiescent(missing, self.identity))
+        self.assertEqual((True, 0), bridge.prove_quiescent(self.workspace, self.identity))
+
+    def test_failing_lsof_is_unproved(self) -> None:
+        for body in (
+            'echo "lsof: something went wrong" >&2; exit 1',
+            "exit 2",
+            "echo garbage; exit 1",
+            "echo p12x; exit 0",
+            "exit 0",
+            "sleep 60",
+        ):
+            with self.subTest(body=body), mock.patch.object(bridge, "LSOF_TIMEOUT_SECONDS", 1):
+                self.fake_lsof(body)
+                self.assertEqual((False, 0), bridge.prove_quiescent(self.workspace, self.identity))
+
+    def test_directory_replaced_during_the_scan_is_unproved(self) -> None:
+        self.fake_lsof('for last; do :; done; mv "$last" "$last.moved"; mkdir "$last"; exit 1')
+        self.assertEqual((False, 0), bridge.prove_quiescent(self.workspace, self.identity))
+
+    def test_matches_reported_with_status_one_are_survivors(self) -> None:
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(holder.kill)
+        self.fake_lsof(f'printf "p{holder.pid}\\nfcwd\\n"; exit 1')
+        self.assertEqual((False, 1), bridge.prove_quiescent(self.workspace, self.identity))
+        self.assertIsNotNone(holder.wait(timeout=10))
+        self.fake_lsof("exit 1")
+        self.assertEqual((True, 0), bridge.prove_quiescent(self.workspace, self.identity))
 
 
 class WriteResultContractTests(unittest.TestCase):
