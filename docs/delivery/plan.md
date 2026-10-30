@@ -67,10 +67,16 @@ The work is mostly integration. The genuinely new pieces are:
   to itself.
 - **Proportionate review:** changes to authority, containment or billing logic get an independent
   security review before release. Everything else gets tests and Ruff.
-- **Branching:** all work, including research, lands on `staging`. Each commit is either
-  product-only or research-only. A `version/<semver>` branch is cut from `main` with only the
-  product commits copied across, and the owner merges it into `main`. Research never merges
-  into `main`. After each merge, `main` is merged back into `staging`.
+- **Branching:** release and feature branches.
+  - **Features:** each work item is built on a `feature/<name>` branch cut from `staging`. It
+    merges into `staging` only after its tests, Ruff, the identifier scan and any required
+    review pass.
+  - **`staging`:** the release-candidate branch. It integrates all features and the research.
+    Each commit is either product-only or research-only.
+  - **Releases:** when a goal is complete, a `version/<semver>` branch is cut from `main` with
+    only the product commits copied across. It must pass the full regression run and CI, then
+    the owner merges it into `main`. Research never merges into `main`. After each release,
+    `main` is merged back into `staging`.
 - **Portability:** add no new POSIX-only code. CI runs on Linux and macOS; Windows support is
   parked (see the parking lot).
 
