@@ -70,6 +70,7 @@ CODEX_LIMITS = {
         "max_admissions_per_window": 60,
     },
     "prior_run_admissions": [],
+    "window_headroom": [],
 }
 CLIENT = ("/usr/bin/fake-client", "f" * 64)
 parse_claude = functools.partial(parse_claude_auth_status, client=CLIENT)
@@ -1062,6 +1063,7 @@ class AdmissionTests(unittest.TestCase):
                     "max_admissions_per_window": 2,
                 },
                 prior_run_admissions=prior,
+                window_headroom=list(headroom),
             )["reason_code"]
 
         now = NOW + 1
@@ -1301,6 +1303,66 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
         finally:
             self.project_id = first_project
+
+    def test_the_cap_window_is_placed_from_every_projects_readings(self) -> None:
+        self.limit("codex", max_admissions_per_window=1)
+        identity = self.observe(
+            **{"rateLimits.secondary.resetsAt": (self.clock + 3_600_000) // 1000}
+        )[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.open_run()
+        other_root = Path(self.temporary.name) / "other-project"
+        other_root.mkdir()
+        first_project = self.project_id
+        self.project_id = self.ledger.register_project(other_root, now_ms=1)
+        try:
+            self.clock += 10_000
+            # Project B alone sees a reset five hours away, which would start
+            # its window after project A's admission.
+            other = self.observe(
+                **{"rateLimits.secondary.resetsAt": (self.clock + 5 * 3_600_000) // 1000}
+            )[0]
+            self.attest("codex", other["account_fingerprint"])
+            with self.assertRaises(AdmissionDenied) as raised:
+                self.open_run()
+            self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+            # The denial is stored in this project, citing only its own records
+            # (the ledger refuses evidence from another project).
+            with self.ledger.repository(self.project_id) as repository:
+                stored = repository.records("admission_decision")[-1]
+            self.assertEqual(
+                ("deny", "window_run_cap_reached"), (stored["decision"], stored["reason_code"])
+            )
+        finally:
+            self.project_id = first_project
+
+    def test_a_reset_less_rejection_survives_the_overflow_merge(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        quiet = {"isUsingOverage": False, "overageStatus": "rejected",
+                 "overageDisabledReason": "org_level_disabled"}
+        reset = (self.clock + 3_600_000) // 1000
+        recorded = 0
+        for step in range(62):
+            recorded += len(self.event(
+                run, status="allowed", rateLimitType="five_hour",
+                utilization=step / 1000, resetsAt=reset, **quiet,
+            ))
+        self.assertEqual(63, recorded)
+        rejected_at = self.clock + 1
+        with self.assertRaisesRegex(ContractError, "too many rate-limit events"):
+            self.event(run, status="rejected", rateLimitType="five_hour",
+                       utilization=1.0, **quiet)
+        with self.ledger.repository(self.project_id) as repository:
+            merged = [record for record in repository.records("provider_headroom")
+                      if record["phase"] == "during"][-1]
+        self.assertEqual("rejected", merged["status"])
+        # The reset-less rejection lasts its day, not the allowed readings' hour.
+        self.assertEqual(rejected_at + 24 * 3_600_000, merged["windows"][0]["resets_at"])
+        after_reset = reset * 1000 + 1
+        self.observe("claude", now_ms=after_reset)
+        self.assert_denied("provider_exhausted", "claude", now_ms=after_reset + 1)
 
     def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
         identity = self.observe()[0]

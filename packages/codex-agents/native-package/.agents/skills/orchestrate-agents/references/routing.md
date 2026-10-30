@@ -122,8 +122,8 @@ first failure denies with a stable `reason_code`:
 9. `window_run_cap_reached`: the account already has `max_admissions_per_window`
    passing run admissions for the provider in the current five-hour window, counted
    across every project in the ledger. The window starts five hours before a recorded
-   five-hour reset still ahead (the earliest such start among live readings, so a later
-   reading never frees places), or is the last five hours when no reset in the next
+   five-hour reset still ahead (the earliest such start among live readings from every
+   project, so a later reading never frees places), or is the last five hours when no reset in the next
    five hours is known. Billing probes do not count. The count and the decision are
    taken under the ledger's write lock, on the ledger's clock read under that lock.
 
@@ -139,7 +139,8 @@ while a Claude run is open, stamps them with the ledger's clock, and keeps each 
 is more restrictive than the run's earlier events, so a rejection late in a run blocks
 the next admission until it resets. Only an earlier event at least as restrictive in
 status can cover a window. At 64 records the run's restriction is merged into one
-record (the highest status with the latest reset), the run is stopped, and later
+record (the highest status with the latest reset, a window without a reset counting
+for a day from its reading), the run is stopped, and later
 events are refused. A failed event is recorded as unavailable. The bridge's own observations carry the run and a
 phase (`before` or `after` launch; in-run events are `during`), a reading that fails is
 stored as `observation_unavailable`, and the run's client-observed usage is stored as

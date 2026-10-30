@@ -1134,22 +1134,32 @@ def _merged_restriction(
     records: list[dict[str, Any]], *, observed_at_ms: int
 ) -> dict[str, Any]:
     """One headroom record as restrictive as all of a run's: the highest status,
-    and per window the highest use and the latest reset."""
+    and per window the highest use and the latest effective reset.
 
-    from .providers import headroom_record
+    A window with no reset time counts for a day from its own observation, so
+    that day's end is its effective reset. The merged window always carries an
+    explicit reset at least as late as every input's, so it never ends sooner.
+    """
+
+    from .providers import EVIDENCE_HORIZON_MS, headroom_record
 
     status = max((item["status"] for item in records), key=CLAUDE_STATUS_RANK.__getitem__)
     windows: dict[tuple[Any, Any], dict[str, Any]] = {}
     for item in records:
         for window in item["windows"]:
             key = (window["scope"], window["window_minutes"])
-            merged = windows.setdefault(key, dict(window))
+            effective_reset = (
+                window["resets_at"] if window["resets_at"] is not None
+                else item["observed_at_ms"] + EVIDENCE_HORIZON_MS
+            )
+            merged = windows.get(key)
+            if merged is None:
+                windows[key] = {**window, "resets_at": effective_reset}
+                continue
             used = [value for value in (merged["used_percent"], window["used_percent"])
                     if value is not None]
-            resets = [value for value in (merged["resets_at"], window["resets_at"])
-                      if value is not None]
             merged["used_percent"] = max(used) if used else None
-            merged["resets_at"] = max(resets) if resets else None
+            merged["resets_at"] = max(merged["resets_at"], effective_reset)
     last = records[-1]
     return headroom_record(
         provider=last["provider"],
@@ -4114,6 +4124,27 @@ class LearningLedger:
         ).fetchall()
         return [(str(row[0]), int(row[1])) for row in rows if row[0] is not None]
 
+    def _window_headroom_locked(
+        self, provider: str, timestamp: int
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Headroom readings from every project that can place the cap window.
+
+        The cap belongs to the account, so its window is placed from every
+        project's readings, like the count. A five-hour reset still ahead was
+        observed less than five hours ago, so older readings cannot matter.
+        """
+
+        from .providers import FIVE_HOURS_MS
+
+        rows = self._connection.execute(
+            "SELECT content,content_digest FROM records WHERE "
+            "record_type='provider_headroom' AND source='provider' "
+            "AND json_extract(CAST(content AS TEXT),'$.provider')=? "
+            "AND observed_at_ms>=? ORDER BY observed_at_ms",
+            (provider, timestamp - FIVE_HOURS_MS),
+        ).fetchall()
+        return [(json.loads(bytes(row["content"])), str(row["content_digest"])) for row in rows]
+
     def _evaluate_admission_locked(
         self, project_id: str, *, provider: str, environ: Any, timestamp: int
     ) -> dict[str, Any]:
@@ -4140,6 +4171,7 @@ class LearningLedger:
             headroom=self._provider_records_locked(
                 project_id, "provider_headroom", provider
             ),
+            window_headroom=self._window_headroom_locked(provider, timestamp),
             prior_claude_admissions={
                 str(row[0])
                 for row in self._connection.execute(

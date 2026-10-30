@@ -845,6 +845,7 @@ def evaluate_admission(
     now_ms: int,
     admission_policy: Any = None,
     prior_run_admissions: list[tuple[str, int]] | None = None,
+    window_headroom: list[tuple[dict[str, Any], str]] | None = None,
 ) -> dict[str, Any]:
     """Apply the admission checks in their fixed order; first failure wins.
 
@@ -856,6 +857,8 @@ def evaluate_admission(
     reviewed client range and its run cap. `prior_run_admissions` lists the
     (account fingerprint, decision time) of earlier passing run admissions for
     this provider; billing probes are not runs and are not in it.
+    `window_headroom` is the account's headroom from every project, which
+    places the cap window; both cap inputs are ledger-wide.
     The result is an unsaved decision; the ledger binds it to a run.
     """
 
@@ -878,7 +881,7 @@ def evaluate_admission(
     if api_keys_present(environ):
         return decision("provider_api_key_present")
     limits = _admission_limits(admission_policy)
-    if limits is None or prior_run_admissions is None:
+    if limits is None or prior_run_admissions is None or window_headroom is None:
         return decision("admission_policy_unavailable")
     minimum_version, maximum_version, run_cap = limits
     current = [
@@ -974,7 +977,13 @@ def evaluate_admission(
         return decision("provider_exhausted", fingerprint, evidence)
     if run_cap is not None:
         # A backstop on run count per usage window, whatever headroom says.
-        start, window_digest = window_start_ms(provider, fingerprint, headroom, now_ms)
+        start, window_digest = window_start_ms(
+            provider, fingerprint, window_headroom, now_ms
+        )
+        # Evidence names only this project's records; a reading from another
+        # project still places the window but is not cited.
+        if window_digest not in {digest for _, digest in headroom}:
+            window_digest = None
         # An admission stamped after now still counts, so a clock that steps
         # back never frees places under the cap.
         counted = sum(
