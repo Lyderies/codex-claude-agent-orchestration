@@ -43,6 +43,7 @@ from codex_agents.providers import (
     billing_attestation_record,
     claude_rate_limit_records,
     evaluate_admission,
+    evaluate_launch,
     observe_claude,
     parse_client_version,
     window_start_ms,
@@ -616,6 +617,128 @@ class AdmissionTests(unittest.TestCase):
         self.clock += 24 * 60 * 60 * 1000 + 1
         self.observe()
         self.assertEqual("pass", self.admit()["decision"])
+
+    def credits_attest(self, fingerprint: str, issued_at: int = 1) -> None:
+        attest_provider(
+            self.ledger, self.project_id, self.owner_private_key, "codex", fingerprint,
+            issued_at=issued_at, credits_spending_disabled=True,
+        )
+
+    def test_attested_disabled_credits_are_admitted_and_rechecked(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.credits_attest(fingerprint)
+        self.observe(**{"rateLimits.credits.hasCredits": True})
+        decision = self.admit()
+        self.assertEqual(("pass", "admitted"), (decision["decision"], decision["reason_code"]))
+        # The observation itself still records credits as usable.
+        with self.ledger.repository(self.project_id) as repository:
+            stored = repository.records("provider_billing")[-1]
+        self.assertEqual(
+            (True, True, False, None),
+            (stored["has_credits"], stored["paid_usage_usable"], stored["unlimited"],
+             stored["spend_control_reached"]),
+        )
+        run = self.open_run()
+        after = self.observe(**{"rateLimits.credits.hasCredits": True})[0]
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            self.assertIsNone(self.ledger.launch_recheck(
+                self.project_id, run_handle=run["run_handle"], identity=after
+            ))
+        self.observe(**{"rateLimits.credits.unlimited": True})
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            self.assertEqual("paid_usage_usable", self.ledger.launch_recheck(
+                self.project_id, run_handle=run["run_handle"], identity=after
+            ))
+
+    def test_credits_without_the_attested_field_are_denied(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.observe(**{"rateLimits.credits.hasCredits": True})
+        self.assert_denied("paid_usage_usable")
+
+    def test_unlimited_credits_are_denied_even_with_the_field(self) -> None:
+        identity = self.observe()[0]
+        self.credits_attest(identity["account_fingerprint"])
+        self.observe(**{
+            "rateLimits.credits.hasCredits": True, "rateLimits.credits.unlimited": True,
+        })
+        self.assert_denied("paid_usage_usable")
+
+    def test_spend_control_reached_is_denied_with_its_own_reason(self) -> None:
+        identity = self.observe()[0]
+        self.credits_attest(identity["account_fingerprint"])
+        self.observe(**{
+            "rateLimits.credits.hasCredits": True, "rateLimits.spendControlReached": True,
+        })
+        self.assert_denied("codex_spend_control_reached")
+        # Without credits, and without the field, it denies the same way.
+        self.observe(**{"rateLimits.spendControlReached": True})
+        self.assert_denied("codex_spend_control_reached")
+        with self.ledger.repository(self.project_id) as repository:
+            self.assertIs(True, repository.records("provider_billing")[-1]["spend_control_reached"])
+
+    def test_credits_attestation_for_another_account_does_not_apply(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.credits_attest("0" * 64, issued_at=2)
+        self.observe(**{"rateLimits.credits.hasCredits": True})
+        self.assert_denied("paid_usage_usable")
+
+    def test_the_credits_field_is_for_a_codex_grant_and_must_be_true(self) -> None:
+        grant = {
+            "version": 1, "provider": "claude", "account_fingerprint": "0" * 64,
+            "no_paid_overage": True, "no_usage_credits": True, "issued_at": 5,
+            "codex_credits_spending_disabled": True,
+        }
+        with self.assertRaisesRegex(ContractError, "only for a Codex grant"):
+            billing_attestation_record(grant)
+        with self.assertRaisesRegex(ContractError, "must be true"):
+            billing_attestation_record(
+                {**grant, "provider": "codex", "codex_credits_spending_disabled": False}
+            )
+        record = billing_attestation_record({**grant, "provider": "codex"})
+        self.assertIs(True, record["codex_credits_spending_disabled"])
+        older = {key: value for key, value in grant.items()
+                 if key != "codex_credits_spending_disabled"}
+        self.assertNotIn(
+            "codex_credits_spending_disabled", billing_attestation_record(older)
+        )
+
+    def test_launch_recheck_function_honours_the_field(self) -> None:
+        fingerprint = "a" * 64
+        identity = {"account_fingerprint": fingerprint, "plan_type": "plus"}
+
+        def billing(**changes) -> list:
+            record = {
+                "provider": "codex", "account_fingerprint": fingerprint,
+                "paid_usage_usable": True, "has_credits": True, "unlimited": False,
+                "spend_control_reached": False, "is_using_overage": None,
+                "ordinary_usage_allowed": True, "observed_at_ms": NOW, **changes,
+            }
+            return [(record, DIGEST_C)]
+
+        def attestation(fingerprint: str = fingerprint, **changes) -> list:
+            record = {"provider": "codex", "account_fingerprint": fingerprint,
+                      "observed_at_ms": 1, "codex_credits_spending_disabled": True, **changes}
+            return [(record, DIGEST_B)]
+
+        def launch(records, attestations):
+            return evaluate_launch(
+                provider="codex", identity=identity, billing=records, headroom=[],
+                now_ms=NOW + 1, attestations=attestations,
+            )
+
+        self.assertIsNone(launch(billing(), attestation()))
+        self.assertEqual("paid_usage_usable", launch(billing(), attestation(**{
+            "codex_credits_spending_disabled": None})))
+        self.assertEqual("paid_usage_usable", launch(billing(), None))
+        self.assertEqual("paid_usage_usable", launch(billing(), attestation("b" * 64)))
+        self.assertEqual("paid_usage_usable", launch(billing(unlimited=True), attestation()))
+        self.assertEqual(
+            "codex_spend_control_reached",
+            launch(billing(spend_control_reached=True), attestation()),
+        )
 
     def test_codex_without_recent_billing_is_denied(self) -> None:
         identity = parse_claude(
@@ -1507,6 +1630,57 @@ class AdmissionTests(unittest.TestCase):
             self.ledger, "_clock_ms", return_value=self.clock + 24 * 3_600_000 + 1
         ):
             self.assertTrue(self.ledger.delete_project(held).startswith("del_"))
+
+    def test_spend_control_denial_survives_deleting_the_recording_project(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.credits_attest(fingerprint)
+        first = self.project_id
+        # Another project of the same account records spend control reached.
+        with self.other_project():
+            self.attest("codex", fingerprint)
+            self.credits_attest(fingerprint, issued_at=2)
+            self.observe(**{
+                "rateLimits.credits.hasCredits": True,
+                "rateLimits.spendControlReached": True,
+            })
+            held = self.project_id
+            with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+                with self.assertRaisesRegex(LedgerError, "project_holds_account_restrictions"):
+                    self.ledger.delete_project(held)
+        self.assertEqual(first, self.project_id)
+        self.observe(**{"rateLimits.credits.hasCredits": True})
+        self.assert_denied("codex_spend_control_reached")
+        # A reading stamped in the future counts too.
+        with self.other_project():
+            future = self.clock + 3_600_000
+            self.observe(now_ms=future, **{"rateLimits.spendControlReached": True})
+            with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+                with self.assertRaisesRegex(LedgerError, "project_holds_account_restrictions"):
+                    self.ledger.delete_project(self.project_id)
+
+    def test_billing_records_without_spend_control_verify_in_a_backup(self) -> None:
+        identity = self.observe()[0]
+        legacy = self.observe()[2]
+        del legacy["spend_control_reached"]
+        legacy = {**legacy, "record_id": "provider_billing:legacy"}
+        self.assertNotIn("spend_control_reached", validate_learning_record(legacy))
+        self.ledger._store_provider_observations(
+            self.project_id, [legacy], timestamp=self.tick()
+        )
+        self.assertEqual(identity["provider"], "codex")
+        self.ledger.create_sanitized_backup(
+            self.project_id, file_id="legacy_billing",
+            expires_at_ms=time.time_ns() // 1_000_000 + 60_000,
+        )
+        self.ledger.verify_sanitized_backup(self.project_id, file_id="legacy_billing")
+        with self.ledger.repository(self.project_id) as repository:
+            stored = [r for r in repository.records("provider_billing")
+                      if r["record_id"] == "provider_billing:legacy"]
+        self.assertEqual(1, len(stored))
+        self.assertNotIn("spend_control_reached", stored[0])
+        with self.assertRaises(ContractError):
+            validate_learning_record({**legacy, "spend_control_reached": "yes"})
 
     def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
         identity = self.observe()[0]

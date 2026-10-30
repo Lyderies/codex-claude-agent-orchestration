@@ -38,6 +38,10 @@
   - A gated billing probe supplies the evidence native Claude children cannot.
 - **Observations.** Headroom, billing and usage records are bound to their run and phase. A failed
   reading is recorded instead of dropped.
+- **Codex credits attestation.** An owner billing attestation for Codex may carry
+  `codex_credits_spending_disabled: true`, which lets a reading of credits that are not unlimited
+  be admitted, at admission and at the launch re-check. `unlimited` credits still deny.
+  `spendControlReached` is now recorded and denies as `codex_spend_control_reached`.
 - **Package version.** The Codex package is now 0.8.0. It had kept the imported 0.7.2, so an existing
   collector authorized for 0.7.2 refused the changed build as a conflict instead of upgrading.
 
