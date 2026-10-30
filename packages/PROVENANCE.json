@@ -153,8 +153,8 @@
         "native-package/.claude/skills/agent-orchestration/SKILL.md": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
         "native-package/.codex/orchestration/codex_agents/hosts.py": "G2 S3 Claude host client and orchestration skills",
         "native-package/.codex/orchestration/codex_agents/claude_host.py": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
-        "native-package/.codex/orchestration/codex_agents/workspace.py": "G3 S1a contained workspace library; G3 S1a review fixes",
-        "tests/test_workspace.py": "G3 S1a contained workspace library; G3 S1a review fixes"
+        "native-package/.codex/orchestration/codex_agents/workspace.py": "G3 S1a contained workspace library; G3 S1a review fixes (two rounds)",
+        "tests/test_workspace.py": "G3 S1a contained workspace library; G3 S1a review fixes (two rounds)"
       }
     },
     "claude-agents": {

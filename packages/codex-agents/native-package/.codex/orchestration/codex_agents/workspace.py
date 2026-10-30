@@ -82,6 +82,7 @@ NEW_FILE_PERMS = {0o644: REGULAR_MODE, 0o755: EXECUTABLE_MODE}
 NEW_DIRECTORY_PERMS = frozenset({0o700, 0o755})
 ENTRY_TYPES = ("file", "directory", "symlink", "fifo", "socket", "device")
 FENCED_MARKER = ".fenced-"
+ROOT_ENTRY = "."
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _O_CLOEXEC
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _O_CLOEXEC
@@ -611,6 +612,7 @@ def export_workspace(
                 "sha256": hashlib.sha256(content).hexdigest(),
             }
         directories = dict(sorted(tracker.perms.items()))
+        root_perm = stat.S_IMODE(os.fstat(workspace_fd).st_mode)
     finally:
         os.close(workspace_fd)
     manifest = {
@@ -620,6 +622,7 @@ def export_workspace(
         "write_set": writable,
         "files": files,
         "directories": directories,
+        "root_perm": root_perm,
     }
     _write_private_json(layout.manifest_path, manifest)
     return manifest
@@ -734,7 +737,11 @@ def _snapshot_workspace(layout: WorkspaceLayout, max_entries: int, max_bytes: in
     except OSError as exc:
         raise WorkspaceRefused("workspace_not_directory") from exc
     snapshot_root = os.open(layout.snapshot, _DIRECTORY_FLAGS)
-    entries: dict[str, dict[str, Any]] = {}
+    root_status = os.fstat(source_root)
+    # The workspace root itself is recorded under ".", which no relative path can spell.
+    entries: dict[str, dict[str, Any]] = {
+        ROOT_ENTRY: {"type": "directory", "mode": stat.S_IMODE(root_status.st_mode), "nlink": root_status.st_nlink},
+    }
     total = 0
     try:
         pending = [""]
@@ -744,7 +751,7 @@ def _snapshot_workspace(layout: WorkspaceLayout, max_entries: int, max_bytes: in
             source = _open_parents(source_root, parts, create=False)
             target = _open_parents(snapshot_root, parts, create=False)
             try:
-                for name in _list_names(source, max_entries - len(entries)):
+                for name in _list_names(source, max_entries - (len(entries) - 1)):
                     path = _checked_name(name, relative)
                     status = os.stat(name, dir_fd=source, follow_symlinks=False)
                     kind = _entry_type(status.st_mode)
@@ -800,7 +807,7 @@ def _inventory_snapshot(
     recorded = _read_private_json(layout.snapshot_entries)
     if not isinstance(recorded, dict):
         raise WorkspaceRefused("snapshot_invalid")
-    if len(recorded) > max_entries:
+    if len(recorded) > max_entries + 1:  # the entries plus the root record
         raise WorkspaceRefused("inventory_too_many_entries")
     inventory: dict[str, dict[str, Any]] = {}
     total = 0
@@ -844,6 +851,13 @@ def _inventory_snapshot(
                 os.close(directory)
     finally:
         os.close(root)
+    root_record = recorded.get(ROOT_ENTRY)
+    if not isinstance(root_record, dict) or root_record.get("type") != "directory":
+        raise WorkspaceRefused("snapshot_inconsistent", ROOT_ENTRY)
+    inventory[ROOT_ENTRY] = {
+        "type": "directory", "mode": int(root_record["mode"]), "nlink": int(root_record["nlink"]),
+        "size": 0, "sha256": None,
+    }
     for path, record in recorded.items():
         if path in inventory:
             continue
@@ -907,6 +921,10 @@ def check_ownership(manifest: Mapping[str, Any], inventory: Mapping[str, Mapping
     }
     changes: list[dict] = []
     for path, entry in sorted(inventory.items()):
+        if path == ROOT_ENTRY:
+            if entry["type"] != "directory" or entry["mode"] != manifest["root_perm"]:
+                raise WorkspaceRefused("mode_change", ROOT_ENTRY)
+            continue
         kind = entry["type"]
         if kind == "symlink":
             raise WorkspaceRefused("symlink_entry", path)
@@ -1233,6 +1251,35 @@ def _files_below(parent_fd: int, name: str) -> set[str] | None:
     return found
 
 
+def _check_existing_spelling(root_fd: int, parts: list[str]) -> None:
+    """Refuse when an existing entry along `parts` is spelled differently on disk.
+
+    A case- or normalization-insensitive destination resolves `src/a` to an
+    existing `src/A`; writing through it would land beside the wrong name.
+    Each component that exists is looked up by exact name in a bounded listing
+    of its parent; the walk stops at the first component that does not exist
+    or is not a directory (later checks handle those).
+    """
+
+    current = os.dup(root_fd)
+    try:
+        for index, part in enumerate(parts):
+            try:
+                os.stat(part, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if part not in _list_names(current, MAX_TREE_ENTRIES, "tree_too_large"):
+                raise WorkspaceRefused("apply_path_collision", "/".join(parts[: index + 1]))
+            try:
+                following = _open_parents(current, [part], create=False)
+            except WorkspaceRefused:
+                return
+            os.close(current)
+            current = following
+    finally:
+        os.close(current)
+
+
 def _install_file(parent: int, name: str, content: bytes, mode: str, *, replace: bool) -> None:
     """Write through a short random temporary name, then link it in (add) or replace (modify).
 
@@ -1299,6 +1346,7 @@ def apply_patch_to_tree(
         for change, _ in decoded:
             path = change["path"]
             parts = path.split("/")
+            _check_existing_spelling(root_fd, parts if change["op"] != "add" else parts[:-1])
             try:
                 parent = tracker.open(parts[:-1], create=False)
             except FileNotFoundError:

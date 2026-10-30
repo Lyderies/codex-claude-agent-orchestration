@@ -1041,5 +1041,82 @@ class ReviewFixesTest(WorkspaceTestCase):
         self.assertEqual([p for p in os.listdir(target / "src") if p.endswith(".tmp")], [])
 
 
+class RoundTwoFixesTest(WorkspaceTestCase):
+    def test_apply_refuses_an_existing_directory_spelled_differently(self) -> None:
+        write(self.project / "src" / "A" / "existing.txt", "existing\n")
+        commit = self.commit("upper")
+        # The child owned only src/a/new.txt, which is absent, so nothing about src/A was exported.
+        layout, manifest = self.export(read=("docs",), write_set=("src/a/new.txt",))
+        self.assertNotIn("src/A/existing.txt", manifest["files"])
+        write(layout.workspace / "src" / "a" / "new.txt", "new\n")
+        patch = self.collect(layout, manifest)
+        self.assertEqual([c["path"] for c in patch["changes"]], ["src/a/new.txt"])
+        target = self.base / "checkout"
+        git(self.project, "worktree", "add", "-q", "--detach", str(target), commit)
+        verified = workspace.verify_tree_at_commit(target, commit)
+        if case_insensitive(self.base):
+            self.assertRefused(
+                "apply_path_collision", workspace.apply_patch_to_tree, patch, target, verified=verified
+            )
+            self.assertEqual(sorted(os.listdir(target / "src" / "A")), ["existing.txt"])
+        else:
+            # The alias cannot occur here: src/a is a separate, new directory.
+            workspace.apply_patch_to_tree(patch, target, verified=verified)
+            self.assertEqual((target / "src" / "a" / "new.txt").read_text(), "new\n")
+            self.assertEqual(sorted(os.listdir(target / "src" / "A")), ["existing.txt"])
+
+    def test_spelling_check_on_both_filesystems(self) -> None:
+        tree = self.base / "tree"
+        write(tree / "src" / "A" / "existing.txt", "existing\n")
+        descriptor = os.open(tree, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        # Exact spellings, and absent components, pass everywhere.
+        workspace._check_existing_spelling(descriptor, ["src", "A", "existing.txt"])
+        workspace._check_existing_spelling(descriptor, ["src", "B", "new.txt"])
+        # Inject the alias a case-insensitive filesystem would produce: `src/a` resolves,
+        # but the listing holds only `A`.
+        real_stat = os.stat
+
+        def aliasing_stat(path, *arguments, **keywords):
+            if path == "a":
+                path = "A"
+            return real_stat(path, *arguments, **keywords)
+
+        with mock.patch.object(workspace.os, "stat", side_effect=aliasing_stat):
+            self.assertRefused(
+                "apply_path_collision", workspace._check_existing_spelling, descriptor, ["src", "a", "new.txt"]
+            )
+
+    def test_modify_and_delete_targets_spelled_differently_are_refused(self) -> None:
+        if not case_insensitive(self.base):
+            self.skipTest("a differently spelled existing file can only be reached on a case-insensitive filesystem")
+        commit = git(self.project, "rev-parse", "HEAD")
+        blob = git(self.project, "rev-parse", "HEAD:src/app.py")
+        target = self.base / "checkout"
+        git(self.project, "worktree", "add", "-q", "--detach", str(target), commit)
+        for change in (
+            {"path": "src/APP.py", "op": "modify", "old_blob": blob, "old_mode": "100644", "content": b"y\n"},
+            {"path": "src/App.py", "op": "delete", "old_blob": blob, "old_mode": "100644"},
+        ):
+            with self.subTest(op=change["op"]):
+                self.assertRefused(
+                    "apply_path_collision", workspace.apply_patch_to_tree, hand_patch(commit, [change]),
+                    target, base_verified_by_caller=True,
+                )
+                self.assertEqual((target / "src" / "app.py").read_text(), "print('app')\n")
+
+    def test_workspace_root_mode_change_is_refused(self) -> None:
+        layout, manifest = self.export()
+        self.assertEqual(manifest["root_perm"], 0o700)
+        os.chmod(layout.workspace, 0o777)
+        workspace.snapshot_workspace(layout)
+        self.assertEqual(workspace.inventory_snapshot(layout)["."]["mode"], 0o777)
+        self.assertRefused("mode_change", workspace.collect_patch, layout, manifest)
+
+    def test_unchanged_workspace_root_is_accepted(self) -> None:
+        layout, manifest = self.export()
+        self.assertEqual(self.collect(layout, manifest)["changes"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
