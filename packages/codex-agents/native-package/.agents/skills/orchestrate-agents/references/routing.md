@@ -88,8 +88,10 @@ decision is stored, and it shares the single per-account bootstrap allowance wit
 Account billing evidence under five minutes old is reused (`probe: "reused"`) instead of
 probing again; otherwise a probe for the same account in the last five minutes, in any
 project and whatever it returned, refuses with `probe_cooldown`. Each event is parsed on
-its own, and the merge of every valid event is stored even when the probe aborts,
-times out, overflows or reports an invalid event; the probe still reports failure. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
+its own, and the merge of every valid event is stored. When the probe aborts, times out,
+overflows or reports an invalid event, only the merge's restrictive parts are stored
+(billing not shown off, or a non-ample window), so an incomplete probe never refreshes
+clean evidence; the probe still reports failure. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
 constrained. The markers only catch accidental
 misuse; they are not proof of identity. Admission, the bridge flag and the read-only sandbox are the
 authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,

@@ -3941,7 +3941,7 @@ class LearningLedger:
 
         from .bridge import BridgeRefused, claude_billing_probe
         from .claude_host import ClaudeHostDenied, check_backend
-        from .providers import AdmissionDenied, claude_rate_limit_records
+        from .providers import AdmissionDenied, _headroom_state, claude_rate_limit_records
 
         environ = os.environ if environ is None else environ
 
@@ -4048,12 +4048,26 @@ class LearningLedger:
                     key=lambda record: BILLING_RANK[record["paid_usage_usable"]],
                 ),
             ]
-            self._store_provider_observations(project_id, records, timestamp=observed)
+            if failure is not None or invalid:
+                # An incomplete probe never refreshes clean evidence: only its
+                # restrictive parts are stored. Clean billing would look fresh
+                # and admit runs, so it is dropped and the older reading ages
+                # out; a clean headroom reading is dropped with it.
+                merged_headroom, merged_billing = records
+                records = [
+                    *([merged_headroom] if merged_headroom["status"] != "allowed"
+                      or _headroom_state("claude", merged_headroom, observed) not in {"ample", None}
+                      else []),
+                    *([merged_billing] if merged_billing["paid_usage_usable"] is not False
+                      else []),
+                ]
+            if records:
+                self._store_provider_observations(project_id, records, timestamp=observed)
         if failure is not None:
             raise BridgeRefused(f"billing probe failed: {failure}")
         if not infos:
             raise BridgeRefused("billing probe reported no rate-limit event")
-        if not records:
+        if not headroom:
             raise BridgeRefused("billing probe reported no valid rate-limit event")
         if invalid:
             raise BridgeRefused("billing probe reported an invalid rate-limit event")

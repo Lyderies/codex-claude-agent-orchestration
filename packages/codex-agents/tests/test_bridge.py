@@ -1840,6 +1840,31 @@ class ClaudeHostReviewTests(ClaudePrimaryCase):
                 self.assertEqual(
                     "paid_usage_usable", self.open_native(expected=2)["reason_code"]
                 )
+        # An incomplete probe never refreshes clean evidence: a clean event plus
+        # a malformed one stores nothing, and the probe still fails.
+        self.fresh_account()
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                counts = (len(repository.records("provider_billing")),
+                          len(repository.records("provider_headroom")))
+        finally:
+            ledger.close()
+        self.frames("claude", [PROBE_INIT, FAVOURABLE, malformed, result_frame("OK")])
+        failed = self.cli(
+            "provider-observe", "--provider", "claude", "--billing-probe", expected=2
+        )
+        self.assertIn("invalid rate-limit event", failed["reason"])
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                self.assertEqual(counts, (len(repository.records("provider_billing")),
+                                          len(repository.records("provider_headroom"))))
+        finally:
+            ledger.close()
+        # The probe used the account's bootstrap and left no billing, so the
+        # next open is refused rather than admitted on a clean reading.
+        self.assertEqual("billing_unverified", self.open_native(expected=2)["reason_code"])
         # A probe whose events are all invalid stores nothing and still fails.
         self.fresh_account()
         ledger = LearningLedger(self.state, client_capabilities=self.clients)
