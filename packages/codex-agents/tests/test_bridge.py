@@ -1319,7 +1319,7 @@ class ClaudePrimaryTests(ClaudePrimaryCase):
         )
         bounded = self.cli("learning-route", "--task", self.write("b.json", self.bounded()))
         self.assertEqual(
-            ("codex", "bridge", "gpt-6-luna", "high"),
+            ("codex", "bridge", "gpt-6.1-sol", "medium"),
             (bounded["provider"], bounded["dispatch"], bounded["model"], bounded["effort"]),
         )
         refused = self.cli(
@@ -1388,7 +1388,7 @@ class ClaudePrimaryTests(ClaudePrimaryCase):
             context, opened["run_handle"], dispatched["result"],
             dispatched["bridge_report"]["terminal_state"],
         )
-        self.assertEqual("gpt-6-luna", recorded["outcome"]["model"])
+        self.assertEqual("gpt-6.1-sol", recorded["outcome"]["model"])
 
 
 PROBE_INIT = init_frame(model="claude-haiku-5-5", tools=[])
