@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # ruff: noqa: I001 -- tests.support bootstraps the native package import path.
 
+import functools
+import hashlib
 import json
 import os
 import subprocess
@@ -37,6 +39,7 @@ from codex_agents.providers import (
     AppServerSession,
     billing_attestation_record,
     claude_rate_limit_records,
+    evaluate_admission,
     observe_claude,
     observe_codex,
     parse_claude_auth_status,
@@ -52,10 +55,14 @@ from tests.learning_support import (
     fake_provider_tools,
     generate_test_owner_key,
     provider_fixture,
+    trusted_tools,
     routing_fields,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "providers"
+CLIENT = ("/usr/bin/fake-client", "f" * 64)
+parse_claude = functools.partial(parse_claude_auth_status, client=CLIENT)
+parse_codex = functools.partial(parse_codex_rate_limits, client=CLIENT)
 KEY = b"k" * 32
 NOW = 10_000_000_000
 CLEAN: dict[str, str] = {}
@@ -105,7 +112,7 @@ def fake_codex(directory: Path) -> tuple[dict[str, str], Path]:
 
 class ProviderObservationTests(unittest.TestCase):
     def test_claude_auth_status_becomes_a_fingerprint(self) -> None:
-        identity = parse_claude_auth_status(
+        identity = parse_claude(
             provider_fixture("claude-auth-status.json"),
             digest_key=KEY,
             observed_at_ms=NOW,
@@ -127,12 +134,12 @@ class ProviderObservationTests(unittest.TestCase):
         for raw in RAW_IDENTITY:
             self.assertNotIn(raw, serialized)
         with self.assertRaisesRegex(ContractError, "identity is incomplete"):
-            parse_claude_auth_status(
+            parse_claude(
                 b'{"loggedIn": false}', digest_key=KEY, observed_at_ms=NOW
             )
 
     def test_codex_rate_limits_identify_windows_by_duration(self) -> None:
-        identity, headroom, billing = parse_codex_rate_limits(
+        identity, headroom, billing = parse_codex(
             json.loads(provider_fixture("codex-rate-limits.json")),
             digest_key=KEY,
             observed_at_ms=NOW,
@@ -210,22 +217,58 @@ class ProviderObservationTests(unittest.TestCase):
             executable = Path(directory) / "claude"
             executable.write_text("#!/bin/sh\nexit 1\n")
             executable.chmod(0o755)
-            environ = {"PATH": directory}
-            records = observe_claude(
-                digest_key=KEY, observed_at_ms=NOW, environ=environ, popen=popen
-            )
-            self.assertEqual("provider_identity", records[0]["record_type"])
-            self.assertEqual([str(executable), "auth", "status", "--json"], calls[0][0])
-            self.assertTrue(calls[0][1]["start_new_session"])
-            for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-                with self.subTest(name=name), self.assertRaisesRegex(
-                    ContractError, "API key"
-                ):
-                    observe_claude(
-                        digest_key=KEY, observed_at_ms=NOW,
-                        environ={**environ, name: "set"}, popen=popen,
-                    )
+            environ = {"CLAUDE_CONFIG_DIR": "/elsewhere", "CODEX_HOME": "/elsewhere"}
+            with trusted_tools(Path(directory)):
+                records = observe_claude(
+                    digest_key=KEY, observed_at_ms=NOW, environ=environ, popen=popen
+                )
+                self.assertEqual("provider_identity", records[0]["record_type"])
+                real = os.path.realpath(executable)
+                self.assertEqual([real, "auth", "status", "--json"], calls[0][0])
+                self.assertTrue(calls[0][1]["start_new_session"])
+                # The child gets only a minimal environment; overrides are dropped.
+                self.assertEqual(
+                    {"HOME", "PATH", "LANG", "TMPDIR"}, set(calls[0][1]["env"])
+                )
+                for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+                    with self.subTest(name=name), self.assertRaisesRegex(
+                        ContractError, "API key"
+                    ):
+                        observe_claude(
+                            digest_key=KEY, observed_at_ms=NOW,
+                            environ={**environ, name: "set"}, popen=popen,
+                        )
             self.assertEqual(1, len(calls))
+
+    def test_clients_resolve_only_from_the_trusted_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            trusted = root / "trusted"
+            planted = root / "planted"
+            fake_provider_tools(trusted)
+            marker = root / "planted-ran"
+            planted.mkdir()
+            impostor = planted / "claude"
+            impostor.write_text(f"#!/bin/sh\n/usr/bin/touch {marker}\nexit 1\n")
+            impostor.chmod(0o755)
+            with trusted_tools(trusted):
+                records = observe_claude(
+                    digest_key=KEY, observed_at_ms=NOW,
+                    environ={"PATH": f"{planted}{os.pathsep}{trusted}"},
+                )
+            self.assertFalse(marker.exists())
+            real = os.path.realpath(trusted / "claude")
+            self.assertEqual(real, records[0]["client_path"])
+            self.assertEqual(
+                hashlib.sha256(Path(real).read_bytes()).hexdigest(),
+                records[0]["client_sha256"],
+            )
+            with trusted_tools(planted / "missing"), self.assertRaisesRegex(
+                ContractError, "trusted path"
+            ):
+                observe_claude(
+                    digest_key=KEY, observed_at_ms=NOW, environ={"PATH": str(trusted)}
+                )
 
     def test_claude_output_is_bounded_while_streaming(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
@@ -249,10 +292,11 @@ class ProviderObservationTests(unittest.TestCase):
             for name, message in (("flood", "too large"), ("stall", "timed out")):
                 with self.subTest(name=name):
                     started = time.monotonic()
-                    with self.assertRaisesRegex(ContractError, message):
+                    with trusted_tools(root / name), self.assertRaisesRegex(
+                        ContractError, message
+                    ):
                         observe_claude(
-                            digest_key=KEY, observed_at_ms=NOW,
-                            environ={"PATH": str(root / name)}, timeout=1,
+                            digest_key=KEY, observed_at_ms=NOW, environ={}, timeout=1,
                         )
                     self.assertLess(time.monotonic() - started, 10)
                     pid = int(Path(f"{marker}-{name}").read_text())
@@ -262,21 +306,21 @@ class ProviderObservationTests(unittest.TestCase):
     def test_labels_are_allow_listed_and_identifiers_never_leak(self) -> None:
         status = json.loads(provider_fixture("claude-auth-status.json"))
         status.update(subscriptionType="fixture-org-7f3a91", authMethod="fixture-org-7f3a91")
-        identity = parse_claude_auth_status(
+        identity = parse_claude(
             json.dumps(status), digest_key=KEY, observed_at_ms=NOW
         )
         self.assertEqual((None, None), (identity["subscription_type"], identity["auth_method"]))
         self.assertNotIn(b"fixture-org-7f3a91", canonical_json(identity))
         result = json.loads(provider_fixture("codex-rate-limits.json"))
         result["rateLimits"]["planType"] = "fixture-account-5c2e08"
-        records = parse_codex_rate_limits(result, digest_key=KEY, observed_at_ms=NOW)
+        records = parse_codex(result, digest_key=KEY, observed_at_ms=NOW)
         self.assertIsNone(records[0]["plan_type"])
         for record in records:
             self.assertNotIn(b"fixture-account-5c2e08", canonical_json(record))
         result["rateLimits"]["planType"] = "prolite"
         self.assertEqual(
             "prolite",
-            parse_codex_rate_limits(result, digest_key=KEY, observed_at_ms=NOW)[0][
+            parse_codex(result, digest_key=KEY, observed_at_ms=NOW)[0][
                 "plan_type"
             ],
         )
@@ -312,10 +356,12 @@ class ProviderObservationTests(unittest.TestCase):
         self.assertEqual(("initialized",), APP_SERVER_NOTIFICATIONS)
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
-            environ, log = fake_codex(root)
-            records = observe_codex(
-                root, digest_key=KEY, observed_at_ms=NOW, environ=environ
-            )
+            _, log = fake_codex(root)
+            environ: dict[str, str] = {}
+            with trusted_tools(root):
+                records = observe_codex(
+                    root, digest_key=KEY, observed_at_ms=NOW, environ=environ
+                )
             self.assertEqual(
                 ["provider_identity", "provider_headroom", "provider_billing"],
                 [record["record_type"] for record in records],
@@ -323,7 +369,8 @@ class ProviderObservationTests(unittest.TestCase):
             self.assertEqual(
                 ["initialize", "initialized", "account/rateLimits/read"], log.read_text().split()
             )
-            session = AppServerSession(root, environ=environ)
+            with trusted_tools(root):
+                session = AppServerSession(root, environ=environ)
             try:
                 for method in ("account/logout", "thread/start", "turn/start"):
                     with self.subTest(method=method), self.assertRaisesRegex(
@@ -340,7 +387,7 @@ class ProviderObservationTests(unittest.TestCase):
             self.assertEqual(
                 ["initialize", "initialized", "account/rateLimits/read"], log.read_text().split()
             )
-            with self.assertRaisesRegex(ContractError, "API key"):
+            with trusted_tools(root), self.assertRaisesRegex(ContractError, "API key"):
                 AppServerSession(root, environ={**environ, "OPENAI_API_KEY": "x"})
 
 
@@ -402,10 +449,22 @@ class AdmissionTests(unittest.TestCase):
         else:
             status = {**json.loads(provider_fixture("claude-auth-status.json")), **changes}
             (self.tools / "claude-status.json").write_text(json.dumps(status))
-        return self.ledger.observe_provider(
-            self.project_id, provider, project_root=self.tools,
-            environ=self.environ, now_ms=now_ms if now_ms is not None else self.tick(),
-        )
+        stamp = now_ms if now_ms is not None else self.tick()
+        with trusted_tools(self.tools), mock.patch.object(
+            self.ledger, "_clock_ms", return_value=stamp
+        ):
+            return self.ledger.observe_provider(
+                self.project_id, provider, project_root=self.tools, environ=CLEAN
+            )
+
+    def event(self, run: dict, **info) -> list[dict]:
+        """Record a run's rate-limit event; the ledger's clock stamps it."""
+
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.tick()):
+            return record_claude_rate_limit_event(
+                self.ledger, self.project_id,
+                run_handle=run["run_handle"], rate_limit_info=info,
+            )
 
     def attest(self, provider: str, fingerprint: str) -> None:
         attest_provider(
@@ -416,6 +475,11 @@ class AdmissionTests(unittest.TestCase):
         orchestration = self.ledger.open_orchestration(
             self.project_id, client_version="codex-host-v1", now_ms=NOW
         )
+        stamp = now_ms if now_ms is not None else self.clock + 1
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=stamp):
+            return self._open_run(provider, orchestration, stamp)
+
+    def _open_run(self, provider: str, orchestration: dict, stamp: int) -> dict:
         assigned = assignment()
         configuration = {
             "model": assigned["model"], "effort": assigned["effort"],
@@ -446,7 +510,7 @@ class AdmissionTests(unittest.TestCase):
             execution_configuration=configuration,
             client_version="codex-host-v1",
             orchestration_handle=orchestration["orchestration_handle"],
-            now_ms=now_ms if now_ms is not None else self.clock + 1,
+            now_ms=stamp,
         )
 
     def test_codex_denials_follow_the_fixed_order(self) -> None:
@@ -461,21 +525,68 @@ class AdmissionTests(unittest.TestCase):
         # The intended compatibility break: Codex-only projects need an attestation.
         self.assert_denied("billing_attestation_missing")
         self.attest("codex", identity["account_fingerprint"])
-        self.observe(**{"rateLimits.credits.hasCredits": True})
-        self.assert_denied("paid_usage_usable")
         self.observe(**{"rateLimits.credits": None})
         self.assert_denied("billing_unverified")
-        self.observe(**{"rateLimits.secondary.usedPercent": 90})
+        soon = (self.clock + 5_000) // 1000
+        self.observe(**{
+            "rateLimits.secondary.usedPercent": 90, "rateLimits.secondary.resetsAt": soon,
+        })
         self.assert_denied("provider_exhausted")
+        # A later, favourable read does not clear a window that has not reset.
+        self.observe()
+        self.assert_denied("provider_exhausted")
+        self.clock += 10_000
         self.observe(ordinaryUsageAllowed=False)
         self.assert_denied("provider_exhausted")
         latest = self.observe()
         decision = self.admit()
-        self.assertEqual(("pass", "admitted"), (decision["decision"], decision["reason_code"]))
+        self.assertEqual(
+            ("pass", "admitted", "evidence"),
+            (decision["decision"], decision["reason_code"], decision["admission_basis"]),
+        )
         for record in latest:
             self.assertIn(content_digest(record), decision["evidence_digests"])
+        self.observe(**{"rateLimits.credits.hasCredits": True})
+        self.assert_denied("paid_usage_usable")
+        # Paid usage seen within a day keeps denying, whatever comes after it.
+        self.observe()
+        self.assert_denied("paid_usage_usable")
+        self.clock += 24 * 60 * 60 * 1000 + 1
+        self.observe()
+        self.assertEqual("pass", self.admit()["decision"])
 
-    def test_claude_requires_subscription_login_and_unexhausted_windows(self) -> None:
+    def test_codex_without_recent_billing_is_denied(self) -> None:
+        identity = parse_claude(
+            provider_fixture("claude-auth-status.json"), digest_key=KEY, observed_at_ms=NOW
+        )
+        codex_identity = {**identity, "provider": "codex", "auth_method": None,
+                          "subscription_type": None}
+        attestation = {"provider": "codex",
+                       "account_fingerprint": identity["account_fingerprint"],
+                       "observed_at_ms": 1}
+        decision = evaluate_admission(
+            provider="codex",
+            identities=[(codex_identity, DIGEST_A)],
+            attestations=[(attestation, DIGEST_B)],
+            billing=[], headroom=[], prior_claude_admissions=set(),
+            environ={}, now_ms=NOW + 1,
+        )
+        self.assertEqual("billing_unverified", decision["reason_code"])
+        stale_billing = {"provider": "codex",
+                         "account_fingerprint": identity["account_fingerprint"],
+                         "paid_usage_usable": False, "is_using_overage": None,
+                         "ordinary_usage_allowed": True,
+                         "observed_at_ms": NOW - IDENTITY_MAX_AGE_MS}
+        decision = evaluate_admission(
+            provider="codex",
+            identities=[(codex_identity, DIGEST_A)],
+            attestations=[(attestation, DIGEST_B)],
+            billing=[(stale_billing, DIGEST_C)], headroom=[],
+            prior_claude_admissions=set(), environ={}, now_ms=NOW + 1,
+        )
+        self.assertEqual("billing_unverified", decision["reason_code"])
+
+    def test_claude_requires_subscription_login(self) -> None:
         console = self.observe("claude", authMethod="console", subscriptionType=None)[0]
         self.attest("claude", console["account_fingerprint"])
         self.assert_denied("claude_subscription_missing", "claude")
@@ -483,43 +594,83 @@ class AdmissionTests(unittest.TestCase):
         self.assert_denied("claude_subscription_missing", "claude")
         fingerprint = self.observe("claude")[0]["account_fingerprint"]
         self.assertEqual(console["account_fingerprint"], fingerprint)
+        self.assertEqual("pass", self.admit("claude")["decision"])
+
+    def test_claude_bootstrap_admits_one_run_until_it_records_billing(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        first = self.open_run("claude")
+        stored = self.ledger.host_run_admission(self.project_id, first["run_handle"])
+        self.assertEqual("bootstrap", stored["admission_basis"])
+        # A second concurrent bootstrap is denied until the first records billing.
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open_run("claude")
+        self.assertEqual("billing_unverified", raised.exception.reason_code)
+        self.event(first, status="allowed", rateLimitType="five_hour",
+                   utilization=0.1, isUsingOverage=True)
+        self.assert_denied("paid_usage_usable", "claude")
+
+    def test_bootstrap_then_evidence_based_admission(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        first = self.open_run("claude")
+        self.event(first, **json.loads(provider_fixture("claude-rate-limit-event.json")))
+        second = self.open_run("claude")
+        stored = self.ledger.host_run_admission(self.project_id, second["run_handle"])
+        self.assertEqual("evidence", stored["admission_basis"])
+
+    def test_fabricated_favourable_event_cannot_clear_a_restriction(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        bootstrap = self.open_run("claude")
+        self.event(bootstrap, status="allowed", rateLimitType="five_hour",
+                   utilization=0.2, isUsingOverage=False, overageStatus="rejected",
+                   overageDisabledReason="org_level_disabled")
+        real, forger = self.open_run("claude"), self.open_run("claude")
+        future = (self.clock + 3_600_000) // 1000
+        self.event(real, status="rejected", rateLimitType="seven_day",
+                   utilization=1.0, resetsAt=future, isUsingOverage=False,
+                   overageStatus="rejected", overageDisabledReason="org_level_disabled")
+        self.assert_denied("provider_exhausted", "claude")
+        self.event(forger, status="allowed", rateLimitType="seven_day",
+                   utilization=0.0, resetsAt=future, isUsingOverage=False,
+                   overageStatus="rejected", overageDisabledReason="org_level_disabled")
+        self.assert_denied("provider_exhausted", "claude")
+        # Each run records one event, and only while it is open.
+        with self.assertRaisesRegex(LedgerError, "already recorded"):
+            self.event(real, status="allowed", rateLimitType="seven_day",
+                       utilization=0.0, isUsingOverage=False, overageStatus="rejected",
+                       overageDisabledReason="org_level_disabled")
+        self.clock += 3_600_000
+        self.observe("claude")
+        self.assertEqual("pass", self.admit("claude")["decision"])
+
+    def test_committed_or_closed_runs_cannot_record_events(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
         run = self.open_run("claude")
-        events = (
-            {"status": "rejected", "rateLimitType": "seven_day", "utilization": 1.0,
-             "isUsingOverage": False, "overageStatus": "rejected",
-             "overageDisabledReason": "org_level_disabled"},
-            json.loads(provider_fixture("claude-rate-limit-event.json")),
-        )
-        for info in events:
+        # Committing a result consumes the binding; emulate that final state.
+        with self.ledger._connection:
+            self.ledger._connection.execute(
+                "UPDATE host_run_bindings SET consumed_at_ms=?,binding_state='terminal' "
+                "WHERE project_id=?",
+                (self.clock, self.project_id),
+            )
+        with self.assertRaisesRegex(LedgerError, "no longer open"):
+            self.event(run, status="allowed")
+        with self.assertRaisesRegex(LedgerError, "unavailable"):
+            self.event({"run_handle": "hrn_" + "0" * 48}, status="allowed")
+        with self.assertRaises(TypeError):
             record_claude_rate_limit_event(
                 self.ledger, self.project_id, run_handle=run["run_handle"],
-                rate_limit_info=info, observed_at_ms=self.tick(),
+                rate_limit_info={"status": "allowed"}, observed_at_ms=1,
             )
-        # A newer five-hour window does not hide the rejected seven-day window.
-        self.assert_denied("provider_exhausted", "claude")
-        record_claude_rate_limit_event(
-            self.ledger, self.project_id, run_handle=run["run_handle"],
-            rate_limit_info={"status": "allowed", "rateLimitType": "seven_day",
-                             "utilization": 0.1, "isUsingOverage": True},
-            observed_at_ms=self.tick(),
-        )
-        self.assert_denied("paid_usage_usable", "claude")
-        record_claude_rate_limit_event(
-            self.ledger, self.project_id, run_handle=run["run_handle"],
-            rate_limit_info={"status": "allowed", "rateLimitType": "seven_day",
-                             "utilization": 0.1, "isUsingOverage": False,
-                             "overageStatus": "rejected",
-                             "overageDisabledReason": "made_up_reason"},
-            observed_at_ms=self.tick(),
-        )
-        self.assert_denied("billing_unverified", "claude")
 
     def test_bootstrap_admits_on_identity_and_attestation_alone(self) -> None:
-        status = json.loads(provider_fixture("claude-auth-status.json"))
-        identity = self.observe("claude", **status)[0]
+        identity = self.observe("claude")[0]
         self.attest("claude", identity["account_fingerprint"])
         decision = self.admit("claude")
-        self.assertEqual("pass", decision["decision"])
+        self.assertEqual(("pass", "bootstrap"), (decision["decision"], decision["admission_basis"]))
         self.assertEqual(2, len(decision["evidence_digests"]))
 
     def test_attestation_for_another_account_does_not_count(self) -> None:
@@ -560,6 +711,7 @@ class AdmissionTests(unittest.TestCase):
             "schema_version": 1, "record_type": "admission_decision",
             "record_id": "admission_decision:forged", "run_id": "run:forged",
             "provider": "codex", "decision": "pass", "reason_code": "admitted",
+            "admission_basis": "evidence",
             "account_fingerprint": None, "evidence_digests": [],
             "observed_at_ms": NOW,
         }
@@ -588,7 +740,7 @@ class AdmissionTests(unittest.TestCase):
         self.attest("codex", identity["account_fingerprint"])
         self.observe(**{"rateLimits.credits.hasCredits": True})
         self.assert_denied("paid_usage_usable")
-        favourable = parse_codex_rate_limits(
+        favourable = parse_codex(
             json.loads(provider_fixture("codex-rate-limits.json")),
             digest_key=self.state.digest_key(), observed_at_ms=self.tick(),
         )
@@ -612,6 +764,9 @@ class AdmissionTests(unittest.TestCase):
 
     def test_collector_sessions_need_admission_to_commit(self) -> None:
         # Blocker 2: the legacy result path is tied to an admission taken at bind.
+        clock = mock.patch.object(self.ledger, "_clock_ms", side_effect=lambda: self.clock + 1)
+        clock.start()
+        self.addCleanup(clock.stop)
         _, _, unadmitted = self.ledger.bind_session(
             self.project, "session-before-evidence", "app_server",
             "codex-cli-0.153.0", now_ms=self.clock + 1,
@@ -655,25 +810,19 @@ class AdmissionTests(unittest.TestCase):
         fingerprint = self.observe("claude")[0]["account_fingerprint"]
         self.attest("claude", fingerprint)
         opened = self.open_run("claude")
-        records = record_claude_rate_limit_event(
-            self.ledger, self.project_id,
-            run_handle=opened["run_handle"],
-            rate_limit_info=json.loads(provider_fixture("claude-rate-limit-event.json")),
-            observed_at_ms=self.tick(),
+        records = self.event(
+            opened, **json.loads(provider_fixture("claude-rate-limit-event.json"))
         )
         self.assertEqual(
             [fingerprint, fingerprint],
             [record["account_fingerprint"] for record in records],
         )
+        self.assertEqual(self.clock, records[0]["observed_at_ms"])
         codex_identity = self.observe()[0]
         self.attest("codex", codex_identity["account_fingerprint"])
         codex_run = self.open_run()
         with self.assertRaisesRegex(ContractError, "not belong to a Claude run"):
-            record_claude_rate_limit_event(
-                self.ledger, self.project_id,
-                run_handle=codex_run["run_handle"],
-                rate_limit_info={"status": "allowed"},
-            )
+            self.event(codex_run, status="allowed")
 
     def test_attestations_require_an_owner_signature(self) -> None:
         identity = self.observe()[0]

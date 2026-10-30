@@ -6,12 +6,15 @@ raw email, organisation and account identifiers never leave this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pwd
 import selectors
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -41,7 +44,13 @@ APP_SERVER_METHODS = ("initialize", "account/rateLimits/read")
 # The protocol handshake notification; it carries no request and changes nothing.
 APP_SERVER_NOTIFICATIONS = ("initialized",)
 IDENTITY_MAX_AGE_MS = 30 * 60 * 1000
+EVIDENCE_HORIZON_MS = 24 * 60 * 60 * 1000
 CODEX_EXHAUSTED_PERCENT = 90
+CODEX_CONSTRAINED_PERCENT = 75
+# Provider clients are found only here, never through the caller's PATH.
+TRUSTED_SEARCH_DIRECTORIES = (
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "~/.local/bin",
+)
 CLAUDE_WINDOW_MINUTES = {"five_hour": 300, "seven_day": 10_080}
 OBSERVATION_TIMEOUT_SECONDS = 15
 MAX_OBSERVATION_BYTES = 262_144
@@ -93,7 +102,11 @@ def _timestamp_ms(value: Any) -> int | None:
 
 
 def parse_claude_auth_status(
-    raw: bytes | str, *, digest_key: bytes, observed_at_ms: int
+    raw: bytes | str,
+    *,
+    digest_key: bytes,
+    observed_at_ms: int,
+    client: tuple[str, str],
 ) -> dict[str, Any]:
     """Turn `claude auth status --json` output into a fingerprinted identity."""
 
@@ -119,10 +132,53 @@ def parse_claude_auth_status(
                 data.get("subscriptionType"), CLAUDE_SUBSCRIPTION_TYPES
             ),
             "plan_type": None,
+            "client_path": client[0],
+            "client_sha256": client[1],
             "observed_at_ms": observed_at_ms,
         },
     )
     return validate_provider_identity(record)
+
+
+def _home() -> str:
+    # The account's home from the password database, not the caller's HOME.
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def trusted_search_path() -> str:
+    home = _home()
+    return os.pathsep.join(
+        home + directory[1:] if directory.startswith("~") else directory
+        for directory in TRUSTED_SEARCH_DIRECTORIES
+    )
+
+
+def resolve_client(name: str) -> tuple[str, str]:
+    """Find a provider client on the trusted path; return its real path and digest."""
+
+    found = shutil.which(name, path=trusted_search_path())
+    if found is None:
+        raise ContractError(f"{name} client is unavailable on the trusted path")
+    real = os.path.realpath(found)
+    digest = hashlib.sha256()
+    try:
+        with open(real, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1_048_576), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ContractError(f"{name} client is unreadable") from exc
+    return real, digest.hexdigest()
+
+
+def client_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """A minimal child environment: no caller overrides such as CODEX_HOME."""
+
+    return {
+        "HOME": _home(),
+        "PATH": trusted_search_path(),
+        "LANG": environ.get("LANG") or "C.UTF-8",
+        "TMPDIR": environ.get("TMPDIR") or tempfile.gettempdir(),
+    }
 
 
 def _stop_process_group(process: Any) -> None:
@@ -195,20 +251,21 @@ def observe_claude(
     popen: Callable[..., Any] = subprocess.Popen,
     timeout: float = OBSERVATION_TIMEOUT_SECONDS,
 ) -> list[dict[str, Any]]:
-    environment = dict(os.environ if environ is None else environ)
-    _require_no_api_keys(environment)
-    executable = shutil.which("claude", path=environment.get("PATH"))
-    if executable is None:
-        raise ContractError("Claude client is unavailable")
+    caller = os.environ if environ is None else environ
+    _require_no_api_keys(caller)
+    executable, client_sha256 = resolve_client("claude")
     output = _bounded_output(
         [executable, "auth", "status", "--json"],
-        environment=environment,
+        environment=client_environment(caller),
         timeout=timeout,
         popen=popen,
     )
     return [
         parse_claude_auth_status(
-            output, digest_key=digest_key, observed_at_ms=observed_at_ms
+            output,
+            digest_key=digest_key,
+            observed_at_ms=observed_at_ms,
+            client=(executable, client_sha256),
         )
     ]
 
@@ -224,11 +281,10 @@ class AppServerSession:
         popen: Callable[..., Any] = subprocess.Popen,
         timeout: float = OBSERVATION_TIMEOUT_SECONDS,
     ) -> None:
-        environment = dict(environ)
-        _require_no_api_keys(environment)
-        executable = shutil.which("codex", path=environment.get("PATH"))
-        if executable is None:
-            raise ContractError("Codex client is unavailable")
+        _require_no_api_keys(environ)
+        executable, self.client_sha256 = resolve_client("codex")
+        self.client_path = executable
+        environment = client_environment(environ)
         self._timeout = timeout
         self._next_id = 0
         self._buffer = b""
@@ -321,7 +377,11 @@ class AppServerSession:
 
 
 def parse_codex_rate_limits(
-    result: dict[str, Any], *, digest_key: bytes, observed_at_ms: int
+    result: dict[str, Any],
+    *,
+    digest_key: bytes,
+    observed_at_ms: int,
+    client: tuple[str, str],
 ) -> list[dict[str, Any]]:
     """Turn an `account/rateLimits/read` result into identity, headroom and billing."""
 
@@ -380,10 +440,12 @@ def parse_codex_rate_limits(
             "auth_method": None,
             "subscription_type": None,
             "plan_type": _allowed(field("planType"), CODEX_PLAN_TYPES),
+            "client_path": client[0],
+            "client_sha256": client[1],
             "observed_at_ms": observed_at_ms,
         })),
         validate_provider_headroom(_record("provider_headroom", {
-            **common, "windows": windows, "status": None,
+            **common, "windows": windows, "status": None, "run_id": None,
             "observed_at_ms": observed_at_ms,
         })),
         validate_provider_billing(_record("provider_billing", {
@@ -395,6 +457,7 @@ def parse_codex_rate_limits(
             "is_using_overage": None,
             "overage_status": None,
             "overage_disabled_reason": None,
+            "run_id": None,
             "observed_at_ms": observed_at_ms,
         })),
     ]
@@ -427,12 +490,19 @@ def observe_codex(
     finally:
         session.close()
     return parse_codex_rate_limits(
-        result, digest_key=digest_key, observed_at_ms=observed_at_ms
+        result,
+        digest_key=digest_key,
+        observed_at_ms=observed_at_ms,
+        client=(session.client_path, session.client_sha256),
     )
 
 
 def claude_rate_limit_records(
-    rate_limit_info: dict[str, Any], *, account_fingerprint: str, observed_at_ms: int
+    rate_limit_info: dict[str, Any],
+    *,
+    account_fingerprint: str,
+    observed_at_ms: int,
+    run_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Turn one stream `rate_limit_info` object into headroom and billing records."""
 
@@ -486,7 +556,7 @@ def claude_rate_limit_records(
     common = {"provider": "claude", "account_fingerprint": account_fingerprint}
     return [
         validate_provider_headroom(_record("provider_headroom", {
-            **common, "windows": windows, "status": status,
+            **common, "windows": windows, "status": status, "run_id": run_id,
             "observed_at_ms": observed_at_ms,
         })),
         validate_provider_billing(_record("provider_billing", {
@@ -498,6 +568,7 @@ def claude_rate_limit_records(
             "is_using_overage": using,
             "overage_status": overage,
             "overage_disabled_reason": reason,
+            "run_id": run_id,
             "observed_at_ms": observed_at_ms,
         })),
     ]
@@ -509,19 +580,15 @@ def record_claude_rate_limit_event(
     *,
     run_handle: str,
     rate_limit_info: dict[str, Any],
-    observed_at_ms: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Record a run's Claude rate-limit event against its admitted identity.
+    """Record a run's single Claude rate-limit event against its admitted identity.
 
-    The trusted bridge calls this; the ledger derives the fingerprint from the
-    run's stored admission, so callers never supply one.
+    The trusted bridge calls this once per run. The ledger derives the
+    fingerprint from the run's stored admission and stamps its own time.
     """
 
     return ledger.record_claude_rate_limit_event(
-        project_id,
-        run_handle=run_handle,
-        rate_limit_info=rate_limit_info,
-        now_ms=observed_at_ms,
+        project_id, run_handle=run_handle, rate_limit_info=rate_limit_info
     )
 
 
@@ -548,6 +615,36 @@ def _latest(records: list[tuple[dict[str, Any], str]]) -> tuple[dict[str, Any], 
     return None if ranked is None else ranked[1]
 
 
+def _window_live(window: dict[str, Any], observed_at_ms: int, now_ms: int) -> bool:
+    # A window counts until it resets; one with no reset time counts for a day.
+    if window["resets_at"] is not None:
+        return window["resets_at"] > now_ms
+    return 0 <= now_ms - observed_at_ms <= EVIDENCE_HORIZON_MS
+
+
+def _headroom_state(provider: str, record: dict[str, Any], now_ms: int) -> str | None:
+    """Rate one headroom record: exhausted, constrained or ample; None once reset."""
+
+    windows = [
+        window for window in record["windows"]
+        if _window_live(window, record["observed_at_ms"], now_ms)
+    ]
+    if not windows:
+        return None
+    used = [window["used_percent"] for window in windows if window["used_percent"] is not None]
+    if provider == "codex":
+        if any(value >= CODEX_EXHAUSTED_PERCENT for value in used):
+            return "exhausted"
+        if any(value >= CODEX_CONSTRAINED_PERCENT for value in used):
+            return "constrained"
+        return "ample"
+    if record["status"] == "rejected" or any(value >= 100 for value in used):
+        return "exhausted"
+    if record["status"] == "allowed_warning":
+        return "constrained"
+    return "ample"
+
+
 def evaluate_admission(
     *,
     provider: str,
@@ -555,22 +652,30 @@ def evaluate_admission(
     attestations: list[tuple[dict[str, Any], str]],
     billing: list[tuple[dict[str, Any], str]],
     headroom: list[tuple[dict[str, Any], str]],
+    prior_claude_admissions: set[str],
     environ: Mapping[str, str],
     now_ms: int,
 ) -> dict[str, Any]:
     """Apply the admission checks in their fixed order; first failure wins.
 
-    Each input is a list of (record, content digest) pairs for one project. The
-    result is an unsaved decision; the caller binds it to a run.
+    Each input is a list of (record, content digest) pairs for one project.
+    Restrictive evidence wins: a later favourable record never clears an earlier
+    restriction that still applies. `prior_claude_admissions` holds the account
+    fingerprints that already have an admitted Claude run.
+    The result is an unsaved decision; the ledger binds it to a run.
     """
 
     def decision(
-        reason: str, fingerprint: str | None = None, evidence: list[str] | None = None
+        reason: str,
+        fingerprint: str | None = None,
+        evidence: list[str] | None = None,
+        basis: str | None = None,
     ) -> dict[str, Any]:
         return {
             "provider": provider,
             "decision": "pass" if reason == "admitted" else "deny",
             "reason_code": reason,
+            "admission_basis": basis,
             "account_fingerprint": fingerprint,
             "evidence_digests": sorted(set(evidence or [])),
             "observed_at_ms": now_ms,
@@ -607,50 +712,59 @@ def evaluate_admission(
         item for item in billing
         if item[0]["provider"] == provider
         and item[0]["account_fingerprint"] == fingerprint
+        and item[0]["observed_at_ms"] <= now_ms
     ]
+    # Any recent sign of paid usage denies; a later favourable record cannot
+    # clear it.
+    for record, digest in own:
+        if now_ms - record["observed_at_ms"] <= EVIDENCE_HORIZON_MS and (
+            record["paid_usage_usable"] is True or record["is_using_overage"] is True
+        ):
+            return decision("paid_usage_usable", fingerprint, [*evidence, digest])
     latest_billing = _latest(own)
-    # Bootstrap: with no billing observation yet, the attestation and identity
-    # admit the run; that run's own observations then gate the next one.
+    basis = "evidence"
+    if provider == "codex":
+        # Codex billing comes from the same non-spending read, so it is required.
+        if (
+            latest_billing is None
+            or now_ms - latest_billing[0]["observed_at_ms"] > IDENTITY_MAX_AGE_MS
+        ):
+            return decision("billing_unverified", fingerprint, evidence)
+    elif latest_billing is None:
+        # Claude has no non-spending billing source. One bootstrap run may open
+        # on the attestation and identity; its own rate-limit event must record
+        # billing before another Claude run is admitted.
+        if fingerprint in prior_claude_admissions:
+            return decision("billing_unverified", fingerprint, evidence)
+        basis = "bootstrap"
     if latest_billing is not None:
         evidence.append(latest_billing[1])
-        usable = latest_billing[0]["paid_usage_usable"]
-        if usable is True:
-            return decision("paid_usage_usable", fingerprint, evidence)
-        if usable is None:
+        if latest_billing[0]["paid_usage_usable"] is not False:
             return decision("billing_unverified", fingerprint, evidence)
-    exhausted = False
-    own_headroom = [
-        item for item in headroom
-        if item[0]["provider"] == provider
-        and item[0]["account_fingerprint"] == fingerprint
-    ]
-    if provider == "codex":
-        latest = _latest(own_headroom)
-        if latest is not None:
-            evidence.append(latest[1])
-            exhausted = any(
-                window["used_percent"] is not None
-                and window["used_percent"] >= CODEX_EXHAUSTED_PERCENT
-                for window in latest[0]["windows"]
-            )
+    rank = {"ample": 0, "constrained": 1, "exhausted": 2}
+    state = "ample"
+    for record, digest in headroom:
         if (
-            latest_billing is not None
-            and latest_billing[0]["ordinary_usage_allowed"] is False
+            record["provider"] != provider
+            or record["account_fingerprint"] != fingerprint
+            or record["observed_at_ms"] > now_ms
         ):
-            exhausted = True
-    else:
-        # Claude reports one window per event, so keep the latest per window.
-        by_scope: dict[Any, tuple[dict[str, Any], str]] = {}
-        for item in sorted(own_headroom, key=lambda entry: entry[0]["observed_at_ms"]):
-            scopes = {window["scope"] for window in item[0]["windows"]} or {None}
-            for scope in scopes:
-                by_scope[scope] = item
-        for record, digest in by_scope.values():
-            evidence.append(digest)
-            exhausted = exhausted or record["status"] == "rejected"
-    if exhausted:
+            continue
+        rated = _headroom_state(provider, record, now_ms)
+        if rated is None:
+            continue
+        evidence.append(digest)
+        if rank[rated] > rank[state]:
+            state = rated
+    if (
+        provider == "codex"
+        and latest_billing is not None
+        and latest_billing[0]["ordinary_usage_allowed"] is False
+    ):
+        state = "exhausted"
+    if state == "exhausted":
         return decision("provider_exhausted", fingerprint, evidence)
-    return decision("admitted", fingerprint, evidence)
+    return decision("admitted", fingerprint, evidence, basis)
 
 
 def admission_record(decision: dict[str, Any], run_id: str | None) -> dict[str, Any]:

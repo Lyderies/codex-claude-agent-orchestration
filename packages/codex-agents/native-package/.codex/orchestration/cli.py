@@ -1345,7 +1345,14 @@ def main() -> int:
                     args.provider,
                     project_root=args.project_root.resolve(),
                 )
-                report = {"ready": True, "records": records}
+                # The local client path stays in the ledger and is never printed.
+                report = {
+                    "ready": True,
+                    "records": [
+                        {key: value for key, value in record.items() if key != "client_path"}
+                        for record in records
+                    ],
+                }
             finally:
                 _close_ledger(ledger)
         elif args.command == "learning-record-billing-attestation":

@@ -74,11 +74,16 @@ first failure denies with a stable `reason_code`:
    fingerprint, recorded with `learning-record-billing-attestation`.
 4. `claude_subscription_missing`: for Claude, the login is not `claude.ai` with a
    subscription.
-5. `paid_usage_usable` or `billing_unverified`: the latest billing observation shows
-   paid overage or credits usable, or cannot show they are not. With no billing
-   observation yet, the identity and attestation admit the run.
-6. `provider_exhausted`: Codex at 90 percent or more on any window, or ordinary usage
-   not allowed; Claude with a rejected window.
+5. `paid_usage_usable` or `billing_unverified`: any billing observation in the last day
+   shows paid usage usable or overage in use, or the latest cannot show it is off.
+   Codex needs a billing read from the last 30 minutes. Claude has no non-spending
+   billing source, so one bootstrap run per account may open on the identity and
+   attestation alone; no other Claude run is admitted until that run records its
+   rate-limit event.
+6. `provider_exhausted`: the most restrictive headroom that has not reset yet is
+   exhausted. That is Codex at 90 percent or more on any window, or ordinary usage not
+   allowed, and Claude with a rejected or full window. A later favourable observation
+   never clears a restriction that still applies.
 
 The ledger evaluates admission itself, from its own records and its own environment,
 and stores the decision and the digests of the records it used with the run. No caller
@@ -87,7 +92,11 @@ binds. Every result commit, including that legacy path, requires the run's store
 passing decision and never re-evaluates time-varying facts.
 
 Observations are written only by `provider-observe`, which runs the provider client
-itself, and by the bridge's rate-limit event recorder. No producer, hook or collector
+itself, and by the bridge's rate-limit event recorder, which accepts one event per
+open Claude run and stamps it with the ledger's clock. Provider clients are found only
+on a fixed trusted path (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and
+`~/.local/bin`), never through the caller's `PATH`. They run with a minimal environment,
+and the identity record keeps the client's real path and SHA-256 locally for audit. No producer, hook or collector
 client can append them. Identities are stored only as keyed fingerprints, and labels
 such as plan and subscription are allow-listed, so anything else is stored as null.
 Every project, including a Codex-only one, needs an attestation before host runs open.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import base64
 import os
@@ -31,6 +33,7 @@ from codex_agents.learning_store import (
     authorized_collector_runtime,
 )
 from cli import _RestartingLedger, _close_ledger
+from cli import main as cli_main
 from codex_agents.learning_engine import generate_candidate, runtime_fixture_digest
 from tests.learning_support import (
     DIGEST_A,
@@ -44,6 +47,7 @@ from tests.learning_support import (
     admit_provider,
     fake_provider_tools,
     generate_test_owner_key,
+    trusted_tools,
     sign_owner_payload,
     result,
     routing_fields,
@@ -272,6 +276,28 @@ class LearningCliTests(unittest.TestCase):
         )
         self.assertEqual(expected, completed.returncode, completed.stderr or completed.stdout)
         return json.loads(completed.stdout)
+
+    def _observe(
+        self,
+        provider: str,
+        *,
+        expected: int = 0,
+        env: dict[str, str] | None = None,
+        raw_output: bool = False,
+    ):
+        """Run provider-observe in-process with the fake clients as trusted ones."""
+
+        stdout = io.StringIO()
+        arguments = [
+            "cli.py", "provider-observe", "--provider", provider,
+            "--state-root", str(self.state_root), "--project-root", str(self.project),
+        ]
+        with trusted_tools(self.tools), mock.patch.object(sys, "argv", arguments), \
+                mock.patch.dict(os.environ, env or {}), \
+                contextlib.redirect_stdout(stdout):
+            code = cli_main()
+        self.assertEqual(expected, code, stdout.getvalue())
+        return stdout.getvalue() if raw_output else json.loads(stdout.getvalue())
 
     @staticmethod
     def _environment(**overrides: str) -> dict[str, str]:
@@ -956,14 +982,15 @@ class LearningCliTests(unittest.TestCase):
         )
 
     def test_provider_observation_and_billing_attestation_commands(self) -> None:
-        # The fake `claude` prints the recorded auth status; nothing is spent.
+        # The fake clients answer from recorded fixtures; nothing is spent. The
+        # command runs in-process so the trusted search path can name them.
         tools = self.tools
-        observed = self._run(
-            "provider-observe", "--provider", "claude", env={"PATH": str(tools)}
-        )
+        observed = self._observe("claude")
         identity = observed["records"][0]
         self.assertEqual("provider_identity", identity["record_type"])
         self.assertNotIn("example.invalid", json.dumps(observed))
+        self.assertNotIn("client_path", identity)
+        self.assertNotIn(str(tools), json.dumps(observed))
         # Identifiers placed in label fields never reach records or output.
         status = json.loads((tools / "claude-status.json").read_text())
         (tools / "claude-status.json").write_text(
@@ -973,24 +1000,13 @@ class LearningCliTests(unittest.TestCase):
         codex["rateLimits"]["planType"] = codex["accountId"]
         (tools / "codex-result.json").write_text(json.dumps(codex))
         for provider, raw in (("claude", status["orgId"]), ("codex", codex["accountId"])):
-            completed = subprocess.run(
-                [
-                    sys.executable, str(ORCHESTRATION_ROOT / "cli.py"),
-                    "provider-observe", "--provider", provider,
-                    "--state-root", str(self.state_root),
-                    "--project-root", str(self.project),
-                ],
-                text=True, capture_output=True, check=False,
-                env=self._environment(PATH=str(tools)),
-            )
-            self.assertEqual(0, completed.returncode, completed.stdout)
-            self.assertNotIn(raw, completed.stdout + completed.stderr)
-            self.assertIsNone(json.loads(completed.stdout)["records"][0][
+            output = self._observe(provider, raw_output=True)
+            self.assertNotIn(raw, output)
+            self.assertIsNone(json.loads(output)["records"][0][
                 "subscription_type" if provider == "claude" else "plan_type"
             ])
-        refused = self._run(
-            "provider-observe", "--provider", "claude", expected=2,
-            env={"PATH": str(tools), "ANTHROPIC_API_KEY": "test-only"},
+        refused = self._observe(
+            "claude", expected=2, env={"ANTHROPIC_API_KEY": "test-only"}
         )
         self.assertEqual("input validation failed", refused["error"])
 

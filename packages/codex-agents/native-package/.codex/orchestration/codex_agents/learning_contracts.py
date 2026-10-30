@@ -1645,17 +1645,19 @@ def validate_learning_export(data: Any) -> dict[str, Any]:
 PROVIDER_NAMES = {"codex", "claude"}
 PROVIDER_IDENTITY_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
-    "logged_in", "auth_method", "subscription_type", "plan_type", "observed_at_ms",
+    "logged_in", "auth_method", "subscription_type", "plan_type", "client_path",
+    "client_sha256", "observed_at_ms",
 }
 PROVIDER_HEADROOM_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
-    "windows", "status", "observed_at_ms",
+    "windows", "status", "run_id", "observed_at_ms",
 }
 HEADROOM_WINDOW_FIELDS = {"window_minutes", "scope", "used_percent", "resets_at"}
 PROVIDER_BILLING_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
     "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
-    "is_using_overage", "overage_status", "overage_disabled_reason", "observed_at_ms",
+    "is_using_overage", "overage_status", "overage_disabled_reason", "run_id",
+    "observed_at_ms",
 }
 BILLING_ATTESTATION_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
@@ -1667,7 +1669,8 @@ BILLING_GRANT_FIELDS = {
 }
 ADMISSION_DECISION_FIELDS = {
     "schema_version", "record_type", "record_id", "run_id", "provider", "decision",
-    "reason_code", "account_fingerprint", "evidence_digests", "observed_at_ms",
+    "reason_code", "admission_basis", "account_fingerprint", "evidence_digests",
+    "observed_at_ms",
 }
 ADMISSION_REASON_CODES = {
     "admitted",
@@ -1720,6 +1723,15 @@ def validate_provider_identity(data: Any) -> dict[str, Any]:
         nullable=True,
     )
     _enum(data["plan_type"], set(CODEX_PLAN_TYPES), "plan_type", nullable=True)
+    # The local client path is kept for audit only and is never printed.
+    if (
+        not isinstance(data["client_path"], str)
+        or not data["client_path"].startswith("/")
+        or not 1 < len(data["client_path"]) <= 1024
+        or "\x00" in data["client_path"]
+    ):
+        raise ContractError("client_path must be an absolute path")
+    _digest(data["client_sha256"], "client_sha256")
     return data
 
 
@@ -1739,6 +1751,7 @@ def validate_provider_headroom(data: Any) -> dict[str, Any]:
         )
         _integer(window["resets_at"], "resets_at", nullable=True)
     _enum(data["status"], CLAUDE_HEADROOM_STATUSES, "status", nullable=True)
+    _identifier(data["run_id"], "run_id", nullable=True)
     return data
 
 
@@ -1756,6 +1769,7 @@ def validate_provider_billing(data: Any) -> dict[str, Any]:
         data["overage_disabled_reason"], set(CLAUDE_OVERAGE_DISABLED_REASONS),
         "overage_disabled_reason", nullable=True,
     )
+    _identifier(data["run_id"], "run_id", nullable=True)
     return data
 
 
@@ -1793,6 +1807,14 @@ def validate_admission_decision(data: Any) -> dict[str, Any]:
     _enum(data["reason_code"], ADMISSION_REASON_CODES, "reason_code")
     if (data["decision"] == "pass") != (data["reason_code"] == "admitted"):
         raise ContractError("admission decision and reason disagree")
+    _enum(
+        data["admission_basis"], {"evidence", "bootstrap"}, "admission_basis",
+        nullable=True,
+    )
+    if (data["decision"] == "pass") != (data["admission_basis"] is not None):
+        raise ContractError("an admission basis belongs only to a pass")
+    if data["admission_basis"] == "bootstrap" and data["provider"] != "claude":
+        raise ContractError("only Claude admissions may bootstrap")
     if data["decision"] == "pass" and (
         data["run_id"] is None
         or data["account_fingerprint"] is None

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest import mock
+import contextlib
 import subprocess
 import sys
 
 from codex_agents.learning_adapters import empty_usage
 from codex_agents.learning_contracts import candidate_base_digest, content_digest
+from codex_agents import providers
 from codex_agents.providers import billing_attestation_record
 from codex_agents.learning_engine import (
     OWNER_SIGNATURE_NAMESPACE,
@@ -507,15 +510,23 @@ def fake_provider_tools(directory: Path) -> dict[str, str]:
     return {"PATH": str(directory)}
 
 
+@contextlib.contextmanager
+def trusted_tools(tools: Path):
+    """Make the fake clients the trusted search path, as installed clients would be."""
+
+    with mock.patch.object(providers, "TRUSTED_SEARCH_DIRECTORIES", (str(tools),)):
+        yield
+
+
 def observe_provider_fixture(
     ledger, project_id: str, provider: str, *, tools: Path, observed_at_ms: int
 ) -> list[dict]:
-    """Run the ledger's own observation against the fake clients."""
+    """Run the ledger's own observation against the fake clients at a fixed time."""
 
-    return ledger.observe_provider(
-        project_id, provider, project_root=tools,
-        environ={"PATH": str(tools)}, now_ms=observed_at_ms,
-    )
+    with trusted_tools(tools), mock.patch.object(
+        ledger, "_clock_ms", return_value=observed_at_ms
+    ):
+        return ledger.observe_provider(project_id, provider, project_root=tools)
 
 
 def attest_provider(
