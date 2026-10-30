@@ -7,6 +7,7 @@ diagnosable from anywhere. Usage: ``ci_unittest.py <start-directory>``.
 
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 
@@ -19,6 +20,7 @@ def _escape(text: str) -> str:
 
 def main(argv: list[str]) -> int:
     start = argv[1] if len(argv) > 1 else "tests"
+    sys.path.insert(0, os.getcwd())  # match `python -m unittest`, which imports from the cwd
     suite = unittest.defaultTestLoader.discover(start)
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     problems = [("ERROR", test, trace) for test, trace in result.errors]
