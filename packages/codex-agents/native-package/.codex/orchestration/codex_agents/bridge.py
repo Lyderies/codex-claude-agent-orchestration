@@ -770,6 +770,84 @@ def check_context_boundary(workspace: Path) -> None:
         current = current.parent
 
 
+PROBE_MODEL = "claude-haiku-5-5"
+PROBE_EFFORT = "low"
+PROBE_PROMPT = "Reply with the single word OK."
+PROBE_DEADLINE_SECONDS = 120
+
+
+def claude_billing_probe(environ: Mapping[str, str]) -> dict[str, Any]:
+    """Run one minimal locked Claude turn and return its first rate_limit_info.
+
+    It uses a little subscription allowance but is never metered: it refuses an
+    API-key or alternate-backend environment, runs Haiku at low effort with no
+    tools in an empty private directory, and keeps only the rate-limit event.
+    """
+
+    from .claude_host import check_backend
+
+    if api_keys_present(environ):
+        raise BridgeRefused("a provider API key is set")
+    parent = Path(os.path.realpath(WORKSPACE_PARENT or tempfile.gettempdir()))
+    workspace = Path(tempfile.mkdtemp(prefix="codex-agents-probe-", dir=parent))
+    try:
+        os.chmod(workspace, 0o700)
+        check_context_boundary(workspace)
+        if [path for path in managed_settings_paths() if os.path.lexists(path)]:
+            raise BridgeRefused("managed_settings_present")
+        empty = workspace / "empty"
+        control = workspace / "control"
+        empty.mkdir(mode=0o700)
+        control.mkdir(mode=0o700)
+        check_backend(environ, empty)
+        executable, _ = resolve_client("claude")
+        settings = _private_file(
+            control / "settings.json", json.dumps(claude_settings(PROBE_MODEL)).encode()
+        )
+        arguments = [
+            executable, "-p",
+            "--model", PROBE_MODEL,
+            "--effort", PROBE_EFFORT,
+            "--tools", "",
+            "--permission-mode", "dontAsk",
+            "--setting-sources", "project",
+            "--settings", str(settings),
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--max-turns", "1",
+            PROBE_PROMPT,
+        ]
+        state: dict[str, Any] = {"init": False, "info": None}
+
+        def on_frame(frame: dict[str, Any]) -> None:
+            if not state["init"]:
+                if frame.get("type") != "system" or frame.get("subtype") != "init":
+                    raise _Abort("missing_init_frame")
+                violation = _check_claude_init(frame, PROBE_MODEL)
+                if violation is not None or frame.get("tools") != []:
+                    raise _Abort(f"init_{violation or 'tool_not_allowed'}")
+                state["init"] = True
+            elif frame.get("type") == "rate_limit_event" and state["info"] is None:
+                state["info"] = frame.get("rate_limit_info")
+
+        outcome = run_child(
+            arguments,
+            environment=client_environment(environ),
+            cwd=empty,
+            deadline_seconds=PROBE_DEADLINE_SECONDS,
+            on_frame=on_frame,
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+    if outcome["abort"] is not None:
+        raise BridgeRefused(f"billing probe failed: {outcome['abort']}")
+    if not isinstance(state["info"], dict):
+        raise BridgeRefused("billing probe reported no rate-limit event")
+    return state["info"]
+
+
 def dispatch(
     ledger: Any,
     project_id: str,

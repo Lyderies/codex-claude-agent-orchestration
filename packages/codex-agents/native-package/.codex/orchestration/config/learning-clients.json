@@ -78,6 +78,17 @@
       "child_usage": false,
       "ordering_proven": false
     },
+    "claude-host-v1": {
+      "producers": ["host"],
+      "hook_coverage": "unknown",
+      "app_server_coverage": "unknown",
+      "root_lifecycle": false,
+      "child_lifecycle": true,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
     "bridge-v1": {
       "producers": ["host"],
       "hook_coverage": "handshake_only",

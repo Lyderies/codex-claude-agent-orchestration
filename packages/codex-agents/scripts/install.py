@@ -50,11 +50,29 @@ class TargetRoot:
 Target = Path | TargetRoot
 
 
-def _safe_relative(raw: str, *, allow_manifest: bool = False) -> Path:
+# The only path under .claude this package owns: the Claude orchestration skill.
+# Everything else under .claude belongs to the Claude package or the project.
+CLAUDE_SKILL_PREFIX = (".claude", "skills", "agent-orchestration")
+
+
+def _safe_relative(
+    raw: str, *, allow_manifest: bool = False, allow_directory: bool = False
+) -> Path:
     path = Path(raw)
     if not raw or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise InstallError(f"unsafe manifest path: {raw!r}")
-    if path.parts[0] not in {".agents", ".codex"} and raw != "VERSION":
+    claude_skill = (
+        len(path.parts) > len(CLAUDE_SKILL_PREFIX)
+        and path.parts[: len(CLAUDE_SKILL_PREFIX)] == CLAUDE_SKILL_PREFIX
+    )
+    # Removing emptied directories may also walk the prefix's own ancestors.
+    claude_ancestor = allow_directory and path.parts == CLAUDE_SKILL_PREFIX[: len(path.parts)]
+    if (
+        path.parts[0] not in {".agents", ".codex"}
+        and raw != "VERSION"
+        and not claude_skill
+        and not claude_ancestor
+    ):
         raise InstallError(f"unsupported package path: {raw!r}")
     if path == MANIFEST_PATH and not allow_manifest:
         raise InstallError(f"unsupported package path: {raw!r}")
@@ -67,8 +85,11 @@ def _open_parent_fd(
     *,
     create: bool = False,
     allow_manifest: bool = False,
+    allow_directory: bool = False,
 ) -> tuple[int, str]:
-    path = _safe_relative(relative, allow_manifest=allow_manifest)
+    path = _safe_relative(
+        relative, allow_manifest=allow_manifest, allow_directory=allow_directory
+    )
     descriptor = (
         os.dup(target.descriptor)
         if isinstance(target, TargetRoot)
@@ -226,7 +247,7 @@ def _unlink_managed(
 
 def _rmdir_managed(target: Target, relative: str) -> None:
     try:
-        parent_fd, name = _open_parent_fd(target, relative)
+        parent_fd, name = _open_parent_fd(target, relative, allow_directory=True)
     except (FileNotFoundError, InstallError):
         return
     try:
@@ -340,7 +361,9 @@ def _plan_install(target: Target, update: bool) -> tuple[dict[str, Path], dict |
         if relative in old_files:
             if current != old_files[relative]:
                 conflicts.append(f"modified installed file: {relative}")
-        elif current != _digest(source):
+        else:
+            # A file the previous manifest does not own is never claimed, even
+            # with identical bytes: it belongs to the project or another package.
             conflicts.append(f"existing unmanaged file: {relative}")
     if update:
         for relative, old_digest in old_files.items():
