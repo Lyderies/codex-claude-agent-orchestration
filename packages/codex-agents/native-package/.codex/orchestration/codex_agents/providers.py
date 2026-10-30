@@ -47,6 +47,8 @@ APP_SERVER_METHODS = ("initialize", "account/rateLimits/read")
 # The protocol handshake notification; it carries no request and changes nothing.
 APP_SERVER_NOTIFICATIONS = ("initialized",)
 IDENTITY_MAX_AGE_MS = 30 * 60 * 1000
+# Billing evidence older than this no longer admits a run, for either provider.
+BILLING_MAX_AGE_MS = 30 * 60 * 1000
 EVIDENCE_HORIZON_MS = 24 * 60 * 60 * 1000
 CODEX_EXHAUSTED_PERCENT = 90
 CODEX_CONSTRAINED_PERCENT = 75
@@ -846,6 +848,8 @@ def evaluate_admission(
     admission_policy: Any = None,
     prior_run_admissions: list[tuple[str, int]] | None = None,
     window_headroom: list[tuple[dict[str, Any], str]] | None = None,
+    cited_digests: set[str] | None = None,
+    probe: bool = False,
 ) -> dict[str, Any]:
     """Apply the admission checks in their fixed order; first failure wins.
 
@@ -859,6 +863,11 @@ def evaluate_admission(
     this provider; billing probes are not runs and are not in it.
     `window_headroom` is the account's headroom from every project, which
     places the cap window; both cap inputs are ledger-wide.
+    Billing, headroom and prior admissions are the account's, from every
+    project; `cited_digests` lists the records this project holds, and only
+    those are cited as evidence. Attestations stay per project.
+    `probe` evaluates a Claude billing probe, whose purpose is to refresh
+    stale billing, so it does not need fresh billing itself.
     The result is an unsaved decision; the ledger binds it to a run.
     """
 
@@ -874,7 +883,10 @@ def evaluate_admission(
             "reason_code": reason,
             "admission_basis": basis,
             "account_fingerprint": fingerprint,
-            "evidence_digests": sorted(set(evidence or [])),
+            "evidence_digests": sorted(
+                set(evidence or [])
+                if cited_digests is None else set(evidence or []) & cited_digests
+            ),
             "observed_at_ms": now_ms,
         }
 
@@ -914,76 +926,54 @@ def evaluate_admission(
         return decision("claude_subscription_missing", fingerprint, evidence)
     if provider == "codex" and identity["plan_type"] not in CODEX_SUBSCRIPTION_PLAN_TYPES:
         return decision("codex_plan_not_subscription", fingerprint, evidence)
-    own = [
+    paid = paid_usage_digest(provider, fingerprint, billing, now_ms)
+    if paid is not None:
+        # Any recent sign of paid usage denies; a later favourable record
+        # cannot clear it.
+        return decision("paid_usage_usable", fingerprint, [*evidence, paid])
+    latest_billing = _latest([
         item for item in billing
         if item[0]["provider"] == provider
         and item[0]["account_fingerprint"] == fingerprint
         and item[0]["observed_at_ms"] <= now_ms
-    ]
-    # Any recent sign of paid usage denies; a later favourable record cannot
-    # clear it.
-    for record, digest in own:
-        if now_ms - record["observed_at_ms"] <= EVIDENCE_HORIZON_MS and (
-            record["paid_usage_usable"] is True or record["is_using_overage"] is True
-        ):
-            return decision("paid_usage_usable", fingerprint, [*evidence, digest])
-    latest_billing = _latest(own)
+    ])
+    fresh = (
+        latest_billing is not None
+        and now_ms - latest_billing[0]["observed_at_ms"] <= BILLING_MAX_AGE_MS
+    )
     basis = "evidence"
     if provider == "codex":
         # Codex billing comes from the same non-spending read, so it is required.
-        if (
-            latest_billing is None
-            or now_ms - latest_billing[0]["observed_at_ms"] > IDENTITY_MAX_AGE_MS
-        ):
+        if not fresh:
             return decision("billing_unverified", fingerprint, evidence)
-    elif latest_billing is None:
-        # Claude has no non-spending billing source. One bootstrap run may open
-        # on the attestation and identity; its own rate-limit event must record
-        # billing before another Claude run is admitted.
+    elif probe and latest_billing is not None:
+        # A probe refreshes billing, so older evidence is enough to admit it;
+        # that evidence must still show paid usage off.
+        fresh = True
+    elif not fresh:
+        # Claude has no non-spending billing source. One bootstrap run per
+        # account may open on the attestation and identity; its own rate-limit
+        # event, or a probe, must record fresh billing before another Claude
+        # run is admitted.
         if fingerprint in prior_claude_admissions:
             return decision("billing_unverified", fingerprint, evidence)
         basis = "bootstrap"
-    if latest_billing is not None:
+    if fresh:
         evidence.append(latest_billing[1])
         if latest_billing[0]["paid_usage_usable"] is not False:
             return decision("billing_unverified", fingerprint, evidence)
-    rank = {"ample": 0, "constrained": 1, "exhausted": 2}
-    state = "ample"
-    # Evidence names the latest record at the deciding level, not every live
-    # record: the decision's digest list is bounded, and runs keep adding
-    # headroom records.
-    state_digest: str | None = None
-    for record, digest in headroom:
-        if (
-            record["provider"] != provider
-            or record["account_fingerprint"] != fingerprint
-            or record["observed_at_ms"] > now_ms
-        ):
-            continue
-        rated = _headroom_state(provider, record, now_ms)
-        if rated is None:
-            continue
-        if rank[rated] >= rank[state]:
-            state, state_digest = rated, digest
+    state, state_digest = headroom_state(provider, fingerprint, headroom, billing, now_ms)
     if state_digest is not None:
         evidence.append(state_digest)
-    if (
-        provider == "codex"
-        and latest_billing is not None
-        and latest_billing[0]["ordinary_usage_allowed"] is False
-    ):
-        state = "exhausted"
     if state == "exhausted":
         return decision("provider_exhausted", fingerprint, evidence)
     if run_cap is not None:
         # A backstop on run count per usage window, whatever headroom says.
+        # A reading from another project still places the window; the
+        # decision cites only this project's records.
         start, window_digest = window_start_ms(
             provider, fingerprint, window_headroom, now_ms
         )
-        # Evidence names only this project's records; a reading from another
-        # project still places the window but is not cited.
-        if window_digest not in {digest for _, digest in headroom}:
-            window_digest = None
         # An admission stamped after now still counts, so a clock that steps
         # back never frees places under the cap.
         counted = sum(
@@ -996,6 +986,123 @@ def evaluate_admission(
                 [*evidence, *([window_digest] if window_digest else [])],
             )
     return decision("admitted", fingerprint, evidence, basis)
+
+
+def paid_usage_digest(
+    provider: str,
+    fingerprint: str,
+    billing: list[tuple[dict[str, Any], str]],
+    now_ms: int,
+) -> str | None:
+    """The digest of a billing record from the last day showing paid usage, if any.
+
+    A record stamped after now also counts, so a clock that steps back never
+    hides paid usage.
+    """
+
+    for record, digest in billing:
+        if (
+            record["provider"] == provider
+            and record["account_fingerprint"] == fingerprint
+            and now_ms - record["observed_at_ms"] <= EVIDENCE_HORIZON_MS
+            and (record["paid_usage_usable"] is True or record["is_using_overage"] is True)
+        ):
+            return digest
+    return None
+
+
+def headroom_state(
+    provider: str,
+    fingerprint: str,
+    headroom: list[tuple[dict[str, Any], str]],
+    billing: list[tuple[dict[str, Any], str]],
+    now_ms: int,
+) -> tuple[str, str | None]:
+    """The most restrictive unreset headroom, and the latest record at that level.
+
+    Only the latest record at the deciding level is named: a decision's digest
+    list is bounded, and runs keep adding headroom records. For Codex, the
+    latest billing reading disallowing ordinary usage also exhausts it, and so
+    does any such reading stamped after now, so a clock step back never hides it.
+    """
+
+    rank = {"ample": 0, "constrained": 1, "exhausted": 2}
+    state = "ample"
+    state_digest: str | None = None
+    for record, digest in headroom:
+        # A record stamped after now still restricts, so a clock step back
+        # never hides an exhausted window.
+        if record["provider"] != provider or record["account_fingerprint"] != fingerprint:
+            continue
+        rated = _headroom_state(provider, record, now_ms)
+        if rated is None:
+            continue
+        if rank[rated] >= rank[state]:
+            state, state_digest = rated, digest
+    if provider == "codex":
+        own = [
+            item for item in billing
+            if item[0]["provider"] == provider and item[0]["account_fingerprint"] == fingerprint
+        ]
+        latest = _latest([item for item in own if item[0]["observed_at_ms"] <= now_ms])
+        if (latest is not None and latest[0]["ordinary_usage_allowed"] is False) or any(
+            record["observed_at_ms"] > now_ms and record["ordinary_usage_allowed"] is False
+            for record, _ in own
+        ):
+            state = "exhausted"
+    return state, state_digest
+
+
+def evaluate_launch(
+    *,
+    provider: str,
+    identity: dict[str, Any],
+    billing: list[tuple[dict[str, Any], str]],
+    headroom: list[tuple[dict[str, Any], str]],
+    now_ms: int,
+    bootstrap: bool = False,
+) -> str | None:
+    """Re-check an admitted run's eligibility just before its child launches.
+
+    The account and client were already compared with the admitted ones. This
+    re-reads the account-wide billing and headroom, including the fresh
+    before-launch reading, and the plan the fresh identity reports. The run
+    cap is not counted again. Billing must be from the last 30 minutes, for
+    either provider; only a run admitted as the Claude bootstrap, on an account
+    with no billing at all yet, launches without it. Returns a denial reason,
+    or None to launch.
+    """
+
+    fingerprint = identity["account_fingerprint"]
+    if provider == "codex" and identity["plan_type"] not in CODEX_SUBSCRIPTION_PLAN_TYPES:
+        return "codex_plan_not_subscription"
+    if provider == "claude" and not (
+        identity["logged_in"]
+        and identity["auth_method"] == "claude.ai"
+        and identity["subscription_type"] in CLAUDE_SUBSCRIPTION_TYPES
+    ):
+        return "claude_subscription_missing"
+    if paid_usage_digest(provider, fingerprint, billing, now_ms) is not None:
+        return "paid_usage_usable"
+    latest = _latest([
+        item for item in billing
+        if item[0]["provider"] == provider
+        and item[0]["account_fingerprint"] == fingerprint
+        and item[0]["observed_at_ms"] <= now_ms
+    ])
+    if latest is None:
+        if not (provider == "claude" and bootstrap):
+            return "billing_unverified"
+    elif now_ms - latest[0]["observed_at_ms"] > BILLING_MAX_AGE_MS:
+        # A dispatch long after its open must refresh billing first (for
+        # Claude, with a billing probe).
+        return "billing_unverified"
+    elif latest[0]["paid_usage_usable"] is not False:
+        return "billing_unverified"
+    state, _ = headroom_state(provider, fingerprint, headroom, billing, now_ms)
+    if state == "exhausted":
+        return "provider_exhausted"
+    return None
 
 
 def admission_record(decision: dict[str, Any], run_id: str | None) -> dict[str, Any]:

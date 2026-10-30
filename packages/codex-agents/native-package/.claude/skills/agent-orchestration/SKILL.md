@@ -21,9 +21,9 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
 3. **Assign.** Write one bounded assignment with stable evidence IDs, then run
    `validate-assignment` and `result-preflight` with the task and parent grant. Give the
    child the returned template.
-4. **Observe and open.** Run `provider-observe --provider <route provider>`; before a
-   native Claude child run `provider-observe --provider claude --billing-probe`
-   instead, because native children report no billing of their own; it reuses recent
+4. **Observe and open.** Run `provider-observe --provider <route provider>`; before any
+   Claude child run `provider-observe --provider claude --billing-probe` instead,
+   because Claude admission needs billing from the last 30 minutes; it reuses recent
    evidence and is refused, like a run, when admission would fail. Then run
    `learning-open-host-run` with the task, route, assignment, parent grant and
    orchestration handle. A denial returns a `reason_code`, for example

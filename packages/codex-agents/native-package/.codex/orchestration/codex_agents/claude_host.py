@@ -103,6 +103,12 @@ def _settings(path: Path) -> dict[str, Any]:
 def check_backend(environ: Mapping[str, str], project_root: Path) -> None:
     """Deny a Claude-host open whose session could run on a metered backend."""
 
+    from .bridge import managed_preference_paths
+
+    # MDM preferences can set any setting, including a metered backend, and
+    # are not read here, so their presence refuses.
+    if any(os.path.lexists(path) for path in managed_preference_paths()):
+        raise ClaudeHostDenied("claude_backend_not_subscription")
     if any(_backend_variable(name) and value for name, value in environ.items()):
         raise ClaudeHostDenied("claude_backend_not_subscription")
     config_directory = environ.get("CLAUDE_CONFIG_DIR")
