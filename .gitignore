@@ -7,3 +7,6 @@ build/
 dist/
 *.egg-info/
 .DS_Store
+
+# Raw research notes may contain account-specific details; only reviewed reports are published.
+research/research_notes/
