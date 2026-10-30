@@ -77,6 +77,17 @@
       "root_usage": false,
       "child_usage": false,
       "ordering_proven": false
+    },
+    "bridge-v1": {
+      "producers": ["host"],
+      "hook_coverage": "handshake_only",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": true,
+      "child_lifecycle": false,
+      "tool_lifecycle": true,
+      "root_usage": true,
+      "child_usage": false,
+      "ordering_proven": false
     }
   }
 }

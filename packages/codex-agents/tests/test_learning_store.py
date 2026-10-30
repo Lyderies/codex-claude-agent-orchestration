@@ -66,6 +66,8 @@ from codex_agents.learning_engine import (
     review_evaluation_case,
 )
 from tests.learning_support import (
+    admit_provider,
+    fake_provider_tools,
     DIGEST_A,
     DIGEST_B,
     DIGEST_C,
@@ -111,6 +113,22 @@ class LearningStoreTests(unittest.TestCase):
         self.ledger = LearningLedger(self.state, client_capabilities=self.clients)
         self.project_a_id = self.ledger.register_project(self.project_a, now_ms=1)
         self.project_b_id = self.ledger.register_project(self.project_b, now_ms=1)
+
+    def _admit(self, project_id: str, *observed_at_ms: int) -> None:
+        """Give a project a fresh identity and an owner attestation for admission.
+
+        Tests use both small fixed clocks and the real clock, so the identity is
+        observed at each clock the test needs.
+        """
+
+        tools = Path(self.temporary.name) / "fake-tools"
+        if not tools.exists():
+            fake_provider_tools(tools)
+        for value in observed_at_ms or (1, time.time_ns() // 1_000_000):
+            admit_provider(
+                self.ledger, project_id, self.owner_private_key,
+                tools=tools, observed_at_ms=value,
+            )
 
     def _installed_bundle(self, name: str, *, version: str = PACKAGE_VERSION) -> Path:
         bundle = Path(self.temporary.name) / name
@@ -948,6 +966,7 @@ class LearningStoreTests(unittest.TestCase):
                 )
 
     def test_trusted_host_run_binds_exact_route_and_keeps_usage_unknown(self) -> None:
+        self._admit(self.project_a_id)
         orchestration = self.ledger.open_orchestration(
             self.project_a_id, client_version="codex-host-v1", now_ms=90
         )
@@ -1273,6 +1292,7 @@ class LearningStoreTests(unittest.TestCase):
             runtime.close()
 
     def test_legacy_host_timeout_requires_reconciled_timeout_stop_reason(self) -> None:
+        self._admit(self.project_a_id)
         client_version = "codex-cli-0.153.0"
         capability = self.clients[client_version]
         _, _, run_id = self.ledger.bind_session(
@@ -1377,7 +1397,92 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual("timed_out", committed["outcome"]["execution_state"])
         self.assertEqual(routing_task_slice(task), committed["outcome"]["task_slice"])
 
+    def test_legacy_result_without_session_admission_is_refused(self) -> None:
+        # No identity or attestation exists when the session binds, so the
+        # legacy path has no admission and its otherwise valid result is refused.
+        client_version = "codex-cli-0.153.0"
+        capability = self.clients[client_version]
+        _, _, run_id = self.ledger.bind_session(
+            self.project_a,
+            "unadmitted-legacy-session",
+            "app_server",
+            client_version,
+            now_ms=100,
+        )
+        task = {
+            "id": "task-1", "objective": "Read one fixture", "family": "research",
+            "complexity": "medium", "risk": "low", "meaningful": True,
+            **routing_fields(),
+            "deterministic_validation": True, "independent_parts": 1,
+            "parallel_safe": False, "failed_attempts": 0, "failure_events": [],
+        }
+        assigned = assignment()
+        configuration = {
+            "model": assigned["model"], "effort": assigned["effort"],
+            "role": assigned["role"], "topology": "single", "max_parallel": 1,
+            "verification_required": True, "verifier_digest": DIGEST_A,
+            "bounds_digest": DIGEST_B, "package_digest": DIGEST_A,
+            "policy_digest": DIGEST_B, "agent_digest": DIGEST_C,
+            "skill_digests": [DIGEST_A], "prompt_digest": DIGEST_B,
+            "client_digest": content_digest(capability),
+        }
+        route = {
+            "task_id": task["id"], "role": assigned["role"],
+            "model": assigned["model"], "effort": assigned["effort"],
+            "topology": "single", "max_parallel": 1,
+            "verification_required": True,
+            "execution_configuration": configuration,
+        }
+        timeout_result = result()
+        timeout_result.update(
+            status="failed",
+            execution_state="timed_out",
+            semantic_verdict="not-applicable",
+            admission_state="unverified",
+            retry={"attempt": 1, "retry_of_assignment_id": None},
+        )
+        observation = {
+            "run_id": run_id,
+            "client_version": client_version,
+            "result_attempts": [
+                {"status": "accepted", "reason_code": None, "receipt_id": None}
+            ],
+        }
+
+        def terminal(identifier: str, stop_reason: str, observed_at_ms: int) -> dict:
+            event = event_record(identifier, observed_at_ms=observed_at_ms)
+            event.update(
+                run_id=run_id,
+                turn_id="legacy-timeout-turn",
+                event_code="turn_failed",
+                status="failed",
+                stop_reason=stop_reason,
+                coverage="root_turn_complete",
+            )
+            return event
+
+        self.ledger.append(
+            self.project_a_id,
+            terminal("unadmitted-timeout-failure", "timeout", 112),
+            producer="app_server",
+            now_ms=112,
+        )
+        # Evidence recorded after binding does not admit the existing session.
+        self._admit(self.project_a_id)
+        with self.assertRaisesRegex(LedgerError, "no stored admission decision"):
+            self.ledger.commit_host_result(
+                self.project_a_id,
+                assignment=assigned,
+                task=task,
+                route=route,
+                result=timeout_result,
+                observation=observation,
+                execution_configuration=configuration,
+                now_ms=113,
+            )
+
     def test_orchestration_report_counts_each_host_run_once_and_keeps_usage_unknown(self) -> None:
+        self._admit(self.project_a_id)
         task = {
             "id": "task-1", "objective": "Read one fixture", "family": "research",
             "complexity": "medium", "risk": "low", "meaningful": True,
@@ -1579,6 +1684,7 @@ class LearningStoreTests(unittest.TestCase):
         return orchestration, opened
 
     def test_signed_upgrade_reconciliation_is_exact_and_single_use(self) -> None:
+        self._admit(self.project_a_id)
         orchestration, opened = self._pending_upgrade_run()
         self.ledger.checkpoint_orchestration(
             self.project_a_id,
@@ -1685,6 +1791,7 @@ class LearningStoreTests(unittest.TestCase):
             self.assertEqual([], repository.records("outcome"))
 
     def test_upgrade_reconciliation_rejects_changed_boundary_and_other_pending(self) -> None:
+        self._admit(self.project_a_id)
         orchestration, opened = self._pending_upgrade_run()
         request = self.ledger.prepare_upgrade_reconciliation(
             self.project_a_id, orchestration_id=orchestration["orchestration_id"],
@@ -1747,6 +1854,7 @@ class LearningStoreTests(unittest.TestCase):
         )["runs"]["pending"])
 
     def test_upgrade_reconciliation_rejects_existing_host_outcome(self) -> None:
+        self._admit(self.project_a_id)
         orchestration, opened = self._pending_upgrade_run()
         request = self.ledger.prepare_upgrade_reconciliation(
             self.project_a_id, orchestration_id=orchestration["orchestration_id"],
@@ -1857,6 +1965,7 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual(110, checkpoints[1]["observed_at_ms"])
 
     def test_operational_qa_supersedes_unverified_run_and_surfaces_no_owner_review(self) -> None:
+        self._admit(self.project_a_id)
         orchestration = self.ledger.open_orchestration(
             self.project_a_id, client_version="codex-host-v1", now_ms=100
         )
