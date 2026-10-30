@@ -52,6 +52,7 @@ RECORD_TYPES = {
     "observation_unavailable",
     "provider_usage",
     "write_result",
+    "write_plan",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -2066,6 +2067,54 @@ def validate_write_result(data: Any) -> dict[str, Any]:
     return data
 
 
+WRITE_PLAN_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "source_commit", "manifest_digest", "write_set", "observed_at_ms",
+}
+MAX_WRITE_SET = 256
+
+
+def validate_write_plan(data: Any) -> dict[str, Any]:
+    """What a write child was allowed to change, fixed before it launched.
+
+    The effective write set (sorted, unique, plain relative paths) and the
+    baseline manifest's digest and source commit; `record_write_result`
+    checks every recorded patch against it.
+    """
+
+    data = _closed(data, WRITE_PLAN_FIELDS, "write_plan")
+    _base(data, "write_plan")
+    _identifier(data["run_id"], "run_id")
+    if not isinstance(data["bridge_run_id"], str) or re.fullmatch(
+        r"brg_[0-9a-f]{32}", data["bridge_run_id"]
+    ) is None:
+        raise ContractError("bridge_run_id is invalid")
+    if not isinstance(data["source_commit"], str) or re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", data["source_commit"]
+    ) is None:
+        raise ContractError("write_plan source_commit is invalid")
+    _digest(data["manifest_digest"], "manifest_digest")
+    write_set = data["write_set"]
+    if (
+        not isinstance(write_set, list)
+        or not 1 <= len(write_set) <= MAX_WRITE_SET
+        or write_set != sorted(set(write_set))
+    ):
+        raise ContractError("write_plan write_set must be a sorted unique non-empty array")
+    for path in write_set:
+        if (
+            not isinstance(path, str)
+            or not path
+            or len(path) > 4096
+            or path.startswith("/")
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or any(ord(character) < 32 for character in path)
+        ):
+            raise ContractError("write_plan write_set path is invalid")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -2093,6 +2142,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "observation_unavailable": validate_observation_unavailable,
     "provider_usage": validate_provider_usage,
     "write_result": validate_write_result,
+    "write_plan": validate_write_plan,
 }
 
 

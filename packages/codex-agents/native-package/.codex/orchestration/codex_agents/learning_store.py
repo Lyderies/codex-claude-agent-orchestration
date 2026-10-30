@@ -2197,7 +2197,7 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile", "probe_admission", "write_result",
+            "host_run_profile", "probe_admission", "write_result", "write_plan",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -3848,9 +3848,9 @@ class LearningLedger:
     def write_run_state(self, project_id: Any, handle_digest: Any, lease_expires_at_ms: Any) -> str:
         """`terminal`, `expired`, `live` or `unknown` for a leftover write layout's run.
 
-        A run this ledger does not know (another state root, or an unknown
-        project) is `unknown`, never removable. A run whose binding has been
-        pruned is `expired` only once the lease's own expiry has passed.
+        A run without a binding in this ledger (another state root, an
+        unknown project, a pruned or fabricated lease) is always `unknown`,
+        and the sweep never removes it. The lease's own expiry is not trusted.
         """
 
         if not isinstance(project_id, str) or not isinstance(handle_digest, str) or isinstance(
@@ -3870,20 +3870,146 @@ class LearningLedger:
                 (project_id, handle_digest),
             ).fetchone()
         if binding is None:
-            return "expired" if lease_expires_at_ms <= now else "unknown"
+            return "unknown"
         if binding["binding_state"] != "pending" or binding["consumed_at_ms"] is not None:
             return "terminal"
         return "expired" if int(binding["expires_at_ms"]) <= now else "live"
+
+    def fence_expired_write_run(self, project_id: str, handle_digest: str) -> bool:
+        """Abandon an expired, still-pending write run before its layout is removed.
+
+        Committed before any deletion, so the run can no longer be bound,
+        dispatched or have a write result recorded. Returns whether the run is
+        now terminal (already terminal counts); a live or unknown run is left
+        alone and returns False.
+        """
+
+        now = self._clock_ms()
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            binding = self._connection.execute(
+                "SELECT binding_state,consumed_at_ms,expires_at_ms FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if binding is None:
+                return False
+            if binding["binding_state"] != "pending" or binding["consumed_at_ms"] is not None:
+                return True
+            if int(binding["expires_at_ms"]) > now:
+                return False
+            changed = self._connection.execute(
+                "UPDATE host_run_bindings SET binding_state='abandoned',"
+                "abandoned_reason='write_lease_expired' WHERE project_id=? AND handle_digest=? "
+                "AND binding_state='pending' AND consumed_at_ms IS NULL",
+                (project_id, handle_digest),
+            ).rowcount
+        self.state.harden_database_files()
+        return changed == 1
+
+    def _write_run_locked(
+        self, project_id: str, run_handle: Any, route: Any, bridge_run_id: str
+    ) -> tuple[str, Any]:
+        """The run ID of an open run bound to `route`, a Claude workspace-write bridge route."""
+
+        key = self.state.digest_key()
+        binding = self._connection.execute(
+            "SELECT run_id,route_digest,binding_state,consumed_at_ms FROM host_run_bindings "
+            "WHERE project_id=? AND handle_digest=?",
+            (project_id, keyed_digest(key, run_handle)),
+        ).fetchone() if isinstance(run_handle, str) else None
+        if binding is None:
+            raise LedgerError("host run is unavailable")
+        if binding["binding_state"] != "pending" or binding["consumed_at_ms"] is not None:
+            raise LedgerError("host run is no longer open for a write result")
+        if not isinstance(route, dict) or str(binding["route_digest"]) != keyed_digest(
+            key, canonical_json(route)
+        ):
+            raise LedgerError("write result route does not match the opened host run")
+        if (
+            route.get("provider") != "claude"
+            or route.get("sandbox_mode") != "workspace-write"
+            or route.get("dispatch") != "bridge"
+        ):
+            raise LedgerError("only a Claude workspace-write bridge run records a write result")
+        run_id = str(binding["run_id"])
+        if self._connection.execute(
+            "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_intent' "
+            "AND json_extract(CAST(content AS TEXT),'$.run_id')=? "
+            "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=? "
+            "AND json_extract(CAST(content AS TEXT),'$.provider')='claude'",
+            (project_id, run_id, bridge_run_id),
+        ).fetchone() is None:
+            raise LedgerError("only a dispatched write run records its result")
+        return run_id, binding
+
+    def record_write_plan(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        bridge_run_id: str,
+        route: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fix a write run's write set and baseline manifest before its child launches."""
+
+        timestamp = self._clock_ms()
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            run_id, _ = self._write_run_locked(project_id, run_handle, route, bridge_run_id)
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='write_plan' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("host run already recorded its write plan")
+            if not isinstance(manifest, dict):
+                raise LedgerError("write plan manifest is invalid")
+            material = {
+                "schema_version": 1,
+                "record_type": "write_plan",
+                "run_id": run_id,
+                "bridge_run_id": bridge_run_id,
+                "source_commit": manifest.get("source_commit"),
+                "manifest_digest": content_digest(manifest),
+                "write_set": manifest.get("write_set"),
+                "observed_at_ms": timestamp,
+            }
+            try:
+                record = validate_learning_record(
+                    {**material, "record_id": f"write_plan:{content_digest(material)}"}
+                )
+            except ContractError as exc:
+                raise LedgerError("write plan is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="lifecycle", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return record
 
     def _check_write_artifacts_locked(
         self,
         record: dict[str, Any],
         patch: bytes | None,
         envelope: bytes | None,
+        *,
+        plan: dict[str, Any],
+        binding: dict[str, Any],
     ) -> None:
-        """Re-verify a passed write result's patch and envelope from their bytes."""
+        """Re-verify a passed write result's patch and envelope from their bytes.
 
-        from .workspace import WorkspaceRefused, validate_patch
+        Everything is checked against facts the ledger fixed itself: the
+        write plan recorded before launch and this run's identity. Only
+        quiescence is taken from the bridge, which observed it.
+        """
+
+        from .workspace import WorkspaceRefused, is_protected_path, validate_patch
+
+        if record["manifest_digest"] != plan["manifest_digest"] or (
+            record["source_commit"] != plan["source_commit"]
+        ):
+            raise LedgerError("write result does not match its write plan")
 
         if record["ownership"] != "passed":
             if patch is not None or envelope is not None:
@@ -3920,6 +4046,16 @@ class LearningLedger:
             or len(patch_value["changes"]) != record["changes"]
         ):
             raise LedgerError("write result envelope does not bind its patch")
+        if envelope_value["manifest"].get("write_set") != plan["write_set"]:
+            raise LedgerError("write result manifest differs from the write plan")
+        if envelope_value.get("run_binding") != binding:
+            raise LedgerError("write result envelope names another run")
+        for change in patch_value["changes"]:
+            path = change["path"]
+            if is_protected_path(path) or not any(
+                path == owned or path.startswith(owned + "/") for owned in plan["write_set"]
+            ):
+                raise LedgerError("write result patch changes a path outside its write plan")
 
     def _stage_owner_file(self, project_id: str, file_id: str, payload: bytes) -> Path:
         """Write an artifact durably (file, then directory fsync) before it is registered."""
@@ -3962,11 +4098,16 @@ class LearningLedger:
     ) -> dict[str, Any]:
         """Persist a bridged write child's outcome once, with its patch and envelope.
 
-        The run must be bound to exactly `route`, which must be a Claude
-        workspace-write bridge route, with a Claude `dispatch_intent` for
-        `bridge_run_id`. A `passed` result needs proved quiescence and a patch
-        and envelope that hash to its digests, validate, and bind each other,
-        the manifest and the source commit; a failed one carries no artifacts.
+        The run must still be open and bound to exactly `route`, which must be
+        a Claude workspace-write bridge route, with a Claude `dispatch_intent`
+        and the `write_plan` recorded before launch for `bridge_run_id`. A
+        `passed` result needs a patch and envelope that hash to its digests,
+        validate and bind each other; their manifest digest, write set and
+        source commit must equal the write plan's, every changed path must lie
+        inside the planned write set and not be protected, and the envelope's
+        run binding must name this run. A failed result carries no artifacts.
+        Quiescence is the one fact taken from the bridge, which observed it: a
+        `passed` result must say it was proved.
 
         Both artifacts are staged durably first; then, in one transaction, the
         `write_result` (ledger-only: digests, counts and codes) is appended
@@ -3976,33 +4117,26 @@ class LearningLedger:
 
         timestamp = self._clock_ms()
         with self._lock:
-            key = self.state.digest_key()
-            binding = self._connection.execute(
-                "SELECT run_id,route_digest FROM host_run_bindings "
-                "WHERE project_id=? AND handle_digest=?",
-                (project_id, keyed_digest(key, run_handle)),
-            ).fetchone() if isinstance(run_handle, str) else None
-            if binding is None:
-                raise LedgerError("host run is unavailable")
-            if not isinstance(route, dict) or str(binding["route_digest"]) != keyed_digest(
-                key, canonical_json(route)
-            ):
-                raise LedgerError("write result route does not match the opened host run")
-            if (
-                route.get("provider") != "claude"
-                or route.get("sandbox_mode") != "workspace-write"
-                or route.get("dispatch") != "bridge"
-            ):
-                raise LedgerError("only a Claude workspace-write bridge run records a write result")
-            run_id = str(binding["run_id"])
-            if self._connection.execute(
-                "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_intent' "
+            run_id, _ = self._write_run_locked(project_id, run_handle, route, bridge_run_id)
+            plan_row = self._connection.execute(
+                "SELECT content FROM records WHERE project_id=? AND record_type='write_plan' "
                 "AND json_extract(CAST(content AS TEXT),'$.run_id')=? "
-                "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=? "
-                "AND json_extract(CAST(content AS TEXT),'$.provider')='claude'",
+                "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?",
                 (project_id, run_id, bridge_run_id),
-            ).fetchone() is None:
-                raise LedgerError("only a dispatched write run records its result")
+            ).fetchone()
+            if plan_row is None:
+                raise LedgerError("a write result needs the run's write plan")
+            try:
+                plan = validate_learning_record(json.loads(bytes(plan_row["content"])))
+            except (ContractError, TypeError, ValueError) as exc:
+                raise LedgerError("write plan is invalid") from exc
+            expected_binding = {
+                "project_id": project_id,
+                "run_handle_sha256": hashlib.sha256(run_handle.encode()).hexdigest(),
+                "bridge_run_id": bridge_run_id,
+                "route_digest": content_digest(route),
+                "source_commit": plan["source_commit"],
+            }
             if self._connection.execute(
                 "SELECT 1 FROM records WHERE project_id=? AND record_type='write_result' "
                 "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
@@ -4024,7 +4158,9 @@ class LearningLedger:
                 })
             except ContractError as exc:
                 raise LedgerError("write result is invalid") from exc
-            self._check_write_artifacts_locked(record, patch, envelope)
+            self._check_write_artifacts_locked(
+                record, patch, envelope, plan=plan, binding=expected_binding
+            )
             staged: list[tuple[str, Path, str]] = []
             try:
                 for kind, content, digest in (

@@ -268,7 +268,11 @@ Claude to Claude and Codex to Codex.
   several letter cases. A write path or workspace path that the rule syntax would read
   specially (a leading `~` or `/`, glob or bracket characters, backslashes,
   parentheses, whitespace or control characters) is refused with
-  `write_path_not_rule_safe` before launch. The child runs with those five tools, `dontAsk`,
+  `write_path_not_rule_safe` before launch. Mixed-case or normalisation variants of a
+  protected name (such as `src/AgEnTs.Md`) can still exist transiently under a
+  directory grant, because the deny rules list only five spellings; the post-run
+  ownership check refuses any patch that contains one, and a settings escalation would
+  need a root-level `.claude/` directory, which no allow rule permits. The child runs with those five tools, `dontAsk`,
   `--setting-sources project`, `--strict-mcp-config`, no session persistence, stdin
   closed, umask 022 and the workspace as its working directory. Its init frame must
   report exactly the five tools.

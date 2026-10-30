@@ -548,7 +548,95 @@ class ClaudeWriteChildTests(BridgeTestCase):
         with self.assertRaisesRegex(LedgerError, "unavailable"):
             self.ledger.write_result_artifact(self.project_id, bridge_run_id, "patch")
 
+    def test_reviewer_probe_outside_the_planned_write_set_is_refused(self) -> None:
+        captured, _ = self.captured_write()
+        patch = json.loads(captured["patch"])
+        envelope = json.loads(captured["envelope"])
+        manifest = envelope["manifest"]
+        content = b"injected = True\n"
+        patch["changes"] = [{
+            "path": "docs/injected.py", "op": "add", "old_blob": None, "old_mode": None,
+            "new_sha256": hashlib.sha256(content).hexdigest(), "mode": "100644",
+            "content_b64": base64.b64encode(content).decode(),
+        }]
+
+        def forged(patch_value, binding):
+            # Assembled by hand, as a forger would, without the builder's own checks.
+            patch_bytes = workspace.encode_patch(patch_value)
+            built = {
+                "schema_version": 1, "run_binding": binding,
+                "source_commit": patch_value["source_commit"],
+                "manifest_digest": patch_value["manifest_digest"], "manifest": manifest,
+                "patch_digest": hashlib.sha256(patch_bytes).hexdigest(), "patch": patch_value,
+                "resulting_files": [
+                    {"path": c["path"], "sha256": c["new_sha256"], "content_b64": c["content_b64"]}
+                    for c in patch_value["changes"] if c["content_b64"] is not None
+                ],
+            }
+            envelope_bytes = workspace.canonical_json(built)
+            return {
+                "patch": patch_bytes, "envelope": envelope_bytes,
+                "result": {**captured["result"], "changes": len(patch_value["changes"]),
+                           "patch_digest": hashlib.sha256(patch_bytes).hexdigest(),
+                           "envelope_digest": hashlib.sha256(envelope_bytes).hexdigest()},
+            }
+
+        other_run = {**envelope["run_binding"], "bridge_run_id": "brg_" + "f" * 32,
+                     "run_handle_sha256": "e" * 64}
+        self.assertEqual(["src"], manifest["write_set"])
+        with self.assertRaisesRegex(LedgerError, "names another run|outside its write plan"):
+            self.record(captured, **forged(patch, other_run))
+        with self.assertRaisesRegex(LedgerError, "outside its write plan"):
+            self.record(captured, **forged(patch, envelope["run_binding"]))
+        inside = json.loads(captured["patch"])
+        with self.assertRaisesRegex(LedgerError, "names another run"):
+            self.record(captured, **forged(inside, other_run))
+        protected = {**inside, "changes": [{**patch["changes"][0], "path": "src/AGENTS.md"}]}
+        with self.assertRaisesRegex(LedgerError, "patch is invalid|outside its write plan"):
+            self.record(captured, **forged(protected, envelope["run_binding"]))
+        self.assertEqual([], self.write_records())
+        self.record(captured)
+
+    def test_write_plan_is_fixed_before_launch(self) -> None:
+        captured, _ = self.captured_write()
+        with self.ledger.repository(self.project_id) as repository:
+            [plan] = repository.records("write_plan")
+        self.assertEqual(["src"], plan["write_set"])
+        self.assertEqual(captured["bridge_run_id"], plan["bridge_run_id"])
+        self.assertEqual(captured["result"]["manifest_digest"], plan["manifest_digest"])
+        with self.assertRaisesRegex(LedgerError, "already recorded its write plan"):
+            self.ledger.record_write_plan(
+                self.project_id, run_handle=captured["run_handle"],
+                bridge_run_id=captured["bridge_run_id"], route=captured["route"],
+                manifest=json.loads(captured["envelope"])["manifest"],
+            )
+
     # --- the layout sweep (finding 7) ---
+
+    def test_sweep_fences_the_run_before_removing_its_layout(self) -> None:
+        captured, _ = self.captured_write()
+        handle = captured["run_handle"]
+        fenced = self.leased_layout(handle)
+        expires = self.ledger.write_run_lease(self.project_id, handle)["expires_at_ms"]
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=expires + 1):
+            report = bridge.sweep_write_layouts(self.ledger, self.dispatch_parent)
+        self.assertEqual(1, report["removed"])
+        self.assertFalse(os.path.lexists(fenced))
+        lease = self.ledger.write_run_lease(self.project_id, handle)
+        self.assertEqual("terminal", self.ledger.write_run_state(
+            self.project_id, lease["handle_digest"], lease["expires_at_ms"]))
+        with self.assertRaisesRegex(LedgerError, "no longer open"):
+            self.record(captured)
+
+    def test_sweep_keeps_a_lease_for_an_unbound_run(self) -> None:
+        self.seed()
+        layout = workspace.create_layout(self.dispatch_parent)
+        bridge._write_lease(layout, {
+            "project_id": self.project_id, "handle_digest": "0" * 64, "expires_at_ms": 0,
+        })
+        report = bridge.sweep_write_layouts(self.ledger, self.dispatch_parent)
+        self.assertEqual({layout.root.name: "run_unknown"}, report["kept"])
+        self.assertTrue(layout.root.exists())
 
     def leased_layout(self, handle: str, *, fence: bool = True) -> Path:
         layout = workspace.create_layout(self.dispatch_parent)
@@ -649,9 +737,21 @@ class QuiescenceTests(unittest.TestCase):
         self.assertEqual((False, 0), bridge.prove_quiescent(missing, self.identity))
         self.assertEqual((True, 0), bridge.prove_quiescent(self.workspace, self.identity))
 
+    @unittest.skipUnless(shutil.which("lsof", path=bridge.LSOF_SEARCH_PATH), "needs lsof")
+    def test_real_lsof_warning_on_an_unreadable_directory_is_unproved(self) -> None:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root can read any directory, so lsof prints no warning")
+        locked = self.workspace / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        self.assertIsNone(bridge._processes_using(self.workspace))
+        self.assertEqual((False, 0), bridge.prove_quiescent(self.workspace, self.identity))
+
     def test_failing_lsof_is_unproved(self) -> None:
         for body in (
             'echo "lsof: something went wrong" >&2; exit 1',
+            'echo "lsof: WARNING: can\'t opendir(x): Permission denied" >&2; exit 1',
             "exit 2",
             "echo garbage; exit 1",
             "echo p12x; exit 0",

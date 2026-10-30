@@ -1195,7 +1195,8 @@ def _directory_identity(path: Path) -> tuple[int, int] | None:
 def _processes_using(path: Path) -> list[int] | None:
     """PIDs with a working directory or an open file under `path`; None when unprovable.
 
-    A bounded `lsof +D` (no name or port lookups, warnings off). Exit status
+    A bounded `lsof +D` (no name or port lookups, warnings on, so a directory
+    it could not read shows up on stderr and leaves the answer unproved). Exit status
     1 means "nothing found", "some search item was not found" and failure
     alike, so it counts as nothing found only with empty output on both
     streams; matches it prints are still matches. Any diagnostic, timeout,
@@ -1208,7 +1209,7 @@ def _processes_using(path: Path) -> list[int] | None:
         return None
     try:
         completed = subprocess.run(
-            [executable, "-n", "-P", "-w", "-F", "p", "+D", str(path)],
+            [executable, "-n", "-P", "+w", "-F", "p", "+D", str(path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
             timeout=LSOF_TIMEOUT_SECONDS, check=False,
@@ -1403,8 +1404,9 @@ def sweep_write_layouts(ledger: Any, parent: Path) -> dict[str, Any]:
 
     Only directories under `parent` with this package's prefix (live or
     fenced) are considered, at most `MAX_SWEEP_ENTRIES`. A layout is removed
-    only when its lease names a run of this ledger that is terminal or past
-    its handle expiry, and quiescence is then proved for the whole layout.
+    only when its lease names a run bound in this ledger that is terminal or
+    past its handle expiry; an expired pending run is first abandoned in the
+    ledger (committed), and quiescence is then proved for the whole layout.
     Anything else (no lease, an unknown run, a live run, survivors) stays in
     place and is reported by reason.
     """
@@ -1443,6 +1445,11 @@ def sweep_write_layouts(ledger: Any, parent: Path) -> dict[str, Any]:
                 )
                 if state not in {"terminal", "expired"}:
                     kept[name] = f"run_{state}"
+                    continue
+                # Fence the run before touching its files: once this commits it can
+                # no longer be bound, dispatched or record a write result.
+                if not ledger.fence_expired_write_run(lease["project_id"], lease["handle_digest"]):
+                    kept[name] = "run_not_fenced"
                     continue
                 proved, _ = prove_quiescent(parent / name, (status.st_dev, status.st_ino))
                 if not proved:
@@ -1620,6 +1627,13 @@ def dispatch(
         ledger.bind_host_agent(
             project_id, run_handle=run_handle, agent_id=intent["bridge_run_id"]
         )
+        if write_route:
+            # The write set and baseline are fixed in the ledger before the child
+            # exists; the recorded patch is checked against them, not against us.
+            ledger.record_write_plan(
+                project_id, run_handle=run_handle, bridge_run_id=intent["bridge_run_id"],
+                route=route, manifest=manifest,
+            )
         launched = True
         if provider == "claude":
             result, report = run_claude(
