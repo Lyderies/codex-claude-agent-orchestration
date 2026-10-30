@@ -42,6 +42,9 @@ class RouteDenied(ContractError):
 # Stable reasons a write route is denied.
 CODEX_WRITE_CHILDREN_UNAVAILABLE = "codex_write_children_unavailable"
 WRITE_CHILDREN_UNSUPPORTED_PLATFORM = "write_children_unsupported_platform"
+# A verification task bound to a write result (`verification_for_write`) needs a
+# read-only, bridged verifier from the other provider; anything else is denied.
+WRITE_VERIFIER_UNAVAILABLE = "write_verifier_unavailable"
 
 
 def write_children_supported() -> bool:
@@ -1254,10 +1257,18 @@ def _select_verifier(
     worker_provider: str,
     primary_provider: str,
     use_legacy_fallback: bool,
+    other_provider_only: bool = False,
 ) -> dict[str, Any]:
-    """Prefer the other vendor's reviewer, then the worker's own vendor."""
+    """Prefer the other vendor's reviewer, then the worker's own vendor.
+
+    With `other_provider_only` (a write result's verifier) the worker's own
+    vendor is never a candidate, and the verifier must be bridged so that it
+    receives the bridge-owned envelope.
+    """
 
     order = ("codex", "claude") if worker_provider == "claude" else ("claude", "codex")
+    if other_provider_only:
+        order = order[:1]
     for provider in order:
         dispatch = _dispatch(primary_provider, provider)
         if provider == "codex":
@@ -1283,6 +1294,8 @@ def _select_verifier(
         if not _provider_admitted(
             policy, primary_provider, provider, verifier["model"]
         ):
+            continue
+        if other_provider_only and dispatch != "bridge":
             continue
         verifier["provider"] = provider
         verifier["dispatch"] = dispatch
@@ -1317,13 +1330,28 @@ def _route_task(
     if verification_for_provider is not None:
         # A verification task for known work follows the same rule as the worker
         # route's advertised verifier, so both name the same provider and model.
-        rule = _select_verifier(
-            policy,
-            task.get("verification_for_family", "verification"),
-            worker_provider=verification_for_provider,
-            primary_provider=primary_provider,
-            use_legacy_fallback=use_legacy_fallback,
-        )
+        write_bound = task.get("verification_for_write") is not None
+        try:
+            rule = _select_verifier(
+                policy,
+                task.get("verification_for_family", "verification"),
+                worker_provider=verification_for_provider,
+                primary_provider=primary_provider,
+                use_legacy_fallback=use_legacy_fallback,
+                other_provider_only=write_bound,
+            )
+        except ContractError as exc:
+            # A write result is verified only by the other provider; with no
+            # eligible candidate there, routing is denied, never widened.
+            if write_bound:
+                raise RouteDenied(WRITE_VERIFIER_UNAVAILABLE) from exc
+            raise
+        if write_bound and (
+            rule["provider"] == verification_for_provider
+            or rule["dispatch"] != "bridge"
+            or rule["sandbox_mode"] != "read-only"
+        ):
+            raise RouteDenied(WRITE_VERIFIER_UNAVAILABLE)
         rule_agent = None
         if rule["provider"] == "claude":
             rule_agent = {
@@ -1476,6 +1504,10 @@ def _route_task(
     if fallback is not None:
         fallback["verifier_substituted"] = verification_required
         result["fallback"] = fallback
+    if task.get("verification_for_write") is not None:
+        # The route, and so the run's admission, is bound to the exact write
+        # result and patch digest under review.
+        result["verification_for_write"] = deepcopy(task["verification_for_write"])
     mapping_digest = policy.get("project_agent_mapping_digest")
     if mapping_digest is not None:
         result["project_agent_mapping_digest"] = mapping_digest

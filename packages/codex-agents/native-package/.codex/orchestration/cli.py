@@ -727,6 +727,13 @@ def main() -> int:
     _add_learning_project(learning_orchestration_report)
     learning_orchestration_report.add_argument("--orchestration-id", required=True)
 
+    learning_write_verification = subparsers.add_parser(
+        "learning-write-verification-state",
+        help="report whether a write result's patch has an accepted other-provider verification",
+    )
+    _add_learning_project(learning_write_verification)
+    learning_write_verification.add_argument("--bridge-run-id", required=True)
+
     learning_bind_agent = subparsers.add_parser(
         "learning-bind-host-agent",
         help="bind a host run to the native subagent identifier",
@@ -1649,6 +1656,18 @@ def main() -> int:
                     "ready": True,
                     **ledger.orchestration_report(
                         project_id, args.orchestration_id
+                    ),
+                }
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "learning-write-verification-state":
+            ledger, project_id = _learning_ledger(args)
+            try:
+                report = {
+                    "ready": True,
+                    "bridge_run_id": args.bridge_run_id,
+                    "write_verification_state": ledger.write_verification_state(
+                        project_id, args.bridge_run_id
                     ),
                 }
             finally:

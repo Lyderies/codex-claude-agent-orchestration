@@ -37,6 +37,7 @@ from .bridge import (
     MAX_EXPORT_BYTES,
     MAX_EXPORT_FILES,
     PATHSPEC_SPECIAL,
+    RESERVED_INPUT_DIRECTORY,
     BridgeRefused,
     _claude_context_path,
     _granted_paths,
@@ -62,9 +63,12 @@ MAX_TREE_BYTES = 1024 * 1024 * 1024
 
 # Never exported as writable and never accepted in a change, at any depth and
 # in any letter case. Compared after Unicode normalization and case folding.
+# The verifier's reserved input directory is one of them, so a patch can never
+# bring that name into the repository.
 PROTECTED_NAMES = frozenset(
     {".git", ".codex", ".agents", ".claude", "agents.md", "claude.md", "claude.local.md", ".mcp.json"}
     | {name.casefold() for name in CLAUDE_CONTEXT_NAMES}
+    | {RESERVED_INPUT_DIRECTORY}
 )
 REGULAR_MODE = "100644"
 EXECUTABLE_MODE = "100755"
@@ -237,7 +241,7 @@ def assignment_export_paths(assignment: Mapping[str, Any]) -> list[str]:
     paths = set()
     for value in (*assignment.get("context", []), *assignment.get("owned_paths", [])):
         path = _literal_path(value)
-        if _claude_context_path(path):
+        if _claude_context_path(path) or bridge.names_reserved_input(path):
             raise WorkspaceRefused("path_protected", path)
         if not _path_granted(path, granted):
             raise WorkspaceRefused("path_not_granted", path)
