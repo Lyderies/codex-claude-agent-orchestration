@@ -331,6 +331,18 @@ def _closed(data: Any, fields: set[str], label: str) -> dict[str, Any]:
     return data
 
 
+def _closed_optional(
+    data: Any, required: set[str], allowed: set[str], label: str
+) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ContractError(f"{label} must be an object")
+    if required - data.keys():
+        raise ContractError(f"{label} missing required fields")
+    if data.keys() - allowed:
+        raise ContractError(f"{label} has unknown fields")
+    return data
+
+
 def _identifier(value: Any, field: str, *, nullable: bool = False) -> None:
     if nullable and value is None:
         return
@@ -1662,18 +1674,25 @@ OBSERVATION_PHASES = {"before", "during", "after"}
 HEADROOM_WINDOW_FIELDS = {"window_minutes", "scope", "used_percent", "resets_at"}
 PROVIDER_BILLING_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
-    "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
-    "is_using_overage", "overage_status", "overage_disabled_reason", "run_id",
-    "phase", "observed_at_ms",
+    "paid_usage_usable", "has_credits", "unlimited", "spend_control_reached",
+    "ordinary_usage_allowed", "is_using_overage", "overage_status",
+    "overage_disabled_reason", "run_id", "phase", "observed_at_ms",
 }
-BILLING_ATTESTATION_FIELDS = {
+# The owner's optional statement that Codex credit spending is disabled on the
+# account. The observation cannot show it, so only a signed grant carries it.
+CODEX_CREDITS_DISABLED_FIELD = "codex_credits_spending_disabled"
+BILLING_ATTESTATION_REQUIRED_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
     "no_paid_overage", "no_usage_credits", "issued_at", "observed_at_ms",
 }
-BILLING_GRANT_FIELDS = {
+BILLING_ATTESTATION_FIELDS = BILLING_ATTESTATION_REQUIRED_FIELDS | {
+    CODEX_CREDITS_DISABLED_FIELD
+}
+BILLING_GRANT_REQUIRED_FIELDS = {
     "version", "provider", "account_fingerprint", "no_paid_overage",
     "no_usage_credits", "issued_at",
 }
+BILLING_GRANT_FIELDS = BILLING_GRANT_REQUIRED_FIELDS | {CODEX_CREDITS_DISABLED_FIELD}
 ADMISSION_DECISION_FIELDS = {
     "schema_version", "record_type", "record_id", "run_id", "provider", "decision",
     "reason_code", "admission_basis", "account_fingerprint", "evidence_digests",
@@ -1693,6 +1712,7 @@ ADMISSION_REASON_CODES = {
     "admission_policy_unavailable",
     "client_version_unreviewed",
     "codex_plan_not_subscription",
+    "codex_spend_control_reached",
     "window_run_cap_reached",
     "probe_cooldown",
 }
@@ -1800,8 +1820,8 @@ def validate_provider_billing(data: Any) -> dict[str, Any]:
     data = _closed(data, PROVIDER_BILLING_FIELDS, "provider_billing")
     _observation_base(data, "provider_billing")
     for field in (
-        "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
-        "is_using_overage",
+        "paid_usage_usable", "has_credits", "unlimited", "spend_control_reached",
+        "ordinary_usage_allowed", "is_using_overage",
     ):
         if data[field] is not None:
             _boolean(data[field], field)
@@ -1817,7 +1837,9 @@ def validate_provider_billing(data: Any) -> dict[str, Any]:
 def validate_billing_grant(data: Any) -> dict[str, Any]:
     """Validate the closed owner billing grant before it is signed or stored."""
 
-    data = _closed(data, BILLING_GRANT_FIELDS, "billing grant")
+    data = _closed_optional(
+        data, BILLING_GRANT_REQUIRED_FIELDS, BILLING_GRANT_FIELDS, "billing grant"
+    )
     if data["version"] != 1:
         raise ContractError("billing grant version is unsupported")
     _enum(data["provider"], PROVIDER_NAMES, "provider")
@@ -1825,14 +1847,31 @@ def validate_billing_grant(data: Any) -> dict[str, Any]:
     if data["no_paid_overage"] is not True or data["no_usage_credits"] is not True:
         raise ContractError("billing grant must attest no paid overage and no usage credits")
     _integer(data["issued_at"], "issued_at")
+    if CODEX_CREDITS_DISABLED_FIELD in data and (
+        data["provider"] != "codex" or data[CODEX_CREDITS_DISABLED_FIELD] is not True
+    ):
+        raise ContractError(
+            f"billing grant {CODEX_CREDITS_DISABLED_FIELD} is only for a Codex grant "
+            "and must be true"
+        )
     return data
 
 
 def validate_billing_attestation(data: Any) -> dict[str, Any]:
-    data = _closed(data, BILLING_ATTESTATION_FIELDS, "billing_attestation")
+    data = _closed_optional(
+        data, BILLING_ATTESTATION_REQUIRED_FIELDS, BILLING_ATTESTATION_FIELDS,
+        "billing_attestation",
+    )
     _observation_base(data, "billing_attestation")
     validate_billing_grant(
-        {"version": 1, **{field: data[field] for field in BILLING_GRANT_FIELDS - {"version"}}}
+        {
+            "version": 1,
+            **{
+                field: data[field]
+                for field in BILLING_GRANT_FIELDS - {"version"}
+                if field in data
+            },
+        }
     )
     if data["observed_at_ms"] != data["issued_at"]:
         raise ContractError("billing attestation time must equal its issue time")

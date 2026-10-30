@@ -3859,9 +3859,12 @@ class LearningLedger:
             headroom, _ = self._account_records_locked(
                 project_id, "provider_headroom", provider
             )
+            attestations = self._provider_records_locked(
+                project_id, "billing_attestation", provider
+            )
             reason = evaluate_launch(
                 provider=provider, identity=identity, billing=billing,
-                headroom=headroom, now_ms=timestamp,
+                headroom=headroom, now_ms=timestamp, attestations=attestations,
                 bootstrap=admission["admission_basis"] == "bootstrap",
             )
             if reason is not None:
