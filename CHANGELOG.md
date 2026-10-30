@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 (in progress): write-capable children (G3)
+
+- **Contained workspace.** A write child runs in a workspace exported from one commit, with no
+  `.git`, and with protected agent and context names refused at any depth and in any letter
+  case. After the child stops, the bridge snapshots the workspace without following links,
+  inventories it, and checks ownership: only the effective write set may change, with no special
+  files, no hard links and no permission changes beyond the executable bit. A self-contained,
+  digest-bound patch and a verifier envelope carry the result. The patch only applies onto a
+  verified tree at the source commit.
+- **Claude write children.** Every write route goes through the bridge. Claude write children run
+  with exact tools and absolute, workspace-anchored `Edit` and `Write` rules, plus deny rules for
+  protected names.
+  - Results count only once the child's processes are proven gone.
+  - A write plan fixed before launch binds what can be recorded.
+  - Patch and envelope are stored atomically and verified on every read.
+  - Expired runs are fenced in the ledger before their workspaces are swept.
+  - Codex write routes, and every write route off macOS, are refused for now.
+
+The Codex package is 0.9.0.
+
 ## 0.2.0: cross-provider read-only routing (G2)
 
 - **Provider-qualified routes.**

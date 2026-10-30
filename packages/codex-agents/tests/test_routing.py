@@ -18,6 +18,7 @@ from codex_agents.learning_contracts import content_digest
 from codex_agents.routing import (
     DEFAULT_PROVIDER_CONFIG_DIGEST,
     PolicyError,
+    RouteDenied,
     _route_task_legacy_fallback,
     admission_settings,
     load_effective_policy,
@@ -1485,7 +1486,7 @@ class ProviderRoutingTests(unittest.TestCase):
                         ORCHESTRATION_ROOT / "config/discovery-policy.json",
                     )
 
-    def test_mapped_claude_agent_with_write_tools_is_ineligible(self) -> None:
+    def test_mapped_claude_agent_with_write_tools_is_a_bridged_write_route(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".claude/agents"
@@ -1550,9 +1551,88 @@ class ProviderRoutingTests(unittest.TestCase):
                 (research["provider"], research["role"], research["agent_type"]),
             )
             self.assertEqual(".claude/agents/project_reader.md", research["agent_path"])
-            coding = route_task(self.exploratory(), policy, primary_provider="claude")
+            # Read and Edit map to workspace-write: a bridged Claude write child, on macOS.
+            with patch.object(routing, "write_children_supported", return_value=True):
+                coding = route_task(self.exploratory(), policy, primary_provider="claude")
+            self.assertEqual(
+                ("claude", "project_writer", "workspace-write", "bridge"),
+                (coding["provider"], coding["agent_type"], coding["sandbox_mode"],
+                 coding["dispatch"]),
+            )
+            # Off macOS the write candidate is denied and the read-only Codex one wins.
+            with patch.object(routing, "write_children_supported", return_value=False):
+                coding = route_task(self.exploratory(), policy, primary_provider="claude")
             self.assertEqual("codex", coding["provider"])
             self.assertEqual("codex_agents_implementation_worker", coding["agent_type"])
+            self.assertEqual("read-only", coding["sandbox_mode"])
+
+
+class WriteRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = load_policy(ORCHESTRATION_ROOT / "config/routing-policy.json")
+
+    def task(self) -> dict:
+        return RoutingTests.task(self)
+
+    def write_policy(
+        self, *, codex_enabled: bool, claude_writer: bool = True, claude_enabled: bool = True
+    ) -> dict:
+        policy = deepcopy(self.policy)
+        config = {
+            "version": 1,
+            "providers": {
+                "codex": {"enabled": codex_enabled}, "claude": {"enabled": claude_enabled},
+            },
+            "codex_primary_may_bridge_to_claude": True,
+        }
+        policy["provider_routing"] = config
+        policy["provider_config_digest"] = content_digest(config)
+        policy["project_agent_mapping_digest"] = "a" * 64
+        policy["project_agent_roles"] = {"coding": "implementation_worker"}
+        policy["project_agent_role_sandboxes"] = {"coding": "workspace-write"}
+        if claude_writer:
+            policy["project_claude_agent_roles"] = {"coding": "project_writer"}
+            policy["project_claude_agent_role_sandboxes"] = {"coding": "workspace-write"}
+        return policy
+
+    def test_claude_to_claude_write_route_is_bridged(self) -> None:
+        with patch.object(routing, "write_children_supported", return_value=True):
+            route = route_task(
+                self.task(), self.write_policy(codex_enabled=False), primary_provider="claude"
+            )
+        self.assertEqual(
+            ("claude", "workspace-write", "bridge", "project_writer"),
+            (route["provider"], route["sandbox_mode"], route["dispatch"], route["agent_type"]),
+        )
+
+    def test_codex_write_route_is_denied_with_a_stable_reason(self) -> None:
+        policy = self.write_policy(codex_enabled=True, claude_writer=False, claude_enabled=False)
+        for primary in ("codex", "claude"):
+            with self.subTest(primary=primary), patch.object(
+                routing, "write_children_supported", return_value=True
+            ):
+                with self.assertRaises(RouteDenied) as denied:
+                    route_task(self.task(), policy, primary_provider=primary)
+                self.assertEqual("codex_write_children_unavailable", denied.exception.reason)
+
+    def test_write_routes_are_denied_off_macos(self) -> None:
+        with patch.object(routing.sys, "platform", "linux"):
+            with self.assertRaises(RouteDenied) as denied:
+                route_task(
+                    self.task(), self.write_policy(codex_enabled=False), primary_provider="claude"
+                )
+            self.assertFalse(routing.write_children_supported())
+        self.assertEqual("write_children_unsupported_platform", denied.exception.reason)
+        with patch.object(routing.sys, "platform", "darwin"):
+            self.assertTrue(routing.write_children_supported())
+
+    def test_claude_write_agent_is_never_a_verifier(self) -> None:
+        policy = self.write_policy(codex_enabled=False)
+        policy["project_claude_agent_roles"]["verification"] = "project_writer"
+        policy["project_claude_agent_role_sandboxes"]["verification"] = "workspace-write"
+        with patch.object(routing, "write_children_supported", return_value=True), \
+                self.assertRaisesRegex(ContractError, "no verifier candidate"):
+            route_task(self.task(), policy, primary_provider="claude")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,10 @@ from codex_agents.contracts import (
     validate_result,
     validate_task,
 )
-from codex_agents.routing import load_effective_policy, load_policy, route_task
+from codex_agents import routing
+from codex_agents.learning_contracts import content_digest
+from codex_agents.routing import RouteDenied, load_effective_policy, load_policy, route_task
+from unittest import mock
 
 
 class ContractTests(unittest.TestCase):
@@ -393,7 +396,7 @@ class ContractTests(unittest.TestCase):
             ],
         )
 
-    def test_result_preflight_uses_project_mapped_workspace_write_agent(self) -> None:
+    def test_result_preflight_refuses_project_mapped_codex_write_agent(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temporary:
             root = Path(temporary)
             agents = root / ".codex/agents"
@@ -433,14 +436,12 @@ class ContractTests(unittest.TestCase):
                 ORCHESTRATION_ROOT / "config/routing-policy.json",
                 ORCHESTRATION_ROOT / "config/discovery-policy.json",
             )
-            route = route_task(task, policy)
+            # A Codex write child would need the bridge, which Codex lacks until G3 S2.
+            with self.assertRaises(RouteDenied) as denied:
+                route_task(task, policy)
+            self.assertEqual("codex_write_children_unavailable", denied.exception.reason)
             assignment = self.assignment()
-            assignment.update(
-                role=route["role"],
-                model=route["model"],
-                effort=route["effort"],
-                owned_paths=["source.txt"],
-            )
+            assignment["owned_paths"] = ["source.txt"]
             assignment["permissions"]["filesystem"] = ["source.txt:write"]
             grant = self.parent_grant()
             grant["filesystem"] = ["source.txt:write"]
@@ -466,10 +467,8 @@ class ContractTests(unittest.TestCase):
                 check=False,
             )
 
-        self.assertEqual(0, completed.returncode, completed.stderr)
-        report = json.loads(completed.stdout)
-        self.assertTrue(report["ready"])
-        self.assertEqual("assignment-1", report["template"]["assignment_id"])
+        self.assertNotEqual(0, completed.returncode)
+        self.assertFalse(json.loads(completed.stdout)["ready"])
 
     def test_legacy_retry_result_inherits_assignment_lineage(self) -> None:
         assigned = self.assignment()
@@ -643,7 +642,25 @@ class ContractTests(unittest.TestCase):
         policy["project_agent_roles"] = {"coding": "implementation_worker"}
         policy["project_agent_role_sandboxes"] = {"coding": "workspace-write"}
         policy["project_agent_mapping_digest"] = "a" * 64
-        route = route_task(task, policy)
+        with self.assertRaises(RouteDenied) as denied:
+            route_task(task, policy)
+        self.assertEqual("codex_write_children_unavailable", denied.exception.reason)
+        # The same mapping to a Claude agent with write tools is a bridged write route.
+        config = {
+            "version": 1,
+            "providers": {"codex": {"enabled": False}, "claude": {"enabled": True}},
+            "codex_primary_may_bridge_to_claude": False,
+        }
+        policy["provider_routing"] = config
+        policy["provider_config_digest"] = content_digest(config)
+        policy["project_claude_agent_roles"] = {"coding": "project_writer"}
+        policy["project_claude_agent_role_sandboxes"] = {"coding": "workspace-write"}
+        with mock.patch.object(routing, "write_children_supported", return_value=True):
+            route = route_task(task, policy, primary_provider="claude")
+        self.assertEqual(
+            ("claude", "workspace-write", "bridge"),
+            (route["provider"], route["sandbox_mode"], route["dispatch"]),
+        )
         assignment = self.assignment()
         assignment.update(
             role=route["role"],

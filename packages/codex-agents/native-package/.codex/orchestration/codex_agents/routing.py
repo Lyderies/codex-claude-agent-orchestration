@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,25 @@ class PolicyError(ValueError):
     """Raised when routing policy is internally inconsistent."""
 
 
+class RouteDenied(ContractError):
+    """No candidate is eligible, for a stable reason code (`reason`)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"no provider candidate is eligible for this route: {reason}")
+        self.reason = reason
+
+
+# Stable reasons a write route is denied.
+CODEX_WRITE_CHILDREN_UNAVAILABLE = "codex_write_children_unavailable"
+WRITE_CHILDREN_UNSUPPORTED_PLATFORM = "write_children_unsupported_platform"
+
+
+def write_children_supported() -> bool:
+    """Write children run only on macOS, where their containment was demonstrated."""
+
+    return sys.platform == "darwin"
+
+
 BOUND_FIELDS = {
     "max_attempts",
     "max_steers_per_attempt",
@@ -42,6 +62,8 @@ BOUND_FIELDS = {
 PROJECT_AGENT_MAPPING = Path(".codex/orchestration/project-agent-routing.json")
 PROVIDER_ROUTING = Path(".codex/orchestration/provider-routing.json")
 WRITABLE_PROJECT_FAMILIES = {"coding", "verification"}
+# A Claude agent with write tools is a contained write child only for coding.
+CLAUDE_WRITABLE_FAMILIES = {"coding"}
 PROVIDERS = ("codex", "claude")
 ROUTE_KEYS = {"bounded", "exploratory", "judgment", "synthesis", "default"}
 TOP_LEVEL_ROUTE_KEYS = ("reconnaissance", "hard_end_to_end")
@@ -406,7 +428,8 @@ def validate_project_agent_mapping(
 
     def validate_claude_agent(agent_type: str) -> str:
         # A mapped Claude agent only names the definition; model and effort stay
-        # with policy, and write tools leave it ineligible rather than writable.
+        # with policy. Read, Glob, Grep plus Edit and Write make it a contained
+        # write child (workspace-write); any other tool leaves it ineligible.
         candidate = claude_selected[agent_type]
         expected_path = f".claude/agents/{agent_type}.md"
         if candidate["source"] != "project" or candidate["path"] != expected_path:
@@ -446,7 +469,10 @@ def validate_project_agent_mapping(
                     f"mapped project agent name is ambiguous: {agent_type}"
                 )
             claude_roles[family] = agent_type
-            claude_role_sandboxes[family] = validate_claude_agent(agent_type)
+            sandbox = validate_claude_agent(agent_type)
+            if sandbox == "workspace-write" and family not in CLAUDE_WRITABLE_FAMILIES:
+                sandbox = "write-tools"
+            claude_role_sandboxes[family] = sandbox
             continue
         role_skill_paths[family] = validate_agent(
             family, agent_type, verifier=False
@@ -1100,12 +1126,20 @@ def _provider_admitted(
     )
 
 
-def _dispatch(primary_provider: str, provider: str) -> str:
+def _dispatch(primary_provider: str, provider: str, sandbox_mode: str = "read-only") -> str:
+    # A native write child would write into the primary's own checkout, so every
+    # write route goes through the bridge's contained workspace.
+    if sandbox_mode == "workspace-write":
+        return "bridge"
     return "native" if provider == primary_provider else "bridge"
 
 
 def _claude_agent(policy: dict[str, Any], family: str) -> dict[str, str] | None:
-    """Resolve the Claude role or mapped Claude agent; write tools are ineligible."""
+    """Resolve the Claude role or mapped Claude agent.
+
+    A read-only agent, or a mapped coding agent with only Read, Glob, Grep,
+    Edit and Write (workspace-write), is eligible; any other tools are not.
+    """
 
     role = _provider_roles(policy, "claude").get(family)
     if role is None:
@@ -1114,13 +1148,13 @@ def _claude_agent(policy: dict[str, Any], family: str) -> dict[str, str] | None:
     sandbox = policy.get("project_claude_agent_role_sandboxes", {}).get(
         family, "read-only"
     )
-    if sandbox != "read-only":
+    if sandbox not in {"read-only", "workspace-write"}:
         return None
     return {
         "role": role,
         "agent_type": agent_type,
         "agent_path": f".claude/agents/{agent_type}.md",
-        "sandbox_mode": "read-only",
+        "sandbox_mode": sandbox,
     }
 
 
@@ -1230,12 +1264,13 @@ def _select_verifier(
             verifier = _codex_verifier(
                 policy, routed_family, use_legacy_fallback=use_legacy_fallback
             )
-            if dispatch == "bridge" and verifier["sandbox_mode"] != "read-only":
+            # A writable verifier would be a write child; Codex has none yet (S2).
+            if verifier["sandbox_mode"] != "read-only":
                 continue
         else:
             claude = policy.get("providers", {}).get("claude")
             agent = _claude_agent(policy, "verification")
-            if claude is None or agent is None:
+            if claude is None or agent is None or agent["sandbox_mode"] != "read-only":
                 continue
             verifier = {
                 "role": agent["role"],
@@ -1307,6 +1342,7 @@ def _route_task(
             policy, *_route_key(policy, routed_family, candidate)
         )
     )
+    denied_reason: str | None = None
     for entry in candidate_entries:
         provider = entry["provider"]
         source = candidate if entry == CODEX_POLICY_CANDIDATE else entry
@@ -1317,20 +1353,38 @@ def _route_task(
             continue
         agent: dict[str, Any] | None = None
         if provider == "codex":
-            if (
-                _dispatch(primary_provider, provider) == "bridge"
-                and codex_agent.get("sandbox_mode", "read-only") != "read-only"
-            ):
-                continue
+            sandbox = codex_agent.get("sandbox_mode", "read-only")
         else:
             agent = _claude_agent(policy, routed_family)
             if agent is None:
                 continue
+            sandbox = agent["sandbox_mode"]
+        if sandbox != "read-only":
+            # Write routes are always bridged. Codex write children are not
+            # available yet (G3 S2), and none run off macOS; both are explicit
+            # denials of this candidate, and the next one may still be eligible.
+            if provider == "codex":
+                denied_reason = denied_reason or CODEX_WRITE_CHILDREN_UNAVAILABLE
+                continue
+            if not write_children_supported():
+                denied_reason = denied_reason or WRITE_CHILDREN_UNSUPPORTED_PLATFORM
+                continue
         picked = (provider, model_effort, agent)
         break
     if picked is None:
+        if denied_reason is not None:
+            raise RouteDenied(denied_reason)
         raise ContractError("no provider candidate is eligible for this route")
     provider, primary, claude_agent = picked
+    sandbox_mode = (
+        claude_agent["sandbox_mode"] if claude_agent is not None
+        else codex_agent.get("sandbox_mode", "read-only")
+    )
+    if sandbox_mode != "read-only":
+        if provider == "codex":
+            raise RouteDenied(CODEX_WRITE_CHILDREN_UNAVAILABLE)
+        if not write_children_supported():
+            raise RouteDenied(WRITE_CHILDREN_UNSUPPORTED_PLATFORM)
     selected = primary
     reason = candidate["reason"]
     fallback: dict[str, Any] | None = None
@@ -1416,7 +1470,7 @@ def _route_task(
         "selection": selection,
         "sandbox_mode": "read-only",
         "provider": provider,
-        "dispatch": _dispatch(primary_provider, provider),
+        "dispatch": _dispatch(primary_provider, provider, sandbox_mode),
         "provider_config_digest": provider_config_digest,
     }
     if fallback is not None:

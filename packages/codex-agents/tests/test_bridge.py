@@ -604,8 +604,10 @@ class DispatchRefusalTests(BridgeTestCase):
         cases = (
             (lambda: self.dispatch(native, assigned, handle), BridgeRefused,
              "not a bridge dispatch"),
+            # A write route needs a non-empty write set (and macOS).
             (lambda: self.dispatch({**route, "sandbox_mode": "workspace-write"},
-                                   assigned, handle), BridgeRefused, "read-only"),
+                                   assigned, handle), BridgeRefused,
+             "write_set_empty|write_children_unsupported_platform"),
             (lambda: self.dispatch(route, writable, handle), BridgeRefused, "read-only"),
             (lambda: self.dispatch(route, {**assigned, "model": "claude-haiku-5-5"},
                                    handle), ContractError, "does not match"),
