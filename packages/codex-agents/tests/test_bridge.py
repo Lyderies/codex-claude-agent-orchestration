@@ -18,7 +18,12 @@ from unittest import mock
 from tests.support import FIXTURES_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 import cli
-from codex_agents.bridge import BridgeRefused, dispatch
+from codex_agents.bridge import (
+    BridgeRefused,
+    dispatch,
+    remove_optional_nulls,
+    strict_output_schema,
+)
 from codex_agents.contracts import ContractError, validate_result
 from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_contracts import content_digest
@@ -41,6 +46,14 @@ from tests.learning_support import (
 )
 
 RESULT_SCHEMA = (ORCHESTRATION_ROOT / "schemas" / "result.schema.json").read_bytes()
+OPTIONAL_RESULT_KEYS = ("execution_state", "semantic_verdict", "admission_state",
+                        "retry", "usage")
+
+
+def null_filled(value: dict) -> dict:
+    """The shape real codex exec returns under the strict schema."""
+
+    return {**{key: None for key in OPTIONAL_RESULT_KEYS}, **value}
 PARENT_GRANT = {
     "tools": ["shell"], "filesystem": ["source.txt:read"],
     "network": False, "mcps": [], "external_effects": False,
@@ -436,6 +449,59 @@ class DispatchRefusalTests(BridgeTestCase):
             )
 
 
+class StrictSchemaTests(unittest.TestCase):
+    def test_strict_variant_requires_every_key_and_leaves_the_original(self) -> None:
+        original = json.loads(RESULT_SCHEMA)
+        before = deepcopy(original)
+        strict = strict_output_schema(original)
+        self.assertEqual(before, original)
+        self.assertNotIn("$schema", strict)
+        self.assertNotIn("$id", strict)
+
+        def check(node, path="$"):
+            if isinstance(node, list):
+                for index, item in enumerate(node):
+                    check(item, f"{path}[{index}]")
+                return
+            if not isinstance(node, dict):
+                return
+            if "properties" in node:
+                self.assertEqual(list(node["properties"]), node["required"], path)
+                self.assertIs(False, node["additionalProperties"], path)
+            for key, value in node.items():
+                check(value, f"{path}.{key}")
+
+        check(strict)
+        properties = strict["properties"]
+        for key in OPTIONAL_RESULT_KEYS:
+            self.assertEqual({"type": "null"}, properties[key]["anyOf"][1], key)
+        self.assertNotIn("anyOf", properties["summary"])
+        usage = properties["usage"]["anyOf"][0]
+        self.assertEqual(sorted(usage["properties"]), sorted(usage["required"]))
+        self.assertEqual(
+            {"type": "null"}, usage["properties"]["input_tokens"]["anyOf"][1]
+        )
+        evidence = properties["evidence"]["items"]
+        self.assertNotIn("anyOf", evidence["properties"]["reference"])
+
+    def test_normaliser_removes_only_optional_nulls(self) -> None:
+        schema = json.loads(RESULT_SCHEMA)
+        filled = null_filled(result())
+        self.assertEqual(result(), remove_optional_nulls(filled, schema))
+        nested = {**result(), "usage": {"input_tokens": None, "output_tokens": 4}}
+        self.assertEqual(
+            {**result(), "usage": {"output_tokens": 4}},
+            remove_optional_nulls(nested, schema),
+        )
+        required_null = {**result(), "summary": None}
+        required_null["evidence"] = [{**result()["evidence"][0], "details": None}]
+        kept = remove_optional_nulls(required_null, schema)
+        self.assertIsNone(kept["summary"])
+        self.assertIsNone(kept["evidence"][0]["details"])
+        with self.assertRaises(ContractError):
+            validate_result(kept, assignment=assignment())
+
+
 class CodexBridgeTests(BridgeTestCase):
     def codex_run(self) -> tuple[dict, dict, str]:
         self.admit("codex")
@@ -458,7 +524,9 @@ class CodexBridgeTests(BridgeTestCase):
              "usage": {"input_tokens": 50, "cached_input_tokens": 5,
                        "output_tokens": 9, "reasoning_output_tokens": 3}},
         ])
-        (self.tools / "codex-last-message.json").write_text(json.dumps(result()))
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
         before = self.identities()
         output = self.dispatch(route, assigned, handle)
         self.assertEqual(before + 2, self.identities())
@@ -483,6 +551,30 @@ class CodexBridgeTests(BridgeTestCase):
         )
         self.assertEqual([], self.workspace_entries())
 
+    def test_the_installed_schema_is_never_passed_unmodified(self) -> None:
+        route, assigned, handle = self.codex_run()
+        self.frames("codex", [{"type": "turn.completed", "usage": {}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        # The fake rejects a non-strict schema the way real codex exec does.
+        output = dispatch(
+            self.ledger, self.project_id,
+            project_root=self.project, bundle_root=self.bundle,
+            task=self.task(), route=route, assignment=assigned,
+            parent_grant=PARENT_GRANT, run_handle=handle, environ=CLEAN,
+            result_schema=json.dumps(
+                {**json.loads(RESULT_SCHEMA), "required": ["assignment_id"]}
+            ).encode(),
+        )
+        self.assertEqual("result", output["bridge_report"]["outcome"])
+        route, assigned, handle = self.codex_run()
+        with mock.patch(
+            "codex_agents.bridge.strict_output_schema", side_effect=lambda schema: schema
+        ):
+            output = self.dispatch(route, assigned, handle)
+        self.assertEqual("child_reported_error", output["bridge_report"]["outcome"])
+
     def test_reroute_or_model_mismatch_marks_the_result_unreviewed(self) -> None:
         for event in (
             {"type": "model/rerouted", "from_model": "gpt-6.1-sol"},
@@ -491,7 +583,9 @@ class CodexBridgeTests(BridgeTestCase):
             with self.subTest(event=event):
                 route, assigned, handle = self.codex_run()
                 self.frames("codex", [event, {"type": "turn.completed", "usage": {}}])
-                (self.tools / "codex-last-message.json").write_text(json.dumps(result()))
+                (self.tools / "codex-last-message.json").write_text(
+                    json.dumps(null_filled(result()))
+                )
                 output = self.dispatch(route, assigned, handle)
                 self.assertFalse(output["bridge_report"]["reviewed"])
                 self.assertTrue(output["bridge_report"]["rerouted"])
@@ -595,7 +689,9 @@ class BridgeLifecycleTests(BridgeTestCase):
         assigned = self.assignment_for(route)
         handle = self.open(route, assigned)
         self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 1}}])
-        (self.tools / "codex-last-message.json").write_text(json.dumps(result()))
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
         output = self.dispatch(route, assigned, handle)
         validate_result(output["result"], assignment=assigned)
         committed = self.ledger.commit_host_result(

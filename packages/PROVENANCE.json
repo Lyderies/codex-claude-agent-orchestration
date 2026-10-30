@@ -147,7 +147,9 @@
         "native-package/.codex/orchestration/config/learning-clients.json": "G2 S2a provider admission and observations",
         "native-package/.codex/orchestration/config/learning-producers.json": "G2 S2a provider admission and observations",
         "native-package/.codex/orchestration/codex_agents/providers.py": "G2 provider admission and observations; G2 S2a provider admission and observations",
-        "tests/test_providers.py": "G2 provider admission and observations; G2 S2a provider admission and observations"
+        "tests/test_providers.py": "G2 provider admission and observations; G2 S2a provider admission and observations",
+        "native-package/.codex/orchestration/codex_agents/bridge.py": "G2 S2b dispatch bridge",
+        "tests/test_bridge.py": "G2 S2b dispatch bridge"
       }
     },
     "claude-agents": {

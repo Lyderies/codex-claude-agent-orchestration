@@ -479,7 +479,27 @@ FAKE_CHILD = """\
 import json, os, sys, time
 
 
+def strict(schema):
+    # The structured-output rule real codex exec enforces: every object lists
+    # all of its properties as required and allows nothing else.
+    if isinstance(schema, list):
+        return all(strict(item) for item in schema)
+    if not isinstance(schema, dict):
+        return True
+    if "properties" in schema and (
+        sorted(schema.get("required", [])) != sorted(schema["properties"])
+        or schema.get("additionalProperties") is not False
+    ):
+        return False
+    return "$schema" not in schema and all(strict(value) for value in schema.values())
+
+
 def child(directory, name):
+    if "--output-schema" in sys.argv:
+        with open(sys.argv[sys.argv.index("--output-schema") + 1]) as handle:
+            if not strict(json.load(handle)):
+                print(json.dumps({"type": "error", "message": "invalid schema"}), flush=True)
+                sys.exit(1)
     with open(os.path.join(directory, name + "-invocations.jsonl"), "a") as log:
         log.write(json.dumps({
             "argv": sys.argv[2:],

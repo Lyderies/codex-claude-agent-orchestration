@@ -278,6 +278,70 @@ def _fenced_result(assignment: dict[str, Any], state: str, reason: str) -> dict[
     }
 
 
+def _is_object_schema(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    kind = schema.get("type")
+    return "properties" in schema or kind == "object" or (
+        isinstance(kind, list) and "object" in kind
+    )
+
+
+def strict_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Derive the strict structured-output variant Codex requires.
+
+    Every object lists all its properties as required and closes them, each
+    originally optional property becomes nullable, and the top-level `$schema`
+    and `$id` are dropped. The input is not modified.
+    """
+
+    def convert(node: Any) -> Any:
+        if isinstance(node, list):
+            return [convert(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        converted = {key: convert(value) for key, value in node.items()
+                     if key != "properties"}
+        if _is_object_schema(node):
+            properties = node.get("properties", {})
+            required = set(node.get("required", []))
+            converted["properties"] = {
+                name: (
+                    convert(value) if name in required
+                    else {"anyOf": [convert(value), {"type": "null"}]}
+                )
+                for name, value in properties.items()
+            }
+            converted["required"] = list(properties)
+            converted["additionalProperties"] = False
+        return converted
+
+    strict = convert(schema)
+    strict.pop("$schema", None)
+    strict.pop("$id", None)
+    return strict
+
+
+def remove_optional_nulls(value: Any, schema: dict[str, Any]) -> Any:
+    """Undo the strict variant's nulls: drop null values of optional keys only.
+
+    A null in a required key is kept, so normal result validation still fails.
+    """
+
+    if isinstance(value, list):
+        items = schema.get("items") if isinstance(schema, dict) else None
+        return [remove_optional_nulls(item, items or {}) for item in value]
+    if not isinstance(value, dict) or not _is_object_schema(schema):
+        return value
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    return {
+        key: remove_optional_nulls(item, properties.get(key, {}))
+        for key, item in value.items()
+        if not (item is None and key in properties and key not in required)
+    }
+
+
 def child_prompt(assignment: dict[str, Any]) -> str:
     template = result_preflight(assignment)["template"]
     return (
@@ -451,7 +515,14 @@ def run_codex(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     model = route["model"]
     executable, _ = resolve_client("codex")
-    schema_path = _private_file(control / "result.schema.json", schema)
+    try:
+        original_schema = json.loads(schema)
+    except ValueError as exc:
+        raise BridgeRefused("result schema is invalid") from exc
+    schema_path = _private_file(
+        control / "result.schema.json",
+        json.dumps(strict_output_schema(original_schema), sort_keys=True).encode(),
+    )
     last_message = control / "last-message.json"
     arguments = [
         executable, "exec",
@@ -528,7 +599,9 @@ def run_codex(
     result = _result_object(raw.decode("utf-8", "replace"))
     if result is None:
         return None, {**report, "outcome": "unparseable_result"}
-    return result, {**report, "outcome": "result"}
+    # The strict schema makes Codex fill optional keys with null; remove those
+    # so the result goes through the ordinary validation unchanged.
+    return remove_optional_nulls(result, original_schema), {**report, "outcome": "result"}
 
 
 def dispatch(

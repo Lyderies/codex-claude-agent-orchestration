@@ -126,8 +126,11 @@ provider API key, and a run handle that was already dispatched.
   no session persistence. The run fails closed unless the init frame reports no API
   key, the requested model, no plugins, no MCP servers and only those tools. The first
   `rate_limit_event` is recorded for the run. `read_containment` is `enforced`.
-- Codex children run `codex exec` read-only and ephemeral with the result schema,
-  between non-spending observations taken before and after. A reroute or a different
+- Codex children run `codex exec` read-only and ephemeral, between non-spending
+  observations taken before and after. Codex structured output needs every key
+  required, so the bridge derives a strict variant of the installed result schema
+  (optional keys become nullable) for each dispatch and removes those optional nulls
+  from the reply before the result is validated. A reroute or a different
   model marks the result unreviewed with an unknown verdict. Codex reads are not contained by the
   sandbox, so `read_containment` is `advisory`.
 - Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
