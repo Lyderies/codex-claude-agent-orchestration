@@ -129,6 +129,69 @@ class UmbrellaInstallTests(unittest.TestCase):
         with self.assertRaisesRegex(installer.InstallRefused, "a merge is in progress"):
             self.install()
 
+    def test_each_in_progress_operation_is_refused(self) -> None:
+        git_dir = self.target / ".git"
+        for marker, is_dir in (("CHERRY_PICK_HEAD", False), ("REVERT_HEAD", False), ("REBASE_HEAD", False),
+                               ("rebase-merge", True), ("rebase-apply", True), ("sequencer", True),
+                               ("BISECT_LOG", False)):
+            with self.subTest(marker=marker):
+                path = git_dir / marker
+                path.mkdir() if is_dir else path.write_text("0" * 40 + "\n")
+                with self.assertRaisesRegex(installer.InstallRefused, "in progress"):
+                    self.install()
+                shutil.rmtree(path) if is_dir else path.unlink()
+
+    def test_unmerged_entries_without_a_merge_are_refused(self) -> None:
+        blob = git(self.target, "hash-object", "-w", "README.md").stdout.strip()
+        entries = "".join(f"100644 {blob} {stage}\tREADME.md\n" for stage in (1, 2, 3))
+        subprocess.run(["git", "-C", str(self.target), "update-index", "--index-info"], input=entries,
+                       env=GIT_ENV, text=True, check=True)
+        with self.assertRaisesRegex(installer.InstallRefused, "unmerged paths"):
+            self.install()
+
+    def assert_refused_before_any_write(self, summary: dict, before: dict[str, str]) -> None:
+        self.assertFalse(summary["ok"], summary)
+        self.assertFalse(summary["applied"])
+        self.assertFalse((self.target / installer.CODEX_MANIFEST).exists())
+        self.assertEqual(inventory(self.target), before)
+
+    def test_committed_claude_collision_refuses_before_codex_writes(self) -> None:
+        collision = self.target / ".claude" / "agents" / "claude_agents_researcher.md"
+        collision.parent.mkdir(parents=True)
+        collision.write_text("project-owned agent\n", encoding="utf-8")
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "project agent")
+        before = inventory(self.target)
+        self.assert_refused_before_any_write(self.install(apply=True), before)
+
+    def test_symlinked_claude_directory_refuses_before_codex_writes(self) -> None:
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (self.target / ".claude").symlink_to(elsewhere, target_is_directory=True)
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "symlinked .claude")
+        before = inventory(self.target)
+        self.assert_refused_before_any_write(self.install(apply=True), before)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_failed_second_package_rolls_back_the_first(self) -> None:
+        before = inventory(self.target)
+        real_run = installer._run
+
+        def failing_claude_apply(script, operation, target, apply, extra):
+            if script == installer.CLAUDE_INSTALLER and apply:
+                return {"error": "simulated write failure", "exit_code": 2}
+            return real_run(script, operation, target, apply, extra)
+
+        installer._run = failing_claude_apply
+        self.addCleanup(setattr, installer, "_run", real_run)
+        summary = self.install(apply=True)
+        self.assertFalse(summary["ok"], summary)
+        self.assertEqual(summary["rollback"], [{"package": "codex", "action": "remove", "ok": True}])
+        self.assertFalse((self.target / installer.CODEX_MANIFEST).exists())
+        after = {path: digest for path, digest in inventory(self.target).items() if path not in PROJECT_CONFIG}
+        self.assertEqual(after, before)
+
     def test_apply_is_refused_when_managed_paths_are_dirty(self) -> None:
         self.install(apply=True)
         git(self.target, "add", ".")

@@ -220,10 +220,13 @@ class PackagingTests(unittest.TestCase):
         malformed = self.base / "malformed"
         malformed.mkdir()
         (malformed / ".git").write_bytes(b"not a git pointer\n")
+        dangling = self.base / "dangling"
+        dangling.mkdir()
+        (dangling / ".git").write_bytes(b"gitdir: " + str(self.base / "missing").encode() + b"\n")
         linked = self.base / "symlinked"
         linked.mkdir()
         (linked / ".git").symlink_to(self.target / ".git")
-        for target in (malformed, linked):
+        for target in (malformed, dangling, linked):
             with self.subTest(target=target.name):
                 with self.assertRaisesRegex(PackageError, "git_target_required"):
                     package_operation(SOURCE, target, "install", apply=True)

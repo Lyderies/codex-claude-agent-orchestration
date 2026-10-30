@@ -31,8 +31,11 @@ IN_PROGRESS = {
     "REBASE_HEAD": "a rebase",
     "rebase-merge": "a rebase",
     "rebase-apply": "a rebase or am",
+    "sequencer": "a cherry-pick or revert sequence",
     "BISECT_LOG": "a bisect",
 }
+# How to undo a package step that was applied before a later package failed.
+REVERSE = {"install": "remove", "remove": "install"}
 
 
 class InstallRefused(RuntimeError):
@@ -81,6 +84,21 @@ def _failed(report: dict) -> bool:
     return "error" in report or report["exit_code"] == 2
 
 
+def _roll_back(applied: list[tuple[Path, str, str]], target: Path) -> list[dict]:
+    """Undo earlier package steps in reverse order after a later package fails to apply."""
+
+    results = []
+    for installer, name, op in reversed(applied):
+        reverse = REVERSE.get(op)
+        if reverse is None:
+            results.append({"package": name, "action": None, "ok": False,
+                            "note": f"a {op} cannot be undone automatically; restore from version control"})
+            continue
+        report = _run(installer, reverse, target, True, [])
+        results.append({"package": name, "action": reverse, "ok": not _failed(report)})
+    return results
+
+
 def operate(operation: str, target: Path, *, apply: bool = False, codex_options: list[str] | None = None) -> dict:
     target = target.absolute()
     check_target(target, mutating=apply and operation != "verify")
@@ -105,12 +123,14 @@ def operate(operation: str, target: Path, *, apply: bool = False, codex_options:
     if any(_failed(report) for report in previews.values()) or not apply:
         summary["ok"] = not any(_failed(report) for report in previews.values())
         return summary
+    applied: list[tuple[Path, str, str]] = []
     for installer, name, op, extra in order:
         summary[name] = _run(installer, op, target, True, extra)
         if _failed(summary[name]):
             summary["ok"] = False
-            summary["next_step"] = f"{name} failed after earlier packages were applied; rerun after fixing"
+            summary["rollback"] = _roll_back(applied, target)
             return summary
+        applied.append((installer, name, op))
     summary["applied"] = True
     summary["ok"] = True
     return summary
