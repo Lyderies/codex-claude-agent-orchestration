@@ -26,6 +26,18 @@ AGENT_ALLOWED_KEYS = {
 
 CLAUDE_AGENT_ALLOWED_KEYS = {"name", "description", "tools", "model", "maxTurns"}
 CLAUDE_READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
+# Edit and Write on top of the read tools make a contained write child.
+CLAUDE_WRITE_TOOLS = {"Edit", "Write"}
+
+
+def claude_sandbox_mode(tools: list[str]) -> str | None:
+    """Map Claude agent tools onto the contract sandbox; None when no profile fits."""
+
+    if set(tools) <= CLAUDE_READ_ONLY_TOOLS:
+        return "read-only"
+    if set(tools) <= CLAUDE_READ_ONLY_TOOLS | CLAUDE_WRITE_TOOLS:
+        return "workspace-write"
+    return None
 
 
 class CatalogError(ValueError):
@@ -404,7 +416,7 @@ def _claude_agent_candidate(
     candidate.update(
         name=metadata["name"],
         requested_tools=sorted(tools),
-        sandbox_mode="read-only" if set(tools) <= CLAUDE_READ_ONLY_TOOLS else None,
+        sandbox_mode=claude_sandbox_mode(tools),
         configured_model=metadata.get("model"),
     )
     return candidate

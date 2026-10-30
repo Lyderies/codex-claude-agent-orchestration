@@ -1,9 +1,12 @@
-"""Bridge one admitted host run to a read-only child of the other provider.
+"""Bridge one admitted host run to a contained child.
 
 The bridge never runs a child in the repository: it exports the committed bytes
 of the assignment's read paths into a private directory, launches the child
-there once, and fences any outcome it cannot prove. It records only digests,
-counts and typed codes; prompts and file contents never reach the ledger.
+there once, and fences any outcome it cannot prove. A read-only child may be
+either provider. A write child (G3 S1b: Claude only, macOS only) works in a
+contained workspace; its result is a checked patch and a verifier envelope,
+which the primary does not apply here. The ledger gets only digests, counts and
+typed codes; prompts and file contents never reach it.
 """
 
 from __future__ import annotations
@@ -41,6 +44,12 @@ MAX_STREAM_BYTES = 8 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_RESULT_BYTES = 1024 * 1024
 CLAUDE_TOOLS = ("Read", "Glob", "Grep")
+# The fixed write profile: a Claude write child has no shell in G3.
+CLAUDE_WRITE_TOOLS = (*CLAUDE_TOOLS, "Edit", "Write")
+CHILD_UMASK = 0o022
+LSOF_SEARCH_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+LSOF_TIMEOUT_SECONDS = 20
+MAX_LSOF_OUTPUT = 1024 * 1024
 # Known built-in plugins are switched off; the init-frame check still fails
 # closed if any plugin loads, so this list is a convenience, not the control.
 CLAUDE_DISABLED_PLUGINS = (
@@ -356,6 +365,7 @@ def run_child(
     deadline_seconds: float,
     on_frame: Callable[[dict[str, Any]], None],
     popen: Callable[..., Any] = subprocess.Popen,
+    umask: int | None = None,
 ) -> dict[str, Any]:
     """Run one child in its own session, feeding each JSON line to `on_frame`.
 
@@ -373,6 +383,7 @@ def run_child(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            **({"umask": umask} if umask is not None else {}),
         )
     except OSError:
         return {"returncode": None, "abort": "launch_failed"}
@@ -599,8 +610,134 @@ def _claude_model_usage(model_usage: Any) -> list[dict[str, Any]]:
     return [merged[key] for key in sorted(merged)]
 
 
-def _check_claude_init(frame: dict[str, Any], model: str) -> str | None:
-    """Return the first init-frame violation, or None when the frame is clean."""
+def claude_write_tools(assignment: dict[str, Any]) -> tuple[tuple[str, ...], list[str]]:
+    """The fixed write profile's tools and the effective write set, or refuse.
+
+    The tools come from the assignment's capabilities: Read, Glob and Grep,
+    plus Edit and Write because the write set must be non-empty. An
+    assignment whose tool grant is not exactly that profile is refused
+    rather than widened or silently narrowed.
+    """
+
+    from .workspace import effective_write_set
+
+    write_set = effective_write_set(assignment)
+    if not write_set:
+        raise BridgeRefused("write_set_empty")
+    for path in write_set:
+        _rule_path(path)
+    granted = assignment.get("permissions", {}).get("tools", [])
+    if sorted(granted) != sorted(CLAUDE_WRITE_TOOLS):
+        raise BridgeRefused("write_profile_mismatch")
+    return CLAUDE_WRITE_TOOLS, write_set
+
+
+# Characters that Claude's permission-rule syntax never treats specially. Every
+# component of a rule path (the workspace's real path and each write path) must
+# use only these, so the generated rule is the literal path and nothing broader.
+RULE_SAFE_COMPONENT = re.compile(r"[A-Za-z0-9._@+=,%-]+")
+# Canonical spellings of the protected names, for deny rules.
+PROTECTED_RULE_NAMES = (
+    ".git", ".codex", ".agents", ".claude", "AGENTS.md", "CLAUDE.md", "CLAUDE.local.md",
+    ".mcp.json",
+)
+
+
+def _rule_path(path: str) -> str:
+    """Refuse a path that cannot be written literally in a Claude rule."""
+
+    parts = path.split("/")
+    if (
+        not path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} or RULE_SAFE_COMPONENT.fullmatch(part) is None for part in parts)
+        or parts[0].startswith("~")
+    ):
+        raise BridgeRefused("write_path_not_rule_safe")
+    return path
+
+
+def _anchor(workspace_path: Path) -> str:
+    """`//<real workspace path>`: Claude's absolute form, never home- or settings-relative."""
+
+    real = os.path.realpath(workspace_path)
+    if not os.path.isabs(real):
+        raise BridgeRefused("write_path_not_rule_safe")
+    return "//" + _rule_path(real.lstrip("/"))
+
+
+def _protected_variants() -> list[str]:
+    from .workspace import PROTECTED_NAMES
+
+    names = set()
+    for name in (*PROTECTED_RULE_NAMES, *PROTECTED_NAMES):
+        names.update({name, name.lower(), name.upper(), name.title(), name.capitalize()})
+    return sorted(names)
+
+
+def claude_write_allow_rules(
+    write_set: list[str], manifest: dict[str, Any], workspace_path: Path
+) -> list[str]:
+    """One `Edit(//<abs>/<p>)` and one `Write(//<abs>/<p>)` rule per write path.
+
+    Rules are absolute, anchored to the workspace's real path, so `~/x` can
+    never mean the home tree and a bare name can never match at another
+    depth. A path is a directory grant (`/**`) when the export holds files
+    beneath it; any other path, including one the child is to create, is an
+    exact file rule. A path the rule syntax would read specially refuses
+    with `write_path_not_rule_safe`.
+    """
+
+    anchor = _anchor(workspace_path)
+    rules = []
+    for path in write_set:
+        literal = _rule_path(path)
+        directory = path in manifest["directories"] or any(
+            name.startswith(path + "/") for name in manifest["files"]
+        )
+        pattern = f"{anchor}/{literal}/**" if directory else f"{anchor}/{literal}"
+        rules += [f"Edit({pattern})", f"Write({pattern})"]
+    return rules
+
+
+def claude_write_deny_rules(workspace_path: Path) -> list[str]:
+    """Deny Edit and Write of every protected name at any depth under the workspace.
+
+    Deny rules take precedence over allow rules, so a directory grant cannot
+    create `AGENTS.md`, `.mcp.json`, `.git/` and the like during the run. The
+    rule syntax may be case-sensitive, so the canonical, lower, upper and
+    title spellings are all listed; the post-run ownership check, which
+    folds case fully, stays the backstop.
+    """
+
+    anchor = _anchor(workspace_path)
+    rules = []
+    for name in _protected_variants():
+        for pattern in (f"{anchor}/**/{name}", f"{anchor}/**/{name}/**"):
+            rules += [f"Edit({pattern})", f"Write({pattern})"]
+    return rules
+
+
+def claude_write_settings(
+    model: str, allow_rules: list[str], deny_rules: list[str] | None = None
+) -> dict[str, Any]:
+    """The read profile's lockdown plus exactly the write set's allow and deny rules."""
+
+    settings = claude_settings(model)
+    settings["permissions"] = {
+        "defaultMode": "dontAsk", "allow": list(allow_rules), "deny": list(deny_rules or []),
+    }
+    return settings
+
+
+def _check_claude_init(
+    frame: dict[str, Any], model: str, tools: tuple[str, ...] = CLAUDE_TOOLS, *, exact: bool = False
+) -> str | None:
+    """Return the first init-frame violation, or None when the frame is clean.
+
+    A read-only child may report a subset of its tools; a write child must
+    report exactly its derived tools, no more and no fewer.
+    """
 
     if frame.get("apiKeySource") != "none":
         return "api_key_source"
@@ -610,9 +747,11 @@ def _check_claude_init(frame: dict[str, Any], model: str) -> str | None:
         return "plugin_loaded"
     if frame.get("mcp_servers") != []:
         return "mcp_server_loaded"
-    tools = frame.get("tools")
-    if not isinstance(tools, list) or not set(tools) <= set(CLAUDE_TOOLS):
+    reported = frame.get("tools")
+    if not isinstance(reported, list) or not set(reported) <= set(tools):
         return "tool_not_allowed"
+    if exact and (len(reported) != len(set(reported)) or set(reported) != set(tools)):
+        return "tool_missing"
     return None
 
 
@@ -630,19 +769,25 @@ def run_claude(
     deadline_seconds: float,
     max_turns: int,
     executable: str,
+    tools: tuple[str, ...] = CLAUDE_TOOLS,
+    settings_document: dict[str, Any] | None = None,
+    umask: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     from .learning_store import LedgerError
 
     model = route["model"]
+    write_child = tools != CLAUDE_TOOLS
     settings = _private_file(
-        control / "settings.json", json.dumps(claude_settings(model)).encode()
+        control / "settings.json",
+        json.dumps(settings_document if settings_document is not None else claude_settings(model))
+        .encode(),
     )
     system_prompt = _private_file(control / "role-prompt.md", role_prompt.encode())
     arguments = [
         executable, "-p",
         "--model", model,
         "--effort", route["effort"],
-        "--tools", ",".join(CLAUDE_TOOLS),
+        "--tools", ",".join(tools),
         "--permission-mode", "dontAsk",
         "--setting-sources", "project",
         "--settings", str(settings),
@@ -667,7 +812,7 @@ def run_claude(
         if state["init"] is None:
             if kind != "system" or frame.get("subtype") != "init":
                 raise _Abort("missing_init_frame")
-            violation = _check_claude_init(frame, model)
+            violation = _check_claude_init(frame, model, tools, exact=write_child)
             if violation is not None:
                 raise _Abort(f"init_{violation}")
             state["init"] = frame
@@ -729,6 +874,7 @@ def run_claude(
         cwd=export,
         deadline_seconds=deadline_seconds,
         on_frame=on_frame,
+        umask=umask,
     )
     report: dict[str, Any] = {
         "provider": "claude",
@@ -737,6 +883,7 @@ def run_claude(
         "effort": route["effort"],
         "wall_seconds": round(time.monotonic() - started, 3),
         "read_containment": "enforced",
+        "containment": "contained_workspace" if write_child else "read_only_export",
         # A fallback after a clean init serves another model; any working model
         # other than the requested one leaves the result unreviewed.
         "rerouted": bool(state["models"] - {model}),
@@ -1033,6 +1180,304 @@ def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | N
     return state["infos"], outcome["abort"]
 
 
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    """`(st_dev, st_ino)` of a real directory at `path`, never following a symlink."""
+
+    try:
+        status = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode):
+        return None
+    return (status.st_dev, status.st_ino)
+
+
+def _processes_using(path: Path) -> list[int] | None:
+    """PIDs with a working directory or an open file under `path`; None when unprovable.
+
+    A bounded `lsof +D` (no name or port lookups, warnings on, so a directory
+    it could not read shows up on stderr and leaves the answer unproved). Exit status
+    1 means "nothing found", "some search item was not found" and failure
+    alike, so it counts as nothing found only with empty output on both
+    streams; matches it prints are still matches. Any diagnostic, timeout,
+    oversized or malformed answer, or other exit status is "cannot prove",
+    and the caller separately proves the scanned directory is the workspace.
+    """
+
+    executable = shutil.which("lsof", path=LSOF_SEARCH_PATH)
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-n", "-P", "+w", "-F", "p", "+D", str(path)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            timeout=LSOF_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.stderr or len(completed.stdout) > MAX_LSOF_OUTPUT:
+        return None
+    if completed.returncode not in {0, 1}:
+        return None
+    pids = []
+    for line in completed.stdout.splitlines():
+        if line.startswith(b"p") and line[1:].isdigit():
+            pids.append(int(line[1:]))
+        elif not line.startswith(b"f"):
+            return None
+    # With `+D`, status 1 also accompanies real matches; status 0 with none is malformed.
+    if completed.returncode == 0 and not pids:
+        return None
+    if completed.stdout and not pids:
+        return None
+    return sorted(set(pids) - {os.getpid()})
+
+
+def prove_quiescent(workspace_path: Path, identity: tuple[int, int] | None) -> tuple[bool, int]:
+    """After the child's group is killed, prove nothing still uses the workspace.
+
+    The scanned directory must exist and be the expected workspace (by
+    device and inode, without following symlinks) both before and after the
+    scan; otherwise, or when `lsof` cannot answer, quiescence is unproved. A
+    survivor gets a second kill, but the run still counts as unproved:
+    `(proved, survivors)`.
+    """
+
+    if identity is None or _directory_identity(workspace_path) != identity:
+        return False, 0
+    pids = _processes_using(workspace_path)
+    if pids is None or _directory_identity(workspace_path) != identity:
+        return False, 0
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return not pids, len(pids)
+
+
+def _write_preconditions(route: dict[str, Any], permissions: dict[str, Any]) -> None:
+    from .routing import (
+        CODEX_WRITE_CHILDREN_UNAVAILABLE,
+        WRITE_CHILDREN_UNSUPPORTED_PLATFORM,
+        write_children_supported,
+    )
+
+    if route.get("provider") != "claude":
+        raise BridgeRefused(CODEX_WRITE_CHILDREN_UNAVAILABLE)
+    if not write_children_supported():
+        raise BridgeRefused(WRITE_CHILDREN_UNSUPPORTED_PLATFORM)
+    if permissions.get("network") is not False or permissions.get("external_effects") is not False:
+        raise BridgeRefused("bridged write children have no network or external effects")
+
+
+def _finish_write(
+    ledger: Any,
+    project_id: str,
+    *,
+    run_handle: str,
+    route: dict[str, Any],
+    layout: Any,
+    identity: tuple[int, int] | None,
+    manifest: dict[str, Any],
+    bridge_run_id: str,
+    child_succeeded: bool,
+    report: dict[str, Any],
+) -> bool:
+    """Prove quiescence, check ownership, build the patch and envelope, and record them.
+
+    Returns whether quiescence was proved, which decides destructive cleanup.
+    The report gains `quiescence`, `survivors`, `ownership`, `changes`,
+    `patch_digest` and `envelope_digest`; anything but `passed` leaves no patch.
+    """
+
+    from .learning_store import LedgerError
+    from .workspace import (
+        WorkspaceRefused,
+        build_verifier_envelope,
+        collect_patch,
+        encode_patch,
+        envelope_digest,
+        manifest_digest,
+        patch_digest,
+        snapshot_workspace,
+    )
+
+    proved, survivors = prove_quiescent(layout.workspace, identity)
+    report.update(quiescence="proved" if proved else "unproved", survivors=survivors)
+    patch = envelope = None
+    if not proved:
+        ownership = "quiescence_unproved"
+    elif not child_succeeded:
+        ownership = "child_failed"
+    else:
+        try:
+            snapshot_workspace(layout)
+            patch = collect_patch(layout, manifest)
+            envelope = build_verifier_envelope(patch, manifest, {
+                "project_id": project_id,
+                "run_handle_sha256": hashlib.sha256(run_handle.encode()).hexdigest(),
+                "bridge_run_id": bridge_run_id,
+                "route_digest": hashlib.sha256(
+                    json.dumps(route, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+                "source_commit": manifest["source_commit"],
+            })
+            ownership = "passed"
+        except WorkspaceRefused as exc:
+            ownership = exc.reason
+            patch = envelope = None
+    patch_bytes = encode_patch(patch) if patch is not None else None
+    envelope_bytes = (
+        json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        if envelope is not None else None
+    )
+    summary = {
+        "source_commit": manifest["source_commit"],
+        "manifest_digest": manifest_digest(manifest),
+        "patch_digest": patch_digest(patch) if patch is not None else None,
+        "envelope_digest": envelope_digest(envelope) if envelope is not None else None,
+        "changes": len(patch["changes"]) if patch is not None else 0,
+        "ownership": ownership,
+        "quiescence": "proved" if proved else "unproved",
+    }
+    try:
+        ledger.record_write_result(
+            project_id, run_handle=run_handle, bridge_run_id=bridge_run_id, route=route,
+            result=summary, patch=patch_bytes, envelope=envelope_bytes,
+        )
+    except (ContractError, LedgerError):
+        summary.update(ownership="write_result_unrecorded", patch_digest=None,
+                       envelope_digest=None, changes=0)
+    report.update(
+        ownership=summary["ownership"], changes=summary["changes"],
+        patch_digest=summary["patch_digest"], envelope_digest=summary["envelope_digest"],
+        source_commit=summary["source_commit"],
+    )
+    return proved
+
+
+LEASE_NAME = "lease.json"
+LAYOUT_PREFIX = "codex-agents-write-"
+MAX_SWEEP_ENTRIES = 256
+MAX_LEASE_BYTES = 4096
+
+
+def _write_lease(layout: Any, lease: dict[str, Any]) -> None:
+    """Record which run owns a write layout, in its private control directory."""
+
+    _private_file(layout.control / LEASE_NAME, json.dumps(lease, sort_keys=True).encode())
+
+
+def _read_lease(parent_fd: int, name: str) -> dict[str, Any] | None:
+    """A leftover layout's lease, read without following symlinks; None if unreadable."""
+
+    from .workspace import WorkspaceRefused, _open_parents
+
+    try:
+        control = _open_parents(parent_fd, [name, "control"], create=False)
+    except (OSError, WorkspaceRefused):
+        return None
+    try:
+        descriptor = os.open(LEASE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=control)
+    except OSError:
+        return None
+    finally:
+        os.close(control)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid():
+            return None
+        raw = os.read(descriptor, MAX_LEASE_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    try:
+        lease = json.loads(raw) if len(raw) <= MAX_LEASE_BYTES else None
+    except ValueError:
+        return None
+    if not isinstance(lease, dict) or set(lease) != {"project_id", "handle_digest", "expires_at_ms"}:
+        return None
+    return lease
+
+
+def sweep_write_layouts(ledger: Any, parent: Path) -> dict[str, Any]:
+    """Remove leftover write layouts whose run is over, under the ledger writer lock.
+
+    Only directories under `parent` with this package's prefix (live or
+    fenced) are considered, at most `MAX_SWEEP_ENTRIES`. A layout is removed
+    only when its lease names a run bound in this ledger that is terminal or
+    past its handle expiry; an expired pending run is first abandoned in the
+    ledger (committed), and quiescence is then proved for the whole layout.
+    Anything else (no lease, an unknown run, a live run, survivors) stays in
+    place and is reported by reason.
+    """
+
+    from .workspace import WorkspaceRefused, remove_quiescent_tree
+
+    removed: list[str] = []
+    kept: dict[str, str] = {}
+    with ledger.writer_lock():
+        try:
+            parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return {"removed": 0, "kept": {}}
+        try:
+            names = []
+            with os.scandir(parent_fd) as listing:
+                for entry in listing:
+                    if entry.name.startswith(LAYOUT_PREFIX):
+                        names.append(entry.name)
+                        if len(names) >= MAX_SWEEP_ENTRIES:
+                            break
+            for name in sorted(names):
+                try:
+                    status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+                    kept[name] = "not_a_layout"
+                    continue
+                lease = _read_lease(parent_fd, name)
+                if lease is None:
+                    kept[name] = "lease_unreadable"
+                    continue
+                state = ledger.write_run_state(
+                    lease["project_id"], lease["handle_digest"], lease["expires_at_ms"]
+                )
+                if state not in {"terminal", "expired"}:
+                    kept[name] = f"run_{state}"
+                    continue
+                # Fence the run before touching its files: once this commits it can
+                # no longer be bound, dispatched or record a write result.
+                if not ledger.fence_expired_write_run(lease["project_id"], lease["handle_digest"]):
+                    kept[name] = "run_not_fenced"
+                    continue
+                proved, _ = prove_quiescent(parent / name, (status.st_dev, status.st_ino))
+                if not proved:
+                    kept[name] = "quiescence_unproved"
+                    continue
+                try:
+                    remove_quiescent_tree(parent / name)
+                except (WorkspaceRefused, OSError):
+                    kept[name] = "removal_stopped"
+                    continue
+                removed.append(name)
+        finally:
+            os.close(parent_fd)
+    return {"removed": len(removed), "kept": dict(sorted(kept.items()))}
+
+
+def _cleanup_write_layout(layout: Any, quiescent: bool) -> None:
+    from .workspace import WorkspaceRefused, cleanup_layout, fence_leftover
+
+    try:
+        cleanup_layout(layout, quiescent=quiescent)
+    except (WorkspaceRefused, OSError):
+        # Removal stopped (a directory moved, or a survivor appeared): fence what
+        # is left for the startup sweep rather than delete through it.
+        with contextlib.suppress(WorkspaceRefused, OSError):
+            fence_leftover(layout.root)
+
+
 def dispatch(
     ledger: Any,
     project_id: str,
@@ -1051,7 +1496,9 @@ def dispatch(
 
     Preconditions are checked before anything is exported or launched. After
     the durable dispatch intent is written the run can never be dispatched again,
-    whatever happens to the child.
+    whatever happens to the child. A `workspace-write` route runs a Claude write
+    child in a contained workspace and returns a checked patch, which is never
+    applied here.
     """
 
     environ = os.environ if environ is None else environ
@@ -1061,13 +1508,21 @@ def dispatch(
     if provider not in {"codex", "claude"}:
         raise BridgeRefused("route provider is invalid")
     permissions = assignment.get("permissions", {}) if isinstance(assignment, dict) else {}
-    if (
+    write_route = route.get("sandbox_mode") == "workspace-write"
+    if write_route:
+        _write_preconditions(route, permissions)
+    elif (
         route.get("sandbox_mode") != "read-only"
         or permissions.get("network") is not False
         or any(not item.endswith(":read") for item in permissions.get("filesystem", []))
     ):
         raise BridgeRefused("bridged children are read-only")
     validate_assignment(assignment, task=task, route=route, parent_grant=parent_grant)
+    tools, write_set = CLAUDE_TOOLS, []
+    if write_route:
+        from .workspace import assignment_export_paths
+
+        tools, write_set = claude_write_tools(assignment)
     admission = ledger.host_run_admission(project_id, run_handle)
     if admission["provider"] != provider:
         raise BridgeRefused("host run admission differs from the route provider")
@@ -1077,7 +1532,7 @@ def dispatch(
     )
     if api_keys_present(environ):
         raise BridgeRefused("a provider API key is set")
-    paths = assignment_read_paths(assignment)
+    paths = assignment_export_paths(assignment) if write_route else assignment_read_paths(assignment)
     role_prompt = ""
     if provider == "claude":
         role_prompt = _claude_role_prompt(bundle_root, route)
@@ -1093,16 +1548,43 @@ def dispatch(
         if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
     parent = Path(os.path.realpath(WORKSPACE_PARENT or tempfile.gettempdir()))
-    workspace = Path(tempfile.mkdtemp(prefix="codex-agents-dispatch-", dir=parent))
+    # Leftover write layouts of finished or expired runs are removed first.
+    sweep = sweep_write_layouts(ledger, parent)
+    layout = manifest = workspace_identity = None
+    launched = False
+    proved = False
+    if write_route:
+        from .workspace import create_layout
+
+        layout = create_layout(parent)
+        workspace = layout.root
+        workspace_identity = _directory_identity(layout.workspace)
+        _write_lease(layout, ledger.write_run_lease(project_id, run_handle))
+    else:
+        workspace = Path(tempfile.mkdtemp(prefix="codex-agents-dispatch-", dir=parent))
     try:
         os.chmod(workspace, 0o700)
-        if provider == "claude":
-            check_context_boundary(workspace)
-        export = workspace / "export"
-        control = workspace / "control"
-        export.mkdir(mode=0o700)
-        control.mkdir(mode=0o700)
-        file_count = export_committed_paths(project_root, paths, export)
+        if write_route:
+            from .workspace import export_workspace
+
+            check_context_boundary(layout.workspace)
+            export, control = layout.workspace, layout.control
+            manifest = export_workspace(project_root, layout, paths, write_set)
+            file_count = len(manifest["files"])
+            settings_document = claude_write_settings(
+                route["model"],
+                claude_write_allow_rules(write_set, manifest, layout.workspace),
+                claude_write_deny_rules(layout.workspace),
+            )
+        else:
+            if provider == "claude":
+                check_context_boundary(workspace)
+            export = workspace / "export"
+            control = workspace / "control"
+            export.mkdir(mode=0o700)
+            control.mkdir(mode=0o700)
+            file_count = export_committed_paths(project_root, paths, export)
+            settings_document = None
         # Re-check the account immediately before launch: it must still be the
         # admitted one, on the admitted reviewed client, and the environment
         # must still be key-free.
@@ -1145,14 +1627,35 @@ def dispatch(
         ledger.bind_host_agent(
             project_id, run_handle=run_handle, agent_id=intent["bridge_run_id"]
         )
+        if write_route:
+            # The write set and baseline are fixed in the ledger before the child
+            # exists; the recorded patch is checked against them, not against us.
+            ledger.record_write_plan(
+                project_id, run_handle=run_handle, bridge_run_id=intent["bridge_run_id"],
+                route=route, manifest=manifest,
+            )
+        launched = True
         if provider == "claude":
             result, report = run_claude(
                 ledger=ledger, project_id=project_id, run_handle=run_handle,
                 route=route, assignment=assignment, role_prompt=role_prompt,
                 export=export, control=control, environ=environ,
                 deadline_seconds=deadline_seconds, max_turns=max_turns,
-                executable=executable,
+                executable=executable, tools=tools, settings_document=settings_document,
+                umask=CHILD_UMASK if write_route else None,
             )
+            if write_route:
+                # The child's group is already killed; nothing is inspected before
+                # quiescence is proved, and then only the snapshot.
+                proved = _finish_write(
+                    ledger, project_id, run_handle=run_handle, route=route, layout=layout,
+                    identity=workspace_identity,
+                    manifest=manifest, bridge_run_id=intent["bridge_run_id"],
+                    child_succeeded=result is not None, report=report,
+                )
+                if report["ownership"] != "passed" and result is not None:
+                    result = None
+                    report["outcome"] = report["ownership"]
             if report["rate_limit_record_failed"]:
                 report.setdefault("observations_unavailable", []).append(
                     {"phase": "during", "reason_code": "observation_failed"}
@@ -1184,7 +1687,12 @@ def dispatch(
                 )
         _record_usage(ledger, project_id, run_handle, provider, route["model"], report)
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if write_route:
+            # No child ever ran when the launch was refused, so removal is safe;
+            # after a launch, only a proved quiescence allows it.
+            _cleanup_write_layout(layout, quiescent=proved or not launched)
+        else:
+            shutil.rmtree(workspace, ignore_errors=True)
     reviewed = True
     if result is None:
         state = "timed_out" if report["outcome"] == "timed_out" else "failed"
@@ -1205,6 +1713,7 @@ def dispatch(
     report.update(
         bridge_run_id=intent["bridge_run_id"],
         export_file_count=file_count,
+        layout_sweep=sweep,
         reviewed=reviewed,
         # A fenced terminal state is an authoritative host fact for the
         # observation; a child's own result carries its state in the result.
