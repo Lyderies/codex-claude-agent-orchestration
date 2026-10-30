@@ -2198,7 +2198,7 @@ class LearningLedger:
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
             "host_run_profile", "probe_admission", "write_result", "write_plan",
-            "write_verification",
+            "write_verification", "write_verifier_result",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -4367,7 +4367,7 @@ class LearningLedger:
             raise LedgerError("write result envelope does not bind the patch")
         return envelope
 
-    def record_write_verification(
+    def record_write_verifier_result(
         self,
         project_id: str,
         *,
@@ -4375,18 +4375,25 @@ class LearningLedger:
         assignment: dict[str, Any],
         task: dict[str, Any],
         route: dict[str, Any],
-        result: dict[str, Any],
+        result: Any,
+        reviewed: bool,
     ) -> dict[str, Any]:
-        """Record a dispatched verifier's validated verdict on one write result's patch.
+        """Record what a dispatched write-result verifier returned, and its verdict if valid.
 
-        Called by the bridge with the child's own result, once per run. The
-        run must still be open and bound to exactly this assignment, task and
-        route; the route must be bound to `verification_for_write`, read-only,
-        bridged and of the other provider, with a passing admission and a
-        `dispatch_intent` for that provider and model; the bound write result
-        must have passed with exactly the bound patch digest; and the result
-        must validate and state that same digest as the one it reviewed. The
-        run's committed host result must later equal this result.
+        Called by the bridge once per execution with the result it will
+        return, failed and fenced results included. The run must still be
+        open and bound to exactly this assignment, task and route; the route
+        must be bound to `verification_for_write`, read-only, bridged and of
+        the other provider, with a passing admission and a `dispatch_intent`
+        for that provider and model; the bound write result must have passed
+        with exactly the bound patch digest. Otherwise nothing is written.
+
+        A `write_verifier_result` with the keyed digest of `result` is then
+        always appended, so the run's committed host result must equal it. A
+        `write_verification` is appended with it only when the result
+        validates, was reviewed by the routed model, completed and states the
+        bound patch digest as the one it reviewed; otherwise the returned
+        `refusal` names why.
         """
 
         from .contracts import reviewed_patch_digest
@@ -4396,20 +4403,34 @@ class LearningLedger:
         try:
             checked_assignment = validate_assignment_shape(assignment)
             checked_task = validate_task(task)
-            checked_result = validate_result(result, assignment=checked_assignment)
         except ContractError as exc:
-            raise LedgerError("write verification result is invalid") from exc
+            raise LedgerError("write verifier run is invalid") from exc
         binding_value = checked_task.get("verification_for_write")
         if binding_value is None:
             raise LedgerError("task is not bound to a write result")
-        axes = result_axes(checked_result, attempt=checked_assignment.get("attempt", 1))
-        if axes["admission_state"] != "unverified":
-            raise LedgerError("a verifier result cannot self-assign admission")
-        reviewed = reviewed_patch_digest(checked_result)
-        if reviewed is None or not secrets.compare_digest(
-            reviewed, binding_value["patch_digest"]
-        ):
-            raise LedgerError("reviewed_patch_digest_mismatch")
+        if not isinstance(result, dict):
+            raise LedgerError("write verifier result must be an object")
+        refusal: str | None = None
+        checked_result: dict[str, Any] | None = None
+        axes: dict[str, Any] | None = None
+        try:
+            checked_result = validate_result(result, assignment=checked_assignment)
+            axes = result_axes(checked_result, attempt=checked_assignment.get("attempt", 1))
+        except ContractError:
+            refusal = "result_invalid"
+        if refusal is None and axes["admission_state"] != "unverified":
+            refusal = "result_invalid"
+        if refusal is None and not reviewed:
+            refusal = "result_unreviewed"
+        if refusal is None and axes["execution_state"] != "completed":
+            refusal = "result_not_completed"
+        if refusal is None:
+            stated = reviewed_patch_digest(checked_result)
+            if stated is None or not secrets.compare_digest(
+                stated, binding_value["patch_digest"]
+            ):
+                refusal = "reviewed_patch_digest_mismatch"
+        result_digest = keyed_digest(key, canonical_json(result))
         with self._lock, self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
             binding = self._connection.execute(
@@ -4453,39 +4474,108 @@ class LearningLedger:
             intent = json.loads(bytes(intents[0]["content"]))
             if intent["provider"] != route.get("provider") or intent["model"] != route.get("model"):
                 raise LedgerError("verifier dispatch differs from its route")
-            if self._connection.execute(
-                "SELECT 1 FROM records WHERE project_id=? AND record_type='write_verification' "
-                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
-                (project_id, run_id),
-            ).fetchone() is not None:
-                raise LedgerError("host run already recorded its write verification")
+            for kind in ("write_verifier_result", "write_verification"):
+                if self._connection.execute(
+                    "SELECT 1 FROM records WHERE project_id=? AND record_type=? "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                    (project_id, kind, run_id),
+                ).fetchone() is not None:
+                    raise LedgerError("host run already recorded its verifier result")
+            records: list[dict[str, Any]] = []
+            verification = None
+            if refusal is None:
+                material = {
+                    "schema_version": 1,
+                    "record_type": "write_verification",
+                    "run_id": run_id,
+                    "bridge_run_id": target["bridge_run_id"],
+                    "patch_digest": target["patch_digest"],
+                    "worker_provider": worker_provider,
+                    "verifier_bridge_run_id": intent["bridge_run_id"],
+                    "verifier_provider": intent["provider"],
+                    "verifier_model": intent["model"],
+                    "result_status": checked_result["status"],
+                    "execution_state": axes["execution_state"],
+                    "semantic_verdict": axes["semantic_verdict"],
+                    "result_digest": result_digest,
+                    "observed_at_ms": timestamp,
+                }
+                try:
+                    verification = validate_learning_record(
+                        {**material, "record_id": f"write_verification:{content_digest(material)}"}
+                    )
+                except ContractError:
+                    refusal = "verification_invalid"
+                else:
+                    records.append(verification)
             material = {
                 "schema_version": 1,
-                "record_type": "write_verification",
+                "record_type": "write_verifier_result",
                 "run_id": run_id,
                 "bridge_run_id": target["bridge_run_id"],
                 "patch_digest": target["patch_digest"],
-                "worker_provider": worker_provider,
                 "verifier_bridge_run_id": intent["bridge_run_id"],
-                "verifier_provider": intent["provider"],
-                "verifier_model": intent["model"],
-                "result_status": checked_result["status"],
-                "execution_state": axes["execution_state"],
-                "semantic_verdict": axes["semantic_verdict"],
-                "result_digest": keyed_digest(key, canonical_json(checked_result)),
+                "result_digest": result_digest,
+                "write_verification": "recorded" if refusal is None else refusal,
                 "observed_at_ms": timestamp,
             }
             try:
-                record = validate_learning_record(
-                    {**material, "record_id": f"write_verification:{content_digest(material)}"}
+                result_record = validate_learning_record(
+                    {**material, "record_id": f"write_verifier_result:{content_digest(material)}"}
                 )
             except ContractError as exc:
-                raise LedgerError("write verification is invalid") from exc
-            self._append_checked_locked(
-                project_id, record, producer="lifecycle", timestamp=timestamp
-            )
+                raise LedgerError("write verifier result is invalid") from exc
+            for record in (result_record, *records):
+                self._append_checked_locked(
+                    project_id, record, producer="lifecycle", timestamp=timestamp
+                )
         self.state.harden_database_files()
-        return record
+        return {
+            "result": result_record,
+            "verification": verification if refusal is None else None,
+            "refusal": refusal,
+        }
+
+    def _qa_write_verification_locked(
+        self,
+        project_id: str,
+        write_binding: dict[str, Any],
+        verifier_run_id: str,
+    ) -> dict[str, Any]:
+        """The positive other-provider verification that attributes a QA verifier to a patch.
+
+        For a write result, operational QA's verifier must be the run of a
+        recorded `write_verification` of exactly the receipt's worker bridge
+        run and patch digest, by the other provider, completed with a
+        positive verdict; and the patch's verification state must be
+        `accepted`. This, not the assignment context, binds the verifier.
+        """
+
+        from .learning_contracts import POSITIVE_VERDICTS
+
+        if self.write_verification_state(
+            project_id, write_binding["bridge_run_id"]
+        ) != "accepted":
+            raise LedgerError("operational QA of a write result needs an accepted verification")
+        rows = self._connection.execute(
+            "SELECT content FROM records WHERE project_id=? "
+            "AND record_type='write_verification' AND source='lifecycle' "
+            "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+            (project_id, verifier_run_id),
+        ).fetchall()
+        records = [validate_learning_record(json.loads(bytes(row["content"]))) for row in rows]
+        if (
+            len(records) != 1
+            or records[0]["bridge_run_id"] != write_binding["bridge_run_id"]
+            or records[0]["patch_digest"] != write_binding["patch_digest"]
+            or records[0]["verifier_provider"] == records[0]["worker_provider"]
+            or records[0]["execution_state"] != "completed"
+            or records[0]["semantic_verdict"] not in POSITIVE_VERDICTS
+        ):
+            raise LedgerError(
+                "operational QA verifier has no positive other-provider verification of this patch"
+            )
+        return records[0]
 
     def write_verification_state(self, project_id: str, bridge_run_id: str) -> str:
         """`accepted`, `missing`, `rejected` or `blocked` for one write result's current patch.
@@ -5607,21 +5697,21 @@ class LearningLedger:
                     if binding["native_assignment_id"] is None:
                         raise LedgerError("host run is not bound to a native agent")
                     if write_bound:
-                        # The bridge recorded the verifier's own result; the
-                        # committed result must be exactly that one.
-                        verification = self._connection.execute(
+                        # The bridge recorded what this verifier run returned,
+                        # failed and refused runs included; the committed
+                        # result must be exactly that one.
+                        executed = self._connection.execute(
                             "SELECT content FROM records WHERE project_id=? "
-                            "AND record_type='write_verification' AND source='lifecycle' "
+                            "AND record_type='write_verifier_result' AND source='lifecycle' "
                             "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
                             (project_id, checked_observation["run_id"]),
                         ).fetchone()
-                        if verification is not None and json.loads(
-                            bytes(verification["content"])
-                        )["result_digest"] != keyed_digest(
-                            self.state.digest_key(), canonical_json(checked_result)
+                        if executed is None or not secrets.compare_digest(
+                            json.loads(bytes(executed["content"]))["result_digest"],
+                            keyed_digest(self.state.digest_key(), canonical_json(checked_result)),
                         ):
                             raise LedgerError(
-                                "host result differs from its recorded write verification"
+                                "host result differs from the verifier run's recorded result"
                             )
                     usage_complete = int(
                         all(value is not None for value in outcome["usage"].values())
@@ -5761,9 +5851,10 @@ class LearningLedger:
         """Validate the two exact runs before executing project-approved checks."""
 
         with self._lock:
-            _, _, orchestration_id = self._operational_qa_scope_locked(
+            host, verifier, orchestration_id = self._operational_qa_scope_locked(
                 project_id, host_outcome_digest, verifier_host_outcome_digest
             )
+            self._qa_write_attribution_locked(project_id, host, verifier)
         return {"ready": True, "orchestration_id": orchestration_id}
 
     def issue_operational_check_receipt(
@@ -5809,7 +5900,7 @@ class LearningLedger:
                 int(host["observed_at_ms"]), int(verifier["observed_at_ms"])
             ):
                 raise LedgerError("operational check report predates its runs")
-            write_binding = self._qa_write_binding_locked(project_id, host["run_id"])
+            write_binding, _ = self._qa_write_attribution_locked(project_id, host, verifier)
             stored_report = (
                 check_report if write_binding is None
                 else {**check_report, "write_binding": write_binding}
@@ -5851,6 +5942,29 @@ class LearningLedger:
             "expires_at_ms": timestamp + OPERATIONAL_CHECK_TTL_MS,
             "write_binding": write_binding,
         }
+
+    def _qa_write_attribution_locked(
+        self,
+        project_id: str,
+        host_outcome: dict[str, Any],
+        verifier_host_outcome: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The patch a QA of a write result binds, and the verification attributing its verifier.
+
+        Both are None when the checked run is not a write child. For a write
+        child the binding names its patch and the supplied verifier run must
+        hold a positive other-provider `write_verification` of that patch.
+        """
+
+        write_binding = self._qa_write_binding_locked(project_id, host_outcome["run_id"])
+        if write_binding is None:
+            return None, None
+        if write_binding["patch_digest"] is None:
+            raise LedgerError("operational QA of a write result needs a passed write result")
+        verification = self._qa_write_verification_locked(
+            project_id, write_binding, str(verifier_host_outcome["run_id"])
+        )
+        return write_binding, verification
 
     def _qa_write_binding_locked(
         self, project_id: str, run_id: str
@@ -5925,13 +6039,30 @@ class LearningLedger:
             raise LedgerError("operational check receipt report is invalid")
         write_binding = check_report.pop("write_binding", None)
         with self._lock:
-            expected_binding = self._qa_write_binding_locked(project_id, host_outcome["run_id"])
+            expected_binding, verification = self._qa_write_attribution_locked(
+                project_id, host_outcome, verifier_host_outcome
+            )
         if write_binding != expected_binding:
             raise LedgerError("operational check receipt binds another patch")
+        if verification is not None:
+            # The supplied verifier result must be the one the bridge recorded
+            # as that verification of this patch.
+            try:
+                checked_verifier = validate_result(
+                    verifier_result, assignment=validate_assignment_shape(verifier_assignment)
+                )
+            except ContractError as exc:
+                raise LedgerError("operational QA admission rejected") from exc
+            if not secrets.compare_digest(
+                verification["result_digest"],
+                keyed_digest(self.state.digest_key(), canonical_json(checked_verifier)),
+            ):
+                raise LedgerError("operational QA verifier result differs from its verification")
         from .learning_engine import build_operational_qa_records
 
         try:
             qa, outcome = build_operational_qa_records(
+                write_attributed=verification is not None,
                 digest_key=self.state.digest_key(),
                 host_outcome=host_outcome,
                 verifier_host_outcome=verifier_host_outcome,

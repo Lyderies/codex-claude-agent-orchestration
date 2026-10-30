@@ -54,6 +54,7 @@ RECORD_TYPES = {
     "write_result",
     "write_plan",
     "write_verification",
+    "write_verifier_result",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -2215,6 +2216,39 @@ def validate_write_verification(data: Any) -> dict[str, Any]:
     return data
 
 
+WRITE_VERIFIER_RESULT_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "patch_digest", "verifier_bridge_run_id", "result_digest", "write_verification",
+    "observed_at_ms",
+}
+
+
+def validate_write_verifier_result(data: Any) -> dict[str, Any]:
+    """The digest of the result one write-bound verifier run actually returned.
+
+    Written by the bridge for every execution of a verifier bound to a write
+    result, failed and refused ones included, so the run's committed host
+    result can always be compared with it. `write_verification` is
+    `recorded` or the stable code why no verification was recorded.
+    """
+
+    data = _closed(data, WRITE_VERIFIER_RESULT_FIELDS, "write_verifier_result")
+    _base(data, "write_verifier_result")
+    _identifier(data["run_id"], "run_id")
+    for field in ("bridge_run_id", "verifier_bridge_run_id"):
+        if not isinstance(data[field], str) or re.fullmatch(
+            r"brg_[0-9a-f]{32}", data[field]
+        ) is None:
+            raise ContractError(f"write_verifier_result {field} is invalid")
+    _digest(data["patch_digest"], "patch_digest")
+    _digest(data["result_digest"], "result_digest")
+    code = data["write_verification"]
+    if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
+        raise ContractError("write_verifier_result write_verification is invalid")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -2244,6 +2278,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "write_result": validate_write_result,
     "write_plan": validate_write_plan,
     "write_verification": validate_write_verification,
+    "write_verifier_result": validate_write_verifier_result,
 }
 
 

@@ -72,17 +72,19 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
      and tells the verifier to review the patch there and state it as one `artifacts`
      entry `reviewed_patch_digest:<patch_digest>`. Do not put the digest in the
      objective.
-   - `dispatch` records the verifier's own verdict (`bridge_report.write_verification`)
-     only when it states exactly the bound digest, and the recorded host result must be
-     that same result. Check `learning-write-verification-state --bridge-run-id <worker
+   - `dispatch` records the verifier's own result every time, and its verdict
+     (`bridge_report.write_verification`) only when it states exactly the bound digest.
+     Record the `result` `dispatch` returned unchanged: any other result is refused. Check `learning-write-verification-state --bridge-run-id <worker
      bridge run>`: only `accepted` (a completed, positive, other-provider verdict on the
      current patch and none negative or blocked) lets integration proceed in a later
      release; `missing`, `rejected` and `blocked` do not.
 8. **Operational QA.** Run `learning-run-operational-checks` with both host outcome
    digests and pass its `check_receipt` to `learning-record-operational-qa`. The routed
-   verifier of either provider is accepted. For a write result the receipt's
-   `write_binding` names its `patch_digest`; its `tested_tree_digest` stays null until
-   integration runs the checks on the patched tree.
+   verifier of either provider is accepted. For a write result, pass the verifier run
+   whose `write_verification` was recorded (keep its repository context); a native or
+   same-provider verifier is refused. The receipt's `write_binding` names the
+   `patch_digest`; its `tested_tree_digest` stays null until integration runs the
+   checks on the patched tree.
 9. **Close.** Report failed, blocked and unverified work plainly, then run
    `learning-close-orchestration` with the real terminal state. Claude Code has no
    native goal counters, so omit `--goal-tokens-used` and `--goal-time-used-seconds`

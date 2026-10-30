@@ -1797,25 +1797,29 @@ def dispatch(
         }
     fenced = report["outcome"] != "result"
     if write_binding is not None:
-        # The child's own validated result is the verdict; the ledger records it
-        # only for a completed run that states exactly the bound patch digest.
+        # Whatever this verifier run returned (a fenced failure included) is
+        # recorded, so the committed host result can only be this one. The
+        # verdict counts only for a completed run that states the bound digest.
+        from .learning_store import LedgerError
+
         report.update(
             verification_input=VERIFIER_ENVELOPE_PATH,
             verification_envelope_digest=hashlib.sha256(envelope_bytes).hexdigest(),
             reviewed_patch_digest=reviewed_patch_digest(result),
             write_verification="not_recorded",
         )
-        if not fenced and reviewed:
-            from .learning_store import LedgerError
-
-            try:
-                ledger.record_write_verification(
-                    project_id, run_handle=run_handle, assignment=assignment, task=task,
-                    route=route, result=result,
-                )
+        try:
+            recorded = ledger.record_write_verifier_result(
+                project_id, run_handle=run_handle, assignment=assignment, task=task,
+                route=route, result=result, reviewed=reviewed,
+            )
+        except LedgerError as exc:
+            report["write_verification_refusal"] = str(exc)
+        else:
+            if recorded["refusal"] is None:
                 report["write_verification"] = "recorded"
-            except LedgerError as exc:
-                report["write_verification_refusal"] = str(exc)
+            else:
+                report["write_verification_refusal"] = recorded["refusal"]
     report.update(
         bridge_run_id=intent["bridge_run_id"],
         export_file_count=file_count,

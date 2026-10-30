@@ -176,6 +176,10 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
         with self.ledger.repository(self.project_id) as repository:
             return repository.records("write_verification")
 
+    def verifier_results(self) -> list[dict]:
+        with self.ledger.repository(self.project_id) as repository:
+            return repository.records("write_verifier_result")
+
     def commit(self, run: dict, task: dict, reply: dict | None = None) -> dict:
         return self.ledger.commit_host_result(
             self.project_id, assignment=run["assignment"], task=task, route=run["route"],
@@ -229,12 +233,19 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
         self.assertNotIn("changed", json.dumps(record))
         # The committed host result must be the verifier's own result.
         forged = {**run["output"]["result"], "summary": "edited by the primary"}
-        with self.assertRaisesRegex(LedgerError, "differs from its recorded write verification"):
+        with self.assertRaisesRegex(LedgerError, "differs from the verifier run's recorded result"):
             self.commit(run, run["task"], forged)
         committed = self.commit(run, run["task"])
         self.assertEqual("accepted", committed["write_verification_state"])
 
-    def test_check_receipt_for_a_write_result_binds_its_patch(self) -> None:
+    def check_report(self) -> dict:
+        check = {"check_id": "unit", "passed": True, "evidence_digest": "a" * 64}
+        return {
+            "deterministic_checks": [check], "security_checks": [check],
+            "observed_at_ms": time.time_ns() // 1_000_000,
+        }
+
+    def test_operational_qa_of_a_write_result_through_its_verification(self) -> None:
         work = self.written()
         binding = self.binding(work)
         run = self.verify(work, self.verdict(binding["patch_digest"]))
@@ -242,17 +253,77 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
         verifier = self.commit(run, run["task"])
         host_digest = content_digest(worker["outcome"])
         verifier_digest = content_digest(verifier["outcome"])
-        check = {"check_id": "unit", "passed": True, "evidence_digest": "a" * 64}
+        # The verifier's context stays the repository paths it read.
+        self.assertEqual(["src"], run["assignment"]["context"])
         receipt = self.ledger.issue_operational_check_receipt(
             self.project_id, host_outcome_digest=host_digest,
-            verifier_host_outcome_digest=verifier_digest,
-            check_report={
-                "deterministic_checks": [check], "security_checks": [check],
-                "observed_at_ms": time.time_ns() // 1_000_000,
-            },
+            verifier_host_outcome_digest=verifier_digest, check_report=self.check_report(),
         )
         self.assertEqual(
             {**binding, "tested_tree_digest": None}, receipt["write_binding"])
+        inputs = {
+            "host_outcome_digest": host_digest,
+            "verifier_host_outcome_digest": verifier_digest,
+            "evaluator_assignment": work["assignment"],
+            "evaluator_result": work["output"]["result"],
+            "check_receipt": receipt["check_receipt"],
+            "verifier_assignment": run["assignment"],
+        }
+        # A verifier result other than the recorded verification is refused.
+        forged = {**run["output"]["result"], "summary": "another review"}
+        with self.assertRaisesRegex(LedgerError, "differs from its verification"):
+            self.ledger.commit_operational_qa(
+                self.project_id, **inputs, verifier_result=forged)
+        committed = self.ledger.commit_operational_qa(
+            self.project_id, **inputs, verifier_result=run["output"]["result"])
+        self.assertTrue(committed["qa"]["accepted"])
+        self.assertEqual("accepted", committed["outcome"]["status"])
+        self.assertEqual({**binding, "tested_tree_digest": None}, committed["write_binding"])
+
+    def test_operational_qa_refuses_a_same_provider_native_verifier(self) -> None:
+        work = self.written()
+        worker = self.commit(work, self.write_task())
+        # A native Claude verifier of the Claude patch, with no write verification.
+        (self.bundle / ".claude/agents/claude_agents_verification_worker.md").write_text(
+            (self.bundle / ".claude/agents/claude_agents_researcher.md").read_text()
+            .replace("claude_agents_researcher", "claude_agents_verification_worker")
+        )
+        task = self.verifier_task(None)
+        route = route_task(task, self.policy_with(codex=False), primary_provider="claude")
+        self.assertEqual(("claude", "native"), (route["provider"], route["dispatch"]))
+        route["execution_configuration"] = installed_execution_configuration(
+            self.bundle, route, client_capability=self.clients["claude-host-v1"]
+        )
+        assigned = self.assignment_for(
+            route, assignment_id="verify-assignment-1", task_id="verify-1",
+            objective="Verify the patch", context=[content_digest(worker["outcome"])],
+            owned_paths=[], verification_required=False, permissions=dict(READ_SRC),
+        )
+        handle = self.ledger.open_host_run(
+            self.project_id, assignment=assigned, task=task, route=route,
+            execution_configuration=route["execution_configuration"],
+            client_version="claude-host-v1", orchestration_handle=self.orchestration(),
+        )["run_handle"]
+        self.ledger.bind_host_agent(self.project_id, run_handle=handle, agent_id="agent-native-1")
+        verifier = self.commit(
+            {"assignment": assigned, "route": route, "handle": handle}, task,
+            self.verdict(None),
+        )
+        self.assertEqual([], self.verifications())
+        scope = {
+            "host_outcome_digest": content_digest(worker["outcome"]),
+            "verifier_host_outcome_digest": content_digest(verifier["outcome"]),
+        }
+        with self.assertRaisesRegex(LedgerError, "accepted verification"):
+            self.ledger.validate_operational_qa_scope(self.project_id, **scope)
+        with self.assertRaisesRegex(LedgerError, "accepted verification"):
+            self.ledger.issue_operational_check_receipt(
+                self.project_id, **scope, check_report=self.check_report())
+        # An accepted Codex verification of the patch does not attribute the Claude run.
+        self.verify(work, self.verdict(self.binding(work)["patch_digest"]))
+        with self.assertRaisesRegex(LedgerError, "no positive other-provider verification"):
+            self.ledger.issue_operational_check_receipt(
+                self.project_id, **scope, check_report=self.check_report())
 
     # --- states other than accepted ----------------------------------------
 
@@ -276,6 +347,9 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
         self.verify(work, self.verdict(self.binding(work)["patch_digest"], verdict="not-ready"))
         self.assertEqual("rejected", self.verification_state(work))
 
+    def forged_pass(self, work: dict) -> dict:
+        return self.verdict(self.binding(work)["patch_digest"])
+
     def test_a_reviewed_digest_that_differs_or_is_missing_records_nothing(self) -> None:
         work = self.written()
         for stated in ("0" * 64, None):
@@ -284,7 +358,15 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
             self.assertEqual("not_recorded", report["write_verification"])
             self.assertEqual("reviewed_patch_digest_mismatch",
                              report["write_verification_refusal"])
+            # The primary cannot replace it with an invented, correctly bound pass.
+            with self.assertRaisesRegex(LedgerError, "recorded result"):
+                self.commit(run, run["task"], self.forged_pass(work))
+            self.commit(run, run["task"])
         self.assertEqual([], self.verifications())
+        self.assertEqual(
+            ["reviewed_patch_digest_mismatch"] * 2,
+            [record["write_verification"] for record in self.verifier_results()],
+        )
         self.assertEqual("missing", self.verification_state(work))
 
     def test_a_failed_verifier_run_records_nothing(self) -> None:
@@ -292,8 +374,25 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
         (self.tools / "codex-exit-code").write_text("1")
         run = self.verify(work, self.verdict(self.binding(work)["patch_digest"]))
         self.assertEqual("failed", run["output"]["result"]["status"])
-        self.assertEqual("not_recorded", run["output"]["bridge_report"]["write_verification"])
+        report = run["output"]["bridge_report"]
+        self.assertEqual(("not_recorded", "result_not_completed"),
+                         (report["write_verification"], report["write_verification_refusal"]))
         self.assertEqual("missing", self.verification_state(work))
+        with self.assertRaisesRegex(LedgerError, "recorded result"):
+            self.commit(run, run["task"], self.forged_pass(work))
+        committed = self.commit(run, run["task"])
+        self.assertEqual("missing", committed["write_verification_state"])
+
+    def test_a_write_bound_run_without_a_recorded_result_cannot_commit(self) -> None:
+        work = self.written()
+        with mock.patch.object(
+            type(self.ledger), "record_write_verifier_result",
+            side_effect=LedgerError("unavailable"),
+        ):
+            run = self.verify(work, self.verdict(self.binding(work)["patch_digest"]))
+        self.assertEqual("unavailable", run["output"]["bridge_report"]["write_verification_refusal"])
+        with self.assertRaisesRegex(LedgerError, "recorded result"):
+            self.commit(run, run["task"])
 
     def test_a_task_bound_to_another_digest_is_refused_at_open(self) -> None:
         work = self.written()
@@ -372,6 +471,20 @@ class WriteVerificationTests(writes.ClaudeWriteChildTests):
         for producer in ("host", "lifecycle", "verifier"):
             with self.assertRaises(LedgerError):
                 self.ledger.append(self.project_id, material, producer=producer)
+        executed = {
+            "schema_version": 1, "record_type": "write_verifier_result", "run_id": "run_1",
+            "bridge_run_id": "brg_" + "a" * 32, "patch_digest": "b" * 64,
+            "verifier_bridge_run_id": "brg_" + "c" * 32, "result_digest": "d" * 64,
+            "write_verification": "result_not_completed", "observed_at_ms": 1,
+            "record_id": "write_verifier_result:x",
+        }
+        validate_learning_record(executed)
+        for changes in ({"write_verification": "Not Recorded"}, {"result": "never stored"}):
+            with self.assertRaises(ContractError):
+                validate_learning_record({**executed, **changes})
+        for producer in ("host", "lifecycle", "verifier"):
+            with self.assertRaises(LedgerError):
+                self.ledger.append(self.project_id, executed, producer=producer)
 
     # --- unrecorded and failed write results --------------------------------
 
