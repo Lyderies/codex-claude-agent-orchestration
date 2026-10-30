@@ -49,6 +49,7 @@ from .learning_contracts import (
     keyed_digest,
     parse_bounded_json_value,
     provider_for_model,
+    validate_billing_attestation,
     validate_canary_report,
     validate_candidate,
     validate_comparison,
@@ -3805,6 +3806,8 @@ class OwnerGrantAuthority:
             checked = validate_feedback(record)
         elif record_type == "grader_calibration":
             checked = validate_grader_calibration(record)
+        elif record_type == "billing_attestation":
+            checked = validate_billing_attestation(record)
         else:
             raise ContractError("owner record type is unsupported")
         return canonical_json(

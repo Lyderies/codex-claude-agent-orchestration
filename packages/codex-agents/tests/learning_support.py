@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 
 from codex_agents.learning_adapters import empty_usage
 from codex_agents.learning_contracts import candidate_base_digest, content_digest
+from codex_agents.providers import (
+    billing_attestation_record,
+    parse_claude_auth_status,
+    parse_codex_rate_limits,
+)
 from codex_agents.learning_engine import (
     OWNER_SIGNATURE_NAMESPACE,
     OwnerGrantAuthority,
@@ -455,3 +461,74 @@ def matched_trials(
         for cohort in ("champion", "candidate")
     ]
     return cases, records
+
+
+PROVIDER_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "providers"
+
+
+def provider_fixture(name: str) -> bytes:
+    return (PROVIDER_FIXTURES / name).read_bytes()
+
+
+def observe_provider_fixture(
+    ledger, project_id: str, provider: str, *, observed_at_ms: int
+) -> list[dict]:
+    """Record the recorded fixture observation for one provider."""
+
+    key = ledger.state.digest_key()
+    if provider == "claude":
+        records = [parse_claude_auth_status(
+            provider_fixture("claude-auth-status.json"),
+            digest_key=key, observed_at_ms=observed_at_ms,
+        )]
+    else:
+        records = parse_codex_rate_limits(
+            json.loads(provider_fixture("codex-rate-limits.json")),
+            digest_key=key, observed_at_ms=observed_at_ms,
+        )
+    ledger.record_provider_observations(project_id, records, now_ms=observed_at_ms)
+    return records
+
+
+def attest_provider(
+    ledger, project_id: str, private_key: Path, provider: str, fingerprint: str,
+    *, issued_at: int = 1,
+) -> dict:
+    """Sign and store an owner billing attestation for one account fingerprint."""
+
+    record = billing_attestation_record({
+        "version": 1,
+        "provider": provider,
+        "account_fingerprint": fingerprint,
+        "no_paid_overage": True,
+        "no_usage_credits": True,
+        "issued_at": issued_at,
+    })
+    authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+    signature = sign_owner_payload(
+        private_key,
+        authority.owner_record_payload(project_id, record),
+        f"attestation-{record['record_id'].split(':')[1]}",
+    )
+    try:
+        ledger.commit_owner_record(
+            project_id, record=record, signature=signature.read_bytes()
+        )
+    finally:
+        signature.unlink(missing_ok=True)
+    return record
+
+
+def admit_provider(
+    ledger, project_id: str, private_key: Path, provider: str = "codex",
+    *, observed_at_ms: int,
+) -> str:
+    """Give a project a fresh identity and a matching attestation; return the fingerprint."""
+
+    identity = observe_provider_fixture(
+        ledger, project_id, provider, observed_at_ms=observed_at_ms
+    )[0]
+    attest_provider(
+        ledger, project_id, private_key, provider, identity["account_fingerprint"]
+    )
+    return identity["account_fingerprint"]

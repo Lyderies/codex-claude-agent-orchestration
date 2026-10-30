@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import base64
+import os
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,7 @@ from tests.learning_support import (
     champion_configuration,
     event_record,
     full_usage,
+    admit_provider,
     generate_test_owner_key,
     sign_owner_payload,
     result,
@@ -68,6 +70,11 @@ class LearningCliTests(unittest.TestCase):
             ),
         )
         self.project_id = ledger.register_project(self.project, now_ms=1)
+        # Host runs are admitted only with a fresh identity and an owner attestation.
+        admit_provider(
+            ledger, self.project_id, self.owner_private_key,
+            observed_at_ms=time.time_ns() // 1_000_000,
+        )
         self.fixture_task = {
             "id": "cli-fixture", "objective": "Verify one fixed fixture",
             "family": "verification", "complexity": "low", "risk": "low",
@@ -234,7 +241,13 @@ class LearningCliTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         return path
 
-    def _run(self, command: str, *arguments: str, expected: int = 0) -> dict:
+    def _run(
+        self,
+        command: str,
+        *arguments: str,
+        expected: int = 0,
+        env: dict[str, str] | None = None,
+    ) -> dict:
         completed = subprocess.run(
             [
                 sys.executable,
@@ -248,10 +261,21 @@ class LearningCliTests(unittest.TestCase):
             ],
             text=True,
             capture_output=True,
+            env=self._environment(**(env or {})),
             check=False,
         )
         self.assertEqual(expected, completed.returncode, completed.stderr or completed.stdout)
         return json.loads(completed.stdout)
+
+    @staticmethod
+    def _environment(**overrides: str) -> dict[str, str]:
+        # Admission denies API-key environments, so tests never inherit them.
+        environment = {
+            key: value for key, value in os.environ.items()
+            if key not in {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
+        }
+        environment.update(overrides)
+        return environment
 
     def _run_state(self, command: str, *arguments: str, expected: int = 0) -> dict:
         completed = subprocess.run(
@@ -925,6 +949,54 @@ class LearningCliTests(unittest.TestCase):
             generated["record"]["champion_configuration"],
         )
 
+    def test_provider_observation_and_billing_attestation_commands(self) -> None:
+        fixtures = Path(__file__).resolve().parent / "fixtures" / "providers"
+        tools = Path(self.temporary.name) / "fake-tools"
+        tools.mkdir()
+        # A stand-in `claude` that prints the recorded auth status; nothing is spent.
+        claude = tools / "claude"
+        claude.write_text(f"#!/bin/sh\nexec /bin/cat {fixtures / 'claude-auth-status.json'}\n")
+        claude.chmod(0o755)
+        observed = self._run(
+            "provider-observe", "--provider", "claude", env={"PATH": str(tools)}
+        )
+        identity = observed["records"][0]
+        self.assertEqual("provider_identity", identity["record_type"])
+        self.assertNotIn("example.invalid", json.dumps(observed))
+        refused = self._run(
+            "provider-observe", "--provider", "claude", expected=2,
+            env={"PATH": str(tools), "ANTHROPIC_API_KEY": "test-only"},
+        )
+        self.assertEqual("input validation failed", refused["error"])
+
+        grant = self._write("billing-grant.json", {
+            "version": 1, "provider": "claude",
+            "account_fingerprint": identity["account_fingerprint"],
+            "no_paid_overage": True, "no_usage_credits": True, "issued_at": 7,
+        })
+        request = self._run(
+            "learning-record-billing-attestation",
+            "--provider", "claude", "--grant", str(grant),
+        )
+        self.assertTrue(request["requires_signature"])
+        mismatched = self._run(
+            "learning-record-billing-attestation",
+            "--provider", "codex", "--grant", str(grant), expected=2,
+        )
+        self.assertEqual("input validation failed", mismatched["error"])
+        signature = sign_owner_payload(
+            self.owner_private_key,
+            base64.b64decode(request["signing_payload_b64"]),
+            "billing-attestation-payload",
+        )
+        stored = self._run(
+            "learning-record-billing-attestation",
+            "--provider", "claude", "--grant", str(grant),
+            "--signature", str(signature),
+        )
+        self.assertTrue(stored["stored"])
+        self.assertEqual("billing_attestation", stored["record"]["record_type"])
+
     def test_trusted_host_lifecycle_opens_and_records_exact_assignment(self) -> None:
         task = {
             "id": "task-1", "objective": "Read one fixture", "family": "research",
@@ -965,7 +1037,7 @@ class LearningCliTests(unittest.TestCase):
             expected=2,
         )
         self.assertEqual("input validation failed", rejected_route["error"])
-        opened = self._run(
+        open_arguments = (
             "learning-open-host-run",
             "--task", str(task_path),
             "--route", str(route_path),
@@ -973,7 +1045,16 @@ class LearningCliTests(unittest.TestCase):
             "--parent-grant", str(parent_path),
             "--orchestration-handle", orchestration["orchestration_handle"],
         )
+        denied = self._run(
+            *open_arguments, expected=2, env={"OPENAI_API_KEY": "test-only"}
+        )
+        self.assertEqual(
+            ("provider admission denied", "provider_api_key_present"),
+            (denied["error"], denied["reason_code"]),
+        )
+        opened = self._run(*open_arguments)
         self.assertRegex(opened["run_handle"], r"^hrn_[0-9a-f]{48}$")
+        self.assertEqual("admitted", opened["admission"])
         self._run(
             "learning-bind-host-agent",
             "--run-handle", opened["run_handle"],

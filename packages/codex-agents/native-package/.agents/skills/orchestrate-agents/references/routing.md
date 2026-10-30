@@ -61,3 +61,26 @@ Learning candidates cannot move a route to another provider.
 The account catalog of the policy's `validated_client` recognizes `low`, `medium`,
 `high`, `xhigh`, and `max` for active models, while initial routes use medium or high.
 Native routing excludes `none` and `ultra`.
+
+## Provider admission
+
+`learning-open-host-run` admits a run for its route's provider before opening it, and a
+verifier is admitted when its own run is opened. The checks run in this order, and the
+first failure denies with a stable `reason_code`:
+
+1. `provider_api_key_present`: `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set.
+2. `provider_identity_missing`: no `provider-observe` identity in the last 30 minutes.
+3. `billing_attestation_missing`: no owner-signed attestation for that account
+   fingerprint, recorded with `learning-record-billing-attestation`.
+4. `claude_subscription_missing`: for Claude, the login is not `claude.ai` with a
+   subscription.
+5. `paid_usage_usable` or `billing_unverified`: the latest billing observation shows
+   paid overage or credits usable, or cannot show they are not. With no billing
+   observation yet, the identity and attestation admit the run.
+6. `provider_exhausted`: Codex at 90 percent or more on any window, or ordinary usage
+   not allowed; Claude with a rejected window.
+
+The decision and the digests of the records it used are stored with the run. Later
+lifecycle steps read that stored decision and never re-evaluate time-varying facts.
+Identities are stored only as keyed fingerprints. Every project, including a Codex-only
+one, needs an attestation before host runs open.

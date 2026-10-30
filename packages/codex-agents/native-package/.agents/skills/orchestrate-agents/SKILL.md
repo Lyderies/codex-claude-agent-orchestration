@@ -62,7 +62,9 @@ Keep the primary agent as the decision owner and final synthesizer.
    roles remain read-only. Send every completed change to independent verification.
 6. Before spawning, call `learning-open-host-run` with the exact task, route, assignment,
    parent grant, project root, and orchestration handle. Do not spawn if this command
-   fails. Spawn the returned agent type, model, and effort with `fork_turns` set to `none` when the
+   fails. It also runs provider admission; a denial returns a `reason_code`. Report it
+   to the owner instead of retrying: refresh `provider-observe` only for a missing or
+   stale identity, and never set a provider API key to get past it. Spawn the returned agent type, model, and effort with `fork_turns` set to `none` when the
    bounded assignment contains all required context; otherwise use the smallest recent
    turn count that is sufficient. Pass paths and concise facts instead of duplicating
    source contents. Do not let a child widen its authority or treat its own output as

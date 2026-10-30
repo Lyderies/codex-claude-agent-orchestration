@@ -1,0 +1,9 @@
+{
+  "status": "allowed",
+  "rateLimitType": "five_hour",
+  "utilization": 0.25,
+  "resetsAt": 1793450000,
+  "isUsingOverage": false,
+  "overageStatus": "rejected",
+  "overageDisabledReason": "org_level_disabled"
+}

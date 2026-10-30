@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -76,6 +77,12 @@ from codex_agents.learning_store import (  # noqa: E402
     ensure_collector,
     require_authorized_collector_runtime,
     validate_collector_runtime,
+)
+from codex_agents.providers import (  # noqa: E402
+    AdmissionDenied,
+    billing_attestation_record,
+    observe_claude,
+    observe_codex,
 )
 from codex_agents.routing import (  # noqa: E402
     PolicyError,
@@ -531,6 +538,26 @@ def main() -> int:
     _add_assignment_context(learning_open_host, allow_policy_override=False)
     learning_open_host.add_argument("--route", required=True)
     learning_open_host.add_argument("--orchestration-handle", required=True)
+
+    provider_observe = subparsers.add_parser(
+        "provider-observe",
+        help="record a non-spending provider identity, headroom and billing observation",
+    )
+    _add_learning_project(provider_observe)
+    provider_observe.add_argument(
+        "--provider", required=True, choices=("codex", "claude")
+    )
+
+    learning_billing_attestation = subparsers.add_parser(
+        "learning-record-billing-attestation",
+        help="record an owner-signed billing attestation for one provider account",
+    )
+    _add_learning_project(learning_billing_attestation)
+    learning_billing_attestation.add_argument(
+        "--provider", required=True, choices=("codex", "claude")
+    )
+    learning_billing_attestation.add_argument("--grant", required=True)
+    learning_billing_attestation.add_argument("--signature", type=Path)
 
     learning_open_orchestration = subparsers.add_parser(
         "learning-open-orchestration",
@@ -1296,6 +1323,13 @@ def main() -> int:
                     route=route,
                     parent_grant=_json_input(args.parent_grant),
                 )
+                # Admission is evaluated once, here; later steps read the stored
+                # decision. A verifier is admitted when its own run is opened.
+                admission = ledger.evaluate_admission(
+                    project_id,
+                    provider=route.get("provider", "codex"),
+                    environ=os.environ,
+                )
                 report = {
                     "ready": True,
                     **ledger.open_host_run(
@@ -1307,8 +1341,58 @@ def main() -> int:
                         client_version=TRUSTED_HOST_CLIENT,
                         orchestration_handle=args.orchestration_handle,
                         fallback_receipt=args.fallback_receipt,
+                        admission=admission,
                     ),
+                    "admission": admission["reason_code"],
                 }
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "provider-observe":
+            ledger, project_id = _learning_ledger(args)
+            try:
+                observed_at_ms = time.time_ns() // 1_000_000
+                if args.provider == "claude":
+                    records = observe_claude(
+                        digest_key=ledger.state.digest_key(),
+                        observed_at_ms=observed_at_ms,
+                    )
+                else:
+                    records = observe_codex(
+                        args.project_root.resolve(),
+                        digest_key=ledger.state.digest_key(),
+                        observed_at_ms=observed_at_ms,
+                    )
+                ledger.record_provider_observations(
+                    project_id, records, now_ms=observed_at_ms
+                )
+                report = {"ready": True, "records": records}
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "learning-record-billing-attestation":
+            ledger, project_id = _learning_ledger(args)
+            try:
+                record = billing_attestation_record(_json_input(args.grant))
+                if record["provider"] != args.provider:
+                    raise ContractError("billing grant provider does not match")
+                authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+                payload = authority.owner_record_payload(project_id, record)
+                if args.signature is None:
+                    report = {
+                        "ready": True,
+                        "requires_signature": True,
+                        "record": record,
+                        "signing_payload_b64": base64.b64encode(payload).decode("ascii"),
+                    }
+                else:
+                    report = {
+                        "ready": True,
+                        **ledger.commit_owner_record(
+                            project_id,
+                            record=record,
+                            signature=args.signature.read_bytes(),
+                        ),
+                        "record": record,
+                    }
             finally:
                 _close_ledger(ledger)
         elif args.command == "learning-open-orchestration":
@@ -1483,6 +1567,11 @@ def main() -> int:
                         route=route,
                         parent_grant=_json_input(args.parent_grant),
                     )
+                    admitted = ledger.host_run_admission(
+                        project_id, observation["run_handle"]
+                    )
+                    if admitted["provider"] != route.get("provider", "codex"):
+                        raise ContractError("host run admission differs from its route")
                     trusted_now_ms = time.time_ns() // 1_000_000
                     committed = ledger.commit_host_result(
                         project_id,
@@ -2352,6 +2441,13 @@ def main() -> int:
             raise ContractError("unsupported command")
     except OSError:
         _print({"ready": False, "error": "filesystem operation failed"})
+        return 2
+    except AdmissionDenied as exc:
+        _print({
+            "ready": False,
+            "error": "provider admission denied",
+            "reason_code": exc.reason_code,
+        })
         return 2
     except ContractError:
         _print({"ready": False, "error": "input validation failed"})
