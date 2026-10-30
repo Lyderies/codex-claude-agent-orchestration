@@ -115,14 +115,17 @@ Keep the primary agent as the decision owner and final synthesizer.
    references, never raw prompts, output, secrets, or unrestricted tool data. Bounded
    mechanical or implementation work with executable QA prefers GPT-6 Luna/high;
    bounded deterministic verification does too. Exploration, diagnosis, planning,
-   cross-system synthesis, security, and judgment-heavy verification use GPT-6 Sol at
-   the policy-selected effort. Risk never raises model or effort. Astra is valid only
-   for an evidenced `end_to_end` operation with
+   cross-system synthesis, and judgment-heavy verification use GPT-6.1 Sol at the
+   policy-selected effort; security review uses GPT-6 Astra/high. Risk never raises
+   model or effort. Otherwise Astra is valid only for an evidenced `end_to_end`
+   operation with
    extreme complexity, high ambiguity, and cross-system context; its initial effort is
    medium. No claimed failure history causes model escalation. Project-bound
    escalation from verifier history remains unavailable until the router can resolve
    the references to actual independent verifier records. Eligible alternatives are
-   evaluation candidates, not permission to substitute them during live work.
+   evaluation candidates, not permission to substitute them during live work. Each
+   route names its `provider` and `dispatch`; spawn only `native` Codex routes, and
+   report a `bridge` route as blocked until the dispatch bridge exists.
    Stop after the configured attempts; do not retry by silently raising model, effort,
    permissions, tools, network, or spend.
 10. After each completed worker-verifier QA pair and before an intended pause, read the

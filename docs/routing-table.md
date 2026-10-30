@@ -75,3 +75,4 @@ These rows are cheap to test and could change soonest:
 | Date | Row | Change | Evidence |
 |---|---|---|---|
 | 2026-10-31 | All | Initial table, rebalanced towards Codex where quality is tied or unproven | Both research reports; owner review |
+| 2026-10-31 | Single scoped coding | Joint first choice becomes ordered: GPT-6.1 Sol (medium) first, Sonnet 5.5 (medium) second, until G4 adds headroom tie-breaking and paired evidence | G2 design review: headroom must not change a recorded route, so G2 routes by fixed order |

@@ -10,14 +10,15 @@ mappings may select workspace-write coding and verification agents within the ac
 parent grant. Use the primary agent as manager when one owner must preserve requirements
 and synthesize results.
 
-The accepted version 4 routing policy is:
+The accepted version 5 routing policy is:
 
 - GPT-6 Luna/high for reconnaissance, bounded mechanical or implementation work with
   deterministic or executable acceptance, and bounded deterministic verification;
-- GPT-6 Sol at medium or high for exploration, diagnosis, planning, cross-system
-  synthesis, architecture, security, and judgment-heavy independent verification;
-- Astra/medium only for evidenced end-to-end work that is extreme-complexity,
-  high-ambiguity, and cross-system; and
+- GPT-6.1 Sol at medium or high for exploration, diagnosis, planning, cross-system
+  synthesis, architecture, and judgment-heavy independent verification;
+- GPT-6 Astra/high for security review, through an explicit provider candidate;
+- Astra/medium for other work only when it is evidenced end-to-end work that is
+  extreme-complexity, high-ambiguity, and cross-system; and
 - GPT-5.6 Sol/high as the sole legacy fallback, available only through the trusted,
   finite, single-use receipt lifecycle after a native GPT-6 host rejection.
 
@@ -42,6 +43,21 @@ reference to an actual independent verifier record. Raw prompts, outputs, secret
 unrestricted tool data are never failure evidence. Escalation never grants more tools
 or authority.
 
-The validated 0.156.1 account catalog recognizes `low`, `medium`, `high`, `xhigh`, and
-`max` for active models, while initial routes use medium or high. Native routing
-excludes `none` and `ultra`.
+Version 5 also lists Claude models and roles and, for each family and route key, an
+ordered list of provider candidates. The first candidate that the committed project
+configuration allows is selected; if none is allowed, routing is denied rather than
+falling back. `.codex/orchestration/provider-routing.json` is optional. Without it,
+only Codex is enabled, so every route is Codex with `native` dispatch. A Codex primary
+reaches Claude only when that file sets `codex_primary_may_bridge_to_claude`. Each route
+records its `provider`, its `dispatch` (`native` or `bridge`) and the digest of the
+provider configuration it used. The verifier prefers the other provider, then the
+worker's own. A verification task that sets `verification_for_provider` to the worker's
+provider is routed by the same rule, so it matches the advertised verifier, including
+under the legacy fallback. Routing requires the project to be a Git repository: when
+the provider configuration is absent, defaults apply only if `HEAD` is unborn or does
+not track it, and any other Git outcome blocks routing.
+Learning candidates cannot move a route to another provider.
+
+The account catalog of the policy's `validated_client` recognizes `low`, `medium`,
+`high`, `xhigh`, and `max` for active models, while initial routes use medium or high.
+Native routing excludes `none` and `ultra`.

@@ -129,7 +129,8 @@
     "prohibited_actions": {"type": "array", "items": {"type": "string"}},
     "verification_for_family": {
       "enum": ["inventory", "research", "planning", "coding", "security"]
-    }
+    },
+    "verification_for_provider": {"enum": ["codex", "claude"]}
   },
   "allOf": [
     {
@@ -148,6 +149,10 @@
     },
     {
       "if": {"required": ["verification_for_family"]},
+      "then": {"properties": {"family": {"const": "verification"}}}
+    },
+    {
+      "if": {"required": ["verification_for_provider"]},
       "then": {"properties": {"family": {"const": "verification"}}}
     },
     {

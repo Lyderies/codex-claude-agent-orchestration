@@ -16,7 +16,7 @@
     "event_code": {"enum": ["session_started", "session_ended", "turn_started", "turn_stop_observed", "turn_completed", "turn_failed", "turn_interrupted", "subagent_started", "subagent_stop_observed", "tool_started", "tool_output_observed", "item_completed", "model_rerouted", "usage_snapshot", "hook_completed", "no_progress", "retry", "repair", "escalation"]},
     "model": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
     "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra", null]},
-    "role": {"enum": ["codex_agents_researcher", "codex_agents_planner", "codex_agents_implementation_worker", "codex_agents_security_reviewer", "codex_agents_verification_worker", null]},
+    "role": {"enum": ["codex_agents_researcher", "codex_agents_planner", "codex_agents_implementation_worker", "codex_agents_security_reviewer", "codex_agents_verification_worker", "claude_agents_researcher", "claude_agents_planner", "claude_agents_implementation_worker", "claude_agents_security_reviewer", "claude_agents_verification_worker", null]},
     "task_family": {"enum": ["inventory", "research", "planning", "coding", "security", "verification", null]},
     "task_slice": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
     "topology": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
