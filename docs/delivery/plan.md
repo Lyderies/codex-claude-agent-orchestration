@@ -1,7 +1,8 @@
 # Delivery plan: cross-provider agent orchestration
 
-- **Status:** draft for owner review. Nothing below is accepted until the owner approves it.
-- **Updated:** 2026-10-30.
+- **Status:** in execution since the owner started it on 2026-10-31. Scope changes since then
+  are listed under "Decisions and open questions".
+- **Updated:** 2026-10-31.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
   sub-tasks to Codex or Claude child agents.
 
@@ -145,8 +146,7 @@ Effort is an estimate in focused working sessions.
   - Claude agent definitions discoverable for project mapping.
 - **Task-based starting table** from [routing-table.md](../routing-table.md), labelled as hypotheses.
   Where two options are expected to be comparable, the table prefers the one expected to use
-  less allowance. That expectation is also a hypothesis until G4 measures it. A paired-run
-  mode can be requested explicitly.
+  less allowance. That expectation is also a hypothesis until G4 measures it.
 - **Current models:** the policy moves from the earlier GPT-6 Sol to GPT-6.1 Sol and validates
   against the current Codex client.
 - **Dispatch bridge** built from the already-tested launch code:
@@ -168,8 +168,6 @@ Effort is an estimate in focused working sessions.
   - Codex: the percentage of each usage window used, before and after the run.
   - Claude: tokens, model, and the rate-limit status, type and reset time.
 - **Signal-based limits:**
-  - Comparison runs pause when Codex passes about 70% of a window, or Claude issues any
-    warning.
   - New children stop for that provider above about 90% for Codex, or on a rejection, until
     the reset time.
   - A per-window run count is a backstop, mainly for Claude.
@@ -222,7 +220,8 @@ code review and verification. That applies both in this repository and in the pi
 
 **Features** (built on the existing learning loop)
 
-- **Paired runs** on a budgeted sample of real read-only tasks.
+- **Paired runs** on a budgeted sample of real read-only tasks, requested explicitly. Comparison
+  runs pause when Codex passes about 70% of a window, or Claude issues any warning.
 - **Frozen evaluation set:** a small held-out set per task family, with matched settings.
 - **Separate tiers:** the three evidence tiers are stored and reported separately.
 - **Backtest:** replay recorded runs against a candidate preference table.
@@ -300,6 +299,10 @@ tests, and a changelog of every change with its evidence.
 - **Usage limits (decided approach; thresholds checked in G2):** limits follow live usage
   signals rather than fixed run counts (see G2). If a provider reports no signal, its headroom
   is treated as unknown and handled cautiously.
+- **Paired-run mode moved from G2 to G4 (2026-10-31):** a gap audit of G2 found it unbuilt. G2's
+  exit does not need it, and G4 already owns paired runs, so the explicit paired mode and the
+  comparison-run pause it governs now ship with G4. Until then, paired tests are run by hand and
+  logged as before.
 - **Cost (researched in G4):** the owner expects Codex to use noticeably less allowance than
   Claude for comparable work. Quality stays the first rule; cost decides only between options
   of equivalent quality, once it is measured.
