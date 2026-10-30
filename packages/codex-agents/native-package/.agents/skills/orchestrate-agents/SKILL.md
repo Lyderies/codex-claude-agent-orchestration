@@ -60,11 +60,14 @@ Keep the primary agent as the decision owner and final synthesizer.
    explicitly mapped coding or verification agent may use `workspace-write` only when
    the validated project definition and active parent grant both permit it. Other mapped
    roles remain read-only. Send every completed change to independent verification.
-6. Before spawning, call `learning-open-host-run` with the exact task, route, assignment,
-   parent grant, project root, and orchestration handle. Do not spawn if this command
-   fails. It also runs provider admission; a denial returns a `reason_code`. Report it
-   to the owner instead of retrying: refresh `provider-observe` only for a missing or
-   stale identity, and never set a provider API key to get past it. Spawn the returned agent type, model, and effort with `fork_turns` set to `none` when the
+6. Before each open, run `cli.py provider-observe --project-root <exact-root>
+   --provider <route provider>`. Then call `learning-open-host-run` with the exact task,
+   route, assignment, parent grant, project root, and orchestration handle. Do not
+   spawn if this command fails. It runs provider admission; a denial returns a
+   `reason_code`. Report it to the owner instead of retrying, and never set a provider
+   API key to get past it. For a `dispatch: bridge` route, do not spawn: run
+   `cli.py dispatch` once with the same task, route, assignment and parent grant and the
+   exact `--run-handle`, then continue at step 8 with its `result`. Spawn the returned agent type, model, and effort with `fork_turns` set to `none` when the
    bounded assignment contains all required context; otherwise use the smallest recent
    turn count that is sufficient. Pass paths and concise facts instead of duplicating
    source contents. Do not let a child widen its authority or treat its own output as
@@ -126,11 +129,11 @@ Keep the primary agent as the decision owner and final synthesizer.
    escalation from verifier history remains unavailable until the router can resolve
    the references to actual independent verifier records. Eligible alternatives are
    evaluation candidates, not permission to substitute them during live work. Each
-   route names its `provider` and `dispatch`; spawn only `native` routes. For a `bridge`
-   route, open the host run as usual and then run `dispatch` once with its run handle
-   instead of spawning. Validate and record the returned `result`; when
-   `bridge_report.terminal_state` is set, pass it as the observation's `terminal_state`.
-   Never dispatch the same run handle twice or retry a fenced outcome.
+   route names its `provider` and `dispatch`; spawn only `native` routes. For a bridged
+   result, `bridge_report.terminal_state`, when set, is the authoritative host terminal
+   fact: pass it as the observation's `terminal_state`. Treat `reviewed: false` as an
+   unverified result. Never dispatch the same run handle twice or retry a fenced
+   outcome.
    Stop after the configured attempts; do not retry by silently raising model, effort,
    permissions, tools, network, or spend.
 10. After each completed worker-verifier QA pair and before an intended pause, read the

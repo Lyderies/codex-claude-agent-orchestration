@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -79,6 +80,13 @@ from codex_agents.learning_store import (  # noqa: E402
     ensure_collector,
     require_authorized_collector_runtime,
     validate_collector_runtime,
+)
+from codex_agents.hosts import (  # noqa: E402
+    CLAUDE_HOST_CLIENT,
+    CODEX_HOST_CLIENT,
+    HOST_CLIENTS,
+    HostClientUnknown,
+    resolve_host_client,
 )
 from codex_agents.providers import (  # noqa: E402
     AdmissionDenied,
@@ -281,24 +289,37 @@ def _validated_assignment(args: argparse.Namespace) -> dict:
     )
 
 
-TRUSTED_HOST_CLIENT = "codex-host-v1"
 # Bridged children run under their own ledger client, which declares the
 # client-observed usage the bridge reports.
 BRIDGE_CLIENT = "bridge-v1"
-# The primary provider follows the trusted host client and never the task. A
-# Claude host client adds its own entry here.
-HOST_CLIENT_PRIMARY_PROVIDERS = {"codex-host-v1": "codex"}
+# The primary provider follows the detected host client and never the task.
+HOST_CLIENT_PRIMARY_PROVIDERS = {
+    CODEX_HOST_CLIENT: "codex",
+    CLAUDE_HOST_CLIENT: "claude",
+}
+# Set from --host-client; it must agree with the detected host.
+_EXPLICIT_HOST_CLIENT: str | None = None
 
 
-def _host_primary_provider(client: str = TRUSTED_HOST_CLIENT) -> str:
-    provider = HOST_CLIENT_PRIMARY_PROVIDERS.get(client)
+def _host_client() -> str:
+    """The host driving this lifecycle step, from its environment markers.
+
+    The markers only catch accidental misuse; see codex_agents.hosts for the
+    trust model. Admission, the bridge flag and the sandbox are the gates.
+    """
+
+    return resolve_host_client(os.environ, _EXPLICIT_HOST_CLIENT)
+
+
+def _host_primary_provider(client: str | None = None) -> str:
+    provider = HOST_CLIENT_PRIMARY_PROVIDERS.get(client or _host_client())
     if provider is None:
         raise ContractError("host client has no trusted primary provider")
     return provider
 
 
 def _host_client_for(route: dict) -> str:
-    return BRIDGE_CLIENT if route.get("dispatch") == "bridge" else TRUSTED_HOST_CLIENT
+    return BRIDGE_CLIENT if route.get("dispatch") == "bridge" else _host_client()
 
 
 def _trusted_host_route(
@@ -357,7 +378,7 @@ def _trusted_host_route(
         receipt_id=fallback_receipt,
         task=task,
         primary_route=primary_route,
-        client_version=TRUSTED_HOST_CLIENT,
+        client_version=_host_client(),
     )
     route = _route_task_legacy_fallback(
         task,
@@ -410,9 +431,7 @@ def main() -> int:
         "learning-route", help="route one task with approved learning lifecycle state"
     )
     learning_route.add_argument("--task", required=True)
-    learning_route.add_argument(
-        "--client-version", default=TRUSTED_HOST_CLIENT
-    )
+    learning_route.add_argument("--client-version")
     learning_route.add_argument(
         "--fallback-from-run-handle",
         help="abandoned primary host run proving model unavailability",
@@ -915,7 +934,15 @@ def main() -> int:
     learning_attach_signature.add_argument("--request", required=True)
     learning_attach_signature.add_argument("--signature", required=True, type=Path)
 
+    for subparser in subparsers.choices.values():
+        subparser.add_argument(
+            "--host-client",
+            choices=HOST_CLIENTS,
+            help="expected host client; refused unless it matches the detected host",
+        )
     args = parser.parse_args()
+    global _EXPLICIT_HOST_CLIENT
+    _EXPLICIT_HOST_CLIENT = args.host_client
     try:
         if args.command == "validate":
             report = validate_package(args.root)
@@ -941,7 +968,7 @@ def main() -> int:
             clients = load_client_capabilities(
                 ORCHESTRATION_ROOT / "config" / "learning-clients.json"
             )
-            client_version = args.client_version
+            client_version = args.client_version or _host_client()
             if client_version not in clients:
                 raise ContractError(
                     "client version is not in the validated capability matrix"
@@ -956,7 +983,7 @@ def main() -> int:
                     trusted_routing_evidence_refs=trusted,
                     primary_provider=_host_primary_provider(),
                 )
-                if client_version == TRUSTED_HOST_CLIENT:
+                if args.client_version is None:
                     # A bridged route runs under the bridge client, as the host
                     # lifecycle will when it opens the run.
                     client_version = _host_client_for(base_route)
@@ -1357,6 +1384,15 @@ def main() -> int:
                         orchestration_handle=args.orchestration_handle,
                         fallback_receipt=args.fallback_receipt,
                     ),
+                    # Native children of either provider run with the parent
+                    # session's permissions, so only a bridged Claude child's
+                    # reads are contained.
+                    "read_containment": (
+                        "enforced"
+                        if route.get("dispatch") == "bridge"
+                        and route.get("provider") == "claude"
+                        else "advisory"
+                    ),
                 }
             finally:
                 _close_ledger(ledger)
@@ -1442,7 +1478,7 @@ def main() -> int:
                 report = {
                     "ready": True,
                     **ledger.open_orchestration(
-                        project_id, client_version=TRUSTED_HOST_CLIENT
+                        project_id, client_version=_host_client()
                     ),
                 }
             finally:
@@ -1580,7 +1616,7 @@ def main() -> int:
             )
             trusted_host = "run_handle" in observation
             client_version = (
-                TRUSTED_HOST_CLIENT if trusted_host else observation.get("client_version")
+                _host_client() if trusted_host else observation.get("client_version")
             )
             if client_version not in clients:
                 raise ContractError("client version is not in the validated capability matrix")
@@ -2482,6 +2518,13 @@ def main() -> int:
             raise ContractError("unsupported command")
     except OSError:
         _print({"ready": False, "error": "filesystem operation failed"})
+        return 2
+    except HostClientUnknown:
+        _print({
+            "ready": False,
+            "error": "host client is unknown",
+            "reason_code": "host_client_unknown",
+        })
         return 2
     except BridgeRefused as exc:
         # Refusal messages are fixed strings; they never carry prompts or paths.

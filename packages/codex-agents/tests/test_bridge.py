@@ -114,13 +114,13 @@ class BridgeTestCase(unittest.TestCase):
         git(self.project, "commit", "-qm", "project")
         self.bundle = base / "bundle"
         shutil.copytree(ORCHESTRATION_ROOT.parent.parent, self.bundle)
-        agent = self.bundle / ".claude/agents/claude_agents_researcher.md"
-        agent.parent.mkdir(parents=True)
-        agent.write_text(
-            (FIXTURES_ROOT / "claude/claude_agents_researcher.md")
-            .read_text()
-            .replace("\n---\n", "\nmaxTurns: 8\n---\n", 1)
-        )
+        (self.bundle / ".claude/agents").mkdir(parents=True)
+        for name in ("claude_agents_researcher", "claude_agents_implementation_worker"):
+            (self.bundle / f".claude/agents/{name}.md").write_text(
+                (FIXTURES_ROOT / f"claude/{name}.md")
+                .read_text()
+                .replace("\n---\n", "\nmaxTurns: 8\n---\n", 1)
+            )
         self.tools = base / "tools"
         fake_provider_tools(self.tools)
         # Exports go to a dedicated directory, and the host's own managed
@@ -264,6 +264,26 @@ class BridgeTestCase(unittest.TestCase):
 
     def workspace_entries(self) -> list[Path]:
         return list(self.dispatch_parent.iterdir())
+
+
+class CliTestCase(BridgeTestCase):
+    def cli(self, command: str, *arguments: str, expected: int = 0) -> dict:
+        stdout = io.StringIO()
+        argv = [
+            "cli.py", command, "--state-root", str(self.state.root),
+            "--project-root", str(self.project), *arguments,
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            cli, "BUNDLE_ROOT", self.bundle
+        ), contextlib.redirect_stdout(stdout):
+            code = cli.main()
+        self.assertEqual(expected, code, stdout.getvalue())
+        return json.loads(stdout.getvalue())
+
+    def write(self, name: str, value: object) -> str:
+        path = Path(self.temporary.name) / name
+        path.write_text(json.dumps(value))
+        return str(path)
 
 
 class ClaudeBridgeTests(BridgeTestCase):
@@ -841,25 +861,7 @@ class CodexBridgeTests(BridgeTestCase):
         self.assertEqual("failed", output["result"]["execution_state"])
 
 
-class BridgeLifecycleTests(BridgeTestCase):
-    def cli(self, command: str, *arguments: str, expected: int = 0) -> dict:
-        stdout = io.StringIO()
-        argv = [
-            "cli.py", command, "--state-root", str(self.state.root),
-            "--project-root", str(self.project), *arguments,
-        ]
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(
-            cli, "BUNDLE_ROOT", self.bundle
-        ), contextlib.redirect_stdout(stdout):
-            code = cli.main()
-        self.assertEqual(expected, code, stdout.getvalue())
-        return json.loads(stdout.getvalue())
-
-    def write(self, name: str, value: object) -> str:
-        path = Path(self.temporary.name) / name
-        path.write_text(json.dumps(value))
-        return str(path)
-
+class BridgeLifecycleTests(CliTestCase):
     def test_claude_open_dispatch_validate_and_record_through_the_cli(self) -> None:
         config = self.project / ".codex/orchestration/provider-routing.json"
         config.parent.mkdir(parents=True)
@@ -967,6 +969,163 @@ class BridgeLifecycleTests(BridgeTestCase):
         )
         self.assertEqual("timed_out", committed["outcome"]["execution_state"])
         self.assertFalse(committed["outcome"]["accepted"])
+
+
+
+CLAUDE_HOST = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-session"}
+
+
+class ClaudePrimaryTests(CliTestCase):
+    """A Claude Code primary: native Claude children and bridged Codex children."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        host = mock.patch.dict(os.environ, CLAUDE_HOST)
+        host.start()
+        self.addCleanup(host.stop)
+        for name in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_SANDBOX"):
+            os.environ.pop(name, None)
+        config = self.project / ".codex/orchestration/provider-routing.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({
+            "version": 1,
+            "providers": {"codex": {"enabled": True}, "claude": {"enabled": True}},
+            "codex_primary_may_bridge_to_claude": False,
+        }))
+        git(self.project, "add", ".")
+        git(self.project, "commit", "-qm", "provider configuration")
+        # The CLI takes the ledger for maintenance, so the test holds none open.
+        self.ledger.close()
+
+    def admit(self, provider: str) -> str:
+        self.ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            return super().admit(provider)
+        finally:
+            self.ledger.close()
+
+    def coding_task(self, **shape) -> dict:
+        return {**self.task(), "family": "coding", **shape}
+
+    def exploratory(self) -> dict:
+        return self.coding_task(**routing_fields(
+            operation="exploration", acceptance_strength="independent_judgment"
+        ))
+
+    def bounded(self) -> dict:
+        return self.coding_task(
+            **routing_fields(operation="implementation", acceptance_strength="executable"),
+            deterministic_validation=True,
+        )
+
+    def lifecycle_inputs(self, task: dict) -> tuple[dict, dict, tuple[str, ...], str]:
+        task_path = self.write("task.json", task)
+        route = self.cli("learning-route", "--task", task_path)
+        assigned = self.assignment_for(route)
+        context = (
+            "--task", task_path,
+            "--assignment", self.write("assignment.json", assigned),
+            "--parent-grant", self.write("grant.json", PARENT_GRANT),
+        )
+        return route, assigned, context, self.write("route.json", route)
+
+    def record(self, context: tuple[str, ...], handle: str, result_value: dict,
+               terminal_state: str | None = None) -> dict:
+        observation = {
+            "run_handle": handle,
+            "result_attempts": [
+                {"status": "accepted", "reason_code": None, "receipt_id": None}
+            ],
+        }
+        if terminal_state is not None:
+            observation["terminal_state"] = terminal_state
+        result_path = self.write("result.json", result_value)
+        self.cli("validate-result", *context, "--result", result_path)
+        return self.cli(
+            "learning-record-host-result", *context, "--result", result_path,
+            "--observation", self.write("observation.json", observation),
+        )
+
+    def test_routes_follow_the_claude_primary(self) -> None:
+        exploratory = self.cli("learning-route", "--task", self.write("e.json", self.exploratory()))
+        self.assertEqual(
+            ("claude", "native", "claude-opus-5-5", "medium",
+             "claude_agents_implementation_worker"),
+            (exploratory["provider"], exploratory["dispatch"], exploratory["model"],
+             exploratory["effort"], exploratory["agent_type"]),
+        )
+        bounded = self.cli("learning-route", "--task", self.write("b.json", self.bounded()))
+        self.assertEqual(
+            ("codex", "bridge", "gpt-6-luna", "high"),
+            (bounded["provider"], bounded["dispatch"], bounded["model"], bounded["effort"]),
+        )
+        refused = self.cli(
+            "learning-route", "--task", self.write("e.json", self.exploratory()),
+            "--host-client", "codex-host-v1", expected=2,
+        )
+        self.assertEqual("host_client_unknown", refused["reason_code"])
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "also-codex"}):
+            both = self.cli(
+                "learning-route", "--task", self.write("e.json", self.exploratory()),
+                expected=2,
+            )
+        self.assertEqual("host_client_unknown", both["reason_code"])
+
+    def test_native_claude_child_lifecycle_binds_its_agent_id(self) -> None:
+        self.admit("claude")
+        route, _, context, route_path = self.lifecycle_inputs(self.exploratory())
+        orchestration = self.cli("learning-open-orchestration")
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration["orchestration_handle"],
+        )
+        self.assertEqual("advisory", opened["read_containment"])
+        for agent_id in ("not an id", "x" * 129, "../a"):
+            with self.subTest(agent_id=agent_id):
+                rejected = self.cli(
+                    "learning-bind-host-agent", "--run-handle", opened["run_handle"],
+                    "--agent-id", agent_id, expected=2,
+                )
+                self.assertIn("identifier is invalid", rejected["error"])
+        bound = self.cli(
+            "learning-bind-host-agent", "--run-handle", opened["run_handle"],
+            "--agent-id", "a73de21371ae8b7ab",
+        )
+        self.assertTrue(bound["bound"])
+        recorded = self.record(context, opened["run_handle"], result())
+        self.assertEqual(
+            ("claude-opus-5-5", "claude_agents_implementation_worker"),
+            (recorded["outcome"]["model"], recorded["outcome"]["role"]),
+        )
+
+    def test_bridged_codex_child_lifecycle_through_the_cli(self) -> None:
+        self.admit("codex")
+        route, _, context, route_path = self.lifecycle_inputs(self.bounded())
+        self.assertEqual("bridge", route["dispatch"])
+        orchestration = self.cli("learning-open-orchestration")
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration["orchestration_handle"],
+        )
+        self.assertEqual("advisory", opened["read_containment"])
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 3}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        dispatched = self.cli(
+            "dispatch", *context, "--route", route_path,
+            "--run-handle", opened["run_handle"],
+        )
+        self.assertEqual(
+            ("result", "advisory"),
+            (dispatched["bridge_report"]["outcome"],
+             dispatched["bridge_report"]["read_containment"]),
+        )
+        recorded = self.record(
+            context, opened["run_handle"], dispatched["result"],
+            dispatched["bridge_report"]["terminal_state"],
+        )
+        self.assertEqual("gpt-6-luna", recorded["outcome"]["model"])
 
 
 if __name__ == "__main__":

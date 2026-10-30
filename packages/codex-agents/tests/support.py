@@ -25,3 +25,11 @@ MACOS_SANDBOX_ONLY = unittest.skipUnless(
 # never inherit one from the developer's shell.
 for _name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
     os.environ.pop(_name, None)
+
+# The lifecycle detects its host from environment markers. These tests drive it
+# as a Codex host unless a test sets the Claude markers itself, so they never
+# depend on the shell that runs them.
+for _name in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_SANDBOX"):
+    os.environ.pop(_name, None)
+os.environ["CODEX_THREAD_ID"] = "tests-thread"
+os.environ["CODEX_SESSION_ID"] = "tests-session"

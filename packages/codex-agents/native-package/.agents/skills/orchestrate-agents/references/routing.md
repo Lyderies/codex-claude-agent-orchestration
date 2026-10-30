@@ -62,6 +62,18 @@ The account catalog of the policy's `validated_client` recognizes `low`, `medium
 `high`, `xhigh`, and `max` for active models, while initial routes use medium or high.
 Native routing excludes `none` and `ultra`.
 
+## Host client
+
+The lifecycle detects its primary from the host's environment: Codex shells set
+`CODEX_THREAD_ID` or `CODEX_SESSION_ID`, and Claude Code sets `CLAUDECODE=1` with
+`CLAUDE_CODE_SESSION_ID`. Codex markers without `CLAUDECODE` mean `codex-host-v1` (a
+Codex primary); Claude markers without Codex thread markers mean `claude-host-v1` (a
+Claude primary). Both or neither refuse with `host_client_unknown`, and an explicit
+`--host-client` must match. The markers only catch accidental misuse; they are not
+proof of identity. Admission, the bridge flag and the read-only sandbox are the
+authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
+installed with this package.
+
 ## Provider admission
 
 `learning-open-host-run` admits a run for its route's provider before opening it, and a

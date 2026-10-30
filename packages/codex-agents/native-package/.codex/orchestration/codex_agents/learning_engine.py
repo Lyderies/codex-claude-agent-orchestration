@@ -160,7 +160,10 @@ def _source_managed_paths(root: Path) -> list[str]:
     """List only package-owned source roots and reject every symlink."""
 
     paths: list[str] = []
-    for package_root in (root / ".agents", root / ".codex"):
+    claude_skill = root / CLAUDE_ORCHESTRATION_SKILL
+    for package_root in (root / ".agents", root / ".codex", claude_skill):
+        if package_root == claude_skill and not os.path.lexists(package_root):
+            continue
         if package_root.is_symlink() or not package_root.is_dir():
             raise ContractError("installed package root is unavailable")
         for current, directories, files in os.walk(package_root, followlinks=False):
@@ -186,6 +189,16 @@ def _source_managed_paths(root: Path) -> list[str]:
     return sorted(paths)
 
 
+# The one path under .claude that this package installs.
+CLAUDE_ORCHESTRATION_SKILL = ".claude/skills/agent-orchestration"
+
+
+def _read_package_bytes(root: Path, relative: str) -> bytes:
+    if relative.startswith(CLAUDE_ORCHESTRATION_SKILL + "/"):
+        return _read_managed_bytes(root, relative, allowed_roots=frozenset({".claude"}))
+    return _read_managed_bytes(root, relative)
+
+
 def _installed_managed_files(root: Path) -> tuple[list[str], dict[str, bytes]]:
     manifest_relative = ".codex/orchestration/install-manifest.json"
     manifest_path = root / manifest_relative
@@ -193,7 +206,7 @@ def _installed_managed_files(root: Path) -> tuple[list[str], dict[str, bytes]]:
         raise ContractError("installed package manifest is invalid")
     if not manifest_path.exists():
         paths = _source_managed_paths(root)
-        return paths, {path: _read_managed_bytes(root, path) for path in paths}
+        return paths, {path: _read_package_bytes(root, path) for path in paths}
     manifest_raw = _read_managed_bytes(root, manifest_relative)
     try:
         manifest = json.loads(manifest_raw)
@@ -218,7 +231,7 @@ def _installed_managed_files(root: Path) -> tuple[list[str], dict[str, bytes]]:
             or len(expected) != 64
         ):
             raise ContractError("installed package manifest is invalid")
-        content = _read_managed_bytes(root, relative)
+        content = _read_package_bytes(root, relative)
         if (
             Path(relative).name != "learning-releases.json"
             and hashlib.sha256(content).hexdigest() != expected

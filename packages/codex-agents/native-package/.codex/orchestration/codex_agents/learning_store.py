@@ -2592,6 +2592,12 @@ class LearningLedger:
             r"hrn_[0-9a-f]{48}", run_handle
         ):
             raise LedgerError("host run handle is invalid")
+        # Native agent IDs are opaque tokens: Codex IDs, Claude Code Agent tool
+        # IDs (short hex) and bridge run IDs all fit this bounded form.
+        if not isinstance(agent_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", agent_id
+        ):
+            raise LedgerError("native agent identifier is invalid")
         native_assignment_id = external_id(
             self.state.digest_key(), "asg", agent_id
         )
