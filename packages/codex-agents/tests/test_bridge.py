@@ -743,6 +743,41 @@ class SecurityReviewFixTests(BridgeTestCase):
             self.open(route, self.assignment_for(route))
         self.assertEqual("paid_usage_usable", raised.exception.reason_code)
 
+    def test_an_invalid_in_run_event_keeps_the_restrictions_before_it(self) -> None:
+        route, assigned, handle = self.claude_run()
+        warning = {**RATE_LIMIT, "uuid": "rate-2", "rate_limit_info": {
+            **RATE_LIMIT["rate_limit_info"], "status": "allowed_warning",
+        }}
+        self.frames("claude", [
+            init_frame(), warning, {"type": "rate_limit_event", "rate_limit_info": None},
+            {"sleep": 30}, result_frame(),
+        ])
+        output = self.dispatch(route, assigned, handle)
+        self.assertEqual("rate_limit_event_invalid", output["bridge_report"]["outcome"])
+        with self.ledger.repository(self.project_id) as repository:
+            run_id = repository.records("dispatch_intent")[-1]["run_id"]
+            kept = [record["status"] for record in repository.records("provider_headroom")
+                    if record["run_id"] == run_id]
+        self.assertEqual(["allowed_warning"], kept)
+
+    def test_a_late_claude_dispatch_needs_fresh_billing(self) -> None:
+        route, assigned, handle = self.claude_run()
+        later = time.time_ns() // 1_000_000 + 31 * 60 * 1000
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=later):
+            self.frames("claude", [init_frame(), RATE_LIMIT, result_frame()])
+            with self.assertRaisesRegex(BridgeRefused, "launch denied: billing_unverified"):
+                self.dispatch(route, assigned, handle)
+            self.assertFalse([i for i in self.invocations("claude") if "-p" in i["argv"]])
+            self.frames("claude", [
+                init_frame(model="claude-haiku-5-5", tools=[]), RATE_LIMIT, result_frame("OK"),
+            ])
+            self.assertEqual("launched", self.ledger.observe_claude_billing(
+                self.project_id, project_root=self.tools, environ=CLEAN,
+            )["probe"])
+            self.frames("claude", [init_frame(), RATE_LIMIT, result_frame()])
+            output = self.dispatch(route, assigned, handle)
+        self.assertEqual("result", output["bridge_report"]["outcome"])
+
     def test_only_granted_paths_are_exported(self) -> None:
         def paths(context: list[str], filesystem: list[str]) -> list[str]:
             return bridge.assignment_read_paths({
@@ -1777,6 +1812,63 @@ class ClaudeHostReviewTests(ClaudePrimaryCase):
             (billing["record_type"], billing["is_using_overage"], billing["paid_usage_usable"]),
         )
         self.assertEqual("paid_usage_usable", self.open_native(expected=2)["reason_code"])
+
+    def test_a_failed_probe_keeps_the_restrictions_it_saw(self) -> None:
+        malformed = {"type": "rate_limit_event", "rate_limit_info": {"status": "bogus"}}
+        missing = {"type": "rate_limit_event"}
+        cases = {
+            "malformed": [PROBE_INIT, OVERAGE, malformed, result_frame("OK")],
+            "missing": [PROBE_INIT, OVERAGE, missing, result_frame("OK")],
+            "overflow": [PROBE_INIT, OVERAGE,
+                         *[FAVOURABLE] * (bridge.MAX_PROBE_EVENTS + 5), result_frame("OK")],
+            "timeout": [PROBE_INIT, OVERAGE, {"sleep": 30}, result_frame("OK")],
+        }
+        for name, frames in cases.items():
+            with self.subTest(case=name):
+                self.fresh_account()
+                # A clean reading from earlier would otherwise admit runs.
+                with self.stale_evidence():
+                    self.assertEqual("launched", self.probe(FAVOURABLE)["probe"])
+                    self.assertIn("run_handle", self.open_native())
+                    self.frames("claude", frames)
+                    with mock.patch.object(bridge, "PROBE_DEADLINE_SECONDS", 1):
+                        failed = self.cli(
+                            "provider-observe", "--provider", "claude", "--billing-probe",
+                            expected=2,
+                        )
+                self.assertIn("billing probe", failed["reason"])
+                self.assertEqual(
+                    "paid_usage_usable", self.open_native(expected=2)["reason_code"]
+                )
+        # A probe whose events are all invalid stores nothing and still fails.
+        self.fresh_account()
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                before = len(repository.records("provider_billing"))
+        finally:
+            ledger.close()
+        self.frames("claude", [PROBE_INIT, malformed, result_frame("OK")])
+        failed = self.cli(
+            "provider-observe", "--provider", "claude", "--billing-probe", expected=2
+        )
+        self.assertIn("no valid rate-limit event", failed["reason"])
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            with ledger.repository(self.project_id) as repository:
+                self.assertEqual(before, len(repository.records("provider_billing")))
+        finally:
+            ledger.close()
+
+    def fresh_account(self) -> None:
+        """Switch the fake client to a new account and attest it in this project."""
+
+        status_path = self.tools / "claude-status.json"
+        status = json.loads(status_path.read_text())
+        self.accounts = getattr(self, "accounts", 0) + 1
+        status["email"] = f"fixture-account-{self.accounts}@example.invalid"
+        status_path.write_text(json.dumps(status))
+        self.admit("claude")
 
     def test_a_probe_reserves_its_account_for_five_minutes(self) -> None:
         self.admit("claude")

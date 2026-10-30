@@ -909,8 +909,12 @@ PROBE_DEADLINE_SECONDS = 120
 MAX_PROBE_EVENTS = 64
 
 
-def claude_billing_probe(environ: Mapping[str, str]) -> list[Any]:
-    """Run one minimal locked Claude turn and return every rate_limit_info it reports.
+def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | None]:
+    """Run one minimal locked Claude turn; return every rate_limit_info it reported
+    and why it failed, if it did.
+
+    The events seen are returned even when the probe aborts or times out, so
+    the ledger never loses a restriction the probe already received.
 
     It uses a little subscription allowance but is never metered: it refuses an
     API-key or alternate-backend environment, runs Haiku at low effort with no
@@ -964,9 +968,10 @@ def claude_billing_probe(environ: Mapping[str, str]) -> list[Any]:
                 state["init"] = True
             elif frame.get("type") == "rate_limit_event":
                 # Every event is kept; the ledger merges them conservatively.
+                # The event that reaches the cap is kept before the probe stops.
+                state["infos"].append(frame.get("rate_limit_info"))
                 if len(state["infos"]) >= MAX_PROBE_EVENTS:
                     raise _Abort("too_many_rate_limit_events")
-                state["infos"].append(frame.get("rate_limit_info"))
 
         outcome = run_child(
             arguments,
@@ -977,11 +982,7 @@ def claude_billing_probe(environ: Mapping[str, str]) -> list[Any]:
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
-    if outcome["abort"] is not None:
-        raise BridgeRefused(f"billing probe failed: {outcome['abort']}")
-    if not state["infos"]:
-        raise BridgeRefused("billing probe reported no rate-limit event")
-    return state["infos"]
+    return state["infos"], outcome["abort"]
 
 
 def dispatch(

@@ -68,7 +68,10 @@ Keep the primary agent as the decision owner and final synthesizer.
    `reason_code`. Report it to the owner instead of retrying, and never set a provider
    API key to get past it. For a `dispatch: bridge` route, do not spawn: run
    `cli.py dispatch` once with the same task, route, assignment and parent grant and the
-   exact `--run-handle`, then continue at step 8 with its `result`. Spawn the returned agent type, model, and effort with `fork_turns` set to `none` when the
+   exact `--run-handle`, then continue at step 8 with its `result`. A refusal before
+   launch (`launch denied: <reason_code>`) writes no dispatch; for a Claude route refused
+   `billing_unverified` (billing over 30 minutes old), run the billing probe and
+   dispatch the same handle again. Spawn the returned agent type, model, and effort with `fork_turns` set to `none` when the
    bounded assignment contains all required context; otherwise use the smallest recent
    turn count that is sufficient. Pass paths and concise facts instead of duplicating
    source contents. Do not let a child widen its authority or treat its own output as

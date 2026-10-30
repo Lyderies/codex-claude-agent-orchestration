@@ -125,13 +125,13 @@ PRODUCER_AUTHORITY = {
     },
     "lifecycle": {"promotion"},
 }
-# Only ledger methods that run the observation themselves may write these.
-# Billing evidence younger than this is reused instead of probing again.
 # Runs opened with this client are bridged: only `dispatch` may run their child.
 BRIDGE_CLIENT_VERSION = "bridge-v1"
+# Billing evidence younger than this is reused instead of probing again.
 PROBE_REUSE_SECONDS = 300
 # A launched probe reserves its account for this long, whatever it returned.
 PROBE_COOLDOWN_SECONDS = 300
+# Only ledger methods that run the observation themselves may write these.
 PROVIDER_OBSERVATION_TYPES = {
     "provider_identity", "provider_headroom", "provider_billing",
     "observation_unavailable", "provider_usage",
@@ -3862,6 +3862,7 @@ class LearningLedger:
             reason = evaluate_launch(
                 provider=provider, identity=identity, billing=billing,
                 headroom=headroom, now_ms=timestamp,
+                bootstrap=admission["admission_basis"] == "bootstrap",
             )
             if reason is not None:
                 denied = {
@@ -3938,7 +3939,7 @@ class LearningLedger:
         it reports is kept as one conservative merge.
         """
 
-        from .bridge import claude_billing_probe
+        from .bridge import BridgeRefused, claude_billing_probe
         from .claude_host import ClaudeHostDenied, check_backend
         from .providers import AdmissionDenied, claude_rate_limit_records
 
@@ -4018,26 +4019,44 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        infos = claude_billing_probe(environ)
+        infos, failure = claude_billing_probe(environ)
         observed = self._clock_ms()
         headroom: list[dict[str, Any]] = []
         billing_records: list[dict[str, Any]] = []
+        invalid = 0
         for info in infos:
-            event_headroom, event_billing = claude_rate_limit_records(
-                info, account_fingerprint=fingerprint, observed_at_ms=observed
-            )
+            # Each event is parsed on its own, so one bad event never discards
+            # the restrictions the others carry.
+            try:
+                event_headroom, event_billing = claude_rate_limit_records(
+                    info, account_fingerprint=fingerprint, observed_at_ms=observed
+                )
+            except ContractError:
+                invalid += 1
+                continue
             headroom.append(event_headroom)
             billing_records.append(event_billing)
-        # One conservative merge: the highest status, per window the highest
-        # use and latest effective reset, and billing at its highest rank.
-        records = [
-            _merged_restriction(headroom, observed_at_ms=observed),
-            max(
-                reversed(billing_records),
-                key=lambda record: BILLING_RANK[record["paid_usage_usable"]],
-            ),
-        ]
-        self._store_provider_observations(project_id, records, timestamp=observed)
+        records: list[dict[str, Any]] = []
+        if headroom:
+            # One conservative merge of every valid event: the highest status,
+            # per window the highest use and latest effective reset, and
+            # billing at its highest rank. Stored even when the probe failed.
+            records = [
+                _merged_restriction(headroom, observed_at_ms=observed),
+                max(
+                    reversed(billing_records),
+                    key=lambda record: BILLING_RANK[record["paid_usage_usable"]],
+                ),
+            ]
+            self._store_provider_observations(project_id, records, timestamp=observed)
+        if failure is not None:
+            raise BridgeRefused(f"billing probe failed: {failure}")
+        if not infos:
+            raise BridgeRefused("billing probe reported no rate-limit event")
+        if not records:
+            raise BridgeRefused("billing probe reported no valid rate-limit event")
+        if invalid:
+            raise BridgeRefused("billing probe reported an invalid rate-limit event")
         return {"probe": "launched", "records": [identity, *records]}
 
     def _store_probe_admission_locked(
@@ -7847,12 +7866,65 @@ class LearningLedger:
                     (root / project_id).rmdir()
         return len(identifiers)
 
+    def _holds_account_restrictions_locked(self, project_id: str, now_ms: int) -> bool:
+        """Whether a project holds a record that still restricts its account.
+
+        That is paid usage or overage in the last day, an exhausted or rejected
+        headroom window that has not reset, ordinary Codex usage disallowed in
+        the last 30 minutes, a probe cooldown, or a passing run admission
+        that may still count under a run cap. Records stamped after now count.
+        """
+
+        from .providers import (
+            BILLING_MAX_AGE_MS,
+            EVIDENCE_HORIZON_MS,
+            FIVE_HOURS_MS,
+            _headroom_state,
+        )
+
+        rows = self._connection.execute(
+            "SELECT record_type,source,observed_at_ms,content FROM records "
+            "WHERE project_id=? AND record_type IN "
+            "('provider_billing','provider_headroom','probe_admission','admission_decision')",
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            record = json.loads(bytes(row["content"]))
+            age = now_ms - int(row["observed_at_ms"])
+            kind = str(row["record_type"])
+            if kind == "provider_billing" and row["source"] == "provider":
+                if age <= EVIDENCE_HORIZON_MS and (
+                    record["paid_usage_usable"] is True or record["is_using_overage"] is True
+                ):
+                    return True
+                if age <= BILLING_MAX_AGE_MS and record["ordinary_usage_allowed"] is False:
+                    return True
+            elif kind == "provider_headroom" and row["source"] == "provider":
+                if _headroom_state(record["provider"], record, now_ms) == "exhausted":
+                    return True
+            elif kind == "probe_admission" and row["source"] == "lifecycle":
+                if record["decision"] == "pass" and age < PROBE_COOLDOWN_SECONDS * 1000:
+                    return True
+            elif kind == "admission_decision" and row["source"] == "lifecycle":
+                if (
+                    record["decision"] == "pass"
+                    and record["run_id"] is not None
+                    and age < FIVE_HOURS_MS
+                ):
+                    return True
+        return False
+
     def delete_project(self, project_id: str, *, now_ms: int | None = None) -> str:
         timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
         deletion_id = f"del_{secrets.token_hex(16)}"
         with self._lock:
             if self._active_readers:
                 raise LedgerError("project deletion requires closed scoped readers")
+            # Account restrictions are read from every project, so deleting the
+            # project that holds one would lift it. The ledger's own clock
+            # decides, never the caller's time.
+            if self._holds_account_restrictions_locked(project_id, self._clock_ms()):
+                raise LedgerError("project_holds_account_restrictions")
             rows = self._connection.execute(
                 "SELECT relative_path FROM stored_files WHERE project_id=?", (project_id,)
             ).fetchall()

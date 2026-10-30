@@ -1168,6 +1168,8 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual("admitted", decide())
         paid = {**billing, "paid_usage_usable": True, "observed_at_ms": ahead}
         self.assertEqual("paid_usage_usable", decide(more_billing=[(paid, "a" * 64)]))
+        blocked = {**billing, "ordinary_usage_allowed": False, "observed_at_ms": ahead}
+        self.assertEqual("provider_exhausted", decide(more_billing=[(blocked, "c" * 64)]))
         full = {**headroom, "observed_at_ms": ahead, "windows": [
             {**headroom["windows"][0], "used_percent": 95.0, "resets_at": ahead + 60_000},
         ]}
@@ -1487,6 +1489,23 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual("pass", probe["decision"])
         self.clean_claude_billing(day_later + 3)
         self.assertEqual("pass", self.admit("claude", now_ms=day_later + 4)["decision"])
+
+    def test_a_project_holding_account_restrictions_cannot_be_deleted(self) -> None:
+        with self.other_project():
+            run = self.open_run("claude")
+            self.event(run, status="allowed", rateLimitType="five_hour", utilization=0.1,
+                       isUsingOverage=True)
+            held = self.project_id
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            with self.assertRaisesRegex(LedgerError, "project_holds_account_restrictions"):
+                self.ledger.delete_project(held)
+            # A caller's time cannot age the restriction out; only the ledger clock.
+            with self.assertRaisesRegex(LedgerError, "project_holds_account_restrictions"):
+                self.ledger.delete_project(held, now_ms=self.clock + 10 * 24 * 3_600_000)
+        with mock.patch.object(
+            self.ledger, "_clock_ms", return_value=self.clock + 24 * 3_600_000 + 1
+        ):
+            self.assertTrue(self.ledger.delete_project(held).startswith("del_"))
 
     def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
         identity = self.observe()[0]

@@ -87,7 +87,9 @@ exhausted window; older clean billing is enough, since the probe refreshes it), 
 decision is stored, and it shares the single per-account bootstrap allowance with runs.
 Account billing evidence under five minutes old is reused (`probe: "reused"`) instead of
 probing again; otherwise a probe for the same account in the last five minutes, in any
-project and whatever it returned, refuses with `probe_cooldown`. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
+project and whatever it returned, refuses with `probe_cooldown`. Each event is parsed on
+its own, and the merge of every valid event is stored even when the probe aborts,
+times out, overflows or reports an invalid event; the probe still reports failure. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
 constrained. The markers only catch accidental
 misuse; they are not proof of identity. Admission, the bridge flag and the read-only sandbox are the
 authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
@@ -119,7 +121,10 @@ first failure denies with a stable `reason_code`:
    project) may open on the identity and attestation alone; after that, Claude needs a
    recent run's rate-limit event or a billing probe. Billing, headroom and the bootstrap
    are the account's, read from every project of the ledger; a decision cites only its
-   own project's records, and attestations stay per project.
+   own project's records, and attestations stay per project. A project holding a live
+   account restriction (paid usage in the last day, an unreset exhausted window, a probe
+   cooldown or admissions that may still count under a cap) cannot be deleted
+   (`project_holds_account_restrictions`).
 8. `provider_exhausted`: the most restrictive headroom that has not reset yet is
    exhausted. That is Codex at 90 percent or more on any window, or ordinary usage not
    allowed, and Claude with a rejected or full window. A later favourable observation
@@ -188,8 +193,9 @@ provider API key, and a run handle that was already dispatched.
   fingerprint and the admitted client version, which must still be in the reviewed
   range; the child is launched from the client that re-check read. Billing, headroom
   and the Codex plan are re-checked account-wide too, including that fresh reading
-  (`launch denied: <reason_code>`, stored as a denial); the run cap is not counted
-  again. A durable `dispatch_intent` is then written, and the bridge run ID is bound as
+  (`launch denied: <reason_code>`, stored as a denial); billing must be from the last
+  30 minutes, unless the run was admitted as the Claude bootstrap and the account has
+  no billing yet, so a late dispatch probes first. The run cap is not counted again. A durable `dispatch_intent` is then written, and the bridge run ID is bound as
   the run's agent; there is no second launch for that run. A bridged run binds no other
   agent ID, and its result cannot be committed without that `dispatch_intent`.
 - The child runs in its own session. The tighter of the route's and the assignment's

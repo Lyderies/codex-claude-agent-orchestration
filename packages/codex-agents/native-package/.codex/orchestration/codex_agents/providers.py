@@ -962,10 +962,7 @@ def evaluate_admission(
         evidence.append(latest_billing[1])
         if latest_billing[0]["paid_usage_usable"] is not False:
             return decision("billing_unverified", fingerprint, evidence)
-    state, state_digest = headroom_state(
-        provider, fingerprint, headroom,
-        latest_billing[0] if latest_billing is not None else None, now_ms,
-    )
+    state, state_digest = headroom_state(provider, fingerprint, headroom, billing, now_ms)
     if state_digest is not None:
         evidence.append(state_digest)
     if state == "exhausted":
@@ -1018,13 +1015,15 @@ def headroom_state(
     provider: str,
     fingerprint: str,
     headroom: list[tuple[dict[str, Any], str]],
-    latest_billing: dict[str, Any] | None,
+    billing: list[tuple[dict[str, Any], str]],
     now_ms: int,
 ) -> tuple[str, str | None]:
     """The most restrictive unreset headroom, and the latest record at that level.
 
     Only the latest record at the deciding level is named: a decision's digest
-    list is bounded, and runs keep adding headroom records.
+    list is bounded, and runs keep adding headroom records. For Codex, the
+    latest billing reading disallowing ordinary usage also exhausts it, and so
+    does any such reading stamped after now, so a clock step back never hides it.
     """
 
     rank = {"ample": 0, "constrained": 1, "exhausted": 2}
@@ -1040,12 +1039,17 @@ def headroom_state(
             continue
         if rank[rated] >= rank[state]:
             state, state_digest = rated, digest
-    if (
-        provider == "codex"
-        and latest_billing is not None
-        and latest_billing["ordinary_usage_allowed"] is False
-    ):
-        state = "exhausted"
+    if provider == "codex":
+        own = [
+            item for item in billing
+            if item[0]["provider"] == provider and item[0]["account_fingerprint"] == fingerprint
+        ]
+        latest = _latest([item for item in own if item[0]["observed_at_ms"] <= now_ms])
+        if (latest is not None and latest[0]["ordinary_usage_allowed"] is False) or any(
+            record["observed_at_ms"] > now_ms and record["ordinary_usage_allowed"] is False
+            for record, _ in own
+        ):
+            state = "exhausted"
     return state, state_digest
 
 
@@ -1056,13 +1060,17 @@ def evaluate_launch(
     billing: list[tuple[dict[str, Any], str]],
     headroom: list[tuple[dict[str, Any], str]],
     now_ms: int,
+    bootstrap: bool = False,
 ) -> str | None:
     """Re-check an admitted run's eligibility just before its child launches.
 
     The account and client were already compared with the admitted ones. This
     re-reads the account-wide billing and headroom, including the fresh
     before-launch reading, and the plan the fresh identity reports. The run
-    cap is not counted again. Returns a denial reason, or None to launch.
+    cap is not counted again. Billing must be from the last 30 minutes, for
+    either provider; only a run admitted as the Claude bootstrap, on an account
+    with no billing at all yet, launches without it. Returns a denial reason,
+    or None to launch.
     """
 
     fingerprint = identity["account_fingerprint"]
@@ -1082,17 +1090,16 @@ def evaluate_launch(
         and item[0]["account_fingerprint"] == fingerprint
         and item[0]["observed_at_ms"] <= now_ms
     ])
-    if provider == "codex" and (
-        latest is None or now_ms - latest[0]["observed_at_ms"] > BILLING_MAX_AGE_MS
-    ):
+    if latest is None:
+        if not (provider == "claude" and bootstrap):
+            return "billing_unverified"
+    elif now_ms - latest[0]["observed_at_ms"] > BILLING_MAX_AGE_MS:
+        # A dispatch long after its open must refresh billing first (for
+        # Claude, with a billing probe).
         return "billing_unverified"
-    # A Claude bootstrap run may have no billing yet; anything recorded must
-    # still show paid usage off.
-    if latest is not None and latest[0]["paid_usage_usable"] is not False:
+    elif latest[0]["paid_usage_usable"] is not False:
         return "billing_unverified"
-    state, _ = headroom_state(
-        provider, fingerprint, headroom, latest[0] if latest is not None else None, now_ms
-    )
+    state, _ = headroom_state(provider, fingerprint, headroom, billing, now_ms)
     if state == "exhausted":
         return "provider_exhausted"
     return None
