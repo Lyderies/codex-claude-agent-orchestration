@@ -2080,7 +2080,7 @@ class LearningLedger:
         if checked["record_type"] in {"qa_evidence", "evidence_review"}:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
-            "admission_decision", "billing_attestation",
+            "admission_decision", "billing_attestation", "dispatch_intent",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -3724,6 +3724,95 @@ class LearningLedger:
         if decision["record_type"] != "admission_decision" or decision["decision"] != "pass":
             raise LedgerError("host run admission is not a pass")
         return decision
+
+    def record_dispatch_intent(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        assignment: dict[str, Any],
+        task: dict[str, Any],
+        route: dict[str, Any],
+        deadline_seconds: int,
+        claim: bool = True,
+    ) -> dict[str, Any]:
+        """Durably claim the single bridged launch for an open, admitted run.
+
+        The run must still be pending and bound to exactly this assignment, task
+        and route, with a passing admission for the route's provider. A second
+        claim for the same run is refused, so a launch is never resent. With
+        `claim` false the same checks run and nothing is written, so a refusal
+        can happen before anything is exported or launched.
+        """
+
+        timestamp = self._clock_ms()
+        handle_digest = keyed_digest(self.state.digest_key(), run_handle)
+        bridge_run_id = f"brg_{secrets.token_hex(16)}"
+        with self._lock, self._connection:
+            binding = self._connection.execute(
+                "SELECT run_id,binding_state,consumed_at_ms,assignment_digest,"
+                "task_digest,route_digest,expires_at_ms FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("host run is unavailable")
+            if (
+                binding["binding_state"] != "pending"
+                or binding["consumed_at_ms"] is not None
+                or int(binding["expires_at_ms"]) <= timestamp
+            ):
+                raise LedgerError("host run is no longer open for dispatch")
+            key = self.state.digest_key()
+            if (
+                str(binding["route_digest"]) != keyed_digest(key, canonical_json(route))
+                or str(binding["assignment_digest"]) != keyed_digest(
+                    key, canonical_json(validate_assignment_shape(assignment))
+                )
+                or str(binding["task_digest"]) != keyed_digest(
+                    key, canonical_json(validate_task(task))
+                )
+            ):
+                raise LedgerError("dispatch does not match the opened host run")
+            run_id = str(binding["run_id"])
+            admission = self._run_admission_locked(project_id, run_id)
+            if admission["provider"] != route.get("provider"):
+                raise LedgerError("host run admission differs from the dispatched provider")
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_intent' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("host run was already dispatched")
+            if not claim:
+                return {"run_id": run_id}
+            material = {
+                "schema_version": 1,
+                "record_type": "dispatch_intent",
+                "run_id": run_id,
+                "bridge_run_id": bridge_run_id,
+                "provider": route["provider"],
+                "model": route["model"],
+                "effort": route["effort"],
+                "deadline_at_ms": timestamp + deadline_seconds * 1000,
+                "observed_at_ms": timestamp,
+            }
+            try:
+                record = validate_learning_record(
+                    {**material, "record_id": f"dispatch_intent:{content_digest(material)}"}
+                )
+            except ContractError as exc:
+                raise LedgerError("dispatch intent is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="lifecycle", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return {
+            "bridge_run_id": bridge_run_id,
+            "run_id": run_id,
+            "account_fingerprint": admission["account_fingerprint"],
+            "deadline_at_ms": record["deadline_at_ms"],
+        }
 
     def host_run_admission(self, project_id: str, run_handle: str) -> dict[str, Any]:
         """Return the stored admission for a run; time-varying facts are not re-read."""

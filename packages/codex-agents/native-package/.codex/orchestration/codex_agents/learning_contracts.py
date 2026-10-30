@@ -46,6 +46,7 @@ RECORD_TYPES = {
     "provider_billing",
     "billing_attestation",
     "admission_decision",
+    "dispatch_intent",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -1829,6 +1830,32 @@ def validate_admission_decision(data: Any) -> dict[str, Any]:
     return data
 
 
+DISPATCH_INTENT_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "provider", "model", "effort", "deadline_at_ms", "observed_at_ms",
+}
+
+
+def validate_dispatch_intent(data: Any) -> dict[str, Any]:
+    """One bridged launch, written before the child starts; never resent."""
+
+    data = _closed(data, DISPATCH_INTENT_FIELDS, "dispatch_intent")
+    _base(data, "dispatch_intent")
+    _identifier(data["run_id"], "run_id")
+    if not isinstance(data["bridge_run_id"], str) or re.fullmatch(
+        r"brg_[0-9a-f]{32}", data["bridge_run_id"]
+    ) is None:
+        raise ContractError("bridge_run_id is invalid")
+    _enum(data["provider"], PROVIDER_NAMES, "provider")
+    _enum(data["model"], SUPPORTED_MODELS, "model")
+    _enum(data["effort"], SUPPORTED_EFFORTS, "effort")
+    if provider_for_model(data["model"]) != data["provider"]:
+        raise ContractError("dispatch_intent model and provider disagree")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    _integer(data["deadline_at_ms"], "deadline_at_ms", minimum=data["observed_at_ms"] + 1)
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -1850,6 +1877,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "provider_billing": validate_provider_billing,
     "billing_attestation": validate_billing_attestation,
     "admission_decision": validate_admission_decision,
+    "dispatch_intent": validate_dispatch_intent,
 }
 
 
