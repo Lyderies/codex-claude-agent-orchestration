@@ -1,7 +1,8 @@
 # G2 design: cross-provider read-only routing
 
-- **Status:** revision 2, after a cross-provider review. That review found eight blockers and
-  proposed a simpler design, which this revision adopts.
+- **Status:** revision 3. The first cross-provider review found eight blockers and proposed a
+  simpler design, which is adopted. The second review confirmed seven fixed and raised three more,
+  addressed below. Reviews are capped at two rounds; the S4 security review checks the result.
 - **Goal:** the G2 exit in [the plan](plan.md).
 - **Evidence:** the [routing table](../routing-table.md) and the dispatch spikes on `staging`.
 
@@ -58,22 +59,37 @@ Each slice is a feature branch with tests and a cross-provider review.
 
 - **Admission at host-run open.** It fails closed, and its decision is stored with the run.
   - Deny if `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set. Deny rather than scrub.
-  - Deny unless the owner's billing attestation for the provider is recorded: no paid overage and
-    no usage credits.
-  - Deny unless the latest billing observation confirms overage is unavailable, and is no older
-    than 24 hours. For Claude, that means `isUsingOverage` false and an overage status of rejected
+  - Deny unless the owner's billing attestation for the provider is recorded (no paid overage, no
+    usage credits) and bound to the current account's fingerprint.
+    - The fingerprint is a keyed digest from a non-spending identity read: the organisation ID
+      and email from `claude auth status --json`, or the account ID from Codex's
+      `account/rateLimits/read`.
+    - Raw identity values are never stored.
+    - `claude auth status` must also report the `claude.ai` login with a subscription.
+  - Deny if the latest billing observation for this fingerprint shows overage usable.
+    - **Bootstrap:** with no observation yet, a run is admitted on the attestation and the
+      non-spending identity check alone. Every run's own usage event then refreshes the
+      evidence, so an observation showing overage blocks the next run. For Claude, that means `isUsingOverage` false and an overage status of rejected
     or disabled. For Codex, the rate-limit read must show no usable paid credits.
   - Deny when the latest headroom record for the provider shows it exhausted. This is evaluated
     from the ledger, not from anything the task supplies.
   - The decision (pass, or the reason for denial) and the record digests it used are bound to the
     run. Replay checks the stored decision and does not re-evaluate time-varying facts.
+- **Re-check at launch:** the environment and the account fingerprint are checked again
+  immediately before the child process starts. A mismatch with the admitted evidence aborts the
+  launch.
 - **Scoped working directory.** A bridged child never runs in the repository root. The bridge
   exports the committed bytes of the assignment's read paths into a fresh temporary directory, and
   the child runs there. The spikes showed Claude's `dontAsk` mode denies reads, globs, greps,
   symlinks and `../` outside the working directory. Tests cover absolute paths, traversal and
-  symlinks. Codex children use the same export as their working directory. Whether Codex's
-  read-only sandbox can also be limited to it is checked in this slice; if not, that limitation is
-  recorded.
+  symlinks. Codex children use the same export as their working directory.
+  - **Codex reads are not contained.** A spike showed Codex's read-only sandbox can still read
+    files outside the working directory, with or without `sandbox_permissions=[]`. That is
+    already true of every native Codex child; the package's accepted policy treats path
+    declarations as task scope unless the host enforces them.
+  - G2 keeps that baseline and states it in the security model.
+  - Enforced read roots, by running `codex exec` inside an outer macOS Seatbelt profile, move to
+    G3 alongside write containment.
 - **Claude child:**
   - Flags: `--tools Read,Glob,Grep`, `--permission-mode dontAsk`, `--setting-sources project`, a
     generated settings file (hooks off, every built-in plugin off, `availableModels` pinned, no
