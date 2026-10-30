@@ -159,10 +159,22 @@ A read-only audit of S1 and S2 against the plan found gaps that S4 would otherwi
   (before or after). A failed reading is recorded as unavailable instead of being dropped.
 - **Policy matches the table:** routine planning uses GPT-6.1 Sol at high effort.
 
+### S3c: policy matches the table
+
+`provider_candidates` now names the Codex model and effort explicitly for every row the table
+covers, and a table-driven test fails CI if policy and table drift apart. Explicit candidates
+apply in every project, including Codex-only projects without a provider configuration, so the
+table also chooses the Codex model there. `routes` remains the fallback for a family without
+candidates. Rows with no task family (documentation, mechanical edits, non-agentic transforms),
+escalation steps and context-size conditions are not expressible yet; they belong to G4.
+
 ### S4: security review, pilot install and exit
 
 - An independent security review covers admission, the bridge, profiles, scoped directories and
-  allow-lists.
+  allow-lists. It reviews the whole release, not slice diffs, with two reviewers from different
+  vendors. The first G2 run found cross-slice and cross-project gaps that slice reviews had
+  missed: billing state scoped per project, exports beyond the assignment's read grant, and
+  billing not re-checked at launch.
 - Install into a fresh worktree of the pilot project.
 - Exit runs: a research and a review task to each provider, from a Claude primary and from a Codex
   primary.
