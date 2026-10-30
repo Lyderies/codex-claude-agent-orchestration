@@ -67,7 +67,7 @@ from tests.learning_support import (
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "providers"
 CODEX_LIMITS = {
     "admission_policy": {
-        "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+        "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.164.1"},
         "max_admissions_per_window": 60,
     },
     "prior_run_admissions": [],
@@ -927,8 +927,9 @@ class AdmissionTests(unittest.TestCase):
         self.attest("codex", identity["account_fingerprint"])
         for text, admitted in (
             ("codex-cli 0.164.0\n", True),   # the lower boundary is inside
-            ("codex-cli 0.164.99\n", True),
-            ("codex-cli 0.165.0\n", False),  # the upper boundary is outside
+            ("codex-cli 0.164.1\n", False),  # the upper boundary is outside
+            ("codex-cli 0.164.99\n", False),
+            ("codex-cli 0.165.0\n", False),
             ("codex-cli 0.163.9\n", False),
             ("codex-cli 1.0.0\n", False),
             ("", False),                       # missing
@@ -947,7 +948,7 @@ class AdmissionTests(unittest.TestCase):
                 else:
                     self.assert_denied("client_version_unreviewed")
                     if observed["client_version"] is not None:
-                        self.assertFalse(observed["client_version"].startswith("0.164."))
+                        self.assertNotEqual("0.164.0", observed["client_version"])
         claude = self.observe("claude")[0]
         self.attest("claude", claude["account_fingerprint"])
         for text, admitted in (
@@ -1075,7 +1076,7 @@ class AdmissionTests(unittest.TestCase):
                 billing=[(identity[2], DIGEST_C)], headroom=list(headroom),
                 prior_claude_admissions=set(), environ={}, now_ms=NOW + 1,
                 admission_policy={
-                    "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+                    "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.164.1"},
                     "max_admissions_per_window": 2,
                 },
                 prior_run_admissions=prior,
