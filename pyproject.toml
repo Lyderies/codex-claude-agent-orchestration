@@ -1,0 +1,14 @@
+[project]
+name = "codex-claude-agent-orchestration"
+version = "0.0.0"
+description = "Deterministic cross-provider orchestration of Codex and Claude child agents"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
