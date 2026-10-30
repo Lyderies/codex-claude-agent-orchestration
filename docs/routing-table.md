@@ -56,6 +56,12 @@ These rows are cheap to test and could change soonest:
 4. **Documentation:** GPT-6.1 Sol (medium) against Sonnet 5.5 (high).
 5. **Claude session size:** read the Claude Code usage meter before and after each run. This
    replaces the provisional Claude percentages.
+6. **Authority-sensitive implementation:** Opus 5.5 at medium against high effort on comparable
+   changes. Medium has needed one or two review rounds per slice so far; the question is whether
+   high effort cuts review rounds enough to pay for itself.
+7. **Security review:** GPT-6.1 Sol (high) against GPT-6 Astra (high) on the same diff. Astra cost
+   about five times Sol's credits at similar token counts; its findings were not yet compared on
+   identical input.
 
 ## How the table changes
 
