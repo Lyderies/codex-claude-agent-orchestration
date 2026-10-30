@@ -525,6 +525,8 @@ def parse_codex_rate_limits(
         unlimited = credits.get("unlimited")
     has_credits = has_credits if isinstance(has_credits, bool) else None
     unlimited = unlimited if isinstance(unlimited, bool) else None
+    spend_control = snapshot.get("spendControlReached", result.get("spendControlReached"))
+    spend_control = spend_control if isinstance(spend_control, bool) else None
     ordinary = field("ordinaryUsageAllowed")
     if has_credits is True or unlimited is True:
         paid_usable: bool | None = True
@@ -554,6 +556,7 @@ def parse_codex_rate_limits(
             "paid_usage_usable": paid_usable,
             "has_credits": has_credits,
             "unlimited": unlimited,
+            "spend_control_reached": spend_control,
             "ordinary_usage_allowed": ordinary if isinstance(ordinary, bool) else None,
             "is_using_overage": None,
             "overage_status": None,
@@ -674,6 +677,7 @@ def claude_rate_limit_records(
             **common,
             "paid_usage_usable": paid_usable,
             "has_credits": None,
+            "spend_control_reached": None,
             "unlimited": None,
             "ordinary_usage_allowed": None,
             "is_using_overage": using,
@@ -926,7 +930,10 @@ def evaluate_admission(
         return decision("claude_subscription_missing", fingerprint, evidence)
     if provider == "codex" and identity["plan_type"] not in CODEX_SUBSCRIPTION_PLAN_TYPES:
         return decision("codex_plan_not_subscription", fingerprint, evidence)
-    paid = paid_usage_digest(provider, fingerprint, billing, now_ms)
+    spent = spend_control_digest(provider, fingerprint, billing, now_ms)
+    if spent is not None:
+        return decision("codex_spend_control_reached", fingerprint, [*evidence, spent])
+    paid = paid_usage_digest(provider, fingerprint, billing, now_ms, attestation[0])
     if paid is not None:
         # Any recent sign of paid usage denies; a later favourable record
         # cannot clear it.
@@ -960,7 +967,9 @@ def evaluate_admission(
         basis = "bootstrap"
     if fresh:
         evidence.append(latest_billing[1])
-        if latest_billing[0]["paid_usage_usable"] is not False:
+        if latest_billing[0]["paid_usage_usable"] is not False and not credits_waived(
+            provider, latest_billing[0], attestation[0]
+        ):
             return decision("billing_unverified", fingerprint, evidence)
     state, state_digest = headroom_state(provider, fingerprint, headroom, billing, now_ms)
     if state_digest is not None:
@@ -988,11 +997,51 @@ def evaluate_admission(
     return decision("admitted", fingerprint, evidence, basis)
 
 
+def credits_waived(provider: str, record: dict[str, Any], attestation: Any) -> bool:
+    """Whether the owner's attestation turns a Codex credits reading into unusable.
+
+    Only when the current attestation says credit spending is disabled, the
+    reading shows credits that are not unlimited, and spend control has not been
+    reached. Any other reading keeps its observed billing meaning.
+    """
+
+    return (
+        provider == "codex"
+        and attestation is not None
+        and attestation.get("codex_credits_spending_disabled") is True
+        and record.get("has_credits") is True
+        and record.get("unlimited") is False
+        and record.get("spend_control_reached") is not True
+    )
+
+
+def spend_control_digest(
+    provider: str,
+    fingerprint: str,
+    billing: list[tuple[dict[str, Any], str]],
+    now_ms: int,
+) -> str | None:
+    """The digest of a Codex billing record from the last day reporting spend control reached."""
+
+    if provider != "codex":
+        return None
+    for record, digest in billing:
+        if (
+            record["provider"] == provider
+            and record["account_fingerprint"] == fingerprint
+            and now_ms - record["observed_at_ms"] <= EVIDENCE_HORIZON_MS
+            and record.get("spend_control_reached") is True
+        ):
+            return digest
+    return None
+
+
 def paid_usage_digest(
     provider: str,
     fingerprint: str,
     billing: list[tuple[dict[str, Any], str]],
     now_ms: int,
+    attestation: Any = None,
 ) -> str | None:
     """The digest of a billing record from the last day showing paid usage, if any.
 
@@ -1005,7 +1054,13 @@ def paid_usage_digest(
             record["provider"] == provider
             and record["account_fingerprint"] == fingerprint
             and now_ms - record["observed_at_ms"] <= EVIDENCE_HORIZON_MS
-            and (record["paid_usage_usable"] is True or record["is_using_overage"] is True)
+            and (
+                (
+                    record["paid_usage_usable"] is True
+                    and not credits_waived(provider, record, attestation)
+                )
+                or record["is_using_overage"] is True
+            )
         ):
             return digest
     return None
@@ -1061,6 +1116,7 @@ def evaluate_launch(
     headroom: list[tuple[dict[str, Any], str]],
     now_ms: int,
     bootstrap: bool = False,
+    attestations: list[tuple[dict[str, Any], str]] | None = None,
 ) -> str | None:
     """Re-check an admitted run's eligibility just before its child launches.
 
@@ -1082,7 +1138,15 @@ def evaluate_launch(
         and identity["subscription_type"] in CLAUDE_SUBSCRIPTION_TYPES
     ):
         return "claude_subscription_missing"
-    if paid_usage_digest(provider, fingerprint, billing, now_ms) is not None:
+    attestation = _latest([
+        item for item in attestations or []
+        if item[0]["provider"] == provider
+        and item[0]["account_fingerprint"] == fingerprint
+    ])
+    current = None if attestation is None else attestation[0]
+    if spend_control_digest(provider, fingerprint, billing, now_ms) is not None:
+        return "codex_spend_control_reached"
+    if paid_usage_digest(provider, fingerprint, billing, now_ms, current) is not None:
         return "paid_usage_usable"
     latest = _latest([
         item for item in billing
@@ -1097,7 +1161,9 @@ def evaluate_launch(
         # A dispatch long after its open must refresh billing first (for
         # Claude, with a billing probe).
         return "billing_unverified"
-    elif latest[0]["paid_usage_usable"] is not False:
+    elif latest[0]["paid_usage_usable"] is not False and not credits_waived(
+        provider, latest[0], current
+    ):
         return "billing_unverified"
     state, _ = headroom_state(provider, fingerprint, headroom, billing, now_ms)
     if state == "exhausted":
