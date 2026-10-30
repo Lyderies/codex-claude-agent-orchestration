@@ -134,6 +134,7 @@ class InstallerTests(unittest.TestCase):
         )
         return {"project_agent_routing": routing, "operational_checks": checks}
 
+    @MACOS_SANDBOX_ONLY
     def test_install_verify_and_remove(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = self.target(directory)

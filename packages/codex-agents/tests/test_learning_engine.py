@@ -1229,6 +1229,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertTrue(report["security_checks"][0]["passed"])
             self.assertFalse((root / "forbidden").exists())
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_sandbox_preflight_is_available(self) -> None:
         self.assertTrue(operational_sandbox_preflight())
 
