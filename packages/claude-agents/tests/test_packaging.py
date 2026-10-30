@@ -200,6 +200,38 @@ class PackagingTests(unittest.TestCase):
             package_operation(SOURCE, plain, "install", apply=True)
         self.assertEqual(list(plain.iterdir()), [])
 
+    def test_linked_worktree_target_installs_verifies_and_removes(self) -> None:
+        env = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        (self.target / "README").write_text("x")
+        identity = ["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid"]
+        for args in (["add", "README"], [*identity, "commit", "-qm", "init"]):
+            subprocess.run(["/usr/bin/git", "-C", str(self.target), *args], check=True, env=env)
+        linked = self.base / "linked"
+        subprocess.run(["/usr/bin/git", "-C", str(self.target), "worktree", "add", "-q", str(linked)],
+                       check=True, env=env)
+        self.assertTrue((linked / ".git").is_file())
+        self.assertEqual(len(package_operation(SOURCE, linked, "install")["changed_paths"]), 10)
+        package_operation(SOURCE, linked, "install", apply=True)
+        self.assertEqual(package_operation(SOURCE, linked, "verify")["result"], "verified")
+        package_operation(SOURCE, linked, "remove", apply=True)
+        self.assertFalse((linked / ".claude/claude-agents/install-manifest.json").exists())
+
+    def test_malformed_or_symlinked_git_marker_is_refused(self) -> None:
+        malformed = self.base / "malformed"
+        malformed.mkdir()
+        (malformed / ".git").write_bytes(b"not a git pointer\n")
+        dangling = self.base / "dangling"
+        dangling.mkdir()
+        (dangling / ".git").write_bytes(b"gitdir: " + str(self.base / "missing").encode() + b"\n")
+        linked = self.base / "symlinked"
+        linked.mkdir()
+        (linked / ".git").symlink_to(self.target / ".git")
+        for target in (malformed, dangling, linked):
+            with self.subTest(target=target.name):
+                with self.assertRaisesRegex(PackageError, "git_target_required"):
+                    package_operation(SOURCE, target, "install", apply=True)
+                self.assertFalse((target / ".claude").exists())
+
     def test_fifo_collision_refuses_promptly_without_modifying_target(self) -> None:
         fifo = self.target / ".claude/agents/claude_agents_researcher.md"
         fifo.parent.mkdir(parents=True)
