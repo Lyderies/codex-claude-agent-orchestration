@@ -38,6 +38,8 @@
   - A gated billing probe supplies the evidence native Claude children cannot.
 - **Observations.** Headroom, billing and usage records are bound to their run and phase. A failed
   reading is recorded instead of dropped.
+- **Package version.** The Codex package is now 0.8.0. It had kept the imported 0.7.2, so an existing
+  collector authorized for 0.7.2 refused the changed build as a conflict instead of upgrading.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the
