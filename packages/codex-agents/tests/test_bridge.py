@@ -37,6 +37,7 @@ from codex_agents.learning_store import (
     LedgerError,
     authorize_collector_runtime,
 )
+from codex_agents.providers import AdmissionDenied
 from codex_agents.routing import load_policy, route_task
 from tests.learning_support import (
     assignment,
@@ -295,12 +296,17 @@ class CliTestCase(BridgeTestCase):
 
 
 class ClaudeBridgeTests(BridgeTestCase):
-    def test_happy_path_runs_contained_and_records_one_rate_limit_event(self) -> None:
+    def test_happy_path_runs_contained_and_a_late_rejection_blocks_until_reset(self) -> None:
         route, assigned, handle = self.claude_run()
+        resets = int(time.time()) + 3600
+        rejected = {**RATE_LIMIT, "uuid": "rate-2", "rate_limit_info": {
+            **RATE_LIMIT["rate_limit_info"], "status": "rejected", "utilization": 1.0,
+            "resetsAt": resets,
+        }}
         self.frames("claude", [
-            init_frame(), RATE_LIMIT,
-            {**RATE_LIMIT, "uuid": "rate-2",
-             "rate_limit_info": {**RATE_LIMIT["rate_limit_info"], "status": "rejected"}},
+            init_frame(), RATE_LIMIT, rejected,
+            # A favourable event after the rejection is not kept.
+            {**RATE_LIMIT, "uuid": "rate-3"},
             result_frame(),
         ])
         output = self.dispatch(route, assigned, handle)
@@ -340,13 +346,31 @@ class ClaudeBridgeTests(BridgeTestCase):
                 record for record in repository.records("provider_headroom")
                 if record["run_id"] == intents[0]["run_id"]
             ]
-        self.assertEqual(["allowed"], [record["status"] for record in run_events])
+        self.assertEqual(
+            [("allowed", "during"), ("rejected", "during")],
+            [(record["status"], record["phase"]) for record in run_events],
+        )
+        self.assertEqual((3, 3), (report["rate_limit_events"], report["rate_limit_records_kept"]))
         self.assertEqual(
             [report["bridge_run_id"]], [intent["bridge_run_id"] for intent in intents]
         )
         # The launch is never resent for the same run handle.
         with self.assertRaisesRegex(LedgerError, "already dispatched"):
             self.dispatch(route, assigned, handle)
+        # The rejection recorded late in that run blocks the next admission...
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open(route, self.assignment_for(route))
+        self.assertEqual("provider_exhausted", raised.exception.reason_code)
+        # ...until its window resets.
+        after_reset = (resets + 1) * 1000
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=after_reset):
+            self.ledger.observe_provider(
+                self.project_id, "claude", project_root=self.tools, environ=CLEAN
+            )
+            reopened = self.open(route, self.assignment_for(route))
+        self.assertEqual(
+            "pass", self.ledger.host_run_admission(self.project_id, reopened)["decision"]
+        )
 
     def test_every_init_frame_violation_fails_closed_and_kills_the_child(self) -> None:
         cases = {
@@ -414,6 +438,133 @@ class ClaudeBridgeTests(BridgeTestCase):
             self.dispatch(route, assigned, handle)
         self.assertFalse([i for i in self.invocations("claude") if "-p" in i["argv"]])
         self.assertEqual([], self.workspace_entries())
+
+    def test_client_change_before_launch_aborts(self) -> None:
+        # Admitted on 2.1.200; an upgrade inside the range still differs.
+        for version, message in (
+            ("2.1.201 (Claude Code)", "differs from the admitted client"),
+            ("", "differs from the admitted client"),
+            ("2.2.0 (Claude Code)", "differs from the admitted client"),
+        ):
+            with self.subTest(version=version):
+                route, assigned, handle = self.claude_run()
+                (self.tools / "claude-version.txt").write_text(version)
+                self.frames("claude", [init_frame(), result_frame()])
+                try:
+                    with self.assertRaisesRegex(BridgeRefused, message):
+                        self.dispatch(route, assigned, handle)
+                finally:
+                    (self.tools / "claude-version.txt").unlink()
+                    # The re-check's own reading is now the latest identity.
+                    self.ledger.observe_provider(
+                        self.project_id, "claude", project_root=self.tools, environ=CLEAN
+                    )
+                self.assertFalse([i for i in self.invocations("claude") if "-p" in i["argv"]])
+        # A narrower reviewed range installed after admission refuses too.
+        route, assigned, handle = self.claude_run()
+        policy = deepcopy(self.policy)
+        policy["providers"]["claude"]["client_versions"]["maximum_exclusive"] = "2.1.100"
+        self.ledger._admission_policy = policy
+        with self.assertRaisesRegex(BridgeRefused, "not reviewed"):
+            self.dispatch(route, assigned, handle)
+        self.ledger._admission_policy = None
+        # The launched client must be the one the re-check read.
+        route, assigned, handle = self.claude_run()
+        with mock.patch.object(
+            bridge, "resolve_client", return_value=("/usr/bin/false", "0" * 64)
+        ), self.assertRaisesRegex(BridgeRefused, "client changed"):
+            self.dispatch(route, assigned, handle)
+        self.assertFalse([i for i in self.invocations("claude") if "-p" in i["argv"]])
+        with self.ledger.repository(self.project_id) as repository:
+            self.assertEqual([], repository.records("dispatch_intent"))
+
+    def test_claude_usage_is_persisted_with_the_run(self) -> None:
+        route, assigned, handle = self.claude_run()
+        final = {**result_frame(), "modelUsage": {
+            "claude-opus-5-5": {"inputTokens": 100, "outputTokens": 25,
+                                "cacheReadInputTokens": 7, "cacheCreationInputTokens": 3},
+            "claude-haiku-5-5": {"inputTokens": 20, "outputTokens": 5},
+            "fixture-model-x": {"inputTokens": 1, "outputTokens": "many"},
+        }}
+        self.frames("claude", [init_frame(), RATE_LIMIT, final])
+        report = self.dispatch(route, assigned, handle)["bridge_report"]
+        self.assertTrue(report["usage_recorded"])
+        with self.ledger.repository(self.project_id) as repository:
+            intent = repository.records("dispatch_intent")[-1]
+            usage = repository.records("provider_usage")
+            unavailable = repository.records("observation_unavailable")
+        self.assertEqual(1, len(usage))
+        record = usage[0]
+        self.assertEqual(
+            (intent["run_id"], "after", "claude", "claude-opus-5-5"),
+            (record["run_id"], record["phase"], record["provider"], record["requested_model"]),
+        )
+        self.assertEqual((120, 30, 0, 0), (
+            record["input_tokens"], record["output_tokens"],
+            record["cached_input_tokens"], record["cache_creation_input_tokens"],
+        ))
+        self.assertEqual(["claude-haiku-5-5"], record["helper_models"])
+        self.assertEqual(
+            [(None, 1, None), ("claude-haiku-5-5", 20, 5), ("claude-opus-5-5", 100, 25)],
+            [(item["model"], item["input_tokens"], item["output_tokens"])
+             for item in record["models"]],
+        )
+        self.assertNotIn(b"fixture-model-x", json.dumps(record).encode())
+        self.assertEqual([], unavailable)
+        # Usage is recorded once per dispatched run, and only for one.
+        with self.assertRaisesRegex(LedgerError, "already recorded its usage"):
+            self.ledger.record_provider_usage(
+                self.project_id, run_handle=handle, provider="claude",
+                usage={key: record[key] for key in (
+                    "requested_model", "models", "helper_models", "input_tokens",
+                    "cached_input_tokens", "cache_creation_input_tokens", "output_tokens",
+                    "reasoning_output_tokens",
+                )},
+            )
+        _, _, undispatched = self.claude_run()
+        with self.assertRaisesRegex(LedgerError, "only a dispatched run"):
+            self.ledger.record_provider_usage(
+                self.project_id, run_handle=undispatched, provider="claude", usage={},
+            )
+
+    def test_an_invalid_rate_limit_event_is_recorded_as_unavailable(self) -> None:
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [
+            init_frame(),
+            {**RATE_LIMIT, "rate_limit_info": {"status": "fixture-account-5c2e08"}},
+            {"sleep": 30}, result_frame(),
+        ])
+        output = self.dispatch(route, assigned, handle)
+        report = output["bridge_report"]
+        self.assertEqual("rate_limit_event_invalid", report["outcome"])
+        self.assertTrue(report["rate_limit_record_failed"])
+        self.assertLess(report["wall_seconds"], 20)
+        with self.ledger.repository(self.project_id) as repository:
+            run_id = repository.records("dispatch_intent")[-1]["run_id"]
+            unavailable = [
+                (item["phase"], item["reason_code"])
+                for item in repository.records("observation_unavailable")
+                if item["run_id"] == run_id
+            ]
+        self.assertEqual(
+            [("during", "observation_failed"), ("after", "usage_unavailable")], unavailable
+        )
+
+    def test_a_run_without_readings_records_them_as_unavailable(self) -> None:
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [init_frame()])
+        report = self.dispatch(route, assigned, handle)["bridge_report"]
+        self.assertEqual("missing_result", report["outcome"])
+        self.assertFalse(report["usage_recorded"])
+        with self.ledger.repository(self.project_id) as repository:
+            run_id = repository.records("dispatch_intent")[-1]["run_id"]
+            unavailable = repository.records("observation_unavailable")
+        self.assertEqual(
+            [("claude", run_id, "during", "no_rate_limit_event"),
+             ("claude", run_id, "after", "usage_unavailable")],
+            [(item["provider"], item["run_id"], item["phase"], item["reason_code"])
+             for item in unavailable],
+        )
 
 
 class DispatchRefusalTests(BridgeTestCase):
@@ -818,6 +969,108 @@ class CodexBridgeTests(BridgeTestCase):
             f"model_reasoning_effort={route['effort']}", argv[argv.index("-c") + 1]
         )
         self.assertEqual([], self.workspace_entries())
+
+    def test_observations_and_usage_are_bound_to_the_run(self) -> None:
+        route, assigned, handle = self.codex_run()
+        self.frames("codex", [
+            {"type": "turn.completed",
+             "usage": {"input_tokens": 50, "cached_input_tokens": 5,
+                       "output_tokens": 9, "reasoning_output_tokens": 3}},
+        ])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        self.dispatch(route, assigned, handle)
+        with self.ledger.repository(self.project_id) as repository:
+            run_id = repository.records("dispatch_intent")[-1]["run_id"]
+            bound = [
+                (record["record_type"], record["phase"])
+                for kind in ("provider_headroom", "provider_billing")
+                for record in repository.records(kind) if record["run_id"] == run_id
+            ]
+            standalone = [
+                record["phase"] for record in repository.records("provider_headroom")
+                if record["run_id"] is None
+            ]
+            usage = repository.records("provider_usage")
+        self.assertEqual(
+            [("provider_headroom", "before"), ("provider_headroom", "after"),
+             ("provider_billing", "before"), ("provider_billing", "after")],
+            bound,
+        )
+        self.assertEqual([None], standalone)
+        self.assertEqual(
+            (run_id, "codex", "gpt-6.1-sol", 50, 5, 9, 3, None, [], []),
+            tuple(usage[-1][key] for key in (
+                "run_id", "provider", "requested_model", "input_tokens",
+                "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+                "cache_creation_input_tokens", "models", "helper_models",
+            )),
+        )
+
+    def test_a_failed_reading_is_persisted_as_unavailable(self) -> None:
+        from codex_agents.providers import ObservationError
+
+        real = self.ledger.observe_provider
+
+        def failing_after(*arguments, **options):
+            if options.get("phase") == "after":
+                raise ObservationError("timed out", "observation_timed_out")
+            return real(*arguments, **options)
+
+        route, assigned, handle = self.codex_run()
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 1}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        with mock.patch.object(self.ledger, "observe_provider", side_effect=failing_after):
+            output = self.dispatch(route, assigned, handle)
+        self.assertEqual("unavailable", output["bridge_report"]["observation_after"])
+        self.assertEqual("result", output["bridge_report"]["outcome"])
+        with self.ledger.repository(self.project_id) as repository:
+            run_id = repository.records("dispatch_intent")[-1]["run_id"]
+            unavailable = repository.records("observation_unavailable")
+        self.assertEqual(
+            [("codex", run_id, "after", "observation_timed_out")],
+            [(item["provider"], item["run_id"], item["phase"], item["reason_code"])
+             for item in unavailable],
+        )
+        # A failed reading before launch is persisted too, and nothing launches.
+        route, assigned, handle = self.codex_run()
+        launches = len([i for i in self.invocations("codex") if "exec" in i["argv"]])
+        with mock.patch.object(
+            self.ledger, "observe_provider",
+            side_effect=ObservationError("missing", "client_unavailable"),
+        ), self.assertRaisesRegex(BridgeRefused, "observation before launch"):
+            self.dispatch(route, assigned, handle)
+        self.assertEqual(
+            launches, len([i for i in self.invocations("codex") if "exec" in i["argv"]])
+        )
+        with self.ledger.repository(self.project_id) as repository:
+            last = repository.records("observation_unavailable")[-1]
+        self.assertEqual(("before", "client_unavailable"), (last["phase"], last["reason_code"]))
+        # Only the ledger writes these records, and a closed run takes none.
+        from codex_agents.learning_contracts import OBSERVATION_UNAVAILABLE_FIELDS
+
+        forged = {key: last[key] for key in OBSERVATION_UNAVAILABLE_FIELDS}
+        for producer in ("host", "lifecycle", "verifier"):
+            with self.assertRaisesRegex(LedgerError, "ledger-run observation|not authorized"):
+                self.ledger.append(self.project_id, forged, producer=producer)
+        with self.assertRaisesRegex(LedgerError, "unavailable"):
+            self.ledger.record_observation_unavailable(
+                self.project_id, run_handle="hrn_" + "0" * 48, provider="codex",
+                phase="after", reason_code="observation_failed",
+            )
+        with self.assertRaisesRegex(LedgerError, "differs from the run's admission"):
+            self.ledger.record_observation_unavailable(
+                self.project_id, run_handle=handle, provider="claude",
+                phase="after", reason_code="observation_failed",
+            )
+        with self.assertRaisesRegex(LedgerError, "invalid"):
+            self.ledger.record_observation_unavailable(
+                self.project_id, run_handle=handle, provider="codex",
+                phase="after", reason_code="fixture-account-5c2e08",
+            )
 
     def test_the_installed_schema_is_never_passed_unmodified(self) -> None:
         route, assigned, handle = self.codex_run()

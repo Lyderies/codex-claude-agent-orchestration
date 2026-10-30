@@ -20,6 +20,7 @@ from .contracts import ContractError, validate_task
 from .learning_contracts import (
     content_digest,
     parse_bounded_json_value,
+    parse_semver,
     provider_for_model,
     provider_for_role,
 )
@@ -785,22 +786,80 @@ def _provider_roles(policy: dict[str, Any], provider: str) -> dict[str, Any]:
     return policy.get("providers", {}).get(provider, {}).get("roles", {})
 
 
+ADMISSION_POLICY_KEYS = {"client_versions", "max_admissions_per_window"}
+CLIENT_VERSION_KEYS = {"minimum", "maximum_exclusive"}
+MAX_ADMISSIONS_PER_WINDOW = 10_000
+
+
+def _validate_admission_settings(provider: str, entry: dict[str, Any]) -> None:
+    """The reviewed client range and the run-count backstop for one provider."""
+
+    versions = entry["client_versions"]
+    if not isinstance(versions, dict) or set(versions) != CLIENT_VERSION_KEYS:
+        raise PolicyError(
+            f"providers.{provider}.client_versions must contain exactly minimum "
+            "and maximum_exclusive"
+        )
+    minimum = parse_semver(versions["minimum"])
+    maximum = parse_semver(versions["maximum_exclusive"])
+    if minimum is None or maximum is None or not minimum < maximum:
+        raise PolicyError(
+            f"providers.{provider}.client_versions must be an ascending semantic "
+            "version range"
+        )
+    cap = entry["max_admissions_per_window"]
+    if cap is not None and (
+        not isinstance(cap, int)
+        or isinstance(cap, bool)
+        or not 1 <= cap <= MAX_ADMISSIONS_PER_WINDOW
+    ):
+        raise PolicyError(
+            f"providers.{provider}.max_admissions_per_window must be a positive "
+            "integer or null"
+        )
+
+
+def admission_settings(policy: dict[str, Any], provider: str) -> dict[str, Any]:
+    """Return one provider's validated admission settings from a loaded policy."""
+
+    entry = policy.get("providers", {}).get(provider)
+    if not isinstance(entry, dict) or not ADMISSION_POLICY_KEYS <= set(entry):
+        raise PolicyError(f"routing policy has no admission settings for {provider}")
+    _validate_admission_settings(provider, entry)
+    return {
+        "client_versions": dict(entry["client_versions"]),
+        "max_admissions_per_window": entry["max_admissions_per_window"],
+    }
+
+
 def _validate_providers(policy: dict[str, Any]) -> None:
     providers = policy.get("providers", {})
-    if not isinstance(providers, dict) or not set(providers) <= set(PROVIDERS) - {
-        "codex"
-    }:
-        raise PolicyError("providers may describe only supported non-Codex providers")
+    if not isinstance(providers, dict) or not set(providers) <= set(PROVIDERS):
+        raise PolicyError("providers may describe only supported providers")
+    if policy["version"] >= 5 and set(providers) != set(PROVIDERS):
+        raise PolicyError("routing policy version 5 must describe every provider")
     try:
         if any(provider_for_model(model) != "codex" for model in policy["models"]):
             raise PolicyError("Codex policy models must be GPT models")
         for provider, entry in providers.items():
+            if provider == "codex":
+                # Codex models and roles stay at the top level of the policy;
+                # its provider entry holds only admission settings.
+                if not isinstance(entry, dict) or set(entry) != ADMISSION_POLICY_KEYS:
+                    raise PolicyError(
+                        "providers.codex must contain exactly client_versions and "
+                        "max_admissions_per_window"
+                    )
+                _validate_admission_settings(provider, entry)
+                continue
             if not isinstance(entry, dict) or set(entry) != {
-                "models", "roles", "verifier"
+                "models", "roles", "verifier", *ADMISSION_POLICY_KEYS
             }:
                 raise PolicyError(
-                    f"providers.{provider} must contain exactly models, roles, and verifier"
+                    f"providers.{provider} must contain exactly models, roles, verifier, "
+                    "client_versions and max_admissions_per_window"
                 )
+            _validate_admission_settings(provider, entry)
             models = entry["models"]
             if (
                 not isinstance(models, dict)

@@ -529,7 +529,12 @@ def child(directory, name):
 
 directory, name = sys.argv[1], sys.argv[2]
 arguments = sys.argv[3:]
-if name == "claude" and arguments[:2] == ["auth", "status"]:
+if arguments == ["--version"]:
+    # Answers from <name>-version.txt, or a version inside the reviewed range.
+    version = os.path.join(directory, name + "-version.txt")
+    default = {"claude": "2.1.200 (Claude Code)", "codex": "codex-cli 0.164.0"}[name]
+    sys.stdout.write(open(version).read() if os.path.exists(version) else default + "\\n")
+elif name == "claude" and arguments[:2] == ["auth", "status"]:
     sys.stdout.write(open(os.path.join(directory, "claude-status.json")).read())
 elif name == "codex" and arguments[:1] == ["app-server"]:
     log = open(os.path.join(directory, "methods.log"), "a")

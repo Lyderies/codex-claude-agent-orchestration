@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -24,6 +25,7 @@ from codex_agents.learning_contracts import (
     keyed_digest,
     validate_learning_record,
 )
+from codex_agents.routing import load_policy
 from codex_agents.learning_store import (
     PRODUCER_AUTHORITY,
     LearningLedger,
@@ -41,6 +43,8 @@ from codex_agents.providers import (
     claude_rate_limit_records,
     evaluate_admission,
     observe_claude,
+    parse_client_version,
+    window_start_ms,
     observe_codex,
     parse_claude_auth_status,
     parse_codex_rate_limits,
@@ -60,6 +64,14 @@ from tests.learning_support import (
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "providers"
+CODEX_LIMITS = {
+    "admission_policy": {
+        "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+        "max_admissions_per_window": 60,
+    },
+    "prior_run_admissions": [],
+    "window_headroom": [],
+}
 CLIENT = ("/usr/bin/fake-client", "f" * 64)
 parse_claude = functools.partial(parse_claude_auth_status, client=CLIENT)
 parse_codex = functools.partial(parse_codex_rate_limits, client=CLIENT)
@@ -225,6 +237,12 @@ class ProviderObservationTests(unittest.TestCase):
                 self.assertEqual("provider_identity", records[0]["record_type"])
                 real = os.path.realpath(executable)
                 self.assertEqual([real, "auth", "status", "--json"], calls[0][0])
+                # The version is read from the same resolved client, the same way.
+                self.assertEqual([real, "--version"], calls[1][0])
+                self.assertEqual(calls[0][1]["env"], calls[1][1]["env"])
+                # This stand-in prints the auth JSON for every command, which
+                # is not a version, so none is recorded.
+                self.assertIsNone(records[0]["client_version"])
                 self.assertTrue(calls[0][1]["start_new_session"])
                 # The child gets only a minimal environment; overrides are dropped.
                 self.assertEqual(
@@ -238,7 +256,7 @@ class ProviderObservationTests(unittest.TestCase):
                             digest_key=KEY, observed_at_ms=NOW,
                             environ={**environ, name: "set"}, popen=popen,
                         )
-            self.assertEqual(1, len(calls))
+            self.assertEqual(2, len(calls))
 
     def test_clients_resolve_only_from_the_trusted_path(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
@@ -588,7 +606,8 @@ class AdmissionTests(unittest.TestCase):
             provider_fixture("claude-auth-status.json"), digest_key=KEY, observed_at_ms=NOW
         )
         codex_identity = {**identity, "provider": "codex", "auth_method": None,
-                          "subscription_type": None}
+                          "subscription_type": None, "plan_type": "plus",
+                          "client_version": "0.164.0"}
         attestation = {"provider": "codex",
                        "account_fingerprint": identity["account_fingerprint"],
                        "observed_at_ms": 1}
@@ -597,7 +616,7 @@ class AdmissionTests(unittest.TestCase):
             identities=[(codex_identity, DIGEST_A)],
             attestations=[(attestation, DIGEST_B)],
             billing=[], headroom=[], prior_claude_admissions=set(),
-            environ={}, now_ms=NOW + 1,
+            environ={}, now_ms=NOW + 1, **CODEX_LIMITS,
         )
         self.assertEqual("billing_unverified", decision["reason_code"])
         stale_billing = {"provider": "codex",
@@ -610,7 +629,7 @@ class AdmissionTests(unittest.TestCase):
             identities=[(codex_identity, DIGEST_A)],
             attestations=[(attestation, DIGEST_B)],
             billing=[(stale_billing, DIGEST_C)], headroom=[],
-            prior_claude_admissions=set(), environ={}, now_ms=NOW + 1,
+            prior_claude_admissions=set(), environ={}, now_ms=NOW + 1, **CODEX_LIMITS,
         )
         self.assertEqual("billing_unverified", decision["reason_code"])
 
@@ -664,11 +683,13 @@ class AdmissionTests(unittest.TestCase):
                    utilization=0.0, resetsAt=future, isUsingOverage=False,
                    overageStatus="rejected", overageDisabledReason="org_level_disabled")
         self.assert_denied("provider_exhausted", "claude")
-        # Each run records one event, and only while it is open.
-        with self.assertRaisesRegex(LedgerError, "already recorded"):
-            self.event(real, status="allowed", rateLimitType="seven_day",
-                       utilization=0.0, isUsingOverage=False, overageStatus="rejected",
-                       overageDisabledReason="org_level_disabled")
+        # A run keeps only events more restrictive than its own earlier ones,
+        # so a later favourable event is dropped rather than recorded.
+        self.assertEqual([], self.event(
+            real, status="allowed", rateLimitType="seven_day", utilization=0.0,
+            resetsAt=future, isUsingOverage=False, overageStatus="rejected",
+            overageDisabledReason="org_level_disabled",
+        ))
         self.clock += 3_600_000
         self.observe("claude")
         self.assertEqual("pass", self.admit("claude")["decision"])
@@ -872,6 +893,507 @@ class AdmissionTests(unittest.TestCase):
                 "no_paid_overage": False, "no_usage_credits": True, "issued_at": 5,
             })
         self.assert_denied("billing_attestation_missing")
+
+    # S3b: client version, Codex plan, the run-count backstop, restrictive
+    # rate-limit events.
+
+    def version(self, provider: str, text: str) -> None:
+        (self.tools / f"{provider}-version.txt").write_text(text)
+
+    def limit(self, provider: str, **settings) -> None:
+        policy = deepcopy(load_policy(ORCHESTRATION_ROOT / "config" / "routing-policy.json"))
+        policy["providers"][provider].update(settings)
+        self.ledger._admission_policy = policy
+
+    def test_client_version_must_be_inside_the_reviewed_range(self) -> None:
+        identity = self.observe()[0]
+        self.assertEqual("0.164.0", identity["client_version"])
+        self.attest("codex", identity["account_fingerprint"])
+        for text, admitted in (
+            ("codex-cli 0.164.0\n", True),   # the lower boundary is inside
+            ("codex-cli 0.164.99\n", True),
+            ("codex-cli 0.165.0\n", False),  # the upper boundary is outside
+            ("codex-cli 0.163.9\n", False),
+            ("codex-cli 1.0.0\n", False),
+            ("", False),                       # missing
+            ("codex-cli\n", False),
+            ("codex-cli 0.164.0-alpha.1\n", False),
+            ("codex-cli 0.164\n", False),
+            ("codex-cli 0.164.0 (extra)\n", False),
+            ("0.164.0\n", False),
+            ("\xff\xfe garbage", False),
+        ):
+            with self.subTest(text=text):
+                self.version("codex", text)
+                observed = self.observe()[0]
+                if admitted:
+                    self.assertEqual("pass", self.admit()["decision"])
+                else:
+                    self.assert_denied("client_version_unreviewed")
+                    if observed["client_version"] is not None:
+                        self.assertFalse(observed["client_version"].startswith("0.164."))
+        claude = self.observe("claude")[0]
+        self.attest("claude", claude["account_fingerprint"])
+        for text, admitted in (
+            ("2.1.0 (Claude Code)\n", True),
+            ("2.1.123 (Claude Code)\n", True),
+            ("2.2.0 (Claude Code)\n", False),
+            ("2.0.99 (Claude Code)\n", False),
+            ("Claude Code\n", False),
+            ("", False),
+        ):
+            with self.subTest(text=text):
+                self.version("claude", text)
+                self.observe("claude")
+                if admitted:
+                    self.assertEqual("pass", self.admit("claude")["decision"])
+                else:
+                    self.assert_denied("client_version_unreviewed", "claude")
+
+    def test_client_version_parsing_keeps_only_a_plain_version(self) -> None:
+        self.assertEqual("2.1.123", parse_client_version("claude", b"2.1.123 (Claude Code)\n"))
+        self.assertEqual("2.1.123", parse_client_version("claude", "2.1.123"))
+        self.assertEqual("0.164.0", parse_client_version("codex", b"codex-cli 0.164.0\n"))
+        for provider, raw in (
+            ("codex", b"0.164.0"), ("claude", b"codex-cli 0.164.0"),
+            ("claude", b"2.1.123 (Claude Code)\n2.1.124"), ("claude", b"\xff"),
+            ("claude", b"9" * 300), ("claude", b"02.1.0"), ("gemini", b"1.0.0"),
+            ("claude", None), ("codex", b"codex-cli 0.164.0 fixture-account-5c2e08"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_client_version(provider, raw))
+        with self.assertRaisesRegex(ContractError, "plain semantic version"):
+            validate_learning_record({
+                **self.observe()[0], "client_version": "0.164.0 fixture-account-5c2e08",
+            })
+
+    def test_admission_without_usable_settings_is_denied(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.ledger._admission_policy = {"providers": {}}
+        self.assert_denied("admission_policy_unavailable")
+        self.limit("codex", client_versions={"minimum": "1.0.0", "maximum_exclusive": "0.1.0"})
+        self.assert_denied("admission_policy_unavailable")
+        self.ledger._admission_policy = None
+        self.assertEqual("pass", self.admit()["decision"])
+
+    def test_codex_requires_a_subscription_plan(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        for plan in (
+            "free", "fixture-account-5c2e08", "unknown", None,
+            "self_serve_business_usage_based", "enterprise_cbp_usage_based",
+        ):
+            with self.subTest(plan=plan):
+                self.observe(**{"rateLimits.planType": plan})
+                self.assert_denied("codex_plan_not_subscription")
+        result = json.loads(provider_fixture("codex-rate-limits.json"))
+        del result["rateLimits"]["planType"]
+        (self.tools / "codex-result.json").write_text(json.dumps(result))
+        with trusted_tools(self.tools), mock.patch.object(
+            self.ledger, "_clock_ms", return_value=self.tick()
+        ):
+            absent = self.ledger.observe_provider(
+                self.project_id, "codex", project_root=self.tools, environ=CLEAN
+            )[0]
+        self.assertIsNone(absent["plan_type"])
+        self.assert_denied("codex_plan_not_subscription")
+        for plan in ("plus", "pro", "team", "business", "enterprise"):
+            with self.subTest(plan=plan):
+                self.observe(**{"rateLimits.planType": plan})
+                self.assertEqual("pass", self.admit()["decision"])
+
+    def test_run_cap_counts_admissions_in_the_current_window(self) -> None:
+        self.limit("codex", max_admissions_per_window=2)
+        resets = self.clock + 3_600_000
+        reset_at = {"rateLimits.secondary.resetsAt": resets // 1000}
+        identity = self.observe(**reset_at)[0]
+        fingerprint = identity["account_fingerprint"]
+        self.attest("codex", fingerprint)
+        self.open_run()   # under the cap
+        self.open_run()   # reaches the cap
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open_run()
+        self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+        with self.ledger.repository(self.project_id) as repository:
+            stored = repository.records("admission_decision")
+        self.assertEqual(
+            ("deny", "window_run_cap_reached", None),
+            (stored[-1]["decision"], stored[-1]["reason_code"], stored[-1]["run_id"]),
+        )
+        self.assertEqual(2, len([item for item in stored if item["decision"] == "pass"]))
+        # Over the cap stays denied; a denial is not an admission and never counts.
+        self.assert_denied("window_run_cap_reached")
+        # Another account's admissions are its own.
+        other = self.observe(accountId="fixture-account-other", **reset_at)[0]
+        self.assertNotEqual(fingerprint, other["account_fingerprint"])
+        self.attest("codex", other["account_fingerprint"])
+        self.assertEqual("pass", self.ledger.host_run_admission(
+            self.project_id, self.open_run()["run_handle"]
+        )["decision"])
+        # The window resets: the next window starts five hours before its reset.
+        self.clock = resets + 1
+        self.observe(**{"rateLimits.secondary.resetsAt": (self.clock + 5 * 3_600_000) // 1000})
+        self.assertEqual("pass", self.ledger.host_run_admission(
+            self.project_id, self.open_run()["run_handle"]
+        )["decision"])
+        self.limit("codex", max_admissions_per_window=None)
+        self.open_run()
+        self.open_run()
+
+    def test_run_cap_window_falls_back_to_the_last_five_hours(self) -> None:
+        identity = parse_codex(
+            json.loads(provider_fixture("codex-rate-limits.json")),
+            digest_key=KEY, observed_at_ms=NOW, client_version="0.164.0",
+        )
+        fingerprint = identity[0]["account_fingerprint"]
+        attestation = {"provider": "codex", "account_fingerprint": fingerprint,
+                       "observed_at_ms": 1}
+        five_hours = 5 * 60 * 60 * 1000
+
+        def decide(prior, headroom=()):
+            return evaluate_admission(
+                provider="codex",
+                identities=[(identity[0], DIGEST_A)],
+                attestations=[(attestation, DIGEST_B)],
+                billing=[(identity[2], DIGEST_C)], headroom=list(headroom),
+                prior_claude_admissions=set(), environ={}, now_ms=NOW + 1,
+                admission_policy={
+                    "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+                    "max_admissions_per_window": 2,
+                },
+                prior_run_admissions=prior,
+                window_headroom=list(headroom),
+            )["reason_code"]
+
+        now = NOW + 1
+        inside, edge = now - five_hours + 1, now - five_hours
+        self.assertEqual("admitted", decide([(fingerprint, inside)]))
+        self.assertEqual("window_run_cap_reached", decide([(fingerprint, inside)] * 2))
+        self.assertEqual("window_run_cap_reached", decide([(fingerprint, inside)] * 3))
+        self.assertEqual("admitted", decide([(fingerprint, edge)] * 2))
+        self.assertEqual("admitted", decide([(DIGEST_C, inside)] * 2))
+        self.assertEqual("window_run_cap_reached", decide([(fingerprint, now + 1)] * 2))
+        # The fixture's five-hour reset is years away, so it is not trusted.
+        self.assertEqual(
+            (now - five_hours + 1, None),
+            window_start_ms("codex", fingerprint, [(identity[1], DIGEST_C)], now),
+        )
+        soon = {**identity[1], "windows": [
+            {**identity[1]["windows"][0], "resets_at": now + 60_000},
+        ]}
+        self.assertEqual(
+            (now + 60_000 - five_hours, DIGEST_C),
+            window_start_ms("codex", fingerprint, [(soon, DIGEST_C)], now),
+        )
+        self.assertEqual(
+            "window_run_cap_reached",
+            decide([(fingerprint, now + 60_000 - five_hours)] * 2, [(soon, DIGEST_C)]),
+        )
+        self.assertEqual(
+            "admitted",
+            decide([(fingerprint, now + 60_000 - five_hours - 1)] * 2, [(soon, DIGEST_C)]),
+        )
+
+    def test_many_headroom_records_keep_the_decision_bounded(self) -> None:
+        from codex_agents.providers import admission_record
+
+        records = parse_codex(
+            json.loads(provider_fixture("codex-rate-limits.json")),
+            digest_key=KEY, observed_at_ms=NOW, client_version="0.164.0",
+        )
+        identity, headroom, billing = records
+        attestation = {"provider": "codex", "account_fingerprint": identity["account_fingerprint"],
+                       "observed_at_ms": 1}
+        many = [
+            ({**headroom, "observed_at_ms": NOW - index}, f"{index:064x}")
+            for index in range(200)
+        ]
+        exhausted = {**headroom, "windows": [
+            {**headroom["windows"][0], "used_percent": 95.0, "resets_at": NOW + 60_000},
+        ]}
+
+        def decide(items):
+            return evaluate_admission(
+                provider="codex", identities=[(identity, DIGEST_A)],
+                attestations=[(attestation, DIGEST_B)], billing=[(billing, DIGEST_C)],
+                headroom=items, prior_claude_admissions=set(), environ={},
+                now_ms=NOW + 1, **CODEX_LIMITS,
+            )
+
+        passed = decide(many)
+        self.assertEqual("admitted", passed["reason_code"])
+        self.assertIn(many[-1][1], passed["evidence_digests"])
+        self.assertLessEqual(len(passed["evidence_digests"]), 5)
+        admission_record(passed, "run-1")
+        denied = decide([*many[:100], (exhausted, "e" * 64), *many[100:]])
+        self.assertEqual("provider_exhausted", denied["reason_code"])
+        self.assertIn("e" * 64, denied["evidence_digests"])
+        admission_record(denied, None)
+
+    def test_billing_probe_admissions_do_not_count_toward_the_cap(self) -> None:
+        self.limit("claude", max_admissions_per_window=2)
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        first = self.open_run("claude")
+        self.event(first, **json.loads(provider_fixture("claude-rate-limit-event.json")))
+        with self.ledger._lock, mock.patch.object(
+            self.ledger, "_clock_ms", return_value=self.tick()
+        ):
+            probe = self.ledger._evaluate_admission_locked(
+                self.project_id, provider="claude", environ=CLEAN, timestamp=self.clock
+            )
+            self.assertEqual("pass", probe["decision"])
+            for _ in range(3):
+                self.ledger._store_probe_admission_locked(
+                    self.project_id, {**probe, "observed_at_ms": self.tick()},
+                    timestamp=self.clock,
+                )
+        self.open_run("claude")
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open_run("claude")
+        self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+
+    def test_a_run_keeps_every_more_restrictive_rate_limit_event(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        quiet = {"isUsingOverage": False, "overageStatus": "rejected",
+                 "overageDisabledReason": "org_level_disabled"}
+        later = (self.clock + 3_600_000) // 1000
+
+        def kept(**info):
+            return [record["record_type"] for record in self.event(run, **info)]
+
+        base = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.2,
+                "resetsAt": later, **quiet}
+        self.assertEqual(["provider_headroom", "provider_billing"], kept(**base))
+        self.assertEqual([], kept(**base))
+        self.assertEqual([], kept(**{**base, "utilization": 0.1}))
+        self.assertEqual(["provider_headroom"], kept(**{**base, "utilization": 0.5}))
+        self.assertEqual(["provider_headroom"], kept(**{**base, "status": "allowed_warning"}))
+        self.assertEqual(["provider_headroom"], kept(**{**base, "rateLimitType": "seven_day"}))
+        self.assertEqual(
+            ["provider_billing"], kept(**{**base, "status": "allowed_warning",
+                                         "overageDisabledReason": None}),
+        )
+        # Once billing is unknown, a favourable event cannot restore it.
+        self.assertEqual([], kept(**{**base, "status": "allowed_warning"}))
+        self.assert_denied("billing_unverified", "claude")
+        with self.ledger.repository(self.project_id) as repository:
+            headroom = [record for record in repository.records("provider_headroom")
+                        if record["run_id"] is not None]
+        self.assertEqual({"during"}, {record["phase"] for record in headroom})
+        self.assertEqual(4, len(headroom))
+
+    def test_a_run_cannot_record_rate_limit_events_without_bound(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        quiet = {"isUsingOverage": False, "overageStatus": "rejected",
+                 "overageDisabledReason": "org_level_disabled"}
+        first_reset = (self.clock + 3_600_000) // 1000
+        later_reset = (self.clock + 7_200_000) // 1000
+        recorded = len(self.event(run, status="rejected", rateLimitType="five_hour",
+                                  utilization=1.0, resetsAt=first_reset, **quiet))
+        # Allowed readings that run longer than the rejection keep arriving
+        # until the run reaches the cap.
+        with self.assertRaisesRegex(ContractError, "too many rate-limit events"):
+            for step in range(200):
+                recorded += len(self.event(
+                    run, status="allowed", rateLimitType="five_hour",
+                    utilization=step / 1000, resetsAt=later_reset, **quiet,
+                ))
+        with self.ledger.repository(self.project_id) as repository:
+            stored = [
+                record for kind in ("provider_headroom", "provider_billing")
+                for record in repository.records(kind) if record["phase"] == "during"
+            ]
+            merged = [record for record in repository.records("provider_headroom")
+                      if record["phase"] == "during"][-1]
+        self.assertEqual(63, recorded)
+        self.assertEqual(64, len(stored))
+        # At the cap the run's whole restriction is merged: the highest status
+        # with the latest reset.
+        self.assertEqual(
+            ("rejected", 100.0, later_reset * 1000),
+            (merged["status"], merged["windows"][0]["used_percent"],
+             merged["windows"][0]["resets_at"]),
+        )
+        # The run is fenced: later events are refused and nothing is stored.
+        with self.assertRaisesRegex(ContractError, "too many rate-limit events"):
+            self.event(run, status="rejected", rateLimitType="five_hour",
+                       utilization=1.0, resetsAt=later_reset + 60, **quiet)
+        with self.ledger.repository(self.project_id) as repository:
+            self.assertEqual(64, len([
+                record for kind in ("provider_headroom", "provider_billing")
+                for record in repository.records(kind) if record["phase"] == "during"
+            ]))
+        # After the earlier reset the merged restriction still applies...
+        after_first = first_reset * 1000 + 1
+        self.observe("claude", now_ms=after_first)
+        self.assert_denied("provider_exhausted", "claude", now_ms=after_first + 1)
+        # ...and it lifts at the later reset.
+        after_later = later_reset * 1000 + 1
+        self.observe("claude", now_ms=after_later)
+        self.assertEqual("pass", self.admit("claude", now_ms=after_later + 1)["decision"])
+
+    def test_a_rejection_is_not_covered_by_a_longer_allowed_reading(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        quiet = {"isUsingOverage": False, "overageStatus": "rejected",
+                 "overageDisabledReason": "org_level_disabled"}
+        first_reset = (self.clock + 3_600_000) // 1000
+        later_reset = (self.clock + 7_200_000) // 1000
+        self.event(run, status="rejected", rateLimitType="five_hour", utilization=1.0,
+                   resetsAt=first_reset, **quiet)
+        self.event(run, status="allowed", rateLimitType="five_hour", utilization=0.5,
+                   resetsAt=later_reset, **quiet)
+        kept = self.event(run, status="rejected", rateLimitType="five_hour",
+                          utilization=1.0, resetsAt=later_reset, **quiet)
+        self.assertEqual(["provider_headroom"], [item["record_type"] for item in kept])
+        after_first = first_reset * 1000 + 1
+        self.observe("claude", now_ms=after_first)
+        self.assert_denied("provider_exhausted", "claude", now_ms=after_first + 1)
+
+    def test_a_later_reset_reading_cannot_free_counted_admissions(self) -> None:
+        self.limit("codex", max_admissions_per_window=1)
+        first = {"rateLimits.secondary.resetsAt": (self.clock + 3_600_000) // 1000}
+        identity = self.observe(**first)[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.open_run()
+        # A later reading reports a reset five hours away, which alone would
+        # start the window now; the earlier window is still live, so it counts.
+        self.observe(**{"rateLimits.secondary.resetsAt": (self.clock + 5 * 3_600_000) // 1000})
+        self.assert_denied("window_run_cap_reached")
+        with self.assertRaises(AdmissionDenied) as raised:
+            self.open_run()
+        self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+        headroom = [
+            ({"provider": "codex", "account_fingerprint": DIGEST_A, "observed_at_ms": NOW,
+              "windows": [{"window_minutes": 300, "scope": None, "used_percent": 1.0,
+                           "resets_at": reset}]}, digest)
+            for reset, digest in ((NOW + 3_600_000, DIGEST_B), (NOW + 5 * 3_600_000, DIGEST_C))
+        ]
+        self.assertEqual(
+            (NOW + 3_600_000 - 5 * 3_600_000, DIGEST_B),
+            window_start_ms("codex", DIGEST_A, headroom, NOW),
+        )
+        # Once the earlier window resets, the later reading places the window.
+        self.assertEqual(
+            (NOW, DIGEST_C), window_start_ms("codex", DIGEST_A, headroom, NOW + 3_600_000 + 1)
+        )
+
+    def test_the_run_cap_counts_the_account_across_projects(self) -> None:
+        self.limit("codex", max_admissions_per_window=1)
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.open_run()
+        other_root = Path(self.temporary.name) / "other-project"
+        other_root.mkdir()
+        first_project = self.project_id
+        self.project_id = self.ledger.register_project(other_root, now_ms=1)
+        try:
+            other = self.observe()[0]
+            self.assertEqual(identity["account_fingerprint"], other["account_fingerprint"])
+            self.attest("codex", other["account_fingerprint"])
+            with self.assertRaises(AdmissionDenied) as raised:
+                self.open_run()
+            self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+        finally:
+            self.project_id = first_project
+
+    def test_the_cap_window_is_placed_from_every_projects_readings(self) -> None:
+        self.limit("codex", max_admissions_per_window=1)
+        identity = self.observe(
+            **{"rateLimits.secondary.resetsAt": (self.clock + 3_600_000) // 1000}
+        )[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.open_run()
+        other_root = Path(self.temporary.name) / "other-project"
+        other_root.mkdir()
+        first_project = self.project_id
+        self.project_id = self.ledger.register_project(other_root, now_ms=1)
+        try:
+            self.clock += 10_000
+            # Project B alone sees a reset five hours away, which would start
+            # its window after project A's admission.
+            other = self.observe(
+                **{"rateLimits.secondary.resetsAt": (self.clock + 5 * 3_600_000) // 1000}
+            )[0]
+            self.attest("codex", other["account_fingerprint"])
+            with self.assertRaises(AdmissionDenied) as raised:
+                self.open_run()
+            self.assertEqual("window_run_cap_reached", raised.exception.reason_code)
+            # The denial is stored in this project, citing only its own records
+            # (the ledger refuses evidence from another project).
+            with self.ledger.repository(self.project_id) as repository:
+                stored = repository.records("admission_decision")[-1]
+            self.assertEqual(
+                ("deny", "window_run_cap_reached"), (stored["decision"], stored["reason_code"])
+            )
+        finally:
+            self.project_id = first_project
+
+    def test_a_reset_less_rejection_survives_the_overflow_merge(self) -> None:
+        fingerprint = self.observe("claude")[0]["account_fingerprint"]
+        self.attest("claude", fingerprint)
+        run = self.open_run("claude")
+        quiet = {"isUsingOverage": False, "overageStatus": "rejected",
+                 "overageDisabledReason": "org_level_disabled"}
+        reset = (self.clock + 3_600_000) // 1000
+        recorded = 0
+        for step in range(62):
+            recorded += len(self.event(
+                run, status="allowed", rateLimitType="five_hour",
+                utilization=step / 1000, resetsAt=reset, **quiet,
+            ))
+        self.assertEqual(63, recorded)
+        rejected_at = self.clock + 1
+        with self.assertRaisesRegex(ContractError, "too many rate-limit events"):
+            self.event(run, status="rejected", rateLimitType="five_hour",
+                       utilization=1.0, **quiet)
+        with self.ledger.repository(self.project_id) as repository:
+            merged = [record for record in repository.records("provider_headroom")
+                      if record["phase"] == "during"][-1]
+        self.assertEqual("rejected", merged["status"])
+        # The reset-less rejection lasts its day, not the allowed readings' hour.
+        self.assertEqual(rejected_at + 24 * 3_600_000, merged["windows"][0]["resets_at"])
+        after_reset = reset * 1000 + 1
+        self.observe("claude", now_ms=after_reset)
+        self.assert_denied("provider_exhausted", "claude", now_ms=after_reset + 1)
+
+    def test_the_locked_recheck_reads_the_clock_it_holds(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        orchestration = self.ledger.open_orchestration(
+            self.project_id, client_version="codex-host-v1", now_ms=NOW
+        )
+        fresh = self.clock + 1
+        # The opener passes its first check, then waits for the lock past the
+        # point where the identity is too old to admit.
+        stale = identity["observed_at_ms"] + IDENTITY_MAX_AGE_MS + 1
+        times = iter([fresh, stale])
+        with mock.patch.object(self.ledger, "_clock_ms", side_effect=lambda: next(times)), \
+                self.assertRaises(AdmissionDenied) as raised:
+            self._open_run("codex", orchestration, fresh)
+        self.assertEqual("provider_identity_missing", raised.exception.reason_code)
+        with self.ledger.repository(self.project_id) as repository:
+            stored = repository.records("admission_decision")[-1]
+        self.assertEqual(
+            ("provider_identity_missing", stale), (stored["reason_code"], stored["observed_at_ms"])
+        )
+        # A pass is stamped with the time the lock was held, too.
+        self.observe()
+        later = self.clock + 5
+        times = iter([self.clock + 1, later])
+        with mock.patch.object(self.ledger, "_clock_ms", side_effect=lambda: next(times)):
+            opened = self._open_run("codex", orchestration, self.clock + 1)
+        self.assertEqual(
+            later,
+            self.ledger.host_run_admission(self.project_id, opened["run_handle"])["observed_at_ms"],
+        )
 
     def test_database_never_stores_raw_identity_values(self) -> None:
         for provider in ("codex", "claude"):

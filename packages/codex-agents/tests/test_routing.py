@@ -19,6 +19,7 @@ from codex_agents.routing import (
     DEFAULT_PROVIDER_CONFIG_DIGEST,
     PolicyError,
     _route_task_legacy_fallback,
+    admission_settings,
     load_effective_policy,
     load_policy,
     route_task,
@@ -111,6 +112,8 @@ class RoutingTests(unittest.TestCase):
         route = route_task(self.task(family="planning"), self.policy)
         self.assertEqual("gpt-6.1-sol", route["model"])
         self.assertEqual("codex_agents_planner", route["role"])
+        # Routine planning runs Sol at high effort, as the routing table says.
+        self.assertEqual(("high", "bounded_planning"), (route["effort"], route["reason"]))
 
     def test_security_route_uses_explicit_astra_high_candidate(self) -> None:
         route = route_task(self.task(family="security"), self.policy)
@@ -1039,6 +1042,65 @@ class ProviderRoutingTests(unittest.TestCase):
                 dir=TEMP_ROOT
             ) as directory, self.assertRaisesRegex(PolicyError, message):
                 load_policy(self.write_policy(directory, policy))
+
+    def test_policy_validates_admission_settings(self) -> None:
+        def versions(**changes):
+            return lambda policy: policy["providers"]["codex"]["client_versions"].update(
+                changes
+            )
+
+        cases = {
+            "must contain exactly minimum": lambda policy: policy["providers"]["claude"][
+                "client_versions"
+            ].pop("maximum_exclusive"),
+            "ascending semantic version range": versions(minimum="0.165.0"),
+            "ascending semantic version range ": versions(maximum_exclusive="0.164"),
+            " ascending semantic version range": versions(minimum="v0.164.0"),
+            "ascending semantic version range  ": versions(minimum="0.164.0-alpha.1"),
+            "ascending semantic version range   ": versions(minimum=164),
+            "positive integer or null": lambda policy: policy["providers"]["codex"].update(
+                max_admissions_per_window=0
+            ),
+            "positive integer or null ": lambda policy: policy["providers"]["claude"].update(
+                max_admissions_per_window=True
+            ),
+            " positive integer or null": lambda policy: policy["providers"]["claude"].update(
+                max_admissions_per_window="40"
+            ),
+            "providers.codex must contain exactly": lambda policy: policy["providers"][
+                "codex"
+            ].update(models={}),
+            "providers.claude must contain exactly": lambda policy: policy["providers"][
+                "claude"
+            ].pop("client_versions"),
+            "must describe every provider": lambda policy: policy["providers"].pop("codex"),
+        }
+        for message, mutate in cases.items():
+            policy = deepcopy(self.policy)
+            mutate(policy)
+            with self.subTest(message=message), tempfile.TemporaryDirectory(
+                dir=TEMP_ROOT
+            ) as directory, self.assertRaisesRegex(PolicyError, message.strip()):
+                load_policy(self.write_policy(directory, policy))
+        uncapped = deepcopy(self.policy)
+        uncapped["providers"]["codex"]["max_admissions_per_window"] = None
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            loaded = load_policy(self.write_policy(directory, uncapped))
+        self.assertEqual(
+            {
+                "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.165.0"},
+                "max_admissions_per_window": None,
+            },
+            admission_settings(loaded, "codex"),
+        )
+        self.assertEqual(
+            {
+                "client_versions": {"minimum": "2.1.0", "maximum_exclusive": "2.2.0"},
+                "max_admissions_per_window": 40,
+            },
+            admission_settings(self.policy, "claude"),
+        )
+        self.assertEqual(60, admission_settings(self.policy, "codex")["max_admissions_per_window"])
 
     def test_provider_configuration_is_closed_and_bounded(self) -> None:
         valid = {
