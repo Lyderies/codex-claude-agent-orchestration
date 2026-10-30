@@ -49,6 +49,8 @@ RECORD_TYPES = {
     "dispatch_intent",
     "host_run_profile",
     "probe_admission",
+    "observation_unavailable",
+    "provider_usage",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -1649,18 +1651,20 @@ PROVIDER_NAMES = {"codex", "claude"}
 PROVIDER_IDENTITY_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
     "logged_in", "auth_method", "subscription_type", "plan_type", "client_path",
-    "client_sha256", "observed_at_ms",
+    "client_sha256", "client_version", "observed_at_ms",
 }
 PROVIDER_HEADROOM_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
-    "windows", "status", "run_id", "observed_at_ms",
+    "windows", "status", "run_id", "phase", "observed_at_ms",
 }
+# When an observation was taken relative to the run it belongs to.
+OBSERVATION_PHASES = {"before", "during", "after"}
 HEADROOM_WINDOW_FIELDS = {"window_minutes", "scope", "used_percent", "resets_at"}
 PROVIDER_BILLING_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
     "paid_usage_usable", "has_credits", "unlimited", "ordinary_usage_allowed",
     "is_using_overage", "overage_status", "overage_disabled_reason", "run_id",
-    "observed_at_ms",
+    "phase", "observed_at_ms",
 }
 BILLING_ATTESTATION_FIELDS = {
     "schema_version", "record_type", "record_id", "provider", "account_fingerprint",
@@ -1686,6 +1690,10 @@ ADMISSION_REASON_CODES = {
     "provider_exhausted",
     "claude_backend_not_subscription",
     "claude_model_override_present",
+    "admission_policy_unavailable",
+    "client_version_unreviewed",
+    "codex_plan_not_subscription",
+    "window_run_cap_reached",
 }
 CLAUDE_HEADROOM_STATUSES = {"allowed", "allowed_warning", "rejected"}
 CLAUDE_OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected"}
@@ -1698,6 +1706,13 @@ CODEX_PLAN_TYPES = frozenset({
     "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise",
     "edu", "edu_plus", "edu_pro", "sci", "sci_plus",
 })
+# The plans admission accepts as a flat subscription. Free, usage-based and
+# consumption-priced plans, and any plan whose billing is not known, stay out.
+CODEX_SUBSCRIPTION_PLAN_TYPES = CODEX_PLAN_TYPES - frozenset({
+    "free", "self_serve_business_usage_based", "enterprise_cbp_automation",
+    "enterprise_cbp_usage_based", "ent26",
+})
+SEMVER_PATTERN = re.compile(r"^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$")
 # Reasons that mean paid overage is switched off. Credit exhaustion, fetch
 # errors, unknown and "no limits configured" do not prove that, so they stay out.
 CLAUDE_OVERAGE_DISABLED_REASONS = frozenset({
@@ -1711,11 +1726,29 @@ CLAUDE_WINDOW_SCOPES = {
 }
 
 
+def parse_semver(value: Any) -> tuple[int, int, int] | None:
+    """A plain MAJOR.MINOR.PATCH version as a tuple; anything else is None."""
+
+    if not isinstance(value, str):
+        return None
+    match = SEMVER_PATTERN.fullmatch(value)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
 def _observation_base(data: dict[str, Any], record_type: str) -> None:
     _base(data, record_type)
     _enum(data["provider"], PROVIDER_NAMES, "provider")
     _digest(data["account_fingerprint"], "account_fingerprint")
     _integer(data["observed_at_ms"], "observed_at_ms")
+
+
+def _run_phase(data: dict[str, Any]) -> None:
+    _identifier(data["run_id"], "run_id", nullable=True)
+    _enum(data["phase"], OBSERVATION_PHASES, "phase", nullable=True)
+    if (data["run_id"] is None) != (data["phase"] is None):
+        raise ContractError("an observation phase belongs only to a run")
 
 
 def validate_provider_identity(data: Any) -> dict[str, Any]:
@@ -1737,6 +1770,8 @@ def validate_provider_identity(data: Any) -> dict[str, Any]:
     ):
         raise ContractError("client_path must be an absolute path")
     _digest(data["client_sha256"], "client_sha256")
+    if data["client_version"] is not None and parse_semver(data["client_version"]) is None:
+        raise ContractError("client_version must be a plain semantic version")
     return data
 
 
@@ -1756,7 +1791,7 @@ def validate_provider_headroom(data: Any) -> dict[str, Any]:
         )
         _integer(window["resets_at"], "resets_at", nullable=True)
     _enum(data["status"], CLAUDE_HEADROOM_STATUSES, "status", nullable=True)
-    _identifier(data["run_id"], "run_id", nullable=True)
+    _run_phase(data)
     return data
 
 
@@ -1774,7 +1809,7 @@ def validate_provider_billing(data: Any) -> dict[str, Any]:
         data["overage_disabled_reason"], set(CLAUDE_OVERAGE_DISABLED_REASONS),
         "overage_disabled_reason", nullable=True,
     )
-    _identifier(data["run_id"], "run_id", nullable=True)
+    _run_phase(data)
     return data
 
 
@@ -1904,6 +1939,85 @@ def validate_probe_admission(data: Any) -> dict[str, Any]:
     return data
 
 
+OBSERVATION_UNAVAILABLE_FIELDS = {
+    "schema_version", "record_type", "record_id", "provider", "run_id", "phase",
+    "reason_code", "observed_at_ms",
+}
+OBSERVATION_UNAVAILABLE_REASONS = {
+    "observation_failed", "observation_timed_out", "client_unavailable",
+    "no_rate_limit_event", "usage_unavailable",
+}
+
+
+def validate_observation_unavailable(data: Any) -> dict[str, Any]:
+    """A run's provider reading that could not be taken; never evidence of headroom."""
+
+    data = _closed(data, OBSERVATION_UNAVAILABLE_FIELDS, "observation_unavailable")
+    _base(data, "observation_unavailable")
+    _enum(data["provider"], PROVIDER_NAMES, "provider")
+    _identifier(data["run_id"], "run_id")
+    _enum(data["phase"], OBSERVATION_PHASES, "phase")
+    _enum(data["reason_code"], OBSERVATION_UNAVAILABLE_REASONS, "reason_code")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
+TOKEN_FIELDS = (
+    "input_tokens", "cached_input_tokens", "cache_creation_input_tokens",
+    "output_tokens", "reasoning_output_tokens",
+)
+PROVIDER_USAGE_FIELDS = {
+    "schema_version", "record_type", "record_id", "provider", "run_id", "phase",
+    "requested_model", "models", "helper_models", *TOKEN_FIELDS, "observed_at_ms",
+}
+MODEL_USAGE_FIELDS = {"model", *TOKEN_FIELDS}
+MAX_USAGE_MODELS = 8
+
+
+def _token_counts(data: dict[str, Any], label: str) -> None:
+    for field in TOKEN_FIELDS:
+        _integer(data[field], f"{label}.{field}", nullable=True)
+
+
+def validate_provider_usage(data: Any) -> dict[str, Any]:
+    """The client-observed usage of one bridged run, linked to that run."""
+
+    data = _closed(data, PROVIDER_USAGE_FIELDS, "provider_usage")
+    _base(data, "provider_usage")
+    _enum(data["provider"], PROVIDER_NAMES, "provider")
+    _identifier(data["run_id"], "run_id")
+    _enum(data["phase"], {"after"}, "phase")
+    _enum(data["requested_model"], SUPPORTED_MODELS, "requested_model")
+    if provider_for_model(data["requested_model"]) != data["provider"]:
+        raise ContractError("provider_usage model and provider disagree")
+    _token_counts(data, "provider_usage")
+    models = data["models"]
+    if not isinstance(models, list) or len(models) > MAX_USAGE_MODELS:
+        raise ContractError("provider_usage models must be a bounded array")
+    names = []
+    for entry in models:
+        entry = _closed(entry, MODEL_USAGE_FIELDS, "provider_usage model")
+        # A model outside the supported set is kept only as an unnamed entry.
+        _enum(entry["model"], SUPPORTED_MODELS, "provider_usage model", nullable=True)
+        _token_counts(entry, "provider_usage model")
+        names.append(entry["model"] or "")
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise ContractError("provider_usage models must be sorted and unique")
+    helpers = data["helper_models"]
+    if (
+        not isinstance(helpers, list)
+        or len(helpers) > MAX_USAGE_MODELS
+        or helpers != sorted(set(helpers))
+    ):
+        raise ContractError("provider_usage helper_models must be a sorted unique array")
+    for helper in helpers:
+        _enum(helper, SUPPORTED_MODELS, "helper_models")
+    if data["provider"] == "codex" and (models or helpers):
+        raise ContractError("Codex usage is reported only as totals")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -1928,6 +2042,8 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "dispatch_intent": validate_dispatch_intent,
     "host_run_profile": validate_host_run_profile,
     "probe_admission": validate_probe_admission,
+    "observation_unavailable": validate_observation_unavailable,
+    "provider_usage": validate_provider_usage,
 }
 
 

@@ -15,7 +15,81 @@ from codex_agents.learning_contracts import (
 from tests.learning_support import candidate, event_record, verification_outcome
 
 
+def usage_record(**changes) -> dict:
+    return {
+        "schema_version": 1, "record_type": "provider_usage", "record_id": "provider_usage:1",
+        "provider": "claude", "run_id": "run-1", "phase": "after",
+        "requested_model": "claude-opus-5-5",
+        "models": [
+            {"model": None, "input_tokens": 1, "cached_input_tokens": None,
+             "cache_creation_input_tokens": None, "output_tokens": None,
+             "reasoning_output_tokens": None},
+            {"model": "claude-opus-5-5", "input_tokens": 10, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0, "output_tokens": 2,
+             "reasoning_output_tokens": None},
+        ],
+        "helper_models": ["claude-haiku-5-5"],
+        "input_tokens": 10, "cached_input_tokens": 0, "cache_creation_input_tokens": 0,
+        "output_tokens": 2, "reasoning_output_tokens": None, "observed_at_ms": 5,
+        **changes,
+    }
+
+
 class LearningContractTests(unittest.TestCase):
+    def test_provider_usage_and_unavailable_readings_are_closed(self) -> None:
+        validate_learning_record(usage_record())
+        validate_learning_record(usage_record(
+            provider="codex", requested_model="gpt-6.1-sol", models=[], helper_models=[],
+        ))
+        model = usage_record()["models"][1]
+        for changes, message in (
+            ({"prompt": "x"}, "unknown fields"),
+            ({"phase": "before"}, "phase"),
+            ({"run_id": None}, "run_id"),
+            ({"requested_model": "gpt-6.1-sol"}, "disagree"),
+            ({"provider": "codex", "requested_model": "gpt-6.1-sol"}, "only as totals"),
+            ({"models": list(reversed(usage_record()["models"]))}, "sorted"),
+            ({"models": [model, model]}, "sorted and unique"),
+            ({"models": [{**model, "model": "fixture-model-x"}]}, "model"),
+            ({"models": [{**model, "cost": 1}]}, "unknown fields"),
+            ({"helper_models": ["fixture-model-x"]}, "helper_models"),
+            ({"input_tokens": -1}, "input_tokens"),
+            ({"output_tokens": True}, "output_tokens"),
+        ):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ContractError, message):
+                validate_learning_record(usage_record(**changes))
+        unavailable = {
+            "schema_version": 1, "record_type": "observation_unavailable",
+            "record_id": "observation_unavailable:1", "provider": "codex",
+            "run_id": "run-1", "phase": "after", "reason_code": "observation_failed",
+            "observed_at_ms": 5,
+        }
+        validate_learning_record(unavailable)
+        for changes, message in (
+            ({"reason_code": "failed: /some/path"}, "reason_code"),
+            ({"phase": None}, "phase"),
+            ({"run_id": None}, "run_id"),
+            ({"detail": "x"}, "unknown fields"),
+        ):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ContractError, message):
+                validate_learning_record({**unavailable, **changes})
+
+    def test_run_observations_carry_a_phase_only_with_a_run(self) -> None:
+        headroom = {
+            "schema_version": 1, "record_type": "provider_headroom",
+            "record_id": "provider_headroom:1", "provider": "codex",
+            "account_fingerprint": "a" * 64, "windows": [], "status": None,
+            "run_id": None, "phase": None, "observed_at_ms": 5,
+        }
+        validate_learning_record(headroom)
+        validate_learning_record({**headroom, "run_id": "run-1", "phase": "before"})
+        for changes in (
+            {"run_id": "run-1", "phase": None}, {"run_id": None, "phase": "after"},
+            {"run_id": "run-1", "phase": "later"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ContractError):
+                validate_learning_record({**headroom, **changes})
+
     def test_provider_is_derived_from_the_model(self) -> None:
         self.assertEqual("codex", provider_for_model("gpt-6.1-sol"))
         self.assertEqual("claude", provider_for_model("claude-opus-5-5"))

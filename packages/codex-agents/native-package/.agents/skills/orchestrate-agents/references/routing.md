@@ -97,21 +97,33 @@ verifier is admitted when its own run is opened. The checks run in this order, a
 first failure denies with a stable `reason_code`:
 
 1. `provider_api_key_present`: `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set.
-2. `provider_identity_missing`: no `provider-observe` identity in the last 30 minutes.
-3. `billing_attestation_missing`: no owner-signed attestation for that account
+2. `admission_policy_unavailable`: the installed routing policy has no usable admission
+   settings for the provider (`providers.<p>.client_versions` and
+   `max_admissions_per_window`).
+3. `provider_identity_missing`: no `provider-observe` identity in the last 30 minutes.
+4. `client_version_unreviewed`: the client version that identity recorded (from
+   `claude --version` or `codex --version`) is missing, unparsable, or outside the
+   policy's reviewed range, `minimum` inclusive to `maximum_exclusive`.
+5. `billing_attestation_missing`: no owner-signed attestation for that account
    fingerprint, recorded with `learning-record-billing-attestation`.
-4. `claude_subscription_missing`: for Claude, the login is not `claude.ai` with a
-   subscription.
-5. `paid_usage_usable` or `billing_unverified`: any billing observation in the last day
+6. `claude_subscription_missing`: for Claude, the login is not `claude.ai` with a
+   subscription. `codex_plan_not_subscription`: for Codex, the plan type is absent,
+   unknown, `free`, or a usage-based or consumption-priced plan.
+7. `paid_usage_usable` or `billing_unverified`: any billing observation in the last day
    shows paid usage usable or overage in use, or the latest cannot show it is off.
    Codex needs a billing read from the last 30 minutes. Claude has no non-spending
    billing source, so one bootstrap run per account may open on the identity and
    attestation alone; no other Claude run is admitted until that run records its
    rate-limit event.
-6. `provider_exhausted`: the most restrictive headroom that has not reset yet is
+8. `provider_exhausted`: the most restrictive headroom that has not reset yet is
    exhausted. That is Codex at 90 percent or more on any window, or ordinary usage not
    allowed, and Claude with a rejected or full window. A later favourable observation
    never clears a restriction that still applies.
+9. `window_run_cap_reached`: the account already has `max_admissions_per_window`
+   passing run admissions for the provider in the current five-hour window. The window
+   starts five hours before the latest recorded five-hour reset, or is the last five
+   hours when no reset in the next five hours is known. Billing probes do not count.
+   The count is taken under the ledger's write lock with the decision.
 
 The ledger evaluates admission itself, from its own records and its own environment,
 and stores the decision and the digests of the records it used with the run. No caller
@@ -120,8 +132,13 @@ binds. Every result commit, including that legacy path, requires the run's store
 passing decision and never re-evaluates time-varying facts.
 
 Observations are written only by `provider-observe`, which runs the provider client
-itself, and by the bridge's rate-limit event recorder, which accepts one event per
-open Claude run and stamps it with the ledger's clock. Provider clients are found only
+itself, and by the bridge. The bridge's rate-limit event recorder accepts events only
+while a Claude run is open, stamps them with the ledger's clock, and keeps each one that
+is more restrictive than the run's earlier events, so a rejection late in a run blocks
+the next admission until it resets. The bridge's own observations carry the run and a
+phase (`before` or `after` launch; in-run events are `during`), a reading that fails is
+stored as `observation_unavailable`, and the run's client-observed usage is stored as
+`provider_usage`. Provider clients are found only
 on a fixed trusted path (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and
 `~/.local/bin`), never through the caller's `PATH`. They run with a minimal environment,
 and the identity record keeps the client's real path and SHA-256 locally for audit. No producer, hook or collector
@@ -152,7 +169,8 @@ provider API key, and a run handle that was already dispatched.
   launch with `managed_settings_present`, because they apply despite
   `--setting-sources project` and the init frame cannot show them.
 - The account is observed again immediately before launch and must match the admitted
-  fingerprint. A durable `dispatch_intent` is then written, and the bridge run ID is
+  fingerprint and the admitted client version, which must still be in the reviewed
+  range; the child is launched from the client that re-check read. A durable `dispatch_intent` is then written, and the bridge run ID is
   bound as the run's agent; there is no second launch for that run.
 - The child runs in its own session. The tighter of the route's and the assignment's
   `timeout_seconds` is a hard deadline, and the tighter `max_tool_calls` sets Claude's
@@ -164,8 +182,8 @@ provider API key, and a run handle that was already dispatched.
 - Claude children run with only Read, Glob and Grep, `dontAsk` permissions, generated
   settings with hooks and built-in plugins off and the model pinned, no MCP servers and
   no session persistence. The run fails closed unless the init frame reports no API
-  key, the requested model, no plugins, no MCP servers and only those tools. The first
-  `rate_limit_event` is recorded for the run. Any model other than the requested one
+  key, the requested model, no plugins, no MCP servers and only those tools. Every
+  `rate_limit_event` goes to the ledger, which keeps the more restrictive ones. Any model other than the requested one
   in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
   unreviewed with an unknown verdict. `read_containment` is `enforced`.
 - Codex children run `codex exec` read-only and ephemeral, between non-spending

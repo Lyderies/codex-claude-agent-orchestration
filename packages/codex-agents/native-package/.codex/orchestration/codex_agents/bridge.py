@@ -27,7 +27,13 @@ from typing import Any
 
 from .catalog import CatalogError, parse_claude_agent
 from .contracts import ContractError, result_preflight, validate_assignment
-from .providers import api_keys_present, client_environment, resolve_client
+from .learning_contracts import SUPPORTED_MODELS
+from .providers import (
+    api_keys_present,
+    client_environment,
+    observation_failure_reason,
+    resolve_client,
+)
 
 MAX_EXPORT_BYTES = 16 * 1024 * 1024
 MAX_EXPORT_FILES = 2_000
@@ -68,6 +74,7 @@ MANAGED_SETTINGS_PATHS = {
 WORKSPACE_PARENT: str | None = None
 WATCHDOG_GRACE_SECONDS = 2
 PATHSPEC_SPECIAL = set("*?[\\")
+MAX_TOKEN_COUNT = 2**53
 
 
 class BridgeRefused(ContractError):
@@ -490,6 +497,42 @@ def _private_file(path: Path, content: bytes) -> Path:
     return path
 
 
+def _token_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_TOKEN_COUNT:
+        return None
+    return value
+
+
+def _claude_model_usage(model_usage: Any) -> list[dict[str, Any]]:
+    """Per-model token counts from Claude's `modelUsage`; unknown names are unnamed."""
+
+    if not isinstance(model_usage, dict):
+        return []
+    merged: dict[str, dict[str, Any]] = {}
+    for name, entry in model_usage.items():
+        if not isinstance(entry, dict):
+            continue
+        model = name if name in SUPPORTED_MODELS and name.startswith("claude-") else None
+        counts = {
+            "input_tokens": _token_count(entry.get("inputTokens")),
+            "cached_input_tokens": _token_count(entry.get("cacheReadInputTokens")),
+            "cache_creation_input_tokens": _token_count(entry.get("cacheCreationInputTokens")),
+            "output_tokens": _token_count(entry.get("outputTokens")),
+            "reasoning_output_tokens": None,
+        }
+        key = model or ""
+        if key in merged:
+            # Unnamed models are summed; a missing count makes the sum unknown.
+            for field, value in counts.items():
+                previous = merged[key][field]
+                merged[key][field] = (
+                    None if previous is None or value is None else previous + value
+                )
+        else:
+            merged[key] = {"model": model, **counts}
+    return [merged[key] for key in sorted(merged)]
+
+
 def _check_claude_init(frame: dict[str, Any], model: str) -> str | None:
     """Return the first init-frame violation, or None when the frame is clean."""
 
@@ -520,9 +563,11 @@ def run_claude(
     environ: Mapping[str, str],
     deadline_seconds: float,
     max_turns: int,
+    executable: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    from .learning_store import LedgerError
+
     model = route["model"]
-    executable, _ = resolve_client("claude")
     settings = _private_file(
         control / "settings.json", json.dumps(claude_settings(model)).encode()
     )
@@ -544,7 +589,8 @@ def run_claude(
         child_prompt(assignment),
     ]
     state: dict[str, Any] = {
-        "init": None, "result": None, "rate_limit_recorded": False, "frames": 0,
+        "init": None, "result": None, "rate_limit_events": 0, "rate_limit_kept": 0,
+        "frames": 0,
         "models": set(),
         "helper_models": set(),
     }
@@ -560,16 +606,19 @@ def run_claude(
                 raise _Abort(f"init_{violation}")
             state["init"] = frame
             return
-        if kind == "rate_limit_event" and not state["rate_limit_recorded"]:
-            state["rate_limit_recorded"] = True
+        if kind == "rate_limit_event":
+            # Every event goes to the ledger, which keeps each one that is more
+            # restrictive than the run's earlier events.
+            state["rate_limit_events"] += 1
             try:
-                ledger.record_claude_rate_limit_event(
+                kept = ledger.record_claude_rate_limit_event(
                     project_id,
                     run_handle=run_handle,
                     rate_limit_info=frame.get("rate_limit_info"),
                 )
-            except ContractError as exc:
+            except (ContractError, LedgerError) as exc:
                 raise _Abort("rate_limit_event_invalid") from exc
+            state["rate_limit_kept"] += len(kept)
         elif kind == "result":
             state["result"] = frame
             usage = frame.get("modelUsage")
@@ -607,7 +656,9 @@ def run_claude(
         # other than the requested one leaves the result unreviewed.
         "rerouted": bool(state["models"] - {model}),
         "helper_models": sorted(state["helper_models"]),
-        "rate_limit_event_recorded": state["rate_limit_recorded"],
+        "rate_limit_event_recorded": state["rate_limit_kept"] > 0,
+        "rate_limit_events": state["rate_limit_events"],
+        "rate_limit_records_kept": state["rate_limit_kept"],
         "usage": None,
         "permission_denials": None,
     }
@@ -622,6 +673,7 @@ def run_claude(
             # An API-list-price estimate reported by the client; never a charge.
             "api_equivalent_cost_usd_estimate": result_frame.get("total_cost_usd"),
         }
+        report["model_usage"] = _claude_model_usage(result_frame.get("modelUsage"))
         denials = result_frame.get("permission_denials")
         if isinstance(denials, list):
             report["permission_denials"] = {
@@ -654,9 +706,9 @@ def run_codex(
     schema: bytes,
     environ: Mapping[str, str],
     deadline_seconds: float,
+    executable: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     model = route["model"]
-    executable, _ = resolve_client("codex")
     try:
         original_schema = json.loads(schema)
     except ValueError as exc:
@@ -920,12 +972,33 @@ def dispatch(
         control.mkdir(mode=0o700)
         file_count = export_committed_paths(project_root, paths, export)
         # Re-check the account immediately before launch: it must still be the
-        # admitted one, and the environment must still be key-free.
-        identity = ledger.observe_provider(
-            project_id, provider, project_root=export, environ=environ
-        )[0]
+        # admitted one, on the admitted reviewed client, and the environment
+        # must still be key-free.
+        try:
+            identity = ledger.observe_provider(
+                project_id, provider, project_root=export, environ=environ,
+                run_handle=run_handle, phase="before",
+            )[0]
+        except ContractError as exc:
+            ledger.record_observation_unavailable(
+                project_id, run_handle=run_handle, provider=provider, phase="before",
+                reason_code=observation_failure_reason(exc),
+            )
+            raise BridgeRefused("provider observation before launch is unavailable") from exc
         if identity["account_fingerprint"] != admission["account_fingerprint"]:
             raise BridgeRefused("provider account differs from the admitted account")
+        admitted = ledger.admitted_client(project_id, run_handle)
+        if (
+            identity["client_version"] is None
+            or identity["client_version"] != admitted["client_version"]
+        ):
+            raise BridgeRefused("provider client version differs from the admitted client")
+        if not ledger.client_version_reviewed(provider, identity["client_version"]):
+            raise BridgeRefused("provider client version is not reviewed")
+        # The child is launched from the client the re-check just read.
+        executable, digest = resolve_client(provider)
+        if (executable, digest) != (identity["client_path"], identity["client_sha256"]):
+            raise BridgeRefused("provider client changed during the launch re-check")
         if api_keys_present(environ):
             raise BridgeRefused("a provider API key is set")
         intent = ledger.record_dispatch_intent(
@@ -941,21 +1014,34 @@ def dispatch(
                 route=route, assignment=assignment, role_prompt=role_prompt,
                 export=export, control=control, environ=environ,
                 deadline_seconds=deadline_seconds, max_turns=max_turns,
+                executable=executable,
             )
+            if report["rate_limit_events"] == 0:
+                # Without an event the run left no headroom or billing reading.
+                _record_unavailable(
+                    ledger, project_id, run_handle, provider, "during",
+                    "no_rate_limit_event", report,
+                )
         else:
             result, report = run_codex(
                 ledger=ledger, project_id=project_id, route=route,
                 assignment=assignment, export=export, control=control,
                 schema=result_schema, environ=environ,
-                deadline_seconds=deadline_seconds,
+                deadline_seconds=deadline_seconds, executable=executable,
             )
             try:
                 ledger.observe_provider(
-                    project_id, "codex", project_root=export, environ=environ
+                    project_id, "codex", project_root=export, environ=environ,
+                    run_handle=run_handle, phase="after",
                 )
                 report["observation_after"] = "recorded"
-            except ContractError:
+            except ContractError as exc:
                 report["observation_after"] = "unavailable"
+                _record_unavailable(
+                    ledger, project_id, run_handle, provider, "after",
+                    observation_failure_reason(exc), report,
+                )
+        _record_usage(ledger, project_id, run_handle, provider, route["model"], report)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
     reviewed = True
@@ -984,6 +1070,76 @@ def dispatch(
         terminal_state=result["execution_state"] if fenced else None,
     )
     return {"result": result, "bridge_report": report}
+
+
+def _record_unavailable(
+    ledger: Any,
+    project_id: str,
+    run_handle: str,
+    provider: str,
+    phase: str,
+    reason_code: str,
+    report: dict[str, Any],
+) -> None:
+    from .learning_store import LedgerError
+
+    try:
+        ledger.record_observation_unavailable(
+            project_id, run_handle=run_handle, provider=provider, phase=phase,
+            reason_code=reason_code,
+        )
+        report.setdefault("observations_unavailable", []).append(
+            {"phase": phase, "reason_code": reason_code}
+        )
+    except (ContractError, LedgerError):
+        report["observation_record_failed"] = True
+
+
+def _record_usage(
+    ledger: Any,
+    project_id: str,
+    run_handle: str,
+    provider: str,
+    model: str,
+    report: dict[str, Any],
+) -> None:
+    """Persist the run's client-observed usage, or that it was unavailable."""
+
+    from .learning_store import LedgerError
+
+    usage = report.get("usage")
+    if not isinstance(usage, dict):
+        _record_unavailable(
+            ledger, project_id, run_handle, provider, "after", "usage_unavailable", report
+        )
+        report["usage_recorded"] = False
+        return
+    totals = {
+        "input_tokens": _token_count(usage.get("input_tokens")),
+        "cached_input_tokens": _token_count(
+            usage.get("cached_input_tokens", usage.get("cache_read_input_tokens"))
+        ),
+        "cache_creation_input_tokens": _token_count(usage.get("cache_creation_input_tokens")),
+        "output_tokens": _token_count(usage.get("output_tokens")),
+        "reasoning_output_tokens": _token_count(usage.get("reasoning_output_tokens")),
+    }
+    claude = provider == "claude"
+    try:
+        ledger.record_provider_usage(
+            project_id, run_handle=run_handle, provider=provider,
+            usage={
+                "requested_model": model,
+                "models": report.get("model_usage", []) if claude else [],
+                "helper_models": sorted(
+                    name for name in report.get("helper_models", [])
+                    if name in SUPPORTED_MODELS
+                ) if claude else [],
+                **totals,
+            },
+        )
+        report["usage_recorded"] = True
+    except (ContractError, LedgerError):
+        report["usage_recorded"] = False
 
 
 def _claude_role_prompt(bundle_root: Path, route: dict[str, Any]) -> str:

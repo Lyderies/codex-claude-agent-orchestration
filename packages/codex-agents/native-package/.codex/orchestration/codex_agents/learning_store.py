@@ -128,7 +128,18 @@ PRODUCER_AUTHORITY = {
 # Only ledger methods that run the observation themselves may write these.
 # Billing evidence younger than this is reused instead of probing again.
 PROBE_REUSE_SECONDS = 300
-PROVIDER_OBSERVATION_TYPES = {"provider_identity", "provider_headroom", "provider_billing"}
+PROVIDER_OBSERVATION_TYPES = {
+    "provider_identity", "provider_headroom", "provider_billing",
+    "observation_unavailable", "provider_usage",
+}
+# A run keeps only rate-limit events more restrictive than those it already
+# recorded, so this cap is reached only by a stream that keeps escalating.
+MAX_RUN_RATE_LIMIT_RECORDS = 64
+CLAUDE_STATUS_RANK = {None: 0, "allowed": 0, "allowed_warning": 1, "rejected": 2}
+BILLING_RANK = {False: 0, None: 1, True: 2}
+INSTALLED_ROUTING_POLICY = (
+    Path(__file__).resolve().parent.parent / "config" / "routing-policy.json"
+)
 SOURCE_BY_PRODUCER = {
     "hook": "hook",
     "app_server": "app_server",
@@ -1076,6 +1087,76 @@ class SessionBinding:
     expires_at_ms: int
 
 
+def _window_covered(window: dict[str, Any], earlier: dict[str, Any]) -> bool:
+    """Whether an earlier window already restricts at least as much, as long."""
+
+    def used(item: dict[str, Any]) -> float:
+        return -1.0 if item["used_percent"] is None else float(item["used_percent"])
+
+    if (earlier["scope"], earlier["window_minutes"]) != (
+        window["scope"], window["window_minutes"]
+    ) or used(earlier) < used(window):
+        return False
+    if window["resets_at"] is None or earlier["resets_at"] is None:
+        return window["resets_at"] == earlier["resets_at"]
+    return earlier["resets_at"] >= window["resets_at"]
+
+
+def _more_restrictive(record: dict[str, Any], prior: list[dict[str, Any]]) -> bool:
+    """Whether a run's new rate-limit record restricts more than its earlier ones.
+
+    Billing is ranked usable over unknown over unusable, and only a higher rank
+    is kept, because admission reads the latest billing record. Headroom is kept
+    for a higher status, or for any window that no earlier window covers.
+    """
+
+    if not prior:
+        return True
+    if record["record_type"] == "provider_billing":
+        return BILLING_RANK[record["paid_usage_usable"]] > max(
+            BILLING_RANK[item["paid_usage_usable"]] for item in prior
+        )
+    if CLAUDE_STATUS_RANK[record["status"]] > max(
+        CLAUDE_STATUS_RANK[item["status"]] for item in prior
+    ):
+        return True
+    earlier = [window for item in prior for window in item["windows"]]
+    return any(
+        not any(_window_covered(window, other) for other in earlier)
+        for window in record["windows"]
+    )
+
+
+def _escalates(record: dict[str, Any], prior: list[dict[str, Any]], now_ms: int) -> bool:
+    """Whether a record raises the run's status, admission rating or billing rank."""
+
+    from .providers import _headroom_state
+
+    if not prior:
+        return True
+    if record["record_type"] == "provider_billing":
+        return _more_restrictive(record, prior)
+    ratings = {None: 0, "ample": 0, "constrained": 1, "exhausted": 2}
+
+    def rank(item: dict[str, Any]) -> tuple[int, int]:
+        return (
+            CLAUDE_STATUS_RANK[item["status"]],
+            ratings[_headroom_state("claude", item, now_ms)],
+        )
+
+    statuses, rated = zip(*(rank(item) for item in prior))
+    new_status, new_rating = rank(record)
+    return new_status > max(statuses) or new_rating > max(rated)
+
+
+class _RecheckDenied(Exception):
+    """An open's locked admission re-check denied; carries the decision to store."""
+
+    def __init__(self, decision: dict[str, Any]) -> None:
+        super().__init__(decision["reason_code"])
+        self.decision = decision
+
+
 class LearningLedger:
     """The only SQLite writer. Callers receive scoped repositories, never its connection."""
 
@@ -1084,8 +1165,12 @@ class LearningLedger:
         state: LearningState,
         *,
         client_capabilities: dict[str, dict[str, Any]] | None = None,
+        admission_policy: dict[str, Any] | None = None,
     ) -> None:
         self.state = state
+        # Admission settings come from the installed routing policy, read at
+        # each decision; a caller-supplied policy is for tests only.
+        self._admission_policy = admission_policy
         self._lock = threading.RLock()
         self._active_readers = 0
         self._client_capabilities = (
@@ -3356,132 +3441,142 @@ class LearningLedger:
                 "usage": empty_usage(),
             }
         )
-        with self._lock, self._connection:
-            project = self._connection.execute(
-                "SELECT status FROM projects WHERE project_id=?", (project_id,)
-            ).fetchone()
-            if not project or project["status"] != "active":
-                raise LedgerError("project binding is not active")
-            orchestration = self._orchestration_for_handle_locked(
-                project_id, orchestration_handle
-            )
-            if orchestration["status"] != "active":
-                raise LedgerError("orchestration is not active")
-            orchestration_id = str(orchestration["orchestration_id"])
-            fallback = route.get("fallback")
-            if (fallback_receipt is None) != (fallback is None):
-                raise LedgerError("fallback route and receipt must appear together")
-            if fallback_receipt is not None:
-                if (
-                    not isinstance(fallback, dict)
-                    or fallback.get("receipt_id") != fallback_receipt
-                    or not isinstance(fallback.get("authorization_digest"), str)
-                ):
-                    raise LedgerError("fallback route receipt binding is invalid")
-                receipt = self._connection.execute(
-                    "SELECT assignment_digest,reason_code,expires_at_ms,"
-                    "consumed_at_ms,run_id FROM repair_receipts "
-                    "WHERE project_id=? AND receipt_id=?",
-                    (project_id, fallback_receipt),
+        try:
+            with self._lock, self._connection:
+                project = self._connection.execute(
+                    "SELECT status FROM projects WHERE project_id=?", (project_id,)
                 ).fetchone()
-                if (
-                    receipt is None
-                    or receipt["reason_code"] != "model_unavailable_fallback"
-                    or receipt["assignment_digest"]
-                    != fallback["authorization_digest"]
-                    or int(receipt["expires_at_ms"]) <= timestamp
-                    or receipt["consumed_at_ms"] is not None
-                    or receipt["run_id"] != orchestration_id
-                ):
-                    raise LedgerError("fallback receipt is unavailable for this run")
-            pending = int(
-                self._connection.execute(
-                    "SELECT COUNT(*) FROM host_run_bindings WHERE project_id=? "
-                    "AND binding_state='pending'",
-                    (project_id,),
-                ).fetchone()[0]
-            )
-            if pending >= MAX_PENDING_HOST_RUNS:
-                raise LedgerError("pending host run capacity is exhausted")
-            self._connection.execute(
-                "INSERT INTO host_run_bindings("
-                "project_id,handle_digest,run_id,assignment_digest,task_digest,"
-                "task_id_digest,"
-                "route_digest,configuration_digest,client_version,created_at_ms,"
-                "expires_at_ms,consumed_at_ms,orchestration_id,native_assignment_id,"
-                "agent_type,usage_complete,binding_state,abandoned_reason,"
-                "observation_started_at_ms,observation_deadline_at_ms,"
-                "last_progress_at_ms,deadline_observed) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,NULL,?,NULL,'pending',NULL,"
-                "?,?,?,0)",
-                (
-                    project_id, handle_digest, run_id, assignment_digest,
-                    task_digest,
-                    keyed_digest(self.state.digest_key(), checked_task["id"]),
-                    route_digest, configuration_digest, client_version,
-                    timestamp, timestamp + HOST_RUN_TTL_MS, orchestration_id,
-                    route.get("agent_type", checked_assignment["role"]),
-                    timestamp, observation_deadline_at_ms, timestamp,
-                ),
-            )
-            if fallback_receipt is not None:
-                changed = self._connection.execute(
-                    "UPDATE repair_receipts SET consumed_at_ms=?,run_id=? "
-                    "WHERE project_id=? AND receipt_id=? "
-                    "AND consumed_at_ms IS NULL AND expires_at_ms>?",
-                    (
-                        timestamp,
-                        run_id,
-                        project_id,
-                        fallback_receipt,
-                        timestamp,
-                    ),
-                ).rowcount
-                if changed != 1:
-                    raise LedgerError("fallback receipt was already consumed")
-            self._connection.execute(
-                "INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)",
-                (project_id, handle_digest, "host", timestamp),
-            )
-            self._connection.execute(
-                "INSERT INTO run_provenance VALUES(?,?,?,?,?,?)",
-                (
-                    project_id, run_id, "host", client_version,
-                    handle_digest, timestamp,
-                ),
-            )
-            self._append_checked_locked(
-                project_id, event, producer="host", timestamp=timestamp
-            )
-            # Re-check under the write lock, so two opens cannot both use the
-            # same Claude bootstrap or race past newer evidence.
-            admission = self._evaluate_admission_locked(
-                project_id, provider=provider, environ=os.environ, timestamp=admitted_at
-            )
-            if admission["decision"] != "pass":
-                raise AdmissionDenied(admission["reason_code"])
-            self._store_admission_locked(
-                project_id, admission, run_id=run_id, timestamp=admitted_at
-            )
-            if host_profile is not None:
-                if host_profile.get("host_client") != orchestration["client_version"]:
-                    raise LedgerError("host run profile differs from the orchestration host")
-                material = {
-                    "schema_version": 1,
-                    "record_type": "host_run_profile",
-                    "run_id": run_id,
-                    **host_profile,
-                    "observed_at_ms": admitted_at,
-                }
-                try:
-                    profile = validate_learning_record(
-                        {**material, "record_id": f"host_run_profile:{content_digest(material)}"}
-                    )
-                except ContractError as exc:
-                    raise LedgerError("host run profile is invalid") from exc
-                self._append_checked_locked(
-                    project_id, profile, producer="lifecycle", timestamp=admitted_at
+                if not project or project["status"] != "active":
+                    raise LedgerError("project binding is not active")
+                orchestration = self._orchestration_for_handle_locked(
+                    project_id, orchestration_handle
                 )
+                if orchestration["status"] != "active":
+                    raise LedgerError("orchestration is not active")
+                orchestration_id = str(orchestration["orchestration_id"])
+                fallback = route.get("fallback")
+                if (fallback_receipt is None) != (fallback is None):
+                    raise LedgerError("fallback route and receipt must appear together")
+                if fallback_receipt is not None:
+                    if (
+                        not isinstance(fallback, dict)
+                        or fallback.get("receipt_id") != fallback_receipt
+                        or not isinstance(fallback.get("authorization_digest"), str)
+                    ):
+                        raise LedgerError("fallback route receipt binding is invalid")
+                    receipt = self._connection.execute(
+                        "SELECT assignment_digest,reason_code,expires_at_ms,"
+                        "consumed_at_ms,run_id FROM repair_receipts "
+                        "WHERE project_id=? AND receipt_id=?",
+                        (project_id, fallback_receipt),
+                    ).fetchone()
+                    if (
+                        receipt is None
+                        or receipt["reason_code"] != "model_unavailable_fallback"
+                        or receipt["assignment_digest"]
+                        != fallback["authorization_digest"]
+                        or int(receipt["expires_at_ms"]) <= timestamp
+                        or receipt["consumed_at_ms"] is not None
+                        or receipt["run_id"] != orchestration_id
+                    ):
+                        raise LedgerError("fallback receipt is unavailable for this run")
+                pending = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM host_run_bindings WHERE project_id=? "
+                        "AND binding_state='pending'",
+                        (project_id,),
+                    ).fetchone()[0]
+                )
+                if pending >= MAX_PENDING_HOST_RUNS:
+                    raise LedgerError("pending host run capacity is exhausted")
+                # Re-check under the write lock before anything is written, so two
+                # opens cannot both use the same Claude bootstrap, take the last
+                # place under the run cap, or race past newer evidence.
+                admission = self._evaluate_admission_locked(
+                    project_id, provider=provider, environ=os.environ, timestamp=admitted_at
+                )
+                if admission["decision"] != "pass":
+                    raise _RecheckDenied(admission)
+                self._connection.execute(
+                    "INSERT INTO host_run_bindings("
+                    "project_id,handle_digest,run_id,assignment_digest,task_digest,"
+                    "task_id_digest,"
+                    "route_digest,configuration_digest,client_version,created_at_ms,"
+                    "expires_at_ms,consumed_at_ms,orchestration_id,native_assignment_id,"
+                    "agent_type,usage_complete,binding_state,abandoned_reason,"
+                    "observation_started_at_ms,observation_deadline_at_ms,"
+                    "last_progress_at_ms,deadline_observed) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,NULL,?,NULL,'pending',NULL,"
+                    "?,?,?,0)",
+                    (
+                        project_id, handle_digest, run_id, assignment_digest,
+                        task_digest,
+                        keyed_digest(self.state.digest_key(), checked_task["id"]),
+                        route_digest, configuration_digest, client_version,
+                        timestamp, timestamp + HOST_RUN_TTL_MS, orchestration_id,
+                        route.get("agent_type", checked_assignment["role"]),
+                        timestamp, observation_deadline_at_ms, timestamp,
+                    ),
+                )
+                if fallback_receipt is not None:
+                    changed = self._connection.execute(
+                        "UPDATE repair_receipts SET consumed_at_ms=?,run_id=? "
+                        "WHERE project_id=? AND receipt_id=? "
+                        "AND consumed_at_ms IS NULL AND expires_at_ms>?",
+                        (
+                            timestamp,
+                            run_id,
+                            project_id,
+                            fallback_receipt,
+                            timestamp,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise LedgerError("fallback receipt was already consumed")
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)",
+                    (project_id, handle_digest, "host", timestamp),
+                )
+                self._connection.execute(
+                    "INSERT INTO run_provenance VALUES(?,?,?,?,?,?)",
+                    (
+                        project_id, run_id, "host", client_version,
+                        handle_digest, timestamp,
+                    ),
+                )
+                self._append_checked_locked(
+                    project_id, event, producer="host", timestamp=timestamp
+                )
+                self._store_admission_locked(
+                    project_id, admission, run_id=run_id, timestamp=admitted_at
+                )
+                if host_profile is not None:
+                    if host_profile.get("host_client") != orchestration["client_version"]:
+                        raise LedgerError("host run profile differs from the orchestration host")
+                    material = {
+                        "schema_version": 1,
+                        "record_type": "host_run_profile",
+                        "run_id": run_id,
+                        **host_profile,
+                        "observed_at_ms": admitted_at,
+                    }
+                    try:
+                        profile = validate_learning_record(
+                            {**material, "record_id": f"host_run_profile:{content_digest(material)}"}
+                        )
+                    except ContractError as exc:
+                        raise LedgerError("host run profile is invalid") from exc
+                    self._append_checked_locked(
+                        project_id, profile, producer="lifecycle", timestamp=admitted_at
+                    )
+        except _RecheckDenied as denied:
+            # The denial is stored like any other, after the open is abandoned.
+            with self._lock, self._connection:
+                self._store_admission_locked(
+                    project_id, denied.decision, run_id=None, timestamp=admitted_at
+                )
+            self.state.harden_database_files()
+            raise AdmissionDenied(denied.decision["reason_code"]) from None
         self.state.harden_database_files()
         return {
             "run_handle": run_handle,
@@ -3533,15 +3628,25 @@ class LearningLedger:
         *,
         project_root: Path,
         environ: Any = None,
+        run_handle: str | None = None,
+        phase: str | None = None,
     ) -> list[dict[str, Any]]:
         """Run one non-spending observation and store it under a keyed fingerprint.
 
         The ledger runs the provider client itself and derives the fingerprint
-        with its own key, so no caller can supply observation records.
+        with its own key, so no caller can supply observation records. With a
+        run handle, the headroom and billing it reads are bound to that open
+        run and to a phase, before or after its launch.
         """
 
         from .providers import observe_claude, observe_codex
 
+        run_id = None
+        if (run_handle is None) != (phase is None) or phase not in {None, "before", "after"}:
+            raise LedgerError("a run observation needs its run and its phase")
+        if run_handle is not None:
+            with self._lock:
+                run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
         timestamp = self._clock_ms()
         if provider == "claude":
             records = observe_claude(
@@ -3555,11 +3660,165 @@ class LearningLedger:
                 digest_key=self.state.digest_key(),
                 observed_at_ms=timestamp,
                 environ=environ,
+                run_id=run_id,
+                phase=phase,
             )
         else:
             raise LedgerError("provider is unsupported")
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
+
+    def _open_run_for_provider_locked(
+        self, project_id: str, run_handle: str, provider: str
+    ) -> str:
+        """The run ID of an open run whose stored admission passed for `provider`."""
+
+        if not isinstance(run_handle, str):
+            raise LedgerError("host run handle is invalid")
+        binding = self._connection.execute(
+            "SELECT run_id,binding_state,consumed_at_ms FROM host_run_bindings "
+            "WHERE project_id=? AND handle_digest=?",
+            (project_id, keyed_digest(self.state.digest_key(), run_handle)),
+        ).fetchone()
+        if binding is None:
+            raise LedgerError("host run is unavailable")
+        if binding["binding_state"] != "pending" or binding["consumed_at_ms"] is not None:
+            raise LedgerError("host run is no longer open for observations")
+        run_id = str(binding["run_id"])
+        if self._run_admission_locked(project_id, run_id)["provider"] != provider:
+            raise LedgerError("observation provider differs from the run's admission")
+        return run_id
+
+    def record_observation_unavailable(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        provider: str,
+        phase: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        """Persist that a run's provider reading could not be taken, and why.
+
+        The record is never evidence for admission; it keeps a failed reading
+        visible in the ledger instead of dropping it.
+        """
+
+        timestamp = self._clock_ms()
+        with self._lock, self._connection:
+            run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
+            material = {
+                "schema_version": 1,
+                "record_type": "observation_unavailable",
+                "provider": provider,
+                "run_id": run_id,
+                "phase": phase,
+                "reason_code": reason_code,
+                "observed_at_ms": timestamp,
+            }
+            try:
+                record = validate_learning_record({
+                    **material,
+                    "record_id": f"observation_unavailable:{content_digest(material)}",
+                })
+            except ContractError as exc:
+                raise LedgerError("unavailable observation is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="provider", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return record
+
+    def record_provider_usage(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        provider: str,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a dispatched run's client-observed usage, once, linked to the run."""
+
+        timestamp = self._clock_ms()
+        with self._lock, self._connection:
+            run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_intent' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is None:
+                raise LedgerError("only a dispatched run records its usage")
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='provider_usage' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("host run already recorded its usage")
+            if not isinstance(usage, dict):
+                raise LedgerError("provider usage is invalid")
+            material = {
+                **usage,
+                "schema_version": 1,
+                "record_type": "provider_usage",
+                "provider": provider,
+                "run_id": run_id,
+                "phase": "after",
+                "observed_at_ms": timestamp,
+            }
+            material.pop("record_id", None)
+            try:
+                record = validate_learning_record({
+                    **material, "record_id": f"provider_usage:{content_digest(material)}",
+                })
+            except ContractError as exc:
+                raise LedgerError("provider usage is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="provider", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return record
+
+    def admitted_client(self, project_id: str, run_handle: str) -> dict[str, Any]:
+        """The identity a run was admitted on: its account and the client it saw.
+
+        Read from the stored admission's own evidence, so the launch re-check
+        compares against what was admitted, never against current facts.
+        """
+
+        with self._lock:
+            binding = self._connection.execute(
+                "SELECT run_id FROM host_run_bindings WHERE project_id=? AND handle_digest=?",
+                (project_id, keyed_digest(self.state.digest_key(), run_handle)),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("host run is unavailable")
+            run_id = str(binding["run_id"])
+            admission = self._run_admission_locked(project_id, run_id)
+            identities = []
+            for digest in admission["evidence_digests"]:
+                row = self._connection.execute(
+                    "SELECT content FROM records WHERE project_id=? AND content_digest=? "
+                    "AND record_type='provider_identity' AND source='provider'",
+                    (project_id, digest),
+                ).fetchone()
+                if row is not None:
+                    identities.append(json.loads(bytes(row["content"])))
+        if len(identities) != 1:
+            raise LedgerError("host run admission has no single admitted identity")
+        try:
+            identity = validate_learning_record(identities[0])
+        except ContractError as exc:
+            raise LedgerError("admitted identity is invalid") from exc
+        if (
+            identity["provider"] != admission["provider"]
+            or identity["account_fingerprint"] != admission["account_fingerprint"]
+        ):
+            raise LedgerError("admitted identity differs from the admission")
+        return {
+            "provider": identity["provider"],
+            "account_fingerprint": identity["account_fingerprint"],
+            "client_version": identity["client_version"],
+        }
 
     def observe_claude_billing(
         self,
@@ -3667,11 +3926,15 @@ class LearningLedger:
         run_handle: str,
         rate_limit_info: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Record the single rate-limit event of an open, admitted Claude run.
+        """Record a rate-limit event of an open, admitted Claude run.
 
         The fingerprint comes from the run's stored admission and the time from
-        the ledger's clock. A run may record one event, and only before its
-        result is committed, so a caller cannot replay favourable evidence.
+        the ledger's clock, and events are accepted only before the run's result
+        is committed. Every event that is more restrictive than what the run
+        already recorded is kept, so a rejection late in a run blocks the next
+        admission. A less restrictive event is dropped, so a caller cannot use a
+        later favourable event to replace the run's evidence. Returns the
+        records kept.
         """
 
         from .providers import claude_rate_limit_records
@@ -3692,29 +3955,56 @@ class LearningLedger:
             decision = self._run_admission_locked(project_id, run_id)
             if decision["provider"] != "claude":
                 raise ContractError("rate-limit event does not belong to a Claude run")
-            if self._connection.execute(
-                "SELECT 1 FROM records WHERE project_id=? "
-                "AND record_type IN ('provider_headroom','provider_billing') "
-                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
-                (project_id, run_id),
-            ).fetchone() is not None:
-                raise LedgerError("host run already recorded its rate-limit event")
+            prior = [
+                json.loads(bytes(row["content"]))
+                for row in self._connection.execute(
+                    "SELECT content FROM records WHERE project_id=? AND source='provider' "
+                    "AND record_type IN ('provider_headroom','provider_billing') "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=? "
+                    "AND json_extract(CAST(content AS TEXT),'$.phase')='during' "
+                    "ORDER BY source_sequence",
+                    (project_id, run_id),
+                ).fetchall()
+            ]
             records = claude_rate_limit_records(
                 rate_limit_info,
                 account_fingerprint=decision["account_fingerprint"],
                 observed_at_ms=timestamp,
                 run_id=run_id,
+                phase="during",
             )
             try:
                 checked = [validate_learning_record(record) for record in records]
             except ContractError as exc:
                 raise LedgerError("record admission rejected") from exc
-            for record in checked:
+            kept = [
+                record for record in checked
+                if _more_restrictive(record, [
+                    item for item in prior if item["record_type"] == record["record_type"]
+                ])
+            ]
+            overflow = len(prior) + len(kept) > MAX_RUN_RATE_LIMIT_RECORDS
+            if overflow:
+                # Past the cap only a rise in status, rating or billing rank is
+                # kept, which can happen a few times at most; the run is then
+                # stopped rather than lose a finer restriction silently.
+                escalations = [
+                    record for record in kept
+                    if _escalates(record, [
+                        item for item in prior
+                        if item["record_type"] == record["record_type"]
+                    ], timestamp)
+                ]
+                overflow = len(escalations) != len(kept)
+                kept = escalations
+            for record in kept:
                 self._append_checked_locked(
                     project_id, record, producer="provider", timestamp=timestamp
                 )
         self.state.harden_database_files()
-        return records
+        if overflow:
+            raise ContractError("host run recorded too many rate-limit events")
+        return kept
 
     def _provider_records_locked(
         self, project_id: str, record_type: str, provider: str
@@ -3742,6 +4032,59 @@ class LearningLedger:
             result.append((record, str(row["content_digest"])))
         return result
 
+    def _admission_settings(self, provider: str) -> dict[str, Any] | None:
+        """The provider's committed admission settings; None if they cannot be read."""
+
+        from .routing import admission_settings, load_policy
+
+        try:
+            policy = (
+                self._admission_policy
+                if self._admission_policy is not None
+                else load_policy(INSTALLED_ROUTING_POLICY)
+            )
+            return admission_settings(policy, provider)
+        except (ValueError, TypeError, KeyError, AttributeError, OSError):
+            return None
+
+    def client_version_reviewed(self, provider: str, version: Any) -> bool:
+        """Whether a client version is inside the provider's committed reviewed range."""
+
+        from .learning_contracts import parse_semver
+
+        settings = self._admission_settings(provider)
+        parsed = parse_semver(version)
+        if settings is None or parsed is None:
+            return False
+        versions = settings["client_versions"]
+        minimum = parse_semver(versions["minimum"])
+        maximum = parse_semver(versions["maximum_exclusive"])
+        return minimum is not None and maximum is not None and minimum <= parsed < maximum
+
+    def _prior_run_admissions_locked(
+        self, project_id: str, provider: str, timestamp: int
+    ) -> list[tuple[str, int]]:
+        """Passing run admissions for a provider since one window before `timestamp`.
+
+        Read under the writer lock with the decision that uses them, so two
+        opens cannot both take the last place under the cap. Probe admissions
+        are a separate record type and never count.
+        """
+
+        from .providers import FIVE_HOURS_MS
+
+        rows = self._connection.execute(
+            "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint'),"
+            "observed_at_ms FROM records WHERE project_id=? "
+            "AND record_type='admission_decision' AND source='lifecycle' "
+            "AND json_extract(CAST(content AS TEXT),'$.provider')=? "
+            "AND json_extract(CAST(content AS TEXT),'$.decision')='pass' "
+            "AND json_extract(CAST(content AS TEXT),'$.run_id') IS NOT NULL "
+            "AND observed_at_ms>=?",
+            (project_id, provider, timestamp - FIVE_HOURS_MS),
+        ).fetchall()
+        return [(str(row[0]), int(row[1])) for row in rows if row[0] is not None]
+
     def _evaluate_admission_locked(
         self, project_id: str, *, provider: str, environ: Any, timestamp: int
     ) -> dict[str, Any]:
@@ -3753,6 +4096,10 @@ class LearningLedger:
         if not project or project["status"] != "active":
             raise LedgerError("project binding is not active")
         return evaluate_admission(
+            admission_policy=self._admission_settings(provider),
+            prior_run_admissions=self._prior_run_admissions_locked(
+                project_id, provider, timestamp
+            ),
             provider=provider,
             identities=self._provider_records_locked(
                 project_id, "provider_identity", provider
