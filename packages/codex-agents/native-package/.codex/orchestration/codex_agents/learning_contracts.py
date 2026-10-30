@@ -1694,6 +1694,7 @@ ADMISSION_REASON_CODES = {
     "client_version_unreviewed",
     "codex_plan_not_subscription",
     "window_run_cap_reached",
+    "probe_cooldown",
 }
 CLAUDE_HEADROOM_STATUSES = {"allowed", "allowed_warning", "rejected"}
 CLAUDE_OVERAGE_STATUSES = {"allowed", "allowed_warning", "rejected"}

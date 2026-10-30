@@ -69,6 +69,16 @@ MANAGED_SETTINGS_PATHS = {
         "/etc/claude-code/managed-settings.d",
     ),
 }
+# Device-management (MDM) preferences for Claude Code also apply despite
+# --setting-sources and cannot be read as settings files here, so any of them
+# refuses. `{user}` is the account name from the password database.
+MANAGED_PREFERENCE_PATHS = {
+    "darwin": (
+        "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+        "/Library/Managed Preferences/{user}/com.anthropic.claudecode.plist",
+    ),
+    "linux": (),
+}
 # Exports live under the resolved system temp directory, not under home, so no
 # user-level CLAUDE.md or .claude directory sits above them. None means that.
 WORKSPACE_PARENT: str | None = None
@@ -92,6 +102,7 @@ class _Abort(Exception):
 def assignment_read_paths(assignment: dict[str, Any]) -> list[str]:
     """The repository paths a child may read: context plus owned paths."""
 
+    granted = _granted_paths(assignment)
     paths: set[str] = set()
     for value in (*assignment.get("context", []), *assignment.get("owned_paths", [])):
         if not isinstance(value, str) or not value or "\x00" in value:
@@ -105,10 +116,40 @@ def assignment_read_paths(assignment: dict[str, Any]) -> list[str]:
             raise BridgeRefused("assignment read path must stay inside the repository")
         if _claude_context_path(path.as_posix()):
             raise BridgeRefused("assignment read path names Claude context files")
+        if not _path_granted(path.as_posix(), granted):
+            raise BridgeRefused("export_path_not_granted")
         paths.add(path.as_posix())
     if not paths:
         raise BridgeRefused("assignment names no read paths to export")
     return sorted(paths)
+
+
+def _granted_paths(assignment: dict[str, Any]) -> list[str]:
+    """The paths the assignment's filesystem permissions name, read or write.
+
+    Permissions are written `<path>:read` or `<path>:write` and are already a
+    subset of the parent grant. Anything else grants nothing.
+    """
+
+    permissions = assignment.get("permissions")
+    entries = permissions.get("filesystem") if isinstance(permissions, dict) else None
+    granted = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, str):
+            continue
+        path, _, access = entry.rpartition(":")
+        if access in {"read", "write"} and path:
+            granted.append(PurePosixPath(path).as_posix())
+    return granted
+
+
+def _path_granted(relative: str, granted: list[str]) -> bool:
+    """A permission covers its own path and, for a directory, what lies beneath.
+
+    Coverage is by whole path components, so `src` never covers `src2/x`.
+    """
+
+    return any(relative == path or relative.startswith(path + "/") for path in granted)
 
 
 def _claude_context_path(relative: str) -> bool:
@@ -626,6 +667,18 @@ def run_claude(
                     )
                 raise _Abort("rate_limit_event_invalid") from exc
             state["rate_limit_kept"] += len(kept)
+            # Paid usage or a rejection seen mid-run stops the child at once.
+            if any(
+                record["record_type"] == "provider_billing"
+                and (record["paid_usage_usable"] is True or record["is_using_overage"] is True)
+                for record in kept
+            ):
+                raise _Abort("paid_usage_observed")
+            if any(
+                record["record_type"] == "provider_headroom" and record["status"] == "rejected"
+                for record in kept
+            ):
+                raise _Abort("provider_rejected")
         elif kind == "result":
             state["result"] = frame
             usage = frame.get("modelUsage")
@@ -811,6 +864,25 @@ def managed_settings_paths() -> tuple[str, ...]:
     return MANAGED_SETTINGS_PATHS[platform]
 
 
+def managed_preference_paths() -> tuple[str, ...]:
+    import pwd
+
+    platform = "darwin" if sys.platform == "darwin" else "linux"
+    user = pwd.getpwuid(os.getuid()).pw_name
+    return tuple(
+        path.format(user=user) for path in MANAGED_PREFERENCE_PATHS[platform]
+    )
+
+
+def managed_configuration_present() -> bool:
+    """Whether enterprise managed settings or MDM preferences exist for Claude Code."""
+
+    return any(
+        os.path.lexists(path)
+        for path in (*managed_settings_paths(), *managed_preference_paths())
+    )
+
+
 def check_context_boundary(workspace: Path) -> None:
     """Refuse when Claude would load context from a directory above the export.
 
@@ -834,14 +906,19 @@ PROBE_MODEL = "claude-haiku-5-5"
 PROBE_EFFORT = "low"
 PROBE_PROMPT = "Reply with the single word OK."
 PROBE_DEADLINE_SECONDS = 120
+MAX_PROBE_EVENTS = 64
 
 
-def claude_billing_probe(environ: Mapping[str, str]) -> dict[str, Any]:
-    """Run one minimal locked Claude turn and return its first rate_limit_info.
+def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | None]:
+    """Run one minimal locked Claude turn; return every rate_limit_info it reported
+    and why it failed, if it did.
+
+    The events seen are returned even when the probe aborts or times out, so
+    the ledger never loses a restriction the probe already received.
 
     It uses a little subscription allowance but is never metered: it refuses an
     API-key or alternate-backend environment, runs Haiku at low effort with no
-    tools in an empty private directory, and keeps only the rate-limit event.
+    tools in an empty private directory, and keeps only the rate-limit events.
     """
 
     from .claude_host import check_backend
@@ -853,7 +930,7 @@ def claude_billing_probe(environ: Mapping[str, str]) -> dict[str, Any]:
     try:
         os.chmod(workspace, 0o700)
         check_context_boundary(workspace)
-        if [path for path in managed_settings_paths() if os.path.lexists(path)]:
+        if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
         empty = workspace / "empty"
         control = workspace / "control"
@@ -879,7 +956,7 @@ def claude_billing_probe(environ: Mapping[str, str]) -> dict[str, Any]:
             "--max-turns", "1",
             PROBE_PROMPT,
         ]
-        state: dict[str, Any] = {"init": False, "info": None}
+        state: dict[str, Any] = {"init": False, "infos": []}
 
         def on_frame(frame: dict[str, Any]) -> None:
             if not state["init"]:
@@ -889,8 +966,12 @@ def claude_billing_probe(environ: Mapping[str, str]) -> dict[str, Any]:
                 if violation is not None or frame.get("tools") != []:
                     raise _Abort(f"init_{violation or 'tool_not_allowed'}")
                 state["init"] = True
-            elif frame.get("type") == "rate_limit_event" and state["info"] is None:
-                state["info"] = frame.get("rate_limit_info")
+            elif frame.get("type") == "rate_limit_event":
+                # Every event is kept; the ledger merges them conservatively.
+                # The event that reaches the cap is kept before the probe stops.
+                state["infos"].append(frame.get("rate_limit_info"))
+                if len(state["infos"]) >= MAX_PROBE_EVENTS:
+                    raise _Abort("too_many_rate_limit_events")
 
         outcome = run_child(
             arguments,
@@ -901,11 +982,7 @@ def claude_billing_probe(environ: Mapping[str, str]) -> dict[str, Any]:
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
-    if outcome["abort"] is not None:
-        raise BridgeRefused(f"billing probe failed: {outcome['abort']}")
-    if not isinstance(state["info"], dict):
-        raise BridgeRefused("billing probe reported no rate-limit event")
-    return state["info"]
+    return state["infos"], outcome["abort"]
 
 
 def dispatch(
@@ -965,8 +1042,7 @@ def dispatch(
         int(route_bounds["max_tool_calls"]), int(assigned_bounds["max_tool_calls"])
     ))
     if provider == "claude":
-        managed = [path for path in managed_settings_paths() if os.path.lexists(path)]
-        if managed:
+        if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
     parent = Path(os.path.realpath(WORKSPACE_PARENT or tempfile.gettempdir()))
     workspace = Path(tempfile.mkdtemp(prefix="codex-agents-dispatch-", dir=parent))
@@ -1007,6 +1083,11 @@ def dispatch(
         executable, digest = resolve_client(provider)
         if (executable, digest) != (identity["client_path"], identity["client_sha256"]):
             raise BridgeRefused("provider client changed during the launch re-check")
+        # Billing, headroom and plan are re-read too, account-wide and including
+        # the fresh reading above; the run cap is not counted again.
+        denied = ledger.launch_recheck(project_id, run_handle=run_handle, identity=identity)
+        if denied is not None:
+            raise BridgeRefused(f"launch denied: {denied}")
         if api_keys_present(environ):
             raise BridgeRefused("a provider API key is set")
         intent = ledger.record_dispatch_intent(
