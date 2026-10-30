@@ -173,8 +173,13 @@ def resolve_client(name: str) -> tuple[str, str]:
 def client_environment(environ: Mapping[str, str]) -> dict[str, str]:
     """A minimal child environment: no caller overrides such as CODEX_HOME."""
 
+    account = pwd.getpwuid(os.getuid()).pw_name
     return {
         "HOME": _home(),
+        # Claude Code finds its macOS keychain login by account name; without these it
+        # reports logged out (verified live), which would only ever fail closed.
+        "USER": account,
+        "LOGNAME": account,
         "PATH": trusted_search_path(),
         "LANG": environ.get("LANG") or "C.UTF-8",
         "TMPDIR": environ.get("TMPDIR") or tempfile.gettempdir(),

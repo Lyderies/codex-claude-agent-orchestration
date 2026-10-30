@@ -228,7 +228,7 @@ class ProviderObservationTests(unittest.TestCase):
                 self.assertTrue(calls[0][1]["start_new_session"])
                 # The child gets only a minimal environment; overrides are dropped.
                 self.assertEqual(
-                    {"HOME", "PATH", "LANG", "TMPDIR"}, set(calls[0][1]["env"])
+                    {"HOME", "USER", "LOGNAME", "PATH", "LANG", "TMPDIR"}, set(calls[0][1]["env"])
                 )
                 for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
                     with self.subTest(name=name), self.assertRaisesRegex(
