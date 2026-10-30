@@ -7,3 +7,6 @@ build/
 dist/
 *.egg-info/
 .DS_Store
+
+# Raw research notes may contain account-specific details; never commit them.
+research/research_notes/
