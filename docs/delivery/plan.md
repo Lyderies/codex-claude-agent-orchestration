@@ -226,8 +226,11 @@ code review and verification. That applies both in this repository and in the pi
 - **Separate tiers:** the three evidence tiers are stored and reported separately.
 - **Backtest:** replay recorded runs against a candidate preference table.
 - **Usage-cost model:** estimate how much of each subscription's allowance a task uses, per
-  provider, model and task type. Codex reports percentages directly. Claude reports only
-  tokens and warnings, so its cost is estimated, with the confidence stated.
+  provider, model and task type. Both clients report window utilization: Codex as percentages from
+  its rate-limit read, Claude as fractions in each run's rate-limit event, at 1% granularity. Cost
+  per task comes from window deltas, with Claude's coarser resolution stated.
+- **More task families:** documentation, mechanical edits and non-agentic transforms have rows in
+  the starting table but no task family yet, so they route as their nearest family until added.
 - **Cost- and headroom-aware ranking:** a material quality advantage first, then usage cost,
   then headroom.
 - **Promotion:** quality must be no worse, with at least 20 admitted cases per slice. Promotion
