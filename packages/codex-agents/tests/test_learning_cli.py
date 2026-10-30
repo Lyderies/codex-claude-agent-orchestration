@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.support import ORCHESTRATION_ROOT
+from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
 from codex_agents.contracts import ContractError
 from codex_agents.learning_contracts import (
@@ -50,7 +50,7 @@ from tests.learning_support import (
 
 class LearningCliTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         base = Path(self.temporary.name)
         self.state_root = base / "state"
         self.project = base / "project"

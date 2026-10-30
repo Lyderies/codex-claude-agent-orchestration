@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.support import REPOSITORY_ROOT
+from tests.support import REPOSITORY_ROOT, TEMP_ROOT
 
 from codex_agents.learning_store import CollectorClient, CollectorError, LearningState
 
@@ -219,7 +219,7 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(installer.verify(target)["ready"])
 
     def test_installed_runtime_creates_registered_project_partition_backup(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             target = self.target(directory)
             inputs = self.project_inputs(directory)
             installer.install(target, apply=True, **inputs)

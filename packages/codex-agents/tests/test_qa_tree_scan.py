@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.support import ORCHESTRATION_ROOT  # noqa: F401
+from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT  # noqa: F401
 
 from codex_agents import learning_engine
 from codex_agents.contracts import ContractError
@@ -29,7 +29,7 @@ class FakeProcess:
 
 class QATreeScanTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.work = Path(self.temporary.name) / "work"
         self.pytest_root = self.work / "pytest"

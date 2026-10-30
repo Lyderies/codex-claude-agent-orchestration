@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.support import ORCHESTRATION_ROOT, REPOSITORY_ROOT
+from tests.support import ORCHESTRATION_ROOT, REPOSITORY_ROOT, TEMP_ROOT
 
 from codex_agents.learning_adapters import (
     load_client_capabilities,
@@ -70,7 +70,7 @@ class LearningHookTests(unittest.TestCase):
 
     def test_unregistered_state_exits_zero_and_emits_no_model_context(self) -> None:
         payload = json.loads((FIXTURES / "hook-pre-tool.json").read_text())
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             missing = Path(directory) / "missing-state"
             completed = subprocess.run(
                 [
@@ -92,7 +92,7 @@ class LearningHookTests(unittest.TestCase):
 
     def test_deleted_project_hook_does_not_recreate_client_failures(self) -> None:
         payload = json.loads((FIXTURES / "hook-pre-tool.json").read_text())
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             base = Path(directory)
             state = LearningState(base / "state")
             authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
@@ -127,7 +127,7 @@ class LearningHookTests(unittest.TestCase):
                 ledger.close()
 
     def test_normalization_rejection_is_counted_without_retaining_input(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             base = Path(directory)
             state = LearningState(base / "state")
             authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
@@ -172,7 +172,7 @@ class LearningHookTests(unittest.TestCase):
 
     def test_binding_and_ingest_rejections_are_counted_by_stage(self) -> None:
         payload = json.loads((FIXTURES / "hook-pre-tool.json").read_text())
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             base = Path(directory)
             state = LearningState(base / "state")
             authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")

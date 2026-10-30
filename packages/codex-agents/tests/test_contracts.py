@@ -8,7 +8,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
-from tests.support import ORCHESTRATION_ROOT
+from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
 from codex_agents.contracts import (
     ContractError,
@@ -166,7 +166,7 @@ class ContractTests(unittest.TestCase):
             "unverified_claims": [],
             "remaining_risks": [],
         }
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temporary:
             root = Path(temporary)
             inputs = {
                 "task.json": self.task(),
@@ -246,7 +246,7 @@ class ContractTests(unittest.TestCase):
                 self.assertEqual("invalid_evidence", captured.exception.reason_code)
 
     def test_cli_maps_malformed_and_nonfinite_json_to_invalid_shape(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temporary:
             root = Path(temporary)
             for name, value in {
                 "task.json": self.task(),
@@ -280,7 +280,7 @@ class ContractTests(unittest.TestCase):
                 self.assertNotIn("TOP_SECRET", completed.stdout)
 
     def test_cli_does_not_treat_missing_result_file_as_model_repair(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temporary:
             root = Path(temporary)
             for name, value in {
                 "task.json": self.task(),
@@ -394,7 +394,7 @@ class ContractTests(unittest.TestCase):
         )
 
     def test_result_preflight_uses_project_mapped_workspace_write_agent(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temporary:
             root = Path(temporary)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"

@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.support import BUNDLE_ROOT, ORCHESTRATION_ROOT
+from tests.support import BUNDLE_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 from codex_agents import routing
 from codex_agents.contracts import ContractError
@@ -328,7 +328,7 @@ class RoutingTests(unittest.TestCase):
     def test_policy_rejects_any_other_legacy_fallback(self) -> None:
         policy = deepcopy(self.policy)
         policy["legacy_fallback"] = {"model": "gpt-6-sol", "effort": "high"}
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             path = Path(directory) / "routing-policy.json"
             path.write_text(json.dumps(policy))
             with self.assertRaisesRegex(PolicyError, "sole legacy fallback"):
@@ -339,7 +339,7 @@ class RoutingTests(unittest.TestCase):
             route_task(self.task(model="gpt-6-astra"), self.policy)
 
     def test_explicit_read_only_project_agent_mapping_preserves_policy_model(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"
@@ -435,7 +435,7 @@ class RoutingTests(unittest.TestCase):
             )
 
     def test_project_agent_mapping_rejects_workspace_write_researcher(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"
@@ -460,7 +460,7 @@ class RoutingTests(unittest.TestCase):
                 )
 
     def test_project_agent_mapping_allows_workspace_write_coding_and_verifier(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             agents.mkdir(parents=True)
@@ -503,7 +503,7 @@ class RoutingTests(unittest.TestCase):
             )
 
     def test_project_agent_mapping_rejects_model_override(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"
@@ -534,7 +534,7 @@ class RoutingTests(unittest.TestCase):
                 )
 
     def test_project_agent_mapping_rejects_duplicate_keys(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             for raw in (
                 b'{"version":1,"roles":{},"roles":{}}',
@@ -551,7 +551,7 @@ class RoutingTests(unittest.TestCase):
                     )
 
     def test_dangling_project_agent_mapping_symlink_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             orchestration = root / ".codex/orchestration"
             orchestration.mkdir(parents=True)
@@ -566,7 +566,7 @@ class RoutingTests(unittest.TestCase):
                 )
 
     def test_mapped_project_agent_symlink_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             definitions = root / "agent-definitions"
@@ -598,7 +598,7 @@ class RoutingTests(unittest.TestCase):
                 )
 
     def test_mapped_project_skill_symlink_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             skill_root = root / ".agents/skills"
@@ -636,7 +636,7 @@ class RoutingTests(unittest.TestCase):
                 )
 
     def test_mapped_project_skill_must_be_committed_and_clean(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agents = root / ".codex/agents"
             orchestration = root / ".codex/orchestration"
@@ -711,7 +711,7 @@ class RoutingTests(unittest.TestCase):
                 )
 
     def test_project_agent_trust_uses_one_captured_byte_set(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             agent = root / ".codex/agents/technology_researcher.toml"
             mapping = root / ".codex/orchestration/project-agent-routing.json"

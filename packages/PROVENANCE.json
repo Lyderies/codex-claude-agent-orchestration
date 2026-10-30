@@ -113,7 +113,16 @@
       },
       "modified_after_import": {
         "scripts/install.py": "noqa markers for the source-tree bootstrap imports (upstream fix that never reached its main branch)",
-        "tests/test_learning_adapters.py": "removed an unused import (same upstream fix)"
+        "tests/test_learning_adapters.py": "removed an unused import (same upstream fix)",
+        "tests/support.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_contracts.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_installer.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_learning_cli.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_learning_engine.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_learning_hook.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_learning_store.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_qa_tree_scan.py": "portable temp directory instead of macOS-only /private/tmp",
+        "tests/test_routing.py": "portable temp directory instead of macOS-only /private/tmp"
       }
     },
     "claude-agents": {

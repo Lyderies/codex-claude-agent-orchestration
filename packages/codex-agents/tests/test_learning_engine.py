@@ -16,7 +16,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tests.support import ORCHESTRATION_ROOT
+from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
 from codex_agents.contracts import ContractError
 from codex_agents.learning_contracts import (
@@ -263,7 +263,7 @@ def canary_results(
 
 class VerifiedQaTests(unittest.TestCase):
     def test_operational_check_requires_exact_interpreter_digest(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             script = root / "qa-check"
             script.write_text(f"#!{sys.executable}\nraise SystemExit(0)\n")
@@ -288,7 +288,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_rejects_script_interpreter_chain(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             interpreter = root / "interpreter"
             interpreter.write_text("#!/usr/bin/python3\nraise SystemExit(0)\n")
@@ -318,7 +318,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_rejects_project_executable_symlink(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             target = root / "real-check"
             target.write_bytes(Path("/usr/bin/true").read_bytes())
@@ -344,7 +344,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_snapshot_uses_opened_validated_bytes(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             source = root / "approved"
             replacement = root / "replacement"
@@ -374,7 +374,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertEqual(b"changed bytes", source.read_bytes())
 
     def test_operational_check_snapshot_rejects_in_place_write(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             source = root / "approved"
             target = root / "snapshot"
@@ -405,7 +405,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertFalse(target.exists())
 
     def test_operational_check_snapshots_pinned_python_runtime_tree(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             config_root = root / ".codex/orchestration"
             packages = (
@@ -469,7 +469,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertTrue(report["security_checks"][0]["passed"])
 
     def test_operational_check_rejects_changed_python_runtime_tree(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             packages = (
                 root
@@ -512,7 +512,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_runtime_digest_includes_empty_directories(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             packages = Path(directory) / "site-packages"
             packages.mkdir()
             before = _copy_and_digest_runtime_tree(packages)
@@ -521,7 +521,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertNotEqual(before, after)
 
     def test_operational_check_runtime_tree_bounds_depth_and_copied_bytes(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             packages = Path(directory) / "site-packages"
             nested = packages / "one" / "two"
             nested.mkdir(parents=True)
@@ -538,7 +538,7 @@ class VerifiedQaTests(unittest.TestCase):
                 _copy_and_digest_runtime_tree(packages)
 
     def test_operational_check_rejects_direct_python_launcher(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             script = root / "qa.py"
             script.write_text("raise SystemExit(0)\n", encoding="utf-8")
@@ -565,7 +565,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_rejects_untyped_code_loaders(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             source = root / "mutable-source"
             source.write_text("exit 0\n", encoding="utf-8")
@@ -598,7 +598,7 @@ class VerifiedQaTests(unittest.TestCase):
                     validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_rejects_ruff_result_control_arguments(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             executable = root / "ruff"
             executable.write_bytes(b"pinned native tool")
@@ -665,7 +665,7 @@ class VerifiedQaTests(unittest.TestCase):
             validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_work_directory_token_is_bounded(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             executable = root / "pytest"
             executable.write_text(
@@ -710,7 +710,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(root, raw)
 
     def test_operational_check_input_rejects_shell_execution(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             raw = json.dumps(
                 {
                     "version": 1,
@@ -746,7 +746,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(Path(directory), raw)
 
     def test_operational_check_input_rejects_env_launcher(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             executable = Path("/usr/bin/env")
             raw = json.dumps(
                 {
@@ -783,7 +783,7 @@ class VerifiedQaTests(unittest.TestCase):
                 validate_operational_check_configuration_input(Path(directory), raw)
 
     def test_operational_check_rejects_changed_executable_digest(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             script = root / "qa-check"
             script.write_text(f"#!{sys.executable}\nraise SystemExit(0)\n")
@@ -855,7 +855,7 @@ class VerifiedQaTests(unittest.TestCase):
             _terminate_process_group(process)
 
     def test_operational_check_pins_runtime_libraries(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             cellar = root / "Cellar"
             library = cellar / "openssl@3" / "3.6.3" / "lib" / "libssl.3.dylib"
@@ -900,7 +900,7 @@ class VerifiedQaTests(unittest.TestCase):
 
     def test_operational_check_grants_sysctl_read_only_to_ruff(self) -> None:
         identity = {"resolved": "/usr/bin/true", "interpreter": None}
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             temporary = Path(directory)
             work = temporary / "work"
             work.mkdir()
@@ -918,7 +918,7 @@ class VerifiedQaTests(unittest.TestCase):
         self.assertIn("(allow file-read-metadata", python[2])
 
     def test_operational_check_runner_uses_only_approved_commands(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             config_root = root / ".codex" / "orchestration"
             config_root.mkdir(parents=True)
@@ -1008,7 +1008,7 @@ class VerifiedQaTests(unittest.TestCase):
         )
 
     def test_operational_check_snapshot_guard_invalidates_tampering(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             config_root = root / ".codex" / "orchestration"
             config_root.mkdir(parents=True)
@@ -1075,7 +1075,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertFalse(report["security_checks"][0]["passed"])
 
     def test_operational_check_configuration_bytes_match_committed_blob(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             config_root = root / ".codex" / "orchestration"
             config_root.mkdir(parents=True)
@@ -1142,7 +1142,7 @@ class VerifiedQaTests(unittest.TestCase):
                 load_operational_check_configuration(root)
 
     def test_operational_check_sandbox_denies_unrelated_authority(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory) / "project"
             root.mkdir()
             outside = Path(directory) / "outside-sentinel"
@@ -1227,7 +1227,7 @@ class VerifiedQaTests(unittest.TestCase):
         self.assertTrue(operational_sandbox_preflight())
 
     def test_operational_check_sandbox_denies_fork(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory) / "project"
             root.mkdir()
             config_root = root / ".codex/orchestration"
@@ -1301,7 +1301,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertTrue(report["security_checks"][0]["passed"])
 
     def test_operational_check_enforces_temporary_storage_bound(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory) / "project"
             root.mkdir()
             config_root = root / ".codex/orchestration"
@@ -1357,7 +1357,7 @@ class VerifiedQaTests(unittest.TestCase):
     def test_operational_check_rejects_directory_symlink_in_temporary_storage(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             parent = Path(directory)
             work = parent / "work"
             outside = parent / "outside"
@@ -1372,7 +1372,7 @@ class VerifiedQaTests(unittest.TestCase):
     def test_operational_check_allows_only_proven_pytest_internal_symlink(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             work = Path(directory) / "work"
             pytest_root = work / "pytest"
             target = pytest_root / "pytest-0"
@@ -1646,7 +1646,7 @@ class VerifiedQaTests(unittest.TestCase):
 
     def test_owner_signature_covers_exact_qa_evidence(self) -> None:
         qa, _ = build_verified_qa_records(**verified_qa_inputs())
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
             private_key, public_key = generate_test_owner_key(root)
             allowed_signers = root / "allowed-signers"
@@ -2108,7 +2108,7 @@ class OutcomeAndCaseTests(unittest.TestCase):
 
 class InstalledEvidenceTests(unittest.TestCase):
     def test_project_agent_snapshot_uses_discovered_path_not_internal_name(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             bundle = Path(directory) / "bundle"
             shutil.copytree(ORCHESTRATION_ROOT.parent.parent, bundle)
             agent = bundle / ".codex/agents/technology-researcher.toml"
@@ -2181,7 +2181,7 @@ class InstalledEvidenceTests(unittest.TestCase):
             )
 
     def test_package_digest_ignores_unmanaged_files_and_rejects_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             bundle = Path(directory) / "bundle"
             shutil.copytree(ORCHESTRATION_ROOT.parent.parent, bundle)
             task = {
@@ -2220,7 +2220,7 @@ class InstalledEvidenceTests(unittest.TestCase):
                 )
 
     def test_release_registry_is_unsigned_only_when_empty(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             registry = Path(directory) / "learning-releases.json"
             registry.write_text(json.dumps({
                 "version": 1,
@@ -2415,7 +2415,7 @@ class ComparisonTests(unittest.TestCase):
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         owner_root = Path(self.temporary.name)
         self.private_key, public_key = generate_test_owner_key(owner_root)
         allowed_signers = owner_root / "allowed-signers"
