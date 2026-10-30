@@ -217,7 +217,16 @@ provider API key, and a run handle that was already dispatched.
   in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
   unreviewed with an unknown verdict. `read_containment` is `enforced`.
 - Codex children run `codex exec` read-only and ephemeral, between non-spending
-  observations taken before and after. Codex structured output needs every key
+  observations taken before and after. The launch disables account connectors,
+  plugins, multi-agent, image generation, goals, browser and computer use and hooks
+  (`--disable <feature>`, never `code_mode_host`) and web search
+  (`web_search="disabled"`). Collaboration tools cannot be configured away, so the
+  event stream is allowlisted: only the events `thread.started`, `turn.started`,
+  `turn.completed`, `turn.failed`, `error` and `item.started/updated/completed`, and
+  the item types `agent_message`, `reasoning`, `command_execution`, `file_change`,
+  `todo_list` and `error`, are accepted. Anything else (an MCP, web search or
+  collaboration item, or an unknown event) kills the child with
+  `codex_tool_not_allowed:<type>` and no result is accepted. Codex structured output needs every key
   required, so the bridge derives a strict variant of the installed result schema
   (optional keys become nullable) for each dispatch and removes those optional nulls
   from the reply before the result is validated. A reroute or a different
