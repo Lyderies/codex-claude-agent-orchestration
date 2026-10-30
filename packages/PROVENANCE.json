@@ -153,7 +153,9 @@
         "native-package/.claude/skills/agent-orchestration/SKILL.md": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
         "native-package/.codex/orchestration/codex_agents/hosts.py": "G2 S3 Claude host client and orchestration skills",
         "native-package/.codex/orchestration/codex_agents/claude_host.py": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
-        "native-package/VERSION": "package version 0.8.0, so existing 0.7.2 collectors upgrade instead of refusing the changed build"
+        "native-package/VERSION": "package version 0.8.0, so existing 0.7.2 collectors upgrade instead of refusing the changed build; 0.8.1 for the attested Codex credits waiver",
+        "tests/test_runtime_release.py": "new: fails when the collector runtime changes without a version bump",
+        "runtime-releases.json": "new: collector runtime digest recorded per package version"
       }
     },
     "claude-agents": {
