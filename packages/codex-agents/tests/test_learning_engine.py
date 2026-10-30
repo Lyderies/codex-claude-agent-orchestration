@@ -16,7 +16,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
+from tests.support import ORCHESTRATION_ROOT, MACOS_SANDBOX_ONLY, TEMP_ROOT
 
 from codex_agents.contracts import ContractError
 from codex_agents.learning_contracts import (
@@ -404,6 +404,7 @@ class VerifiedQaTests(unittest.TestCase):
                 _snapshot_file(source, digest, target)
             self.assertFalse(target.exists())
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_snapshots_pinned_python_runtime_tree(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
@@ -564,6 +565,7 @@ class VerifiedQaTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "driver is invalid"):
                 validate_operational_check_configuration_input(root, raw)
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_rejects_untyped_code_loaders(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
@@ -898,6 +900,7 @@ class VerifiedQaTests(unittest.TestCase):
                 "libssl.dylib",
             )
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_grants_sysctl_read_only_to_ruff(self) -> None:
         identity = {"resolved": "/usr/bin/true", "interpreter": None}
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
@@ -917,6 +920,7 @@ class VerifiedQaTests(unittest.TestCase):
         self.assertNotIn("(allow sysctl-read)", python[2])
         self.assertIn("(allow file-read-metadata", python[2])
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_runner_uses_only_approved_commands(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
@@ -1007,6 +1011,7 @@ class VerifiedQaTests(unittest.TestCase):
             set(report["security_checks"][0]),
         )
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_snapshot_guard_invalidates_tampering(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
@@ -1141,6 +1146,7 @@ class VerifiedQaTests(unittest.TestCase):
             ), self.assertRaisesRegex(ContractError, "committed and clean"):
                 load_operational_check_configuration(root)
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_sandbox_denies_unrelated_authority(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory) / "project"
@@ -1226,6 +1232,7 @@ class VerifiedQaTests(unittest.TestCase):
     def test_operational_check_sandbox_preflight_is_available(self) -> None:
         self.assertTrue(operational_sandbox_preflight())
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_sandbox_denies_fork(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory) / "project"
@@ -1300,6 +1307,7 @@ class VerifiedQaTests(unittest.TestCase):
             self.assertTrue(report["deterministic_checks"][0]["passed"])
             self.assertTrue(report["security_checks"][0]["passed"])
 
+    @MACOS_SANDBOX_ONLY
     def test_operational_check_enforces_temporary_storage_bound(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory) / "project"

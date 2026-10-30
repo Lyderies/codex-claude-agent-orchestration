@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.support import REPOSITORY_ROOT, TEMP_ROOT
+from tests.support import REPOSITORY_ROOT, MACOS_SANDBOX_ONLY, TEMP_ROOT
 
 from codex_agents.learning_store import CollectorClient, CollectorError, LearningState
 
@@ -172,6 +172,7 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue((target / installer.OPERATIONAL_CHECKS_PATH).exists())
             self.assertTrue((target / ".git").exists())
 
+    @MACOS_SANDBOX_ONLY
     def test_clean_project_installs_with_explicit_empty_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = self.empty_target(directory)
@@ -192,6 +193,7 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertTrue(installer.verify(target)["ready"])
 
+    @MACOS_SANDBOX_ONLY
     def test_clean_project_mapping_can_select_packaged_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = self.empty_target(directory)

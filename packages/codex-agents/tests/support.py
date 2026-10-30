@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 
@@ -14,3 +15,8 @@ FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
 # package refuses symlinked paths.
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
+
+# Operational QA runs checks inside macOS Seatbelt (sandbox-exec); other platforms fail closed.
+MACOS_SANDBOX_ONLY = unittest.skipUnless(
+    sys.platform == "darwin", "operational-check sandbox (sandbox-exec) is macOS-only"
+)
