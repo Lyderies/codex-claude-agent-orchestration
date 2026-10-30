@@ -15,6 +15,9 @@ ORCHESTRATION_ROOT = Path(__file__).resolve().parent
 BUNDLE_ROOT = ORCHESTRATION_ROOT.parent.parent
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
+from codex_agents.bridge import BridgeRefused  # noqa: E402
+from codex_agents.bridge import signal_guard as bridge_signal_guard  # noqa: E402
+from codex_agents.bridge import dispatch as dispatch_bridge  # noqa: E402
 from codex_agents.catalog import CatalogError, discover, load_discovery_policy  # noqa: E402
 from codex_agents.contracts import (  # noqa: E402
     ContractError,
@@ -279,6 +282,9 @@ def _validated_assignment(args: argparse.Namespace) -> dict:
 
 
 TRUSTED_HOST_CLIENT = "codex-host-v1"
+# Bridged children run under their own ledger client, which declares the
+# client-observed usage the bridge reports.
+BRIDGE_CLIENT = "bridge-v1"
 # The primary provider follows the trusted host client and never the task. A
 # Claude host client adds its own entry here.
 HOST_CLIENT_PRIMARY_PROVIDERS = {"codex-host-v1": "codex"}
@@ -289,6 +295,10 @@ def _host_primary_provider(client: str = TRUSTED_HOST_CLIENT) -> str:
     if provider is None:
         raise ContractError("host client has no trusted primary provider")
     return provider
+
+
+def _host_client_for(route: dict) -> str:
+    return BRIDGE_CLIENT if route.get("dispatch") == "bridge" else TRUSTED_HOST_CLIENT
 
 
 def _trusted_host_route(
@@ -316,7 +326,7 @@ def _trusted_host_route(
     clients = load_client_capabilities(
         ORCHESTRATION_ROOT / "config" / "learning-clients.json"
     )
-    capability = clients[TRUSTED_HOST_CLIENT]
+    capability = clients[_host_client_for(primary_route)]
     primary_route["execution_configuration"] = installed_execution_configuration(
         BUNDLE_ROOT, primary_route, client_capability=capability
     )
@@ -535,6 +545,15 @@ def main() -> int:
     _add_assignment_context(learning_open_host, allow_policy_override=False)
     learning_open_host.add_argument("--route", required=True)
     learning_open_host.add_argument("--orchestration-handle", required=True)
+
+    dispatch_parser = subparsers.add_parser(
+        "dispatch",
+        help="run one admitted, opened host run as a read-only bridged child",
+    )
+    _add_learning_project(dispatch_parser)
+    _add_assignment_context(dispatch_parser, allow_policy_override=False)
+    dispatch_parser.add_argument("--route", required=True)
+    dispatch_parser.add_argument("--run-handle", required=True)
 
     provider_observe = subparsers.add_parser(
         "provider-observe",
@@ -937,6 +956,10 @@ def main() -> int:
                     trusted_routing_evidence_refs=trusted,
                     primary_provider=_host_primary_provider(),
                 )
+                if client_version == TRUSTED_HOST_CLIENT:
+                    # A bridged route runs under the bridge client, as the host
+                    # lifecycle will when it opens the run.
+                    client_version = _host_client_for(base_route)
                 configuration = installed_execution_configuration(
                     BUNDLE_ROOT, base_route, client_capability=clients[client_version]
                 )
@@ -1330,11 +1353,42 @@ def main() -> int:
                         task=task,
                         route=route,
                         execution_configuration=route["execution_configuration"],
-                        client_version=TRUSTED_HOST_CLIENT,
+                        client_version=_host_client_for(route),
                         orchestration_handle=args.orchestration_handle,
                         fallback_receipt=args.fallback_receipt,
                     ),
                 }
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "dispatch":
+            if args.fallback_receipt is not None:
+                raise ContractError("bridged dispatch never uses a fallback receipt")
+            task = _json_input(args.task)
+            route = _json_input(args.route)
+            if not isinstance(route, dict):
+                raise ContractError("route must be an object")
+            ledger, project_id = _learning_ledger(args)
+            try:
+                # A termination signal kills the child's process group before
+                # this process exits, and the export is still removed.
+                with bridge_signal_guard():
+                    report = {
+                        "ready": True,
+                        **dispatch_bridge(
+                            ledger,
+                            project_id,
+                            project_root=args.project_root.resolve(),
+                            bundle_root=BUNDLE_ROOT,
+                            task=task,
+                            route=route,
+                            assignment=_json_input(args.assignment),
+                            parent_grant=_json_input(args.parent_grant),
+                            run_handle=args.run_handle,
+                            result_schema=(
+                                ORCHESTRATION_ROOT / "schemas" / "result.schema.json"
+                            ).read_bytes(),
+                        ),
+                    }
             finally:
                 _close_ledger(ledger)
         elif args.command == "provider-observe":
@@ -2428,6 +2482,10 @@ def main() -> int:
             raise ContractError("unsupported command")
     except OSError:
         _print({"ready": False, "error": "filesystem operation failed"})
+        return 2
+    except BridgeRefused as exc:
+        # Refusal messages are fixed strings; they never carry prompts or paths.
+        _print({"ready": False, "error": "dispatch refused", "reason": str(exc)})
         return 2
     except AdmissionDenied as exc:
         _print({

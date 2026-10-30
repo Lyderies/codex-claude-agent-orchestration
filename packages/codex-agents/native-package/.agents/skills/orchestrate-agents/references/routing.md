@@ -100,3 +100,53 @@ and the identity record keeps the client's real path and SHA-256 locally for aud
 client can append them. Identities are stored only as keyed fingerprints, and labels
 such as plan and subscription are allow-listed, so anything else is stored as null.
 Every project, including a Codex-only one, needs an attestation before host runs open.
+
+## Bridge dispatch
+
+`dispatch` runs one opened, admitted host run whose route has `dispatch: bridge` as a
+read-only child of the route's provider, and prints the child's `result` with a
+separate `bridge_report`. It refuses a native route, a writable sandbox or grant, an
+assignment that does not validate, a run handle without a passing admission for the
+route's provider, a route, task or assignment that differs from the opened run, a
+provider API key, and a run handle that was already dispatched.
+
+- The child never runs in the repository. The committed `HEAD` bytes of the
+  assignment's `context` and `owned_paths` are exported into a private directory under
+  the resolved system temp directory, which is removed afterwards. Paths must be plain
+  literals: pathspec magic (a leading `:`, or any of `*?[\`) refuses, git runs with
+  literal pathspecs, and a listed path outside the request refuses. Symlinks,
+  submodules, missing paths, traversal, absolute paths and oversize exports refuse.
+- `CLAUDE.md`, `CLAUDE.local.md`, `.claude/` and `.mcp.json` are never exported: naming
+  one refuses, and directory exports drop them. A Claude child is refused with
+  `context_boundary_violation` if any directory from its workspace up to `/` holds
+  `CLAUDE.md`, `CLAUDE.local.md` or `.claude`; there is no exception for `~/.claude`,
+  which is why exports live outside home. Enterprise managed settings refuse a Claude
+  launch with `managed_settings_present`, because they apply despite
+  `--setting-sources project` and the init frame cannot show them.
+- The account is observed again immediately before launch and must match the admitted
+  fingerprint. A durable `dispatch_intent` is then written, and the bridge run ID is
+  bound as the run's agent; there is no second launch for that run.
+- The child runs in its own session. The tighter of the route's and the assignment's
+  `timeout_seconds` is a hard deadline, and the tighter `max_tool_calls` sets Claude's
+  `--max-turns`. Its process group is killed on timeout, on a contract violation, on
+  an over-long line and after it exits. `dispatch` kills it on SIGTERM, SIGINT or
+  SIGHUP, and a detached watchdog kills it at the deadline even if the bridge itself
+  is killed. Any outcome the bridge cannot prove (timeout, crash, a broken stream or no
+  parseable result) returns a failed or timed-out result, never success.
+- Claude children run with only Read, Glob and Grep, `dontAsk` permissions, generated
+  settings with hooks and built-in plugins off and the model pinned, no MCP servers and
+  no session persistence. The run fails closed unless the init frame reports no API
+  key, the requested model, no plugins, no MCP servers and only those tools. The first
+  `rate_limit_event` is recorded for the run. Any model other than the requested one
+  in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
+  unreviewed with an unknown verdict. `read_containment` is `enforced`.
+- Codex children run `codex exec` read-only and ephemeral, between non-spending
+  observations taken before and after. Codex structured output needs every key
+  required, so the bridge derives a strict variant of the installed result schema
+  (optional keys become nullable) for each dispatch and removes those optional nulls
+  from the reply before the result is validated. A reroute or a different
+  model marks the result unreviewed with an unknown verdict. Codex reads are not contained by the
+  sandbox, so `read_containment` is `advisory`.
+- Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
+  typed codes, never prompts or file contents.
+
