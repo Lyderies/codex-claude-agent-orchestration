@@ -102,6 +102,9 @@ class UmbrellaInstallTests(unittest.TestCase):
         verified = installer.operate("verify", self.target)
         self.assertEqual(verified["claude"]["result"], "verified", verified)
         self.assertTrue(verified["codex"]["package_ready"], verified)
+        # The Codex package's Claude skill sits beside the Claude package's files.
+        self.assertTrue((self.target / ".claude/skills/agent-orchestration/SKILL.md").is_file())
+        self.assertTrue((self.target / ".claude/skills/claude-agents/SKILL.md").is_file())
         removed = installer.operate("remove", self.target, apply=True)
         self.assertTrue(removed["ok"] and removed["applied"], removed)
         after = {path: digest for path, digest in inventory(self.target).items() if path not in PROJECT_CONFIG}

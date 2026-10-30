@@ -173,6 +173,79 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue((target / installer.OPERATIONAL_CHECKS_PATH).exists())
             self.assertTrue((target / ".git").exists())
 
+    def test_claude_skill_installs_verifies_and_removes_with_the_package(self) -> None:
+        skill = ".claude/skills/agent-orchestration/SKILL.md"
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.target(directory)
+            inputs = self.project_inputs(directory)
+            installer.install(target, apply=True, **inputs)
+            manifest = json.loads((target / installer.MANIFEST_PATH).read_text())
+            self.assertIn(skill, manifest["files"])
+            self.assertEqual(
+                [path for path in manifest["files"] if path.startswith(".claude/")],
+                [skill],
+            )
+            self.assertTrue((target / skill).is_file())
+            subprocess.run(["git", "-C", str(target), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(target), "commit", "-qm", "install package"],
+                check=True,
+            )
+            self.assertTrue(installer.verify(target)["package_ready"])
+            (target / skill).write_text("changed\n")
+            with self.assertRaisesRegex(installer.InstallError, "refusing to remove"):
+                installer.remove(target, apply=True)
+            subprocess.run(["git", "-C", str(target), "checkout", "--", skill], check=True)
+            installer.remove(target, apply=True)
+            self.assertFalse((target / skill).exists())
+            self.assertFalse((target / ".claude").exists())
+
+    def test_unmanaged_file_at_the_claude_skill_path_refuses_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.target(directory)
+            existing = target / ".claude/skills/agent-orchestration/SKILL.md"
+            existing.parent.mkdir(parents=True)
+            existing.write_text("---\nname: agent-orchestration\n---\nProject owned.\n")
+            with self.assertRaisesRegex(installer.InstallError, "existing unmanaged file"):
+                installer.install(target, apply=True, **self.project_inputs(directory))
+            self.assertIn("Project owned", existing.read_text())
+
+    def test_identical_unmanaged_files_are_not_claimed(self) -> None:
+        for relative in (
+            ".claude/skills/agent-orchestration/SKILL.md",
+            ".agents/skills/plan-change/SKILL.md",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                target = self.target(directory)
+                existing = target / relative
+                existing.parent.mkdir(parents=True, exist_ok=True)
+                existing.write_bytes((installer.BUNDLE_ROOT / relative).read_bytes())
+                with self.assertRaisesRegex(
+                    installer.InstallError, f"existing unmanaged file: {relative}"
+                ):
+                    installer.install(
+                        target, apply=True, **self.project_inputs(directory)
+                    )
+                self.assertFalse((target / installer.MANIFEST_PATH).exists())
+
+    def test_only_the_claude_skill_prefix_is_admitted_under_claude(self) -> None:
+        installer._safe_relative(".claude/skills/agent-orchestration/SKILL.md")
+        for path in (
+            ".claude/settings.json",
+            ".claude/agents/claude_agents_researcher.md",
+            ".claude/skills/claude-agents/SKILL.md",
+            ".claude/claude-agents/manifest.json",
+            ".claude/skills/agent-orchestration",
+            ".claude/skills/agent-orchestration-extra/SKILL.md",
+        ):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                installer.InstallError, "unsupported package path"
+            ):
+                installer._safe_relative(path)
+        installer._safe_relative(".claude/skills", allow_directory=True)
+        with self.assertRaises(installer.InstallError):
+            installer._safe_relative(".claude/agents", allow_directory=True)
+
     @MACOS_SANDBOX_ONLY
     def test_clean_project_installs_with_explicit_empty_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

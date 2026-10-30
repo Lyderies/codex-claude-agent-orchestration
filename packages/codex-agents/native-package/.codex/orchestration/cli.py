@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -79,6 +80,21 @@ from codex_agents.learning_store import (  # noqa: E402
     ensure_collector,
     require_authorized_collector_runtime,
     validate_collector_runtime,
+)
+from codex_agents.hosts import (  # noqa: E402
+    CLAUDE_HOST_CLIENT,
+    CODEX_HOST_CLIENT,
+    HOST_CLIENTS,
+    HostClientMismatch,
+    HostClientUnknown,
+    resolve_host_client,
+)
+from codex_agents.claude_host import (  # noqa: E402
+    ClaudeHostDenied,
+    check_backend,
+    check_model_overrides,
+    is_native_claude,
+    native_spawn,
 )
 from codex_agents.providers import (  # noqa: E402
     AdmissionDenied,
@@ -281,24 +297,99 @@ def _validated_assignment(args: argparse.Namespace) -> dict:
     )
 
 
-TRUSTED_HOST_CLIENT = "codex-host-v1"
 # Bridged children run under their own ledger client, which declares the
 # client-observed usage the bridge reports.
 BRIDGE_CLIENT = "bridge-v1"
-# The primary provider follows the trusted host client and never the task. A
-# Claude host client adds its own entry here.
-HOST_CLIENT_PRIMARY_PROVIDERS = {"codex-host-v1": "codex"}
+# The primary provider follows the detected host client and never the task.
+HOST_CLIENT_PRIMARY_PROVIDERS = {
+    CODEX_HOST_CLIENT: "codex",
+    CLAUDE_HOST_CLIENT: "claude",
+}
+# Set from --host-client; it must agree with the detected host.
+_EXPLICIT_HOST_CLIENT: str | None = None
 
 
-def _host_primary_provider(client: str = TRUSTED_HOST_CLIENT) -> str:
-    provider = HOST_CLIENT_PRIMARY_PROVIDERS.get(client)
+def _host_client() -> str:
+    """The host driving this lifecycle step, from its environment markers.
+
+    The markers only catch accidental misuse; see codex_agents.hosts for the
+    trust model. Admission, the bridge flag and the sandbox are the gates.
+    """
+
+    return resolve_host_client(os.environ, _EXPLICIT_HOST_CLIENT)
+
+
+def _host_primary_provider(client: str | None = None) -> str:
+    provider = HOST_CLIENT_PRIMARY_PROVIDERS.get(client or _host_client())
     if provider is None:
         raise ContractError("host client has no trusted primary provider")
     return provider
 
 
+def _require_host_owner(
+    ledger: LearningLedger,
+    project_id: str,
+    *,
+    orchestration_handle: str | None = None,
+    run_handle: str | None = None,
+) -> str:
+    """Refuse a lifecycle mutation from a host other than the one that owns it.
+
+    Ownership is the host client stored when the orchestration opened; the
+    bridge's execution client is separate and never counts as an owner.
+    """
+
+    host = _host_client()
+    owner = ledger.host_owner(
+        project_id, orchestration_handle=orchestration_handle, run_handle=run_handle
+    )
+    if owner != host:
+        raise HostClientMismatch("host_client_mismatch")
+    return host
+
+
+def _claude_host_open_checks(
+    ledger: LearningLedger,
+    project_id: str,
+    host: str,
+    route: dict,
+    project_root: Path,
+) -> tuple[dict, dict | None]:
+    """Run the Claude-host open checks and return the run profile to record.
+
+    Every Claude-host open checks for a metered backend, since its children
+    inherit the session. A native Claude child also gets its spawn parameters
+    from code, and an environment that would override its model is denied.
+    """
+
+    if host != CLAUDE_HOST_CLIENT:
+        return {
+            "host_client": host, "backend_check": "not_applicable", "model_pin": None,
+            "subagent_type": None, "model_alias": None, "effort": None,
+        }, None
+    try:
+        check_backend(os.environ, project_root)
+        spawn = None
+        if is_native_claude(route):
+            check_model_overrides(os.environ, project_root)
+            spawn = native_spawn(route)
+    except ClaudeHostDenied as exc:
+        ledger.record_host_denial(
+            project_id, provider=route.get("provider", "codex"), reason_code=exc.reason_code
+        )
+        raise
+    return {
+        "host_client": host,
+        "backend_check": "passed",
+        "model_pin": "alias" if spawn is not None else None,
+        "subagent_type": spawn["subagent_type"] if spawn else None,
+        "model_alias": spawn["model_alias"] if spawn else None,
+        "effort": spawn["effort"] if spawn else None,
+    }, spawn
+
+
 def _host_client_for(route: dict) -> str:
-    return BRIDGE_CLIENT if route.get("dispatch") == "bridge" else TRUSTED_HOST_CLIENT
+    return BRIDGE_CLIENT if route.get("dispatch") == "bridge" else _host_client()
 
 
 def _trusted_host_route(
@@ -357,7 +448,7 @@ def _trusted_host_route(
         receipt_id=fallback_receipt,
         task=task,
         primary_route=primary_route,
-        client_version=TRUSTED_HOST_CLIENT,
+        client_version=_host_client(),
     )
     route = _route_task_legacy_fallback(
         task,
@@ -410,9 +501,7 @@ def main() -> int:
         "learning-route", help="route one task with approved learning lifecycle state"
     )
     learning_route.add_argument("--task", required=True)
-    learning_route.add_argument(
-        "--client-version", default=TRUSTED_HOST_CLIENT
-    )
+    learning_route.add_argument("--client-version")
     learning_route.add_argument(
         "--fallback-from-run-handle",
         help="abandoned primary host run proving model unavailability",
@@ -562,6 +651,11 @@ def main() -> int:
     _add_learning_project(provider_observe)
     provider_observe.add_argument(
         "--provider", required=True, choices=("codex", "claude")
+    )
+    provider_observe.add_argument(
+        "--billing-probe",
+        action="store_true",
+        help="for Claude, also run one minimal locked turn to record billing evidence",
     )
 
     learning_billing_attestation = subparsers.add_parser(
@@ -915,7 +1009,15 @@ def main() -> int:
     learning_attach_signature.add_argument("--request", required=True)
     learning_attach_signature.add_argument("--signature", required=True, type=Path)
 
+    for subparser in subparsers.choices.values():
+        subparser.add_argument(
+            "--host-client",
+            choices=HOST_CLIENTS,
+            help="expected host client; refused unless it matches the detected host",
+        )
     args = parser.parse_args()
+    global _EXPLICIT_HOST_CLIENT
+    _EXPLICIT_HOST_CLIENT = args.host_client
     try:
         if args.command == "validate":
             report = validate_package(args.root)
@@ -941,7 +1043,14 @@ def main() -> int:
             clients = load_client_capabilities(
                 ORCHESTRATION_ROOT / "config" / "learning-clients.json"
             )
-            client_version = args.client_version
+            explicit_client = args.client_version
+            if explicit_client in HOST_CLIENTS:
+                # An explicit host must be the detected one; it is then treated
+                # exactly like the implicit host, bridge client included.
+                if explicit_client != _host_client():
+                    raise HostClientUnknown("host_client_unknown")
+                explicit_client = None
+            client_version = explicit_client or _host_client()
             if client_version not in clients:
                 raise ContractError(
                     "client version is not in the validated capability matrix"
@@ -956,7 +1065,7 @@ def main() -> int:
                     trusted_routing_evidence_refs=trusted,
                     primary_provider=_host_primary_provider(),
                 )
-                if client_version == TRUSTED_HOST_CLIENT:
+                if explicit_client is None:
                     # A bridged route runs under the bridge client, as the host
                     # lifecycle will when it opens the run.
                     client_version = _host_client_for(base_route)
@@ -984,6 +1093,9 @@ def main() -> int:
                 report["learning_candidate_digests"] = applied
                 report["ready"] = True
                 if args.fallback_from_run_handle is not None:
+                    _require_host_owner(
+                        ledger, project_id, run_handle=args.fallback_from_run_handle
+                    )
                     receipt = ledger.issue_legacy_fallback_receipt(
                         project_id,
                         run_handle=args.fallback_from_run_handle,
@@ -1328,6 +1440,9 @@ def main() -> int:
             supplied_route = _json_input(args.route)
             ledger, project_id = _learning_ledger(args)
             try:
+                host = _require_host_owner(
+                    ledger, project_id, orchestration_handle=args.orchestration_handle
+                )
                 route, _ = _trusted_host_route(
                     ledger,
                     project_id,
@@ -1343,6 +1458,9 @@ def main() -> int:
                     route=route,
                     parent_grant=_json_input(args.parent_grant),
                 )
+                host_profile, spawn = _claude_host_open_checks(
+                    ledger, project_id, host, route, args.project_root.resolve()
+                )
                 # The ledger admits the run itself as it opens it; later steps read
                 # the stored decision. A verifier is admitted when its run opens.
                 report = {
@@ -1356,6 +1474,17 @@ def main() -> int:
                         client_version=_host_client_for(route),
                         orchestration_handle=args.orchestration_handle,
                         fallback_receipt=args.fallback_receipt,
+                        host_profile=host_profile,
+                    ),
+                    **({"native_spawn": spawn} if spawn is not None else {}),
+                    # Native children of either provider run with the parent
+                    # session's permissions, so only a bridged Claude child's
+                    # reads are contained.
+                    "read_containment": (
+                        "enforced"
+                        if route.get("dispatch") == "bridge"
+                        and route.get("provider") == "claude"
+                        else "advisory"
                     ),
                 }
             finally:
@@ -1369,6 +1498,9 @@ def main() -> int:
                 raise ContractError("route must be an object")
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, run_handle=args.run_handle
+                )
                 # A termination signal kills the child's process group before
                 # this process exits, and the export is still removed.
                 with bridge_signal_guard():
@@ -1394,11 +1526,20 @@ def main() -> int:
         elif args.command == "provider-observe":
             ledger, project_id = _learning_ledger(args)
             try:
-                records = ledger.observe_provider(
-                    project_id,
-                    args.provider,
-                    project_root=args.project_root.resolve(),
-                )
+                if args.billing_probe and args.provider != "claude":
+                    raise ContractError("the billing probe is for Claude only")
+                probe = None
+                if args.billing_probe:
+                    observed = ledger.observe_claude_billing(
+                        project_id, project_root=args.project_root.resolve()
+                    )
+                    probe, records = observed["probe"], observed["records"]
+                else:
+                    records = ledger.observe_provider(
+                        project_id,
+                        args.provider,
+                        project_root=args.project_root.resolve(),
+                    )
                 # The local client path stays in the ledger and is never printed.
                 report = {
                     "ready": True,
@@ -1406,6 +1547,7 @@ def main() -> int:
                         {key: value for key, value in record.items() if key != "client_path"}
                         for record in records
                     ],
+                    **({"probe": probe} if probe is not None else {}),
                 }
             finally:
                 _close_ledger(ledger)
@@ -1442,7 +1584,7 @@ def main() -> int:
                 report = {
                     "ready": True,
                     **ledger.open_orchestration(
-                        project_id, client_version=TRUSTED_HOST_CLIENT
+                        project_id, client_version=_host_client()
                     ),
                 }
             finally:
@@ -1450,6 +1592,9 @@ def main() -> int:
         elif args.command == "learning-checkpoint-orchestration":
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, orchestration_handle=args.orchestration_handle
+                )
                 report = {
                     "ready": True,
                     **ledger.checkpoint_orchestration(
@@ -1466,6 +1611,9 @@ def main() -> int:
         }:
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, orchestration_handle=args.orchestration_handle
+                )
                 report = {
                     "ready": True,
                     **ledger.set_orchestration_paused(
@@ -1479,6 +1627,9 @@ def main() -> int:
         elif args.command == "learning-close-orchestration":
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, orchestration_handle=args.orchestration_handle
+                )
                 report = {
                     "ready": True,
                     **ledger.close_orchestration(
@@ -1505,6 +1656,9 @@ def main() -> int:
         elif args.command == "learning-bind-host-agent":
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, run_handle=args.run_handle
+                )
                 report = {
                     "ready": True,
                     **ledger.bind_host_agent(
@@ -1518,6 +1672,9 @@ def main() -> int:
         elif args.command == "learning-observe-host-run":
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, run_handle=args.run_handle
+                )
                 report = {
                     "ready": True,
                     **ledger.observe_host_run(
@@ -1531,6 +1688,9 @@ def main() -> int:
         elif args.command == "learning-classify-host-run-abandoned":
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, run_handle=args.run_handle
+                )
                 report = {
                     "ready": True,
                     **ledger.classify_host_run_abandoned(
@@ -1544,6 +1704,9 @@ def main() -> int:
         elif args.command == "learning-prepare-upgrade-reconciliation":
             ledger, project_id = _learning_ledger(args)
             try:
+                _require_host_owner(
+                    ledger, project_id, run_handle=args.run_handle
+                )
                 request = ledger.prepare_upgrade_reconciliation(
                     project_id,
                     orchestration_id=args.orchestration_id,
@@ -1579,9 +1742,16 @@ def main() -> int:
                 ORCHESTRATION_ROOT / "config" / "learning-clients.json"
             )
             trusted_host = "run_handle" in observation
-            client_version = (
-                TRUSTED_HOST_CLIENT if trusted_host else observation.get("client_version")
-            )
+            # The host is detected unconditionally. Legacy telemetry recording
+            # (no run handle) is a Codex path: only a Codex host, for a Codex run.
+            host = _host_client()
+            client_version = host if trusted_host else observation.get("client_version")
+            if not trusted_host and (
+                host != CODEX_HOST_CLIENT
+                or not isinstance(client_version, str)
+                or not client_version.startswith("codex-")
+            ):
+                raise HostClientMismatch("host_client_mismatch")
             if client_version not in clients:
                 raise ContractError("client version is not in the validated capability matrix")
             if (args.evaluation_assignment_digest is None) != (args.trial_id is None):
@@ -1591,6 +1761,9 @@ def main() -> int:
             ledger, project_id = _learning_ledger(args)
             try:
                 if trusted_host:
+                    _require_host_owner(
+                        ledger, project_id, run_handle=observation["run_handle"]
+                    )
                     if args.evaluation_assignment_digest is not None:
                         raise ContractError(
                             "trusted host handles do not accept evaluation overrides"
@@ -2482,6 +2655,27 @@ def main() -> int:
             raise ContractError("unsupported command")
     except OSError:
         _print({"ready": False, "error": "filesystem operation failed"})
+        return 2
+    except HostClientMismatch:
+        _print({
+            "ready": False,
+            "error": "host client does not own this lifecycle",
+            "reason_code": "host_client_mismatch",
+        })
+        return 2
+    except ClaudeHostDenied as exc:
+        _print({
+            "ready": False,
+            "error": "provider admission denied",
+            "reason_code": exc.reason_code,
+        })
+        return 2
+    except HostClientUnknown:
+        _print({
+            "ready": False,
+            "error": "host client is unknown",
+            "reason_code": "host_client_unknown",
+        })
         return 2
     except BridgeRefused as exc:
         # Refusal messages are fixed strings; they never carry prompts or paths.

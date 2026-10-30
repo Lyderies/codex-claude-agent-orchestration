@@ -126,6 +126,8 @@ PRODUCER_AUTHORITY = {
     "lifecycle": {"promotion"},
 }
 # Only ledger methods that run the observation themselves may write these.
+# Billing evidence younger than this is reused instead of probing again.
+PROBE_REUSE_SECONDS = 300
 PROVIDER_OBSERVATION_TYPES = {"provider_identity", "provider_headroom", "provider_billing"}
 SOURCE_BY_PRODUCER = {
     "hook": "hook",
@@ -2081,6 +2083,7 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
+            "host_run_profile", "probe_admission",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -2592,6 +2595,12 @@ class LearningLedger:
             r"hrn_[0-9a-f]{48}", run_handle
         ):
             raise LedgerError("host run handle is invalid")
+        # Native agent IDs are opaque tokens: Codex IDs, Claude Code Agent tool
+        # IDs (short hex) and bridge run IDs all fit this bounded form.
+        if not isinstance(agent_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", agent_id
+        ):
+            raise LedgerError("native agent identifier is invalid")
         native_assignment_id = external_id(
             self.state.digest_key(), "asg", agent_id
         )
@@ -3262,6 +3271,7 @@ class LearningLedger:
         client_version: str,
         orchestration_handle: str,
         fallback_receipt: str | None = None,
+        host_profile: dict[str, Any] | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
         """Persist a trusted assigned-run start and return a single-use opaque handle.
@@ -3453,6 +3463,25 @@ class LearningLedger:
             self._store_admission_locked(
                 project_id, admission, run_id=run_id, timestamp=admitted_at
             )
+            if host_profile is not None:
+                if host_profile.get("host_client") != orchestration["client_version"]:
+                    raise LedgerError("host run profile differs from the orchestration host")
+                material = {
+                    "schema_version": 1,
+                    "record_type": "host_run_profile",
+                    "run_id": run_id,
+                    **host_profile,
+                    "observed_at_ms": admitted_at,
+                }
+                try:
+                    profile = validate_learning_record(
+                        {**material, "record_id": f"host_run_profile:{content_digest(material)}"}
+                    )
+                except ContractError as exc:
+                    raise LedgerError("host run profile is invalid") from exc
+                self._append_checked_locked(
+                    project_id, profile, producer="lifecycle", timestamp=admitted_at
+                )
         self.state.harden_database_files()
         return {
             "run_handle": run_handle,
@@ -3531,6 +3560,105 @@ class LearningLedger:
             raise LedgerError("provider is unsupported")
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
+
+    def observe_claude_billing(
+        self,
+        project_id: str,
+        *,
+        project_root: Path,
+        environ: Any = None,
+    ) -> dict[str, Any]:
+        """Observe the Claude identity, then probe billing and headroom once.
+
+        Native Claude children emit no rate-limit event, so this probe is the
+        billing evidence for a Claude primary. It is a real, small request, so
+        it passes the same admission rules as a run first, shares the single
+        bootstrap allowance, and reuses evidence younger than five minutes.
+        Only its rate-limit event is kept.
+        """
+
+        from .bridge import claude_billing_probe
+        from .claude_host import ClaudeHostDenied, check_backend
+        from .providers import AdmissionDenied, claude_rate_limit_records
+
+        environ = os.environ if environ is None else environ
+
+        def deny(reason: str, timestamp: int, decision: dict[str, Any] | None = None):
+            record = decision or {
+                "provider": "claude", "decision": "deny", "reason_code": reason,
+                "admission_basis": None, "account_fingerprint": None,
+                "evidence_digests": [], "observed_at_ms": timestamp,
+            }
+            with self._lock, self._connection:
+                self._store_probe_admission_locked(project_id, record, timestamp=timestamp)
+            self.state.harden_database_files()
+
+        try:
+            check_backend(environ, project_root)
+        except ClaudeHostDenied as exc:
+            deny(exc.reason_code, self._clock_ms())
+            raise
+        identity = self.observe_provider(
+            project_id, "claude", project_root=project_root, environ=environ
+        )[0]
+        fingerprint = identity["account_fingerprint"]
+        timestamp = self._clock_ms()
+        with self._lock, self._connection:
+            billing = [
+                record for record, _ in self._provider_records_locked(
+                    project_id, "provider_billing", "claude"
+                )
+                if record["account_fingerprint"] == fingerprint
+            ]
+            latest = max(billing, key=lambda record: record["observed_at_ms"], default=None)
+            if latest is not None and 0 <= timestamp - latest["observed_at_ms"] < (
+                PROBE_REUSE_SECONDS * 1000
+            ):
+                # Fresh evidence bounds the spend when children open back to back.
+                headroom = [
+                    record for record, _ in self._provider_records_locked(
+                        project_id, "provider_headroom", "claude"
+                    )
+                    if record["account_fingerprint"] == fingerprint
+                ]
+                return {
+                    "probe": "reused",
+                    "records": [identity, *headroom[-1:], latest],
+                }
+            decision = self._evaluate_admission_locked(
+                project_id, provider="claude", environ=environ, timestamp=timestamp
+            )
+            if decision["decision"] == "pass":
+                # Stored before launch, in the same transaction as the decision,
+                # so a crash or a repeat cannot take the bootstrap twice.
+                self._store_probe_admission_locked(
+                    project_id, decision, timestamp=timestamp
+                )
+        if decision["decision"] != "pass":
+            deny(decision["reason_code"], timestamp, decision)
+            raise AdmissionDenied(decision["reason_code"])
+        self.state.harden_database_files()
+        info = claude_billing_probe(environ)
+        observed = self._clock_ms()
+        records = claude_rate_limit_records(
+            info, account_fingerprint=fingerprint, observed_at_ms=observed
+        )
+        self._store_provider_observations(project_id, records, timestamp=observed)
+        return {"probe": "launched", "records": [identity, *records]}
+
+    def _store_probe_admission_locked(
+        self, project_id: str, decision: dict[str, Any], *, timestamp: int
+    ) -> None:
+        material = {"schema_version": 1, "record_type": "probe_admission", **decision}
+        try:
+            record = validate_learning_record(
+                {**material, "record_id": f"probe_admission:{content_digest(material)}"}
+            )
+        except ContractError as exc:
+            raise LedgerError("probe admission decision is invalid") from exc
+        self._append_checked_locked(
+            project_id, record, producer="lifecycle", timestamp=timestamp
+        )
 
     def record_claude_rate_limit_event(
         self,
@@ -3642,7 +3770,8 @@ class LearningLedger:
                 str(row[0])
                 for row in self._connection.execute(
                     "SELECT json_extract(CAST(content AS TEXT),'$.account_fingerprint') "
-                    "FROM records WHERE project_id=? AND record_type='admission_decision' "
+                    "FROM records WHERE project_id=? "
+                    "AND record_type IN ('admission_decision','probe_admission') "
                     "AND json_extract(CAST(content AS TEXT),'$.provider')='claude' "
                     "AND json_extract(CAST(content AS TEXT),'$.decision')='pass'",
                     (project_id,),
@@ -3813,6 +3942,60 @@ class LearningLedger:
             "account_fingerprint": admission["account_fingerprint"],
             "deadline_at_ms": record["deadline_at_ms"],
         }
+
+    def host_owner(
+        self,
+        project_id: str,
+        *,
+        orchestration_handle: str | None = None,
+        run_handle: str | None = None,
+    ) -> str:
+        """The host client that opened the orchestration owning this handle.
+
+        A run bound before orchestrations existed has no owner record; those were
+        only ever opened by the Codex host.
+        """
+
+        with self._lock:
+            if orchestration_handle is not None:
+                row = self._orchestration_for_handle_locked(project_id, orchestration_handle)
+                return str(row["client_version"])
+            if not isinstance(run_handle, str):
+                raise LedgerError("host run handle is invalid")
+            binding = self._connection.execute(
+                "SELECT orchestration_id FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, keyed_digest(self.state.digest_key(), run_handle)),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("host run is unavailable")
+            if binding["orchestration_id"] is None:
+                return "codex-host-v1"
+            row = self._connection.execute(
+                "SELECT client_version FROM orchestrations "
+                "WHERE project_id=? AND orchestration_id=?",
+                (project_id, str(binding["orchestration_id"])),
+            ).fetchone()
+        if row is None:
+            raise LedgerError("host run orchestration is unavailable")
+        return str(row["client_version"])
+
+    def record_host_denial(
+        self, project_id: str, *, provider: str, reason_code: str
+    ) -> None:
+        """Store a host-side open denial, as admission denials are stored."""
+
+        timestamp = self._clock_ms()
+        decision = {
+            "provider": provider, "decision": "deny", "reason_code": reason_code,
+            "admission_basis": None, "account_fingerprint": None,
+            "evidence_digests": [], "observed_at_ms": timestamp,
+        }
+        with self._lock, self._connection:
+            self._store_admission_locked(
+                project_id, decision, run_id=None, timestamp=timestamp
+            )
+        self.state.harden_database_files()
 
     def host_run_admission(self, project_id: str, run_handle: str) -> dict[str, Any]:
         """Return the stored admission for a run; time-varying facts are not re-read."""

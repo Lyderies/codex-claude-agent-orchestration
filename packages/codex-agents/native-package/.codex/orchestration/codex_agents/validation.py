@@ -64,6 +64,7 @@ EXPECTED_SKILLS = {
     "review-security",
     "verify-result",
 }
+CLAUDE_ORCHESTRATION_SKILL = "agent-orchestration"
 EXPECTED_EVALUATION_FAMILIES = {
     "research",
     "planning",
@@ -159,6 +160,26 @@ def _validate_skills(root: Path, errors: list[str]) -> None:
         errors.append(
             "missing package skills: " + ", ".join(sorted(missing))
         )
+
+
+def _validate_claude_skill(root: Path, errors: list[str]) -> None:
+    """The package also ships the Claude primary's orchestration skill."""
+
+    skill = root / ".claude" / "skills" / CLAUDE_ORCHESTRATION_SKILL / "SKILL.md"
+    if skill.is_symlink() or not skill.is_file():
+        errors.append(f"missing package Claude skill: {CLAUDE_ORCHESTRATION_SKILL}")
+        return
+    text = skill.read_text()
+    header = text.split("\n---\n", 1)[0].removeprefix("---\n") if text.startswith(
+        "---\n"
+    ) else ""
+    values = dict(
+        (key.strip(), value.strip()) for key, _, value in (
+            line.partition(":") for line in header.splitlines() if ":" in line
+        )
+    )
+    if values.get("name") != CLAUDE_ORCHESTRATION_SKILL or not values.get("description"):
+        errors.append(f"Claude skill {CLAUDE_ORCHESTRATION_SKILL} has invalid frontmatter")
 
 
 def _validate_agents(root: Path, policy: dict[str, Any], errors: list[str]) -> None:
@@ -569,6 +590,7 @@ def validate_package(root: Path) -> dict[str, Any]:
         }
     _validate_agents(root, policy, package_errors)
     _validate_skills(root, package_errors)
+    _validate_claude_skill(root, package_errors)
     _validate_schemas(root, package_errors)
     _validate_learning_producers(root, package_errors)
     _validate_learning_clients(root, package_errors)

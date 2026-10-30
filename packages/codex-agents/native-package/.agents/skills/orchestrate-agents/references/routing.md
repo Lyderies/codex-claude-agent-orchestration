@@ -62,6 +62,34 @@ The account catalog of the policy's `validated_client` recognizes `low`, `medium
 `high`, `xhigh`, and `max` for active models, while initial routes use medium or high.
 Native routing excludes `none` and `ultra`.
 
+## Host client
+
+The lifecycle detects its primary from the host's environment: Codex shells set
+`CODEX_THREAD_ID` or `CODEX_SESSION_ID`, and Claude Code sets `CLAUDECODE=1` with
+`CLAUDE_CODE_SESSION_ID`. Codex markers without `CLAUDECODE` mean `codex-host-v1` (a
+Codex primary); Claude markers without Codex thread markers mean `claude-host-v1` (a
+Claude primary). Both or neither refuse with `host_client_unknown`, and an explicit
+`--host-client` must match. The host that opens an orchestration owns it: every later mutation (open, bind,
+observe, abandon, checkpoint, pause, resume, close, dispatch and record) from another
+host is refused with `host_client_mismatch`, and legacy recording without a run handle
+is a Codex-host path only. A Claude-host open is denied
+`claude_backend_not_subscription` when the session environment or the user, project,
+local or managed Claude settings point at a metered backend or another credential. A
+native Claude open is also denied `claude_model_override_present` when a model or
+effort override is set, and it returns `native_spawn` (agent, model alias and effort)
+computed from the route. Claude's billing evidence for native children comes from
+`provider-observe --provider claude --billing-probe`, one minimal locked Haiku turn
+whose rate-limit event is the only thing recorded. The probe spends a little, so it is
+admitted like a run first (no API key or alternate backend, a fresh identity, a
+`claude.ai` subscription, an owner attestation, no paid usage and no exhausted window),
+its decision is stored, it shares the single bootstrap allowance with runs, and billing
+evidence under five minutes old is reused (`probe: "reused"`) instead of probing
+again. Claude windows use the Codex thresholds: 90 percent is exhausted and 75 percent
+constrained. The markers only catch accidental
+misuse; they are not proof of identity. Admission, the bridge flag and the read-only sandbox are the
+authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
+installed with this package.
+
 ## Provider admission
 
 `learning-open-host-run` admits a run for its route's provider before opening it, and a
