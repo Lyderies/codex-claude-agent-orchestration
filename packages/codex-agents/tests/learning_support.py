@@ -500,10 +500,21 @@ def child(directory, name):
             if not strict(json.load(handle)):
                 print(json.dumps({"type": "error", "message": "invalid schema"}), flush=True)
                 sys.exit(1)
+    umask = os.umask(0)
+    os.umask(umask)
+    settings = None
+    if "--settings" in sys.argv:
+        try:
+            with open(sys.argv[sys.argv.index("--settings") + 1]) as handle:
+                settings = json.load(handle)
+        except (OSError, ValueError):
+            settings = "unreadable"
     with open(os.path.join(directory, name + "-invocations.jsonl"), "a") as log:
         log.write(json.dumps({
             "argv": sys.argv[2:],
             "cwd": os.getcwd(),
+            "umask": umask,
+            "settings": settings,
             "env": sorted(os.environ),
             "pid": os.getpid(),
             "pgid": os.getpgid(0),
@@ -517,6 +528,30 @@ def child(directory, name):
         frame = json.loads(line)
         if "sleep" in frame:
             time.sleep(frame["sleep"])
+            continue
+        # Workspace actions a write child might take, relative to its cwd.
+        if "write" in frame:
+            target = os.path.join(os.getcwd(), frame["write"])
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w") as handle:
+                handle.write(frame.get("content", ""))
+            continue
+        if "symlink" in frame:
+            os.symlink(frame["target"], os.path.join(os.getcwd(), frame["symlink"]))
+            continue
+        if "chmod" in frame:
+            os.chmod(os.path.join(os.getcwd(), frame["chmod"]), frame["mode"])
+            continue
+        if "holder" in frame:
+            # A descendant in its own session that keeps the workspace as its cwd.
+            import subprocess
+            holder = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(%d)" % frame["holder"]],
+                cwd=os.getcwd(), start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            with open(frame["pidfile"], "w") as handle:
+                handle.write(str(holder.pid))
             continue
         print(frame["raw"] if "raw" in frame else json.dumps(frame), flush=True)
     last = os.path.join(directory, name + "-last-message.json")

@@ -29,7 +29,7 @@ from typing import Any
 
 import tomllib
 
-from .catalog import CLAUDE_READ_ONLY_TOOLS, CatalogError, parse_claude_agent
+from .catalog import CatalogError, claude_sandbox_mode, parse_claude_agent
 from .contracts import (
     ContractError,
     result_axes,
@@ -252,15 +252,24 @@ DEFAULT_PROVIDER_CONFIG_DIGEST = content_digest(
 )
 
 
-def _claude_agent_definition(raw: bytes) -> tuple[dict[str, Any], str]:
-    """Parse one Claude agent with the discovery parser and require read-only tools."""
+def _claude_agent_definition(
+    raw: bytes, sandbox_mode: str = "read-only"
+) -> tuple[dict[str, Any], str]:
+    """Parse one Claude agent with the discovery parser and require its route's tools.
+
+    A read-only route needs read-only tools; a workspace-write route accepts
+    Edit and Write on top of them, and nothing else.
+    """
 
     try:
         metadata, prompt = parse_claude_agent(raw)
     except CatalogError as exc:
         raise ContractError(f"installed Claude agent is invalid: {exc}") from exc
-    if not set(metadata["tools"]) <= CLAUDE_READ_ONLY_TOOLS:
+    tool_sandbox = claude_sandbox_mode(metadata["tools"])
+    if sandbox_mode != "workspace-write" and tool_sandbox != "read-only":
         raise ContractError("installed Claude agent must use read-only tools")
+    if tool_sandbox not in {"read-only", "workspace-write"}:
+        raise ContractError("installed Claude agent tools do not fit its write route")
     return metadata, prompt
 
 
@@ -274,7 +283,9 @@ def _claude_agent_artifacts(
     agent_bytes = _read_managed_bytes(root, agent_relative, allowed_roots=claude_roots)
     if len(agent_bytes) > 1_048_576:
         raise ContractError("installed Claude agent is too large")
-    metadata, prompt = _claude_agent_definition(agent_bytes)
+    metadata, prompt = _claude_agent_definition(
+        agent_bytes, route.get("sandbox_mode", "read-only")
+    )
     if metadata["name"] != agent_type:
         raise ContractError("installed agent identity does not match route")
     skill_contents: dict[str, bytes] = {}
