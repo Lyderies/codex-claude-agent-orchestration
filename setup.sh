@@ -124,22 +124,215 @@ expand_home() {
   EXPANDED=$v
 }
 
-# codex_network_on FILE : succeeds when the Codex profile file is a regular file whose
-# [sandbox_workspace_write] table sets network_access = true. Only that one setting is
-# read (the last assignment wins); the file is never echoed and at most 64 KiB is read.
+# ---------------------------------------------------------------------------
+# JSON helper (python3 is required anyway)
+# ---------------------------------------------------------------------------
+IFS= read -r -d '' PY_HELPER <<'PY'
+import json, os, re, stat, subprocess, sys, unicodedata
+
+def load(path):
+    try:
+        if path == "-":
+            return json.load(sys.stdin)
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+def walk(data, path):
+    for key in path.split("."):
+        if key == "":
+            continue
+        if isinstance(data, dict) and key in data:
+            data = data[key]
+        else:
+            return None
+    return data
+
+def fmt(value):
+    if value is None:
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (list, dict)):
+        return str(len(value))
+    return str(value)
+
+def safe(value):
+    text = re.sub(r"[^A-Za-z0-9_ .+-]", "", str(value or ""))[:30]
+    return text or "unknown"
+
+op = sys.argv[1]
+if op == "get":
+    print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
+elif op == "claude":
+    data = load("-")
+    if isinstance(data, dict) and data.get("loggedIn") is True:
+        print("yes|%s|%s" % (safe(data.get("subscriptionType")), safe(data.get("authMethod"))))
+    else:
+        print("no||")
+elif op in ("plan", "planpaths", "paths"):
+    import hashlib
+
+    def unsafe(rel):
+        """A managed file name must be a plain, printable, relative UTF-8 path."""
+        if not isinstance(rel, str) or not rel or rel[0] == " " or rel[-1] == " ":
+            return True
+        try:
+            rel.encode("utf-8")
+        except UnicodeEncodeError:
+            return True
+        if any(unicodedata.category(ch) in ("Cc", "Cs") for ch in rel):
+            return True
+        return rel.startswith(("-", "/")) or ".." in rel.split("/")
+
+    def digest(path):
+        try:
+            with open(path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            return None
+
+    def entries(report_path, target, bundle):
+        data = load(report_path) or {}
+        codex = data.get("codex") or {}
+        claude = data.get("claude") or {}
+        out = []
+        files = codex.get("files") or []
+        for rel in files:
+            if unsafe(rel):
+                out.append(("UNSAFE", None))
+                continue
+            installed = os.path.join(target, rel)
+            if not os.path.lexists(installed):
+                out.append(("ADD", rel))
+            elif digest(installed) == digest(os.path.join(bundle, rel)):
+                out.append(("KEEP", rel))
+            else:
+                out.append(("UPDATE", rel))
+        manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
+        old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
+        if isinstance(old, dict):
+            for rel in sorted(set(old) - set(f for f in files if isinstance(f, str))):
+                out.append(("UNSAFE", None) if unsafe(rel) else ("REMOVE", rel))
+        for rel in claude.get("changed_paths") or []:
+            if unsafe(rel):
+                out.append(("UNSAFE", None))
+            else:
+                out.append(("UPDATE" if os.path.lexists(os.path.join(target, rel)) else "ADD", rel))
+        for rel, action in sorted((codex.get("project_configuration") or {}).items()):
+            out.append(("UNSAFE", None) if unsafe(rel) else ("CONFIG", "%s -> %s" % (rel, safe(action))))
+        return out
+
+    if op == "plan":
+        for kind, rel in entries(sys.argv[2], sys.argv[3], sys.argv[4]):
+            print(kind if rel is None else "%s %s" % (kind, rel))
+    elif op == "planpaths":
+        found = entries(sys.argv[2], sys.argv[3], sys.argv[4])
+        if any(kind == "UNSAFE" for kind, _ in found):
+            sys.exit(3)
+        for rel in sorted(set(r for k, r in found if k in ("ADD", "UPDATE", "REMOVE"))):
+            sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
+    else:
+        data = load(sys.argv[2]) or {}
+        project, plan_file = sys.argv[3], sys.argv[4]
+        found = set()
+        try:
+            with open(plan_file, "rb") as handle:
+                found.update(item.decode("utf-8") for item in handle.read().split(b"\0") if item)
+        except (OSError, UnicodeDecodeError):
+            sys.exit(3)
+        codex = data.get("codex") or {}
+        claude = data.get("claude") or {}
+        for rel, action in (codex.get("project_configuration") or {}).items():
+            if action != "preserve":
+                found.add(rel)
+        found.update(claude.get("changed_paths") or [])
+        found.add(".codex/orchestration/install-manifest.json")
+        found.add(".codex/orchestration/provider-routing.json")
+        if any(unsafe(rel) for rel in found):
+            sys.exit(3)
+        keep = []
+        for rel in sorted(found):
+            result = subprocess.run(
+                ["git", "--literal-pathspecs", "-C", project, "ls-files", "-z", "--", rel],
+                capture_output=True)
+            if result.returncode != 0:
+                sys.exit(4)
+            if os.path.lexists(os.path.join(project, rel)) or result.stdout:
+                keep.append(rel)
+        for rel in keep:
+            sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
+elif op == "netprofile":
+    def read_profile(path):
+        uid = os.geteuid()
+        parts = [part for part in os.path.abspath(path).split("/") if part]
+        cur = "/"
+        for index, part in enumerate(parts):
+            nxt = os.path.join(cur, part)
+            info = os.lstat(nxt)
+            last = index == len(parts) - 1
+            if stat.S_ISLNK(info.st_mode):
+                # Only root-owned system links (such as /var on macOS) are followed.
+                if last or info.st_uid != 0:
+                    return None
+                cur = os.path.realpath(nxt)
+                continue
+            if info.st_uid != (uid if last else info.st_uid) or info.st_uid not in (0, uid):
+                return None
+            cur = nxt
+        fd = os.open(cur, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+                return None
+            return os.read(fd, 65536)
+        finally:
+            os.close(fd)
+
+    result = "no"
+    try:
+        raw = read_profile(sys.argv[2])
+        section, net = "", False
+        for line in (raw or b"").decode("utf-8", "replace").splitlines():
+            compact = re.sub(r"\s+", "", line.split("#", 1)[0])
+            if compact.startswith("[") and compact.endswith("]"):
+                section = compact[1:-1]
+            elif section == "sandbox_workspace_write" and compact == "network_access=true":
+                net = True
+            elif section == "sandbox_workspace_write" and compact == "network_access=false":
+                net = False
+        if net:
+            result = "yes"
+    except Exception:
+        pass
+    print(result)
+elif op == "raw":
+    data = load(sys.argv[2]) or {}
+    parts = []
+    for key in ("refused", "error"):
+        if isinstance(data.get(key), str):
+            parts.append(data[key])
+    for source in (data.get("codex") or {}, data.get("claude") or {}):
+        for key in ("errors", "project_errors", "package_errors"):
+            for item in source.get(key) or []:
+                if isinstance(item, str):
+                    parts.append(item)
+        for key in ("error", "required_action"):
+            if isinstance(source.get(key), str):
+                parts.append(source[key])
+    print(" ".join(parts).lower().replace("\n", " "))
+PY
+pj() { python3 -I -c "$PY_HELPER" "$@"; }
+
+# codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
+# [sandbox_workspace_write]. The Python helper walks every path component with lstat (no
+# user-owned symlinks, owners must be root or you), opens the file with O_NOFOLLOW, reads at
+# most 64 KiB from that descriptor, and prints only yes or no, never the contents.
 codex_network_on() {
-  local file=$1 line compact sect="" net=1
-  { [ -f "$file" ] && [ ! -L "$file" ]; } || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    line=${line%%#*}
-    compact=$(printf '%s' "$line" | tr -d '[:space:]')
-    case "$compact" in
-      "["*"]") sect=${compact#[}; sect=${sect%]};;
-      network_access=true) [ "$sect" = sandbox_workspace_write ] && net=0;;
-      network_access=false) [ "$sect" = sandbox_workspace_write ] && net=1;;
-    esac
-  done < <(head -c 65536 "$file" 2>/dev/null)
-  return "$net"
+  [ "$(pj netprofile "$1" 2>/dev/null)" = yes ]
 }
 
 # codex_hint WANTED READY -> CODEX_CMD, CODEX_WHY : which command starts a Codex session
@@ -188,6 +381,8 @@ case "${1:-}" in
   --print-codex-hint)
     if [ "$#" -ne 3 ]; then echo "usage: setup.sh --print-codex-hint WANTED READY" >&2; exit 2; fi
     codex_hint "$2" "$3"; printf '%s\n%s\n' "$CODEX_CMD" "$CODEX_WHY"; exit 0;;
+  --helper)
+    shift; pj "$@"; exit "$?";;
   -h|--help) usage; exit 0;;
 esac
 
@@ -616,125 +811,6 @@ save_summary() {
 }
 
 # ---------------------------------------------------------------------------
-# JSON helper (python3 is required anyway)
-# ---------------------------------------------------------------------------
-IFS= read -r -d '' PY_HELPER <<'PY'
-import json, os, re, sys
-
-def load(path):
-    try:
-        if path == "-":
-            return json.load(sys.stdin)
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except Exception:
-        return None
-
-def walk(data, path):
-    for key in path.split("."):
-        if key == "":
-            continue
-        if isinstance(data, dict) and key in data:
-            data = data[key]
-        else:
-            return None
-    return data
-
-def fmt(value):
-    if value is None:
-        return ""
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, (list, dict)):
-        return str(len(value))
-    return str(value)
-
-def safe(value):
-    text = re.sub(r"[^A-Za-z0-9_ .+-]", "", str(value or ""))[:30]
-    return text or "unknown"
-
-op = sys.argv[1]
-if op == "get":
-    print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
-elif op == "claude":
-    data = load("-")
-    if isinstance(data, dict) and data.get("loggedIn") is True:
-        print("yes|%s|%s" % (safe(data.get("subscriptionType")), safe(data.get("authMethod"))))
-    else:
-        print("no||")
-elif op == "plan":
-    import hashlib
-    data = load(sys.argv[2]) or {}
-    target, bundle = sys.argv[3], sys.argv[4]
-    codex = data.get("codex") or {}
-    claude = data.get("claude") or {}
-
-    def digest(path):
-        try:
-            with open(path, "rb") as handle:
-                return hashlib.sha256(handle.read()).hexdigest()
-        except OSError:
-            return None
-
-    files = codex.get("files") or []
-    for rel in files:
-        installed = os.path.join(target, rel)
-        if not os.path.lexists(installed):
-            print("ADD %s" % rel)
-        elif digest(installed) == digest(os.path.join(bundle, rel)):
-            print("KEEP %s" % rel)
-        else:
-            print("UPDATE %s" % rel)
-    manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
-    old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
-    if isinstance(old, dict):
-        for rel in sorted(set(old) - set(files)):
-            print("REMOVE %s" % rel)
-    for rel in claude.get("changed_paths") or []:
-        print(("UPDATE %s" if os.path.lexists(os.path.join(target, rel)) else "ADD %s") % rel)
-    for rel, action in sorted((codex.get("project_configuration") or {}).items()):
-        print("CONFIG %s -> %s" % (rel, action))
-elif op == "paths":
-    import subprocess
-    data = load(sys.argv[2]) or {}
-    project = sys.argv[3]
-    found = set(line.strip() for line in sys.stdin if line.strip())
-    codex = data.get("codex") or {}
-    claude = data.get("claude") or {}
-    for rel, action in (codex.get("project_configuration") or {}).items():
-        if action != "preserve":
-            found.add(rel)
-    found.update(p for p in claude.get("changed_paths") or [] if isinstance(p, str))
-    found.add(".codex/orchestration/install-manifest.json")
-    for rel in sorted(found):
-        if (not isinstance(rel, str) or rel.startswith("-") or os.path.isabs(rel)
-                or ".." in rel.split("/") or "\n" in rel):
-            continue
-        tracked = subprocess.run(["git", "-C", project, "ls-files", "--", rel],
-                                 capture_output=True, text=True).stdout.strip()
-        if os.path.lexists(os.path.join(project, rel)) or tracked:
-            print(rel)
-elif op == "raw":
-    data = load(sys.argv[2]) or {}
-    parts = []
-    for key in ("refused", "error"):
-        if isinstance(data.get(key), str):
-            parts.append(data[key])
-    for source in (data.get("codex") or {}, data.get("claude") or {}):
-        for key in ("errors", "project_errors", "package_errors"):
-            for item in source.get(key) or []:
-                if isinstance(item, str):
-                    parts.append(item)
-        for key in ("error", "required_action"):
-            if isinstance(source.get(key), str):
-                parts.append(source[key])
-    print(" ".join(parts).lower().replace("\n", " "))
-PY
-pj() { python3 -I -c "$PY_HELPER" "$@"; }
-
-# ---------------------------------------------------------------------------
 # Step bookkeeping
 # ---------------------------------------------------------------------------
 begin_step() { STEP=$1; screen_reset; }
@@ -978,6 +1054,23 @@ step_project() {
       default=$dir
       continue
     fi
+    # File names reach bash only through the helper, which refuses unsafe ones (newlines or
+    # other control characters, edge spaces, invalid UTF-8, absolute or .. paths).
+    pj planpaths "$PREVIEW_FILE" "$dir" "$ROOT_DIR/packages/codex-agents/native-package" >"$LOGDIR/plan-paths.nul"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      list_add fail "$dir"
+      if [ "$rc" -eq 3 ]; then
+        list_sub "Unsafe file name in managed paths (a control character, edge space or invalid text in a file name). Nothing was changed."
+      else
+        list_sub "The install plan could not be read. Nothing was changed."
+      fi
+      record_failure "unsafe file name in managed paths" "refused before any change"
+      menu 0 "Choose another path" "Quit"
+      [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
+      default=$dir
+      continue
+    fi
     PROJECT=$dir
     PLAN_TEXT=$(pj plan "$PREVIEW_FILE" "$PROJECT" "$ROOT_DIR/packages/codex-agents/native-package")
     list_add ok "Project: $PROJECT"
@@ -1174,7 +1267,7 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 
 step_install() {
   local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
-  local commit_note
+  local commit_note paths_ok paths_rc
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
   body "Install into: $PROJECT"
@@ -1220,48 +1313,67 @@ step_install() {
   # Stage exactly what the installer reported (changed files, the manifests, project
   # configuration it wrote) plus provider-routing.json, never a whole directory.
   cp "$LAST_OUT" "$LOGDIR/apply.json" 2>/dev/null
-  plan_paths=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE) ' | cut -d' ' -f2-)
-  plan_paths="$plan_paths
-.codex/orchestration/provider-routing.json"
   COMMIT_PATHS=()
-  while IFS= read -r path; do
-    [ -n "$path" ] && COMMIT_PATHS+=("$path")
-  done < <(printf '%s\n' "$plan_paths" | pj paths "$LOGDIR/apply.json" "$PROJECT")
+  paths_ok=1
+  pj paths "$LOGDIR/apply.json" "$PROJECT" "$LOGDIR/plan-paths.nul" >"$LOGDIR/commit-paths.nul"
+  paths_rc=$?
+  while IFS= read -r -d '' path; do
+    COMMIT_PATHS+=("$path")
+  done <"$LOGDIR/commit-paths.nul"
   n_paths=${#COMMIT_PATHS[@]}
-  body "Next: commit the installed files in the project. Only these $n_paths paths are staged and committed, nothing is pushed. The exact commands are below; choose 'Show every path' for the full list."
-  list_cmd "git -C $q_project add -A -- <the $n_paths paths below>"
-  list_cmd "git -C $q_project commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
-  shown=0
-  for path in "${COMMIT_PATHS[@]}"; do
-    [ "$shown" -ge 10 ] && break
-    list_sub "$path"
-    shown=$((shown + 1))
-  done
-  [ "$n_paths" -gt "$shown" ] && list_sub "... and $((n_paths - shown)) more"
-  while :; do
-    menu 0 "Commit now (recommended)" "I will commit myself" "Show every path"
-    [ "$MENU_IDX" -eq 2 ] || break
-    view_plan "$(printf 'git add -A -- %s\n' "${COMMIT_PATHS[@]}")"
-  done
-  screen_reset; begin_step 4
-  list_add ok "Packages installed"
-  COMMIT_STATE=not_committed
-  if [ "$MENU_IDX" -eq 0 ]; then
-    render
-    RUN_QUIET=1
-    COMMIT_STATE=failed
-    if run_cmd "Staging" git -C "$PROJECT" add -A -- "${COMMIT_PATHS[@]}" &&
-       run_cmd "Committing" git -C "$PROJECT" commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- "${COMMIT_PATHS[@]}"; then
-      RUN_QUIET=0
-      commit_done=1
-      COMMIT_STATE=committed
+  if [ "$paths_rc" -ne 0 ] || [ "$n_paths" -eq 0 ]; then
+    paths_ok=0
+    COMMIT_PATHS=()
+    n_paths=0
+  fi
+  if [ "$paths_ok" -eq 0 ]; then
+    # Never run git add with an empty or untrustworthy path list: that would stage everything.
+    if [ "$paths_rc" -eq 3 ]; then
+      LAST_RC=$paths_rc
+      record_failure "commit refused" "unsafe file name in managed paths"
+      list_add fail "Unsafe file name in managed paths; nothing was staged or committed"
     else
-      RUN_QUIET=0
-      failure_detail "The commit failed" "Check your Git identity (user.name, user.email) and any commit hooks. Commit the files yourself, then run ./setup.sh again and choose Verify."
+      LAST_RC=$paths_rc
+      record_failure "commit failed: no paths to commit" "the path list could not be built"
+      list_add fail "commit failed: no paths to commit (nothing was staged)"
+    fi
+    COMMIT_STATE=failed
+  else
+    body "Next: commit the installed files in the project. Only these $n_paths paths are staged and committed, nothing is pushed. The exact commands are below; choose 'Show every path' for the full list."
+    list_cmd "git -C $q_project --literal-pathspecs add -A -- <the $n_paths paths below>"
+    list_cmd "git -C $q_project --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
+    shown=0
+    for path in "${COMMIT_PATHS[@]}"; do
+      [ "$shown" -ge 10 ] && break
+      list_sub "$path"
+      shown=$((shown + 1))
+    done
+    [ "$n_paths" -gt "$shown" ] && list_sub "... and $((n_paths - shown)) more"
+    while :; do
+      menu 0 "Commit now (recommended)" "I will commit myself" "Show every path"
+      [ "$MENU_IDX" -eq 2 ] || break
+      view_plan "$(printf 'git --literal-pathspecs add -A -- %s\n' "${COMMIT_PATHS[@]}")"
+    done
+    screen_reset; begin_step 4
+    list_add ok "Packages installed"
+    COMMIT_STATE=not_committed
+    if [ "$MENU_IDX" -eq 0 ]; then
+      render
+      RUN_QUIET=1
+      COMMIT_STATE=failed
+      if run_cmd "Staging" git -C "$PROJECT" --literal-pathspecs add -A -- "${COMMIT_PATHS[@]}" &&
+         run_cmd "Committing" git -C "$PROJECT" --literal-pathspecs commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- "${COMMIT_PATHS[@]}"; then
+        RUN_QUIET=0
+        commit_done=1
+        COMMIT_STATE=committed
+      else
+        RUN_QUIET=0
+        failure_detail "The commit failed" "Check your Git identity (user.name, user.email) and any commit hooks. Commit the files yourself, then run ./setup.sh again and choose Verify."
+      fi
     fi
   fi
   # Whatever is still uncommitted in the managed paths is listed in the final summary.
-  UNCOMMITTED=$(git -C "$PROJECT" status --porcelain --untracked-files=all -- .agents .claude .codex 2>/dev/null | cut -c4-)
+  UNCOMMITTED=$(git -C "$PROJECT" status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null | tr '\0' '\n' | cut -c4- | tr -d '\001-\011\013-\037\177')
   if [ "$COMMIT_STATE" = committed ] && [ -n "$UNCOMMITTED" ]; then
     COMMIT_STATE=failed
     commit_done=0

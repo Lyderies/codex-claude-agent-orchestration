@@ -170,6 +170,134 @@ class SetupScriptTests(unittest.TestCase):
                 stdin=subprocess.DEVNULL, env=dict(os.environ, CODEX_HOME=str(home)))
         self.assertEqual(result.stdout.splitlines()[0], "codex")
 
+    def test_codex_hint_refuses_a_symlinked_codex_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(os.path.realpath(directory))
+            real = base / "real"
+            real.mkdir()
+            (real / "orchestrator.config.toml").write_text(
+                "[sandbox_workspace_write]\nnetwork_access = true\n")
+            link = base / "link"
+            link.symlink_to(real)
+            for home, expected in ((real, "codex -p orchestrator"), (link, "codex")):
+                with self.subTest(home=home.name):
+                    result = subprocess.run(
+                        ["bash", str(SETUP), "--print-codex-hint", "1", "0"], capture_output=True,
+                        text=True, stdin=subprocess.DEVNULL, env=dict(os.environ, CODEX_HOME=str(home)))
+                    self.assertEqual(result.stdout.splitlines()[0], expected)
+            # A symlink in the middle of the path is refused as well.
+            (base / "outer").mkdir()
+            (base / "outer" / "inner").symlink_to(real)
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-codex-hint", "1", "0"], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL,
+                env=dict(os.environ, CODEX_HOME=str(base / "outer" / "inner")))
+            self.assertEqual(result.stdout.splitlines()[0], "codex")
+
+    def helper(self, *args: str, stdin: bytes = b"", env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(SETUP), "--helper", *args], input=stdin, capture_output=True,
+                              env=dict(os.environ, **(env or {})))
+
+    def planned_project(self, directory: str, obsolete: str) -> tuple[Path, Path]:
+        import json
+        project = Path(directory) / "project"
+        (project / ".codex" / "orchestration").mkdir(parents=True)
+        (project / ".codex" / "orchestration" / "install-manifest.json").write_text(
+            json.dumps({"files": {obsolete: "0" * 64}}))
+        preview = Path(directory) / "preview.json"
+        preview.write_text(json.dumps({"codex": {"files": []}}))
+        return project, preview
+
+    def test_unsafe_file_names_are_refused_before_any_plan_text_exists(self) -> None:
+        bundle = str(ORCHESTRATION.parents[1])
+        names = {
+            "newline injection": ".codex/old\nREMOVE private.txt",
+            "carriage return": ".codex/old\rx",
+            "tab": ".codex/old\tx",
+            "escape sequence": ".codex/old\x1b[2Jx",
+            "trailing space": ".codex/old ",
+            "leading space": " .codex/old",
+            "lone surrogate (invalid UTF-8)": ".codex/old\udcff",
+            "parent traversal": ".codex/../../x",
+            "absolute": "/etc/passwd",
+        }
+        for label, name in names.items():
+            with self.subTest(name=label), tempfile.TemporaryDirectory() as directory:
+                project, preview = self.planned_project(directory, name)
+                plan = self.helper("plan", str(preview), str(project), bundle)
+                self.assertEqual(plan.returncode, 0, plan.stderr)
+                lines = plan.stdout.decode().splitlines()
+                self.assertEqual(lines, ["UNSAFE"])
+                paths = self.helper("planpaths", str(preview), str(project), bundle)
+                self.assertEqual(paths.returncode, 3)
+                self.assertEqual(paths.stdout, b"")
+
+    def test_names_are_never_stripped_and_travel_nul_delimited(self) -> None:
+        bundle = str(ORCHESTRATION.parents[1])
+        with tempfile.TemporaryDirectory() as directory:
+            project, preview = self.planned_project(directory, ".codex/my file (1).txt")
+            result = self.helper("planpaths", str(preview), str(project), bundle)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b".codex/my file (1).txt\0")
+
+    def git_project(self, directory: str, quote_path: bool = False) -> Path:
+        project = Path(directory) / "project"
+        project.mkdir()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+        subprocess.run(["git", "init", "-q", str(project)], check=True, env=env)
+        subprocess.run(["git", "-C", str(project), "config", "core.quotePath", str(quote_path).lower()],
+                       check=True, env=env)
+        return project
+
+    def test_commit_paths_are_literal_and_a_bad_list_fails_closed(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            codex = project / ".codex"
+            codex.mkdir()
+            (codex / "local-other").write_text("x")
+            (codex / "ok").write_text("x")
+            git = ["git", "-C", str(project)]
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            subprocess.run(git + ["add", "-A"], check=True, env=env)
+            apply = Path(directory) / "apply.json"
+            apply.write_text(json.dumps({"codex": {"project_configuration": {}}, "claude": {"changed_paths": []}}))
+            plan = Path(directory) / "plan.nul"
+            # `.codex/local*` is only a wildcard to Git, never a file here: it must not match local-other.
+            plan.write_bytes(b".codex/local*\0.codex/ok\0")
+            result = self.helper("paths", str(apply), str(project), str(plan))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b".codex/ok\0")
+            # Invalid UTF-8 in the plan fails closed with no output (core.quotePath=false).
+            try:  # macOS file systems refuse invalid UTF-8 names; Linux accepts them.
+                (codex / os.fsdecode(b"bad\xff")).write_text("x")
+            except OSError:
+                pass
+            plan.write_bytes(b".codex/ok\0.codex/bad\xff\0")
+            result = self.helper("paths", str(apply), str(project), str(plan))
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(result.stdout, b"")
+            # A missing plan file fails closed too.
+            result = self.helper("paths", str(apply), str(project), str(Path(directory) / "missing"))
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(result.stdout, b"")
+            # A tracked file with an invalid-UTF-8 name does not break a valid list.
+            subprocess.run(git + ["add", "-A"], check=True, env=env)
+            plan.write_bytes(b".codex/ok\0")
+            result = self.helper("paths", str(apply), str(project), str(plan))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b".codex/ok\0")
+
+    def test_every_git_call_with_paths_is_literal(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        for needle in (" add -A -- ", " commit -m ", '"ls-files"'):
+            lines = [line for line in text.splitlines()
+                     if needle in line and not line.lstrip().startswith("#")]
+            self.assertTrue(lines, needle)
+            for line in lines:
+                with self.subTest(line=line.strip()):
+                    self.assertIn("--literal-pathspecs", line)
+
     def test_refuses_without_a_terminal(self) -> None:
         result = subprocess.run(["bash", str(SETUP)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
         self.assertEqual(result.returncode, 2)
@@ -283,6 +411,7 @@ class WizardTerminalTests(unittest.TestCase):
             ' echo \'{"error": "boom ' + TOKEN + ' user@example.invalid"}\'; echo ' + TOKEN + ' >&2; exit 2;; esac; fi\n'
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
+            'for a in "$@"; do if [ "$a" = paths ] && [ -n "$FAKE_PJ_FAIL" ]; then exit 1; fi; done\n'
             f'exec "{sys.executable}" "$@"\n')
         for fake in self.fakes.iterdir():
             fake.chmod(0o755)
@@ -635,6 +764,72 @@ class WizardTerminalTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertNotEqual(status, "")
+
+    def test_a_failed_path_helper_stages_and_commits_nothing(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_PJ_FAIL": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("commit failed: no paths to commit")
+        self.expect("Continue")
+        self.assertNotIn("Commit now", self.screen)
+        final = self.finish_after_install()
+        self.assertIn("commit failed", final)
+        count = subprocess.run(["git", "-C", str(project), "rev-list", "--count", "HEAD"],
+                               capture_output=True, text=True, env=self.env).stdout.strip()
+        self.assertEqual(count, "1")
+        staged = subprocess.run(["git", "-C", str(project), "diff", "--cached", "--name-only"],
+                                capture_output=True, text=True, env=self.env).stdout
+        self.assertEqual(staged, "")
+
+    def test_wildcard_named_obsolete_file_is_removed_without_touching_its_neighbour(self) -> None:
+        import hashlib
+        import json
+        project, checks = self.make_project()
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        (project / ".codex" / "local*").write_text("local\n")
+        (project / ".codex" / "local-other").write_text("other\n")
+        manifest = project / ".codex" / "orchestration" / "install-manifest.json"
+        data = json.loads(manifest.read_text())
+        data["files"][".codex/local*"] = hashlib.sha256(b"local\n").hexdigest()
+        manifest.write_text(json.dumps(data, indent=2))
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "adopt"], check=True, env=self.env)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Commit now")
+        self.assertIn(".codex/local*", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.send("\r")
+        final = self.finish_after_install()
+        self.assertIn("; committed", final)
+        tracked = subprocess.run(["git", "-C", str(project), "ls-files"],
+                                 capture_output=True, text=True, env=self.env).stdout.splitlines()
+        self.assertNotIn(".codex/local*", tracked)
+        self.assertIn(".codex/local-other", tracked)
+        self.assertEqual((project / ".codex" / "local-other").read_text(), "other\n")
+        status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
+                                capture_output=True, text=True, env=self.env).stdout
+        self.assertEqual(status, "")
 
     def test_summary_says_commit_failed_when_a_hook_refuses(self) -> None:
         project, checks = self.make_project()
