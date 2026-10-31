@@ -678,6 +678,7 @@ INSTALL_EXISTS=0
 PROFILE_WANTED=0
 CODEX_PRIMARY=0
 RULE_FILE=""
+RULE_COPY=""
 RULE_READY=0
 RULE_EXISTS=0
 ROUTING_CONTENT=""
@@ -2041,10 +2042,11 @@ temp_project_refusal() {
   list_sub "Move the project out of the temporary folder, for example into your home folder, and run setup again. Nothing was written."
 }
 
-check_rule() { # check_rule -> RULE_STATUS (installed, missing, stale or empty), RULE_FILE
+check_rule() { # check_rule -> RULE_STATUS (installed, missing, stale or empty), RULE_FILE, RULE_COPY
   run_project_cli "Checking the Codex commands rule" host-command --project-root "$PROJECT"
   RULE_STATUS=$(pj get "$LAST_OUT" codex_rule)
   RULE_FILE=$(pj get "$LAST_OUT" rule_file)
+  RULE_COPY=$(pj get "$LAST_OUT" runtime_copy)
   case "$RULE_STATUS" in
     installed|missing|stale) ;;
     *) RULE_STATUS="";;
@@ -2053,7 +2055,7 @@ check_rule() { # check_rule -> RULE_STATUS (installed, missing, stale or empty),
 
 commands_screen() {
   screen_reset; begin_step 8
-  body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it, delete the rule file shown below."
+  body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it later, use the remove command shown at the end of setup."
   body "Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). It runs a protected copy of the orchestrator kept in your Codex settings folder, so a session opened on a folder above this project cannot change what it runs. Never start Codex with your home folder's parent or / as its workspace."
   if [ "$RULE_STATUS" = stale ]; then
     list_add warn "A rule for this project already exists and differs from this one, for example after a Python upgrade (the rule names the exact Python build) or a package update. It stays unchanged unless you replace it; until then Codex sessions may not reach the orchestrator."
@@ -2274,8 +2276,12 @@ summary_screen() {
   list_plain " - To remove everything, including the Codex commands rule, run:"
   list_cmd "python3 -I -B -S $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
   if [ "$RULE_EXISTS" -eq 1 ] && [ -n "$RULE_FILE" ]; then
-    list_plain " - The Codex commands rule is outside the project. To undo it, delete:"
+    list_plain " - The Codex commands rule and its protected copy of the orchestrator are outside the project. The remove command above deletes both; to undo only the rule, delete:"
     list_cmd "$(printf '%q' "$RULE_FILE")"
+    if [ -n "$RULE_COPY" ]; then
+      list_plain "   and its copy:"
+      list_cmd "$(printf '%q' "$RULE_COPY")"
+    fi
   fi
 }
 
@@ -2314,7 +2320,7 @@ reset_attempt() {
   FAILED_ANY=0; FAIL_SUMMARY=""; FAIL_REASON=""; INSTALL_FAILED=0
   MODE=full; INSTALL_EXISTS=0
   PROFILE_WANTED=0; PROFILE_READY=0; CODEX_PRIMARY=0
-  RULE_FILE=""; RULE_READY=0; RULE_EXISTS=0; RULE_STATUS=""; TEMP_PROJECT=0
+  RULE_FILE=""; RULE_COPY=""; RULE_READY=0; RULE_EXISTS=0; RULE_STATUS=""; TEMP_PROJECT=0
   ROUTING_CONTENT=""; ROUTING_WRITE=0; INSTALL_OPTS=(); PREVIEW_FILE=""
   CH_CODEX=on; CH_CLAUDE=on; CH_MODELS=""; CH_BRIDGE=off
   PLAN_TEXT=""; COMMIT_PATHS=(); COMMIT_STATE=""; UNCOMMITTED=""; VERIFY_LIMITED=0

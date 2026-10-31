@@ -989,7 +989,12 @@ class WizardTerminalTests(unittest.TestCase):
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
     @NEEDS_TRUSTED_PYTHON
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
-        project, checks = self.make_project("my proj;x", self.non_temporary_base())
+        base = self.non_temporary_base()
+        project, checks = self.make_project("my proj;x", base)
+        # The rule's protected copy refuses a temporary home, so this run's HOME is outside them too.
+        self.home = base / "home"
+        self.home.mkdir(mode=0o700)
+        self.env["HOME"] = str(self.home)
         self.to_project_prompt(project)
         self.send("\r")
         self.expect("Path to operational-checks.json")
@@ -1035,7 +1040,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertRegex(final, r"To remove everything, including the Codex commands rule, run:\n"
                                 r"\s+python3 -I -B -S .*install\.py.* remove --target ")
         self.assertEqual(final.count("To remove everything"), 1)
-        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-[0-9a-f]{12}\.rules")
+        self.assertRegex(final, r"to undo only the rule, delete:\n\s+\S*/\.codex/rules/agent-orchestration-[0-9a-f]{12}\.rules")
+        self.assertRegex(final, r"and its copy:\n\s+\S*/\.codex/agent-orchestration/")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
         rules = list((self.home / ".codex" / "rules").iterdir())
@@ -1047,7 +1053,13 @@ class WizardTerminalTests(unittest.TestCase):
             capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1"), check=True)
         import json
         self.assertEqual(rules[0].read_text(), json.loads(expected.stdout)["rule_text"])
-        self.assertIn(json.dumps(str(cli)), rules[0].read_text())
+        status = json.loads(subprocess.run(
+            [sys.executable, str(cli), "host-command", "--project-root", str(project)],
+            capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1")).stdout)
+        self.assertEqual(status["codex_rule"], "installed")
+        copy_cli = status["argv_prefix"][-1]
+        self.assertTrue(copy_cli.startswith(str(self.home / ".codex" / "agent-orchestration")), copy_cli)
+        self.assertIn(json.dumps(copy_cli), rules[0].read_text())
         runs = self.py_log.read_text().split()
         self.assertTrue(runs and set(runs) == {"1"}, runs)
         self.assert_python_isolated()
@@ -1685,7 +1697,7 @@ class WizardTerminalTests(unittest.TestCase):
         # A project in a temporary folder is told why and gets no rule.
         self.assertIn("8. Commands: project in a temporary folder", final)
         self.assertIn("This project is in a temporary folder, so Codex sessions cannot", final)
-        self.assertNotIn("To undo it, delete:", final)
+        self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
         self.assertIn("; committed", final)
         self.assertNotIn("not committed", final)
@@ -1730,7 +1742,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertIn("8. Commands: exists, differs, left alone", final)
         self.assertIn("rule for this project is stale", final)
         self.assertNotIn("until the Codex commands rule exists", final)
-        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
+        self.assertRegex(final, r"to undo only the rule, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
                          + digest + r"\.rules")
         self.assertEqual("# an older rule for this project\n", stale.read_text())
 
@@ -1764,7 +1776,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertEqual(self.finish(), 0)
         self.assertIn("8. Commands: missing", final)
         self.assertIn("Codex sessions cannot reach the orchestrator", final)
-        self.assertNotIn("To undo it, delete:", final)
+        self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
 
     def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
@@ -1774,7 +1786,7 @@ class WizardTerminalTests(unittest.TestCase):
         final = self.finish_after_install(trusted=False, temporary=False)
         self.assertIn("8. Commands: not checked", final)
         self.assertIn("until the Codex commands rule exists", final)
-        self.assertNotIn("To undo it, delete:", final)
+        self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:
