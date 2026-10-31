@@ -97,6 +97,38 @@ misuse; they are not proof of identity. Admission, the bridge flag and the read-
 authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
 installed with this package.
 
+## Command boundary
+
+A Codex primary runs the CLI inside Codex's workspace-write sandbox, which denies the
+learning collector's local socket and the writes its state needs, so collector-backed
+commands fail there (`filesystem operation failed`, plus a `hint` under a Codex host).
+`./setup.sh` (Codex commands step) offers, with the owner's consent, one Codex command
+rule per project in the user's rules layer:
+`${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<12 hex digits>.rules`, named by a
+digest of the resolved project root. It allows, outside the sandbox and without a prompt,
+exactly the resolved base interpreter (never a virtual environment's, and refused when it
+or its standard library is in the project, in a temporary directory, behind a symlink or
+writable by another user), the isolation flags `-I -B -S`, the absolute project `cli.py`,
+then one of the primary-host subcommands (`PRIMARY_HOST_COMMANDS` in
+`codex_agents/host_commands.py`). A project in a temporary directory never gets a rule.
+Owner commands (registration, attestation, owner keys, grants, backups, canaries,
+promotion, rollback, upgrade reconciliation and `install-codex-rule` itself) are not
+listed and stay sandboxed. `host-command --project-root <exact-root>` reads only and needs
+no collector. It prints `argv_prefix` and `codex_rule`: `installed`, `missing`, or `stale`
+when the file differs from what setup would write now, as after a Python or package
+change, or is a symlink. The rule leaves every argument after the subcommand to the CLI,
+so for these commands an installed CLI refuses a `--project-root` or `--root` other than
+its own project, a `--state-root` other than the default learning state, and any
+`--policy`, before doing any other work. Commands it runs outside the sandbox never use a
+sandbox-writable location: trust checks read the repository with git plumbing only (no
+index refresh, fsmonitor, filters, diff drivers, hooks, pager, transport or lazy fetch)
+and refuse a git directory inside the working tree or in a temporary directory and a
+partial clone; the collector and watchdog start with `-I -B -S`; bridge exports, control
+files and child temporary directories live in an owner-only directory under the per-user
+cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere); operational-check snapshots and
+provider clients' temporary directories live under the learning state. A Claude primary
+does not use the rule.
+
 ## Provider admission
 
 `learning-open-host-run` admits a run for its route's provider before opening it, and a

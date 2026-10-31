@@ -7,12 +7,25 @@ description: Route and supervise Codex subagents for multi-step research, planni
 
 Keep the primary agent as the decision owner and final synthesizer.
 
+Codex's sandbox blocks the learning collector, so lifecycle commands run outside it only
+through the owner's Codex command rule. Before any other CLI call, run
+`python3 .codex/orchestration/cli.py host-command --project-root <exact-root>`. If its
+`codex_rule` is not `installed`, stop and tell the owner to run `./setup.sh` (Codex
+commands step); do not retry or work around it. Otherwise run every later CLI command as
+exactly its `argv_prefix` (the absolute base interpreter, the isolation flags `-I -B -S`,
+then the absolute `cli.py`) followed by the subcommand and its arguments: one command per
+call, with no shell compounds (`&&`, `;`,
+pipes, redirections or substitutions) and no environment-variable prefixes. Any other form
+stays sandboxed and fails. Below, every command, named alone or as `cli.py <command>`,
+runs with that prefix. A failure whose `hint` names the Codex sandbox means the prefix was
+not used exactly.
+
 1. Read the applicable project instructions and accepted decisions. Do not fill a
    material open choice with an assumption.
 2. Before a meaningful route, run `learning-status` for the exact project root. The
    command recovers a stopped collector for a registered project. If registration is
-   missing, run `learning-register` only when registration of that exact root is already
-   owner-authorized; otherwise report the missing registration. Do not spawn a child
+   missing, report it to the owner: `learning-register` is an owner command that
+   `./setup.sh` runs, and it stays sandboxed from a Codex session. Do not spawn a child
    while learning is unavailable, and do not describe the failure as disabled learning.
    Also run `cli.py validate --root <exact-root>`. Do not begin managed orchestration
    unless both `package_ready` and `project_ready` are true. A package-only pass does not
@@ -25,7 +38,7 @@ Keep the primary agent as the decision owner and final synthesizer.
    references. Risk never selects model, effort, or topology or widens authority. High
    and critical tasks must remain meaningful and independently verified. Pass
    the task contract to
-   `.codex/orchestration/cli.py learning-route --project-root <exact-root>`; do not choose
+   `cli.py learning-route --project-root <exact-root>`; do not choose
    a more powerful or cheaper model merely from its name. Run the CLI and consume its
    JSON; do not inspect runtime source or schemas during ordinary routing. When the route
    contains `agent_type`, spawn that explicitly mapped project agent. Otherwise spawn
@@ -87,8 +100,9 @@ Keep the primary agent as the decision owner and final synthesizer.
    correctness. Steer only with new task-relevant information; interrupt on scope drift,
    repeated no-progress work, or exhausted bounds.
 8. Before spawning, run `result-preflight` with the exact assignment, task, and parent
-   grant and give the returned literal template to the child. This is non-mutating and
-   does not consume an attempt. Treat `observation_deadline_seconds` as an observation
+   grant and give the returned literal template and its `consistency_rules` to the
+   child. This is non-mutating and does not consume an attempt. Treat
+   `observation_deadline_seconds` as an observation
    bound, not a process-kill promise; only an authoritative host terminal fact may
    report `timed_out`. For native collaboration runs, the primary host must derive
    that fact from the native child status it observes; never copy a child-authored
@@ -101,6 +115,9 @@ Keep the primary agent as the decision owner and final synthesizer.
    send one compact correction containing the packaged result template and the safe
    structural error code; do not resend or store the rejected output. Revalidate the
    corrected object. After one such repair, stop the attempt if it is still invalid.
+   A `duplicate_criterion` repair merges entries: one entry per criterion, every finding
+   kept in its `details`, and the most severe outcome (`fail`, then `not_run`, then
+   `observed`, then `pass`); never soften a `fail`.
    Never classify a result-contract failure as semantic or reasoning failure.
    Keep execution state, semantic verdict, and admission separate. A completed review
    may validly return a negative verdict. Always finish the opened host run with

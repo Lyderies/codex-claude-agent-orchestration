@@ -197,6 +197,141 @@ build.
   primary.
 - Tag toolchain v1.
 
+### S5b: Codex host command boundary
+
+- **Problem.** A Codex primary runs `cli.py` inside Codex's workspace-write sandbox. The
+  sandbox denies connecting to the collector's local socket and writing the collector's
+  runtime lock in the per-user state directory, so every collector-backed command failed
+  (`filesystem operation failed`). `validate` and `learning-run-operational-checks` also
+  refuse inside a sandbox, because the operational checks need their own nested one. The
+  package assumed an approved unsandboxed command boundary but never provided one for a
+  headless Codex primary.
+- **Rule.** With the owner's consent, the wizard's Commands step writes one Codex command
+  rule per project: a `prefix_rule` with `decision = "allow"`, which runs a matching
+  command outside the sandbox without a prompt. The pattern is the absolute base interpreter,
+  the isolation flags `-I -B -S`, the absolute `<root>/.codex/orchestration/cli.py`, then
+  one allowlisted subcommand. The file carries `match` and `not_match` examples that Codex
+  checks when it loads it: an owner command, the relative forms and the form without the
+  flags must not match. It is written with mode 0600 and symlinks are refused. A new rule is
+  published with a hard link, which never overwrites, so a rule another setup wrote in the
+  meantime is reported as differing; identical content is left alone, and a differing rule
+  is replaced only after the owner confirms.
+- **Allowlist.** `PRIMARY_HOST_COMMANDS` in `codex_agents/host_commands.py`, tested to be
+  real subcommands and disjoint from the owner commands: `validate`, `inventory`, `route`,
+  `learning-route`, `validate-assignment`, `result-preflight`, `validate-result`,
+  `learning-status`, the orchestration open, checkpoint, pause, resume, close and report
+  commands, the host-run open, bind, observe, classify-abandoned and record commands,
+  `dispatch`, `provider-observe`, `learning-run-operational-checks` and
+  `learning-record-operational-qa`.
+- **Why the user layer.** Codex loads `${CODEX_HOME:-~/.codex}/rules/*.rules` in every
+  session. A project's `.codex/rules/` loads only when that project's `.codex/` layer is
+  trusted, which is unreliable for worktrees.
+- **Why absolute paths.** Inside the workspace, the sandbox keeps `.codex/`, `.agents/` and
+  `.git` read-only, but the model can write elsewhere in the workspace and in temporary
+  directories. A relative `cli.py` would let it plant a look-alike and run it unsandboxed.
+- **Host command.** `host-command` is read-only and needs no collector, so it works inside
+  the sandbox. It prints the exact `argv_prefix` and whether the rule is `installed`,
+  `missing` or `stale` (it differs from what setup would write now). The Codex skill runs it
+  first and stops unless the rule is installed. A collector-backed command that cannot
+  reach the collector under a Codex host keeps its error and adds a hint.
+- **Governing rule.** A rule-matched command runs outside the sandbox, so nothing it
+  executes or loads may come from a sandbox-writable location, and nothing it writes and
+  later trusts or hands to a child may live in one. Sandbox-writable means the workspace
+  (except its top-level `.git`, `.codex` and `.agents`), `/tmp` and `$TMPDIR`. On codex-cli
+  0.164 the per-user cache directory, `/var/tmp`, `~/Library/Caches` and the learning state
+  were shown not writable from the workspace-write sandbox.
+- **Interpreter.** The rule names the base interpreter, never a virtual environment's (a
+  project `.venv` would let the model replace the executable or add `.pth` startup code),
+  pinned as its realpath: no symlink on the way remains that a sandboxed session could
+  later retarget, so a chain through a writable hop cannot redirect it, and a Python
+  upgrade makes the rule stale until setup runs again. The resolved interpreter and its
+  standard-library prefix are walked component by component: no component may be a
+  symlink, belong to another user or be writable by another user, and neither may lie in
+  the project or a temporary directory. One exception: on macOS a directory writable by
+  the `admin` group is accepted, because Homebrew and python.org install that way and
+  admin members can already administer the machine. `-I` ignores the environment and user
+  site-packages and keeps the script directory off the path, `-S` skips site-packages
+  entirely (no `.pth` file or `sitecustomize` runs; the CLI needs only the standard
+  library and its own package), and `-B` writes no bytecode into `.codex`. The collector
+  the CLI starts or restarts, and the bridge's deadline watchdog, get the same flags.
+- **Project.** The generator refuses a project in a temporary directory, which a session
+  can rewrite wholesale (including `cli.py`), and a CLI path with a symlink or a component
+  another user could change. It refuses before writing, printing or reporting `installed`;
+  the wizard checks the location with this repository's own code first and writes
+  nothing.
+- **Git plumbing only.** Every git call reached from the allowlisted commands uses only
+  `rev-parse`, `ls-tree` and `cat-file`; committed blobs are compared with working-tree
+  bytes read through no-follow opens, including an operational-check executable's mode.
+  No call refreshes the index, so an fsmonitor, filters, textconv, an external diff,
+  hooks and a pager configured in the repository never run. Each call also passes
+  `--no-pager`, `--no-optional-locks`, literal pathspecs and `-c` overrides
+  (`core.fsmonitor=false`, `core.hooksPath=/dev/null` and others), with
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_TERMINAL_PROMPT=0`.
+  A git directory or common directory inside the working tree (other than `<root>/.git`),
+  or in a temporary directory while the project is not, is refused before any other call:
+  that closes a linked worktree whose shared repository the model could rewrite. Plumbing
+  can still fetch a missing object from a promisor remote, whose transport (`ext::` runs a
+  command) a file the configuration includes could name, so `GIT_ALLOW_PROTOCOL` is empty
+  (no transport, whatever `protocol.*.allow` says), `GIT_NO_LAZY_FETCH=1` is set, and a
+  repository with partial-clone settings or a promisor remote is refused, read with
+  `git config`, which runs nothing. On `/usr/bin/git` 2.54.0 (Apple Git-157) the empty
+  protocol list and the lazy-fetch switch each stopped a planted `ext::` payload, and
+  `file://` and local-path fetches report "transport not allowed".
+- **Host-private scratch.** Bridge exports, control files (including Claude's settings),
+  child and probe temporary directories live in an owner-only directory under the per-user
+  cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere; dispatch refuses without one).
+  Claude's workspace must stay outside home, where `~/.claude` would sit above it.
+  The scratch base may neither lie inside nor contain the project or any temporary
+  directory; dispatch and the probe refuse otherwise, on every platform.
+  Operational-check snapshots and work directories, and provider clients' temporary
+  directories, live under the learning state's `scratch` directory. Each directory is
+  created through directory descriptors with no-follow opens at every component,
+  owner-only, and removed afterwards; a planted symlink refuses. Later writes inside it
+  use paths, which only the host process can reach.
+- **Own-root invariant.** The rule fixes only the start of a command, so the arguments
+  after the subcommand are the model's. An installed CLI therefore pins every allowlisted
+  command, before any git, process or collector work: `--state-root` must resolve to the
+  default learning state, `--project-root` and `--root` must resolve to the project that
+  holds the running `cli.py`, and `--policy` is refused outright. The checked, resolved
+  values replace the given ones, so a swapped symlink cannot redirect a later use, and a
+  repeated option is checked at the value argparse keeps. Refusals name the option, never
+  its value. No flag turns the check off, and host markers play no part.
+  - **Why keyed to the installed CLI.** It applies when an install manifest sits next to
+    `cli.py`. A sandboxed Codex session cannot create or remove that file, because
+    `.codex/` is read-only there, and the rule only ever runs the installed `cli.py`. The
+    source tree has no manifest and keeps these options for development and tests.
+  - **Why the default state is safe to trust.** It follows `HOME` (or `XDG_STATE_HOME`
+    on Linux) in the process environment. A command Codex runs through the rule is a
+    fresh process with Codex's environment, and an environment-assignment prefix breaks
+    the rule's argument match, so the model cannot move it. Tests that drive an
+    installed CLI point `HOME` at a temporary directory instead of using an opt-out.
+  - **What it closes.** Before it, `validate --root`, `route --root`, `learning-route`
+    and the assignment and result checks ran git in a caller-chosen directory before
+    any registration check (provider-routing and operational-check trust both read the
+    repository). A model-built repository whose own `.git/config` sets
+    `core.fsmonitor` runs a command on the first index refresh, which through the rule
+    would run outside the sandbox. A model-built state directory would likewise have
+    let `dispatch` start a bridged child without the owner's attestation. Both are
+    unreachable now: every allowlisted command uses this project and the owner's state.
+- **Residual risks.**
+  - The project must be the Codex session's workspace root: Codex keeps `.codex` read-only
+    only at the top of a writable root, and the rule runs that `cli.py`.
+  - The interpreter check accepts admin-group-writable directories on macOS, and trusts
+    the interpreter's standard library and dynamic libraries where they are installed.
+  - A shared repository in a writable root other than the project and the temporary
+    directories (one added to the session explicitly) is not detected; git then only
+    reads its objects and refs, with every helper off.
+  - The cache-directory and learning-state locations were verified unwritable only on
+    codex-cli 0.164's macOS sandbox; `$XDG_RUNTIME_DIR` on Linux was not tested live.
+    A crash can leave a private scratch directory behind; it stays owner-only.
+  - Input files (task, assignment, grant, route, result) remain caller-chosen data,
+    validated as before.
+  - Owner commands stay unreachable from a sandboxed Codex primary; registration,
+    attestation and the rule itself come from the owner's terminal. An owner who runs
+    `scripts/attest.py --state-root` against an installed project is refused at
+    `provider-observe`, because only the default state is accepted.
+  - The Claude primary's permission rules are a separate follow-up.
+
 ## Deferred to G4
 
 - Headroom tie-breaking between equally ranked candidates.

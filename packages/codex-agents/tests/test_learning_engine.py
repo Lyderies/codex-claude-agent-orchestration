@@ -267,6 +267,11 @@ def canary_results(
 
 
 class VerifiedQaTests(unittest.TestCase):
+    def qa_scratch(self) -> Path:
+        """An existing directory to hold each check's private scratch, outside the project."""
+
+        return Path(self.enterContext(tempfile.TemporaryDirectory(dir=TEMP_ROOT)))
+
     def test_operational_check_requires_exact_interpreter_digest(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             root = Path(directory)
@@ -470,9 +475,13 @@ class VerifiedQaTests(unittest.TestCase):
                 cwd=root,
                 check=True,
             )
-            report = run_operational_check_suite(root)
+            scratch = self.qa_scratch()
+            report = run_operational_check_suite(root, scratch_root=scratch)
             self.assertTrue(report["deterministic_checks"][0]["passed"])
             self.assertTrue(report["security_checks"][0]["passed"])
+            # Each check ran from a private directory under the given root, removed after.
+            self.assertEqual(0o700, os.stat(scratch / "scratch").st_mode & 0o777)
+            self.assertEqual([], list((scratch / "scratch").iterdir()))
 
     def test_operational_check_rejects_changed_python_runtime_tree(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
@@ -1008,7 +1017,7 @@ class VerifiedQaTests(unittest.TestCase):
                 cwd=root,
                 check=True,
             )
-            report = run_operational_check_suite(root)
+            report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
         self.assertTrue(report["deterministic_checks"][0]["passed"])
         self.assertFalse(report["security_checks"][0]["passed"])
         self.assertEqual(
@@ -1080,7 +1089,7 @@ class VerifiedQaTests(unittest.TestCase):
                 "codex_agents.learning_engine._sandboxed_check_argv",
                 side_effect=tamper,
             ):
-                report = run_operational_check_suite(root)
+                report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
             self.assertFalse(report["deterministic_checks"][0]["passed"])
             self.assertFalse(report["security_checks"][0]["passed"])
 
@@ -1229,7 +1238,7 @@ class VerifiedQaTests(unittest.TestCase):
                 check=True,
             )
 
-            report = run_operational_check_suite(root)
+            report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
             self.assertTrue(report["deterministic_checks"][0]["passed"])
             self.assertTrue(report["security_checks"][0]["passed"])
             self.assertFalse((root / "forbidden").exists())
@@ -1309,7 +1318,7 @@ class VerifiedQaTests(unittest.TestCase):
                 check=True,
             )
 
-            report = run_operational_check_suite(root)
+            report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
             self.assertTrue(report["deterministic_checks"][0]["passed"])
             self.assertTrue(report["security_checks"][0]["passed"])
 
@@ -1364,7 +1373,7 @@ class VerifiedQaTests(unittest.TestCase):
             )
 
             with patch("codex_agents.learning_engine.MAX_QA_TEMP_BYTES", 1024):
-                report = run_operational_check_suite(root)
+                report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
             self.assertFalse(report["deterministic_checks"][0]["passed"])
             self.assertFalse(report["security_checks"][0]["passed"])
 

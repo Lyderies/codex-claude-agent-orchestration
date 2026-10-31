@@ -14,12 +14,10 @@ import json
 import os
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
@@ -27,7 +25,23 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .catalog import CatalogError, parse_claude_agent
-from .contracts import ContractError, result_preflight, validate_assignment
+from .contracts import (
+    ONE_EVIDENCE_ENTRY_RULE,
+    ContractError,
+    result_preflight,
+    validate_assignment,
+)
+from .git_plumbing import git_executable as find_git
+from .git_plumbing import repository_layout_problem, run_git
+from .host_paths import (
+    PYTHON_ISOLATION_FLAGS,
+    HostPathError,
+    darwin_directory,
+    overlaps_untrusted,
+    private_directory,
+    remove_private_directory,
+    temp_roots,
+)
 from .learning_contracts import SUPPORTED_MODELS
 from .providers import (
     api_keys_present,
@@ -105,9 +119,13 @@ MANAGED_PREFERENCE_PATHS = {
     ),
     "linux": (),
 }
-# Exports live under the resolved system temp directory, not under home, so no
-# user-level CLAUDE.md or .claude directory sits above them. None means that.
+# Exports, control files and a child's temporary directory live in a host-private
+# directory that the sandboxed primary cannot write (the system temp directory is
+# writable to it) and, for Claude, outside home, so no user-level CLAUDE.md or
+# .claude directory sits above them: the per-user cache directory on macOS and
+# $XDG_RUNTIME_DIR elsewhere. Tests set WORKSPACE_PARENT instead.
 WORKSPACE_PARENT: str | None = None
+SCRATCH_CONTAINER = "codex-agents-scratch"
 WATCHDOG_GRACE_SECONDS = 2
 # The verifier of a write result gets the bridge-owned envelope here, at the top
 # of its read-only export. The name is not a repository path: no assignment may
@@ -219,23 +237,11 @@ def _claude_context_path(relative: str) -> bool:
 
 
 def _git(root: Path, *arguments: str, text: bool = False) -> subprocess.CompletedProcess:
-    executable = shutil.which("git", path=os.defpath)
+    executable = find_git()
     if executable is None:
         raise BridgeRefused("git is unavailable")
     try:
-        return subprocess.run(
-            [executable, "--literal-pathspecs", "-C", str(root), *arguments],
-            env={
-                "PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
-                "GIT_LITERAL_PATHSPECS": "1",
-            },
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=text,
-            timeout=60,
-            check=False,
-        )
+        return run_git(executable, root, *arguments, text=text, timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         raise BridgeRefused("git export failed") from exc
 
@@ -256,6 +262,9 @@ def export_committed_paths(
     """
 
     root = repository_root.resolve()
+    executable = find_git()
+    if executable is None or repository_layout_problem(executable, root) is not None:
+        raise BridgeRefused("project repository cannot be trusted for export")
     top = _git(root, "rev-parse", "--show-toplevel", text=True)
     if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root:
         raise BridgeRefused("project root is not the top of a git repository")
@@ -332,7 +341,10 @@ while True:
 def _start_watchdog(group: int, deadline_epoch: float) -> None:
     try:
         subprocess.Popen(
-            [sys.executable, "-I", "-c", WATCHDOG_SOURCE, str(group), repr(deadline_epoch)],
+            [
+                sys.executable, *PYTHON_ISOLATION_FLAGS, "-c", WATCHDOG_SOURCE,
+                str(group), repr(deadline_epoch),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -617,6 +629,7 @@ def child_prompt(assignment: dict[str, Any], *, worker_result_path: str | None =
         "Work only with the files in the current directory. When you finish, reply "
         "with exactly one JSON object and no other text, filling in this template:\n"
         f"{json.dumps(template, indent=2)}\n"
+        f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.\n"
     )
 
 
@@ -800,7 +813,7 @@ def run_claude(
     started = time.monotonic()
     outcome = run_child(
         arguments,
-        environment=client_environment(environ),
+        environment=client_environment(environ, control.parent / "tmp"),
         cwd=export,
         deadline_seconds=deadline_seconds,
         on_frame=on_frame,
@@ -946,7 +959,7 @@ def run_codex(
     started = time.monotonic()
     outcome = run_child(
         arguments,
-        environment=client_environment(environ),
+        environment=client_environment(environ, control.parent / "tmp"),
         cwd=export,
         deadline_seconds=deadline_seconds,
         on_frame=on_frame,
@@ -1007,13 +1020,56 @@ def managed_configuration_present() -> bool:
     )
 
 
+def scratch_base() -> Path:
+    """The existing host directory that holds private dispatch and probe workspaces."""
+
+    if WORKSPACE_PARENT is not None:
+        return Path(WORKSPACE_PARENT)
+    if sys.platform == "darwin":
+        value = darwin_directory("DARWIN_USER_CACHE_DIR")
+    else:
+        value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value or not os.path.isabs(value):
+        raise BridgeRefused("host_scratch_unavailable")
+    return Path(value)
+
+
+def private_workspace(prefix: str, *, claude: bool, project_root: Path | None) -> Path:
+    """Create an owner-only workspace in the scratch base; Claude's is boundary-checked.
+
+    The base may neither lie inside nor contain the project or any temporary
+    directory, since a sandboxed session could then pre-create or race what the
+    host writes there. This holds for every base, whatever the platform.
+    """
+
+    base = scratch_base()
+    untrusted = [*temp_roots(), *([project_root] if project_root is not None else [])]
+    if overlaps_untrusted(base, untrusted):
+        raise BridgeRefused("host_scratch_unavailable")
+    if claude:
+        check_context_boundary(base)
+    try:
+        workspace = private_directory(base, SCRATCH_CONTAINER, prefix)
+    except HostPathError as exc:
+        raise BridgeRefused("host_scratch_unavailable") from exc
+    try:
+        if claude:
+            check_context_boundary(workspace)
+        for name in ("export", "control", "tmp"):
+            (workspace / name).mkdir(mode=0o700)
+    except BaseException:
+        remove_private_directory(workspace)
+        raise
+    return workspace
+
+
 def check_context_boundary(workspace: Path) -> None:
     """Refuse when Claude would load context from a directory above the export.
 
     The rule: no directory from the workspace up to `/` may hold CLAUDE.md,
     CLAUDE.local.md or a .claude directory. There is no exception for the
-    user's own ~/.claude; exports live under the system temp directory, so a
-    workspace under home (an unusual TMPDIR) is refused rather than trusted.
+    user's own ~/.claude; workspaces live outside home, so one under home (an
+    unusual scratch base) is refused rather than trusted.
     """
 
     current = workspace.resolve()
@@ -1033,7 +1089,9 @@ PROBE_DEADLINE_SECONDS = 120
 MAX_PROBE_EVENTS = 64
 
 
-def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | None]:
+def claude_billing_probe(
+    environ: Mapping[str, str], *, project_root: Path | None = None
+) -> tuple[list[Any], str | None]:
     """Run one minimal locked Claude turn; return every rate_limit_info it reported
     and why it failed, if it did.
 
@@ -1049,17 +1107,12 @@ def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | N
 
     if api_keys_present(environ):
         raise BridgeRefused("a provider API key is set")
-    parent = Path(os.path.realpath(WORKSPACE_PARENT or tempfile.gettempdir()))
-    workspace = Path(tempfile.mkdtemp(prefix="codex-agents-probe-", dir=parent))
+    workspace = private_workspace("probe-", claude=True, project_root=project_root)
     try:
-        os.chmod(workspace, 0o700)
-        check_context_boundary(workspace)
         if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
-        empty = workspace / "empty"
+        empty = workspace / "export"
         control = workspace / "control"
-        empty.mkdir(mode=0o700)
-        control.mkdir(mode=0o700)
         check_backend(environ, empty)
         executable, _ = resolve_client("claude")
         settings = _private_file(
@@ -1099,13 +1152,13 @@ def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | N
 
         outcome = run_child(
             arguments,
-            environment=client_environment(environ),
+            environment=client_environment(environ, workspace / "tmp"),
             cwd=empty,
             deadline_seconds=PROBE_DEADLINE_SECONDS,
             on_frame=on_frame,
         )
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        remove_private_directory(workspace)
     return state["infos"], outcome["abort"]
 
 
@@ -1176,16 +1229,12 @@ def dispatch(
     if provider == "claude":
         if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
-    parent = Path(os.path.realpath(WORKSPACE_PARENT or tempfile.gettempdir()))
-    workspace = Path(tempfile.mkdtemp(prefix="codex-agents-dispatch-", dir=parent))
+    workspace = private_workspace(
+        "dispatch-", claude=provider == "claude", project_root=project_root
+    )
     try:
-        os.chmod(workspace, 0o700)
-        if provider == "claude":
-            check_context_boundary(workspace)
         export = workspace / "export"
         control = workspace / "control"
-        export.mkdir(mode=0o700)
-        control.mkdir(mode=0o700)
         file_count = export_committed_paths(project_root, paths, export)
         worker_result_path = None
         if verification_input is not None:
@@ -1274,7 +1323,7 @@ def dispatch(
                 )
         _record_usage(ledger, project_id, run_handle, provider, route["model"], report)
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        remove_private_directory(workspace)
     reviewed = True
     if result is None:
         state = "timed_out" if report["outcome"] == "timed_out" else "failed"

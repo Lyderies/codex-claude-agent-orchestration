@@ -234,7 +234,8 @@ class ProviderObservationTests(unittest.TestCase):
             environ = {"CLAUDE_CONFIG_DIR": "/elsewhere", "CODEX_HOME": "/elsewhere"}
             with trusted_tools(Path(directory)):
                 records = observe_claude(
-                    digest_key=KEY, observed_at_ms=NOW, environ=environ, popen=popen
+                    tmpdir=Path(directory), digest_key=KEY, observed_at_ms=NOW,
+                    environ=environ, popen=popen,
                 )
                 self.assertEqual("provider_identity", records[0]["record_type"])
                 real = os.path.realpath(executable)
@@ -250,12 +251,14 @@ class ProviderObservationTests(unittest.TestCase):
                 self.assertEqual(
                     {"HOME", "USER", "LOGNAME", "PATH", "LANG", "TMPDIR"}, set(calls[0][1]["env"])
                 )
+                # TMPDIR is the caller's private directory, never the system one.
+                self.assertEqual(directory, calls[0][1]["env"]["TMPDIR"])
                 for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
                     with self.subTest(name=name), self.assertRaisesRegex(
                         ContractError, "API key"
                     ):
                         observe_claude(
-                            digest_key=KEY, observed_at_ms=NOW,
+                            tmpdir=Path(directory), digest_key=KEY, observed_at_ms=NOW,
                             environ={**environ, name: "set"}, popen=popen,
                         )
             self.assertEqual(2, len(calls))
@@ -273,7 +276,7 @@ class ProviderObservationTests(unittest.TestCase):
             impostor.chmod(0o755)
             with trusted_tools(trusted):
                 records = observe_claude(
-                    digest_key=KEY, observed_at_ms=NOW,
+                    tmpdir=Path(directory), digest_key=KEY, observed_at_ms=NOW,
                     environ={"PATH": f"{planted}{os.pathsep}{trusted}"},
                 )
             self.assertFalse(marker.exists())
@@ -287,7 +290,8 @@ class ProviderObservationTests(unittest.TestCase):
                 ContractError, "trusted path"
             ):
                 observe_claude(
-                    digest_key=KEY, observed_at_ms=NOW, environ={"PATH": str(trusted)}
+                    tmpdir=Path(directory), digest_key=KEY, observed_at_ms=NOW,
+                    environ={"PATH": str(trusted)},
                 )
 
     def test_claude_output_is_bounded_while_streaming(self) -> None:
@@ -316,7 +320,7 @@ class ProviderObservationTests(unittest.TestCase):
                         ContractError, message
                     ):
                         observe_claude(
-                            digest_key=KEY, observed_at_ms=NOW, environ={}, timeout=1,
+                            tmpdir=Path(directory), digest_key=KEY, observed_at_ms=NOW, environ={}, timeout=1,
                         )
                     self.assertLess(time.monotonic() - started, 10)
                     pid = int(Path(f"{marker}-{name}").read_text())
@@ -380,7 +384,8 @@ class ProviderObservationTests(unittest.TestCase):
             environ: dict[str, str] = {}
             with trusted_tools(root):
                 records = observe_codex(
-                    root, digest_key=KEY, observed_at_ms=NOW, environ=environ
+                    root, digest_key=KEY, observed_at_ms=NOW, environ=environ,
+                    tmpdir=Path(directory),
                 )
             self.assertEqual(
                 ["provider_identity", "provider_headroom", "provider_billing"],
@@ -390,7 +395,7 @@ class ProviderObservationTests(unittest.TestCase):
                 ["initialize", "initialized", "account/rateLimits/read"], log.read_text().split()
             )
             with trusted_tools(root):
-                session = AppServerSession(root, environ=environ)
+                session = AppServerSession(root, environ=environ, tmpdir=root)
             try:
                 for method in ("account/logout", "thread/start", "turn/start"):
                     with self.subTest(method=method), self.assertRaisesRegex(
@@ -408,7 +413,7 @@ class ProviderObservationTests(unittest.TestCase):
                 ["initialize", "initialized", "account/rateLimits/read"], log.read_text().split()
             )
             with trusted_tools(root), self.assertRaisesRegex(ContractError, "API key"):
-                AppServerSession(root, environ={**environ, "OPENAI_API_KEY": "x"})
+                AppServerSession(root, environ={**environ, "OPENAI_API_KEY": "x"}, tmpdir=root)
 
 
 class HeadroomThresholdTests(unittest.TestCase):

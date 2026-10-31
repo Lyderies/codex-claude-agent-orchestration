@@ -3335,7 +3335,8 @@ class LearningLedger:
                     if orchestration["status"] == "active"
                     else 0
                 ),
-                "native_agent_bound": sum(
+                # Native or bridged: a bridged run binds its bridge run ID here.
+                "agent_bound": sum(
                     row["native_assignment_id"] is not None for row in bindings
                 ),
                 "deadlines_observed": sum(
@@ -3721,32 +3722,44 @@ class LearningLedger:
         run and to a phase, before or after its launch.
         """
 
+        from .host_paths import HostPathError, private_directory, remove_private_directory
         from .providers import observe_claude, observe_codex
 
         run_id = None
         if (run_handle is None) != (phase is None) or phase not in {None, "before", "after"}:
             raise LedgerError("a run observation needs its run and its phase")
+        if provider not in {"claude", "codex"}:
+            raise LedgerError("provider is unsupported")
         if run_handle is not None:
             with self._lock:
                 run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
         timestamp = self._clock_ms()
-        if provider == "claude":
-            records = observe_claude(
-                digest_key=self.state.digest_key(),
-                observed_at_ms=timestamp,
-                environ=environ,
-            )
-        elif provider == "codex":
-            records = observe_codex(
-                project_root,
-                digest_key=self.state.digest_key(),
-                observed_at_ms=timestamp,
-                environ=environ,
-                run_id=run_id,
-                phase=phase,
-            )
-        else:
-            raise LedgerError("provider is unsupported")
+        # The client's TMPDIR is a fresh owner-only directory under the learning
+        # state, never the system temp directory a sandboxed primary can write.
+        try:
+            tmpdir = private_directory(self.state.root, "scratch", "client-")
+        except HostPathError as exc:
+            raise LedgerError("a private client directory is unavailable") from exc
+        try:
+            if provider == "claude":
+                records = observe_claude(
+                    digest_key=self.state.digest_key(),
+                    observed_at_ms=timestamp,
+                    tmpdir=tmpdir,
+                    environ=environ,
+                )
+            else:
+                records = observe_codex(
+                    project_root,
+                    digest_key=self.state.digest_key(),
+                    observed_at_ms=timestamp,
+                    tmpdir=tmpdir,
+                    environ=environ,
+                    run_id=run_id,
+                    phase=phase,
+                )
+        finally:
+            remove_private_directory(tmpdir)
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
 
@@ -4060,7 +4073,7 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        infos, failure = claude_billing_probe(environ)
+        infos, failure = claude_billing_probe(environ, project_root=project_root)
         observed = self._clock_ms()
         headroom: list[dict[str, Any]] = []
         billing_records: list[dict[str, Any]] = []
@@ -9091,11 +9104,15 @@ def _start_collector_locked(
         raise
     except CollectorError:
         pass
+    from .host_paths import PYTHON_ISOLATION_FLAGS
+
     subprocess.Popen(
         [
             sys.executable,
-            "-I",
-            "-B",  # isolated mode ignores PYTHONDONTWRITEBYTECODE; keep managed paths clean
+            # Isolated, no bytecode in managed paths (isolated mode ignores
+            # PYTHONDONTWRITEBYTECODE), and no site-packages, so no .pth file or
+            # sitecustomize a sandboxed session could reach runs in the collector.
+            *PYTHON_ISOLATION_FLAGS,
             str(cli_path.resolve(strict=True)),
             "learning-serve",
             "--state-root",

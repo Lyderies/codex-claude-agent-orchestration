@@ -69,6 +69,30 @@
   opened for its exact worker outcome. A verification-required result too large to keep as
   canonical JSON is refused before the run is consumed, instead of being recorded without
   the copy its verifier needs.
+- **Codex host command boundary (0.8.6).** A Codex primary runs the CLI inside Codex's
+  sandbox, which blocks the learning collector, so every collector-backed command failed.
+  A new wizard step, Commands, offers a per-project Codex command rule in the user's rules
+  layer. It lets only the primary-host subcommands, run with an exact interpreter, flags
+  and project `cli.py`, run outside the sandbox; owner commands stay sandboxed.
+  `host-command` reports that exact command prefix and whether the rule is installed, and
+  the Codex skill runs it first and stops until the rule is in place. Because the rule
+  cannot constrain later arguments, an installed CLI pins these commands to its own
+  project, the default learning state and its installed policy, refusing any other
+  `--project-root`, `--root`, `--state-root` or `--policy` before it runs git or reaches
+  the collector. Nothing such a command runs or trusts comes from a sandbox-writable place:
+  the rule names the resolved, trusted base interpreter with `-I -B -S` (never a virtual
+  environment's, a project's or a temporary one), and the collector and watchdog it starts
+  get the same flags; a project in a temporary directory never gets a rule; trust checks
+  use git plumbing only, with every repository-configured helper and every transport off,
+  and refuse a shared repository inside the working tree or in a temporary directory and
+  a partial clone; bridge exports, control files and child, probe, operational-check and
+  provider-client temporary directories move from the system temp directory to owner-only
+  host directories that overlap no project or temporary directory. A new rule never overwrites one that
+  another setup wrote meanwhile. A sandboxed collector failure now carries a hint. The
+  result template and the bridged child's prompt state one evidence entry per criterion,
+  at its most severe outcome, so neither a child nor a repair can soften a `fail`. The
+  orchestration report's `runs.native_agent_bound` is now `agent_bound`, because it counts
+  bridged runs too.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the

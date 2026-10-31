@@ -45,6 +45,25 @@ VALIDATE = (
 TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789SECRETTOKEN"
 
 
+def interpreter_trusted() -> bool:
+    """Whether the Codex rule may name this Python (CI toolcaches can be world-writable)."""
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from codex_agents.host_commands import interpreter_path; interpreter_path()",
+         str(ORCHESTRATION)],
+        capture_output=True, stdin=subprocess.DEVNULL, check=False,
+    )
+    return completed.returncode == 0
+
+
+TRUSTED_PYTHON = interpreter_trusted()
+NEEDS_TRUSTED_PYTHON = unittest.skipUnless(
+    TRUSTED_PYTHON, "this machine's Python cannot be named by the Codex rule"
+)
+
+
 def write_routing(project: Path, codex: str = "on", claude: str = "on",
                   models: str = "claude-opus-5-5", bridge: str = "off") -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -204,6 +223,36 @@ class SetupScriptTests(unittest.TestCase):
                 stdin=subprocess.DEVNULL, env=dict(os.environ, CODEX_HOME=str(base)), timeout=20)
             self.assertLess(time.time() - started, 15)
         self.assertEqual(result.stdout.splitlines()[0], "codex")
+
+    def test_codex_primary_follows_the_provider_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def primary(path: Path) -> str:
+                result = subprocess.run(
+                    ["bash", str(SETUP), "--print-codex-primary", str(path)],
+                    capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout.strip()
+
+            # Without the file only Codex is enabled, so a Codex session may orchestrate.
+            self.assertEqual(primary(base / "absent.json"), "yes")
+            for choices, expected in (
+                (("on", "off", "-", "off"), "yes"),
+                (("off", "on", "claude-opus-5-5", "on"), "yes"),
+                (("on", "on", "claude-opus-5-5", "off"), "yes"),
+                (("off", "on", "claude-opus-5-5", "off"), "no"),
+            ):
+                with self.subTest(choices=choices):
+                    path = base / ("-".join(choices) + ".json")
+                    path.write_text(routing(*choices).stdout)
+                    self.assertEqual(primary(path), expected)
+            (base / "broken.json").write_text("{")
+            self.assertEqual(primary(base / "broken.json"), "no")
+            (base / "linked.json").symlink_to(base / "on-off---off.json")
+            self.assertEqual(primary(base / "linked.json"), "no")
+            os.mkfifo(base / "fifo.json")
+            self.assertEqual(primary(base / "fifo.json"), "no")
 
     def test_uncommitted_summary_keeps_rename_source_names_whole(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -445,11 +494,16 @@ class WizardTerminalTests(unittest.TestCase):
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
             'for a in "$@"; do if [ "$a" = paths ] && [ -n "$FAKE_PJ_FAIL" ]; then exit 1; fi; done\n'
+            'if [ -n "$FAKE_UNTRUSTED" ]; then case "$*" in *host-command*)'
+            ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
+            ' exit 2;; esac; fi\n'
             f'exec "{sys.executable}" "$@"\n')
         for fake in self.fakes.iterdir():
             fake.chmod(0o755)
+        # CODEX_HOME is dropped so the commands step can only write under the test's HOME.
         self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR", "PYTHONDONTWRITEBYTECODE")}
+                    if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR",
+                                 "PYTHONDONTWRITEBYTECODE", "CODEX_HOME")}
         self.env.update(
             PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
             TMPDIR=str(self.tmpdir), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
@@ -551,8 +605,28 @@ class WizardTerminalTests(unittest.TestCase):
                     time.sleep(0.1)
         self.fail("the wizard did not exit")
 
-    def make_project(self, name: str = "project") -> tuple[Path, Path]:
-        project = self.base / name
+    def non_temporary_base(self) -> Path:
+        """A fresh folder outside every temporary root (a rule refuses those), or skip."""
+
+        candidates = [os.environ.get("XDG_RUNTIME_DIR") or ""]
+        if sys.platform == "darwin":
+            cache = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"],
+                                   capture_output=True, text=True, check=False).stdout.strip()
+            candidates.insert(0, cache)
+        temporary = {os.path.realpath(path) for path in
+                     ("/tmp", "/var/tmp", tempfile.gettempdir(), os.environ.get("TMPDIR") or "/tmp")}
+        for candidate in candidates:
+            real = os.path.realpath(candidate) if candidate else ""
+            if real and os.path.isdir(real) and not any(
+                real == root or real.startswith(root + os.sep) for root in temporary
+            ):
+                base = Path(os.path.realpath(tempfile.mkdtemp(prefix="agent-orch-test-", dir=real)))
+                self.addCleanup(shutil.rmtree, base, True)
+                return base
+        self.skipTest("no folder outside the temporary roots is available")
+
+    def make_project(self, name: str = "project", base: Path | None = None) -> tuple[Path, Path]:
+        project = (base or self.base) / name
         project.mkdir()
         subprocess.run(["git", "init", "-q", str(project)], check=True, env=self.env)
         (project / "qa-check").write_text("#!/usr/bin/python3\nprint(1)\n")
@@ -583,7 +657,7 @@ class WizardTerminalTests(unittest.TestCase):
 
     def test_quit_on_the_first_screen_changes_nothing(self) -> None:
         self.start(self.base)
-        self.expect("Step 1 of 8")
+        self.expect("Step 1 of 9")
         self.expect("signed in (plan: max, login: x)")
         self.send("q")
         self.expect("Quit setup?")
@@ -621,8 +695,9 @@ class WizardTerminalTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
+    @NEEDS_TRUSTED_PYTHON
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
-        project, checks = self.make_project("my proj;x")
+        project, checks = self.make_project("my proj;x", self.non_temporary_base())
         self.to_project_prompt(project)
         self.send("\r")
         self.expect("Path to operational-checks.json")
@@ -646,17 +721,38 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\r")
         self.expect("Not chosen")
         self.send("\r")
+        self.expect("Yes, allow these commands")
+        self.assertIn("owner commands", self.screen)
+        self.send("\x1b[B\x1b[B\r")
+        self.expect("Codex commands rule: lines")
+        self.send("q")
+        self.expect("Yes, allow these commands")
+        self.send("\x1b[B\r")
+        self.expect("Rule created")
+        self.send("\r")
         self.expect("Press Enter to exit")
         self.assertIn("my\\ proj\\;x", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
         final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen.split("\x1b[2J")[-1]).replace("\r", "")
         self.assertIn("4. Install: installed and verified; committed", final)
-        self.assertLess(final.index("7. Profile"), final.index("How to use it"))
+        self.assertLess(final.index("7. Profile"), final.index("8. Commands: created"))
+        self.assertLess(final.index("8. Commands"), final.index("How to use it"))
         self.assertLess(final.index("How to use it"), final.index("To remove everything, run:"))
         self.assertRegex(final, r"To remove everything, run:\n\s+python3 .*install\.py.* remove --target ")
         self.assertEqual(final.count("To remove everything"), 1)
+        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-[0-9a-f]{12}\.rules")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
+        rules = list((self.home / ".codex" / "rules").iterdir())
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(oct(rules[0].stat().st_mode & 0o777), "0o600")
+        cli = project / ".codex" / "orchestration" / "cli.py"
+        expected = subprocess.run(
+            [sys.executable, str(cli), "install-codex-rule", "--project-root", str(project), "--print"],
+            capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1"), check=True)
+        import json
+        self.assertEqual(rules[0].read_text(), json.loads(expected.stdout)["rule_text"])
+        self.assertIn(json.dumps(str(cli)), rules[0].read_text())
         runs = self.py_log.read_text().split()
         self.assertTrue(runs and set(runs) == {"1"}, runs)
         self.assertEqual(list(self.tmpdir.iterdir()), [])
@@ -767,8 +863,8 @@ class WizardTerminalTests(unittest.TestCase):
             self.send("\r")
         self.expect("Commit now")
 
-    def finish_after_install(self) -> str:
-        """Skip the collector, billing and profile steps, and return the final screen."""
+    def finish_after_install(self, trusted: bool = TRUSTED_PYTHON, temporary: bool = True) -> str:
+        """Skip the collector, billing, profile and commands steps; return the final screen."""
         self.expect("Continue")
         self.send("\r")
         self.expect("Register now")
@@ -776,6 +872,14 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Start the attestation")
         self.send("\x1b[B\r")
         self.expect("Not chosen")
+        self.send("\r")
+        if temporary:
+            # Test projects live in the system temp folder, which never gets a rule.
+            self.expect("This project is in a temporary folder")
+        elif trusted:
+            self.expect("No, not now")
+        else:
+            self.expect("This Python cannot be trusted")
         self.send("\r")
         self.expect("remove --target")
         self.settle()
@@ -881,6 +985,11 @@ class WizardTerminalTests(unittest.TestCase):
         self.drive_to_commit_menu(project, checks)
         self.send("\r")
         final = self.finish_after_install()
+        # A project in a temporary folder is told why and gets no rule.
+        self.assertIn("8. Commands: project in a temporary folder", final)
+        self.assertIn("This project is in a temporary folder, so Codex sessions cannot", final)
+        self.assertNotIn("To undo it, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
         self.assertIn("; committed", final)
         self.assertNotIn("not committed", final)
         self.assertNotIn("Left uncommitted", final)
@@ -891,6 +1000,85 @@ class WizardTerminalTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
+
+    @NEEDS_TRUSTED_PYTHON
+    def test_a_stale_rule_left_unchanged_keeps_its_undo_instruction(self) -> None:
+        import hashlib
+        project, checks = self.make_project(base=self.non_temporary_base())
+        digest = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:12]
+        rules = self.home / ".codex" / "rules"
+        rules.mkdir(parents=True, mode=0o700)
+        stale = rules / f"agent-orchestration-{digest}.rules"
+        stale.write_text("# an older rule for this project\n")
+        stale.chmod(0o600)
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\x1b[B\r")
+        self.expect("Not chosen")
+        self.send("\r")
+        self.expect("Leave it unchanged")
+        self.assertIn("differs", self.screen)
+        self.send("\r")
+        self.expect("remove --target")
+        self.settle()
+        final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "",
+                       self.screen.split("\x1b[2J")[-1]).replace("\r", "")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertIn("8. Commands: exists, differs, left alone", final)
+        self.assertIn("rule for this project is stale", final)
+        self.assertNotIn("until the Codex commands rule exists", final)
+        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
+                         + digest + r"\.rules")
+        self.assertEqual("# an older rule for this project\n", stale.read_text())
+
+    @NEEDS_TRUSTED_PYTHON
+    def test_verify_reports_the_codex_commands_rule_without_writing_it(self) -> None:
+        import json
+        project, checks = self.make_project(base=self.non_temporary_base())
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("Codex commands rule: missing")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("remove --target")
+        self.settle()
+        final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "",
+                       self.screen.split("\x1b[2J")[-1]).replace("\r", "")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertIn("8. Commands: missing", final)
+        self.assertIn("Codex sessions cannot reach the orchestrator", final)
+        self.assertNotIn("To undo it, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
+
+    def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
+        project, checks = self.make_project(base=self.non_temporary_base())
+        self.drive_to_commit_menu(project, checks, {"FAKE_UNTRUSTED": "1"})
+        self.send("\r")
+        final = self.finish_after_install(trusted=False, temporary=False)
+        self.assertIn("8. Commands: not checked", final)
+        self.assertIn("until the Codex commands rule exists", final)
+        self.assertNotIn("To undo it, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:
         (self.base / "-odd").mkdir()

@@ -28,7 +28,7 @@ from codex_agents.bridge import (
     remove_optional_nulls,
     strict_output_schema,
 )
-from codex_agents.contracts import ContractError, validate_result
+from codex_agents.contracts import ONE_EVIDENCE_ENTRY_RULE, ContractError, validate_result
 from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_contracts import content_digest
 from codex_agents.learning_engine import installed_execution_configuration
@@ -139,6 +139,9 @@ class BridgeTestCase(unittest.TestCase):
         self.managed = base / "managed-settings.json"
         for name, value in (
             ("WORKSPACE_PARENT", str(self.dispatch_parent)),
+            # The test scratch lives in the system temp directory, which production
+            # refuses (see test_host_paths); here no directory counts as temporary.
+            ("temp_roots", lambda: set()),
             ("MANAGED_SETTINGS_PATHS", {
                 "darwin": (str(self.managed),),
                 "linux": (str(self.managed),),
@@ -277,7 +280,11 @@ class BridgeTestCase(unittest.TestCase):
             os.killpg(invocation["pgid"], 0)
 
     def workspace_entries(self) -> list[Path]:
-        return list(self.dispatch_parent.iterdir())
+        """What a dispatch left in its scratch: nothing, once it has finished."""
+
+        container = self.dispatch_parent / bridge.SCRATCH_CONTAINER
+        outside = [path for path in self.dispatch_parent.iterdir() if path != container]
+        return outside + (list(container.iterdir()) if container.exists() else [])
 
 
 class CliTestCase(BridgeTestCase):
@@ -340,6 +347,9 @@ class ClaudeBridgeTests(BridgeTestCase):
         argv = invocation["argv"]
         for flag in ("--strict-mcp-config", "--no-session-persistence", "--verbose"):
             self.assertIn(flag, argv)
+        # The prompt, last, states one evidence entry per criterion at its most severe outcome.
+        self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
+        self.assertIn("(fail, then not_run, then observed, then pass)", argv[-1])
         self.assertNotIn("--bare", argv)
         self.assertEqual("Read,Glob,Grep", argv[argv.index("--tools") + 1])
         self.assertEqual("dontAsk", argv[argv.index("--permission-mode") + 1])
@@ -1182,6 +1192,7 @@ class CodexBridgeTests(BridgeTestCase):
         invocation = [i for i in self.invocations("codex") if "exec" in i["argv"]][0]
         argv = invocation["argv"]
         self.assertEqual("read-only", argv[argv.index("-s") + 1])
+        self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
         for flag in ("--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
                      "--json"):
             self.assertIn(flag, argv)
@@ -2388,7 +2399,7 @@ class VerifierHandoffTests(ClaudePrimaryCase):
             "--verifier-result", self.write("verifier-result.json", dispatched["result"]),
         )
         with mock.patch.object(
-            cli, "run_operational_check_suite", side_effect=lambda _: passing_check_report()
+            cli, "run_operational_check_suite", side_effect=lambda _root, **_scratch: passing_check_report()
         ):
             refused = self.cli(
                 "learning-run-operational-checks",
@@ -2421,6 +2432,9 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         # Only the native worker's usage is unknown now; the bridged run's is not.
         self.assertEqual(1, summary["usage"]["unknown_runs"]["input_tokens"])
         self.assertEqual(1, summary["qa"]["passed"])
+        # Both the native worker and the bridged verifier count as agent-bound.
+        self.assertEqual(2, summary["runs"]["agent_bound"])
+        self.assertNotIn("native_agent_bound", summary["runs"])
 
     def ledger_value(self, read):
         ledger = LearningLedger(self.state, client_capabilities=self.clients)
@@ -2560,7 +2574,7 @@ class VerifierHandoffTests(ClaudePrimaryCase):
 
     def run_checks(self, worker: str, verifier: str, expected: int = 0) -> dict:
         with mock.patch.object(
-            cli, "run_operational_check_suite", side_effect=lambda _: passing_check_report()
+            cli, "run_operational_check_suite", side_effect=lambda _root, **_scratch: passing_check_report()
         ):
             return self.cli(
                 "learning-run-operational-checks", "--host-outcome-digest", worker,
