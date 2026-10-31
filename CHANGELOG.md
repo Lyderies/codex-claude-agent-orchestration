@@ -2,6 +2,9 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **Codex agent paths bind (0.8.7).** Codex 0.164 names a spawned child by its agent path
+  (for example `/root/<task_name>`); `learning-bind-host-agent` accepts slash-separated paths of
+  the same bounded tokens, and the Codex skill says to bind that path.
 - **Setup wizard polish.**
   - The commit step lists and commits only files that really changed; with none it says
     "Nothing to commit" and skips the question. An existing install is described as an update.
