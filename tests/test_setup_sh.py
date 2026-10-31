@@ -627,6 +627,9 @@ class WizardTerminalTests(unittest.TestCase):
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
             'for a in "$@"; do if [ "$a" = paths ] && [ -n "$FAKE_PJ_FAIL" ]; then exit 1; fi; done\n'
+            'if [ -n "$FAKE_ATTEST" ]; then case "$*" in *attest.py*)'
+            ' n=$(cat "$FAKE_ATTEST" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_ATTEST";'
+            ' echo "attest stub run $n"; [ "$n" -le "${FAKE_ATTEST_FAILS:-0}" ] && exit 1; exit 0;; esac; fi\n'
             'if [ -n "$FAKE_UNTRUSTED" ]; then case "$*" in *host-command*)'
             ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
             ' exit 2;; esac; fi\n'
@@ -863,7 +866,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\r")
         self.expect("Rule created")
         self.send("\r")
-        self.expect("Press Enter to exit")
+        self.expect("Back to the main menu")
         self.assertIn("my\\ proj\\;x", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
         final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen.split("\x1b[2J")[-1]).replace("\r", "")
@@ -908,14 +911,16 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("The install failed")
         self.expect("run it manually to see why")
         self.expect("Continue to the summary")
-        self.send("\r")
+        self.send("\x1b[B\r")
         self.expect("Save a summary of what failed")
         self.send("\x1b[B\r")
         self.expect("Save the summary to")
         destination = self.base / "summary.txt"
         self.send(f"{destination}\r")
         self.expect("Saved a summary")
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
         saved = destination.read_text()
         self.assertIn("exit code 2", saved)
@@ -1030,7 +1035,7 @@ class WizardTerminalTests(unittest.TestCase):
             self.expect(wait)
             self.send("\r")
         self.expect("Continue to the summary")
-        self.send("\r")
+        self.send("\x1b[B\r")
         self.expect("Save a summary of what failed")
         self.send("\x1b[B\r")
         self.expect("Save the summary to")
@@ -1042,7 +1047,9 @@ class WizardTerminalTests(unittest.TestCase):
                       re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.send("\r")
         self.expect("Saved a summary")
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
         self.assertTrue((self.home / "agent-orchestration-setup-summary.txt").is_file())
         self.assertFalse((project / "agent-orchestration-setup-summary.txt").exists())
@@ -1058,7 +1065,9 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.send("\x1b[B\r")  # save it here anyway
         self.expect("Saved a summary")
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
         self.assertTrue(destination.is_file())
 
@@ -1070,6 +1079,204 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("control character")
         self.assertFalse(any(self.base.glob("sum*mary.txt")))
         self.assertFalse(destination.exists())
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
+        self.assertEqual(self.finish(), 0)
+
+    def to_failed_billing(self, fails: int) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks, {
+            "FAKE_ATTEST": str(self.base / "attest.count"), "FAKE_ATTEST_FAILS": str(fails)})
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 1")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("Try again")
+
+    def test_a_failed_attestation_offers_try_again_and_succeeds_on_retry(self) -> None:
+        self.to_failed_billing(1)
+        self.settle()
+        self.assertIn("Skip for now", self.screen)
+        self.assertIn("Back to the main menu", self.screen)
+        self.send("\r")  # Try again is the default
+        self.expect("attest stub run 2")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("attest.py ran")
+
+    def test_back_to_the_main_menu_after_a_failure_then_another_option_works(self) -> None:
+        self.to_failed_billing(1)
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")  # the existing-install menu, not the summary
+        self.assertNotIn("Exit", self.screen)
+        self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 2")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("attest.py ran")
+        self.send("\r")
+        self.expect("Back to the main menu")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+
+    def test_the_wizard_only_ends_on_quit_after_failures(self) -> None:
+        self.to_failed_billing(2)
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 2")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("Try again")
+        self.settle()
+        self.assertNotIn("Skip for now", self.screen)  # attestation-only has nothing to skip to
+        self.send("\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.settle()
+        self.assertGreater(self.pid, 0)  # still running: a failure never ended the wizard
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.expect("Stopped.")
+        self.assertEqual(self.finish(), 0)
+
+    def test_failure_menu_defaults_to_the_main_menu_and_the_summary_can_go_back(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_FAIL": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Back to the main menu")
+        self.send("\r")  # the default: back, not the summary
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Continue to the summary")
+        self.send("\x1b[B\r")
+        self.expect("Save a summary of what failed")
+        self.settle()
+        self.assertIn("Back to the main menu", self.screen)
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu from the summary
+        self.expect("Project path")
+        self.send("q\r")
+        self.expect("Quit setup?")  # only an explicit quit ends the script
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "operational checks use the macOS sandbox, so verify is not ready elsewhere")
+    @NEEDS_TRUSTED_PYTHON
+    def test_verify_retry_back_and_the_summary_return_to_the_menu(self) -> None:
+        import json
+        project, checks = self.make_project(base=self.non_temporary_base())
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)  # left uncommitted: verification fails
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("Try again")
+        self.send("\r")  # Try again: still failing, so the menu comes back
+        self.expect("Try again")
+        self.send("\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("Codex commands rule: missing")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Back to the main menu")  # the final summary
+        self.settle()
+        self.assertNotIn("Save a summary of what failed", self.screen)  # the old failures are gone
+        self.send("\x1b[B\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.expect("Stopped.")
+        self.assertEqual(self.finish(), 0)
+
+    def test_going_back_does_not_leak_the_last_attempts_choices_into_the_next(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_ATTEST": str(self.base / "attest.count"), "FAKE_ATTEST_FAILS": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        self.expect("fresh install is possible")
+        self.send("\r")
+        self.expect("Codex children")
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B \r")  # also turn on bridging to Claude
+        self.expect("Looks right")
+        self.send("\r")
+        self.expect("Install now")
+        self.send("\r")
+        self.expect("Commit now")
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 1")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("Try again")
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\r")  # a different mode: attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("attest.py ran")
+        self.send("\r")
+        self.expect("Back to the main menu")
+        self.settle()
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        # This attempt never chose bridging, so the earlier attempt's profile choice must be gone.
+        self.assertIn("bridging was not chosen", plain.replace("\r\n", " "))
+        self.assertNotIn("orchestrator profile is missing", plain.replace("\r\n", " "))
         self.send("\r")
         self.assertEqual(self.finish(), 0)
 

@@ -2,6 +2,13 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **Setup wizard retry.** A wrong owner-key passphrase no longer stops `scripts/attest.py`: it says
+  "That passphrase did not unlock the key." and offers Try again or Exit, for the key check, the
+  signing and the passphrase change (other failures still stop). In `setup.sh`, no failed step
+  ends the wizard: after a failure the choices are Try again, Back to the main menu (the
+  project menu) or Quit, the final summary also offers Back to the main menu, and only Exit or
+  Quit ends the script. Saving a summary returns to the final menu, and going back starts the
+  next attempt from a clean state.
 - **Route-first model guidance.** The Codex skill and its routing reference no longer summarize
   per-family models, which had drifted from policy v5's provider candidates; they defer to the
   route's provider, model and effort.
