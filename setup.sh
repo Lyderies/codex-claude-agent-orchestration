@@ -2028,7 +2028,10 @@ verify_rule() {
       list_add fail "Could not check the Codex commands rule"
       list_sub "The installed orchestrator may be older than this check. Update the install, then verify again."
       mark_step 8 fail "not checked"
-      LAST_RC=1
+      # Keep the check's own non-zero status, and file the failure under step 8, not the
+      # verify screen's step 4.
+      [ "${LAST_RC:-0}" -ne 0 ] || LAST_RC=1
+      local STEP=8
       record_failure "Could not check the Codex commands rule" "update the install, then verify again";;
   esac
 }

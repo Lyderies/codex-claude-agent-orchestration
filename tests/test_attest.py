@@ -59,6 +59,20 @@ def _finish_child(pid: int, fd: int) -> int:
     return status
 
 
+def _child_finisher(pid: int, fd: int):
+    """Return a once-only finisher, so the explicit call and the registered cleanup never
+    close the pty descriptor twice (a reused descriptor number could belong to something else)."""
+
+    state: dict[str, int] = {}
+
+    def finish() -> int:
+        if "status" not in state:
+            state["status"] = _finish_child(pid, fd)
+        return state["status"]
+
+    return finish
+
+
 def write_key(path: Path) -> None:
     path.write_text(PRIVATE_HEAD)
     path.chmod(0o600)
@@ -874,7 +888,8 @@ class RealTerminalTests(unittest.TestCase):
         pid, fd = pty.fork()
         if pid == 0:
             os.execve(sys.executable, command, env)
-        self.addCleanup(_finish_child, pid, fd)
+        finish = _child_finisher(pid, fd)
+        self.addCleanup(finish)
         transcript = ""
         sent = False
         start = time.time()
@@ -899,7 +914,7 @@ class RealTerminalTests(unittest.TestCase):
                 time.sleep(0.3)
                 os.write(fd, (secret + "\r").encode())
                 sent = True
-        _finish_child(pid, fd)
+        finish()
         self.assertTrue(sent or break_echo, transcript)
         return transcript
 
@@ -972,7 +987,8 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         if pid == 0:
             os.execve(sys.executable, [sys.executable, str(_SCRIPT), "--target", str(self.project),
                                        "--state-root", str(self.state)], env)
-        self.addCleanup(_finish_child, pid, fd)
+        finish = _child_finisher(pid, fd)
+        self.addCleanup(finish)
         transcript = buffer = ""
         steps = list(script)
         end = time.time() + 40
@@ -993,7 +1009,7 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
                 buffer = buffer[buffer.index(expected) + len(expected):]
                 time.sleep(0.3)
                 os.write(fd, (answer + "\r").encode())
-        status = _finish_child(pid, fd)
+        status = finish()
         self.assertEqual(steps, [], f"never saw the prompts for {steps}: {transcript}")
         return transcript, os.WEXITSTATUS(status)
 
