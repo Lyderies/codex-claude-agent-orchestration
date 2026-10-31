@@ -12,11 +12,12 @@ through the owner's Codex command rule. Before any other CLI call, run
 `python3 .codex/orchestration/cli.py host-command --project-root <exact-root>`. If its
 `codex_rule` is not `installed`, stop and tell the owner to run `./setup.sh` (Codex
 commands step); do not retry or work around it. Otherwise run every later CLI command as
-exactly its `argv_prefix` (the absolute base interpreter, the isolation flags `-I -B -S`,
-then the absolute `cli.py` of the owner-only runtime copy under the Codex home, never the
-project's own `.codex/orchestration/cli.py`) followed by the subcommand and its
-arguments: one command per call, with no shell compounds (`&&`, `;`,
-pipes, redirections or substitutions) and no environment-variable prefixes. Any other form
+exactly its `argv_prefix` (the absolute base interpreter, the isolation flags
+`-I -B -S -X pycache_prefix=/dev/null`, then the absolute `cli.py` of the owner-only
+runtime copy under the Codex home, never the project's own `.codex/orchestration/cli.py`)
+followed by the subcommand and its arguments: one command per call, with no shell
+compounds (`&&`, `;`, pipes, redirections or substitutions) and no environment-variable
+prefixes. Any other form
 stays sandboxed and fails. Below, every command, named alone or as `cli.py <command>`,
 runs with that prefix. A failure whose `hint` names the Codex sandbox means the prefix was
 not used exactly; one saying the installed runtime differs from its protected copy means

@@ -431,9 +431,17 @@ approvals, and safety comes from redundant layers.
     the project's runtime must pass its manifest digests and match this package's
     recorded collector runtime digest and version (the build `runtime-releases.json`
     records). A project without an install manifest gets neither copy nor rule.
-  - The rule keeps the `[interpreter, -I, -B, -S, cli]` shape and names the copy's
+  - The rule keeps the `[interpreter, isolation flags, cli]` shape and names the copy's
     `cli.py`; its `not_match` examples include the project's own `cli.py`. After the rule
-    names a copy, the project's older copies are removed.
+    names a copy, the project's older copies are removed. The copy holds exactly the
+    manifest's files, the manifest and the binding: any other entry, a `__pycache__`
+    directory included, makes it fail verification.
+  - **No bytecode read.** `-B` only stops Python writing bytecode; CPython 3.14 still
+    loaded a planted timestamp `.pyc` from `__pycache__` beside a module. The isolation
+    flags are now `-I -B -S -X pycache_prefix=/dev/null`, which moves the cache to a
+    prefix that can never hold a file, for the rule, `argv_prefix`, the collector and the
+    deadline watchdog. A rule without the new flag is `stale`, and its `not_match`
+    examples include the old prefix.
   - The copy's CLI reads its binding at start-up: the copy must sit at exactly the path
     the binding implies and its manifest must have the bound digest. Its `BUNDLE_ROOT` is
     the bound project, so the own-root invariant pins `--project-root` and `--root` to the

@@ -14,7 +14,13 @@
     `installed` only when rule, copy and project all match (earlier rules are `stale`),
     and its `argv_prefix` names the copy. New owner command `remove-codex-rule
     --project-root <root>` removes the rule and the copy and prints
-    `{"ready": true, "removed": [...]}`.
+    `{"ready": true, "removed": [...]}` (an empty list when there is nothing, for any
+    project, including one in a temporary folder).
+  - Every Python launched outside the sandbox (the rule's prefix, the collector, the
+    deadline watchdog) adds `-X pycache_prefix=/dev/null`: `-B` only stops writing
+    bytecode, and CPython still loaded a planted `.pyc` from `__pycache__`. Rules without
+    it are `stale`, and a copy holding any file its manifest does not list, bytecode
+    included, fails verification.
   - Git runs from a real binary (Command Line Tools, Xcode or Homebrew on macOS, never
     the `/usr/bin/git` xcrun shim whose cache sits in `$TMPDIR`), with `xcrun_nocache=1`
     for git, provider clients and operational checks.

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 # ruff: noqa: I001 -- tests.support bootstraps the native package import path.
 
+import importlib.util
 import os
+import py_compile
 import stat
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -201,7 +205,7 @@ class PythonLaunchTests(unittest.TestCase):
     """Every Python an allowlisted command starts outside the sandbox is isolated."""
 
     def test_the_collector_and_the_watchdog_start_without_site_packages(self) -> None:
-        self.assertEqual(("-I", "-B", "-S"), PYTHON_ISOLATION_FLAGS)
+        self.assertEqual(("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"), PYTHON_ISOLATION_FLAGS)
         launched: list[list[str]] = []
 
         def record(argv, **options):
@@ -223,7 +227,38 @@ class PythonLaunchTests(unittest.TestCase):
             bridge._start_watchdog(-1, "0.0", 0.0)
         self.assertEqual(2, len(launched))
         for argv in launched:
-            self.assertEqual([sys.executable, "-I", "-B", "-S"], argv[:4])
+            self.assertEqual([sys.executable, *PYTHON_ISOLATION_FLAGS], argv[:6])
+
+
+    def test_a_planted_bytecode_file_never_loads(self) -> None:
+        # -B only stops writing; the pycache prefix stops reading a planted .pyc.
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            (root / "pkg").mkdir()
+            source = root / "pkg" / "mod.py"
+            source.write_text('print("source")\n')
+            planted = root / "planted.py"
+            planted.write_text('print("PLANTED")\n')
+            cache = Path(importlib.util.cache_from_source(str(source)))
+            cache.parent.mkdir()
+            py_compile.compile(str(planted), cfile=str(cache), dfile=str(source))
+            data = bytearray(cache.read_bytes())
+            info = source.stat()
+            # A timestamp .pyc that matches the source is what Python trusts.
+            data[8:16] = struct.pack(
+                "<II", int(info.st_mtime) & 0xFFFFFFFF, info.st_size & 0xFFFFFFFF
+            )
+            cache.write_bytes(bytes(data))
+            program = f"import sys; sys.path.insert(0, {str(root / 'pkg')!r}); import mod"
+
+            def run(*flags: str) -> str:
+                return subprocess.run(
+                    [sys.executable, *flags, "-c", program], capture_output=True,
+                    text=True, check=True, stdin=subprocess.DEVNULL,
+                ).stdout.strip()
+
+            self.assertEqual("PLANTED", run("-I", "-B", "-S"))
+            self.assertEqual("source", run(*PYTHON_ISOLATION_FLAGS))
 
 
 class HostScratchTests(unittest.TestCase):

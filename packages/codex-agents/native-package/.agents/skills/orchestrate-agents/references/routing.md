@@ -110,7 +110,9 @@ digest of the resolved project root. It allows, outside the sandbox and without 
 exactly the resolved base interpreter (never a virtual environment's or a macOS xcrun
 shim, and refused when it or its standard library is in the project, in a temporary
 directory, behind a symlink or writable by another user), the isolation flags
-`-I -B -S`, the absolute `cli.py` of an owner-only copy of the installed runtime, then
+`-I -B -S -X pycache_prefix=/dev/null` (no bytecode written or read: `-B` alone still
+loads a planted `.pyc`), the absolute `cli.py` of an owner-only copy of the installed
+runtime, then
 one of the primary-host subcommands (`PRIMARY_HOST_COMMANDS` in
 `codex_agents/host_commands.py`). The copy lives at
 `${CODEX_HOME:-~/.codex}/agent-orchestration/<12 hex digits>/<manifest SHA-256>/`, next
@@ -139,7 +141,8 @@ index refresh, fsmonitor, filters, diff drivers, hooks, pager, transport or lazy
 and refuse a git directory inside the working tree or in a temporary directory and a
 partial clone, through a real git binary (never the macOS `/usr/bin/git` xcrun shim,
 whose lookup cache sits in `$TMPDIR`); provider clients must resolve outside the project
-and every temporary directory; the collector and watchdog start with `-I -B -S`; bridge
+and every temporary directory; the collector and watchdog start with the same isolation
+flags; bridge
 exports, control
 files and child temporary directories live in an owner-only directory under the per-user
 cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere); operational-check snapshots and

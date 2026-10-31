@@ -22,9 +22,12 @@ from pathlib import Path
 
 # The flags every Python launched outside the sandbox gets: isolated mode (no
 # environment variables, user site-packages or script directory on the path), no
-# bytecode written, and no site-packages at all, so no `.pth` or `sitecustomize`
-# runs. The runtime needs only the standard library and its own package.
-PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S")
+# bytecode written, no site-packages at all, so no `.pth` or `sitecustomize`
+# runs, and no bytecode read: `-B` only stops writing, and CPython still loads a
+# planted timestamp `.pyc` from `__pycache__`, so the cache moves to a prefix
+# that can never hold one. The runtime needs only the standard library and its
+# own package.
+PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
 # Group members may write these on macOS by design (Homebrew, python.org); the group
 # is the administrators, who can already change anything on the machine.
 MACOS_ADMIN_GROUP = 80

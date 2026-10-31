@@ -463,14 +463,41 @@ def runtime_copy_problem(copy: Path, root: Path) -> str | None:
             return "the runtime copy's manifest differs from its name"
         if _manifest_version(copy_manifest) != binding["version"]:
             return "the runtime copy's version differs from its binding"
-        for relative in sorted(_manifest_files(copy_manifest)):
+        files = _manifest_files(copy_manifest)
+        for relative in sorted(files):
             ours = _read_nofollow(copy, relative, MAX_RUNTIME_FILE_BYTES)
             theirs = _read_nofollow(root, relative, MAX_RUNTIME_FILE_BYTES)
             if ours is None or theirs is None or ours != theirs:
                 return "the runtime copy differs from the project's installed files"
+        if _unexpected_entries(copy, {*files, MANIFEST_RELATIVE, BINDING_RELATIVE}):
+            return "the runtime copy holds files it should not, such as bytecode"
     except HostCommandError as exc:
         return str(exc)
     return None
+
+
+def _unexpected_entries(copy: Path, expected: set[str]) -> bool:
+    """Whether the copy holds anything but `expected` files and their directories.
+
+    A `__pycache__` directory, a symlink or any other extra entry counts; the
+    copy is written without bytecode and nothing else may add to it.
+    """
+
+    directories = {
+        PurePosixPath(*PurePosixPath(item).parts[:index]).as_posix()
+        for item in expected
+        for index in range(1, len(PurePosixPath(item).parts))
+    }
+    for current, subdirectories, names in os.walk(copy, followlinks=False):
+        base = Path(current).relative_to(copy)
+        for name in subdirectories:
+            relative = (base / name).as_posix()
+            if os.path.islink(Path(current, name)) or relative not in directories:
+                return True
+        for name in names:
+            if (base / name).as_posix() not in expected or os.path.islink(Path(current, name)):
+                return True
+    return False
 
 
 def argv_prefix(
@@ -520,6 +547,8 @@ def render_rule(
         [python, *PYTHON_FLAGS, relative_cli, "learning-status", "--project-root", str(root)],
         # Without the isolation flags, startup could load code the model wrote.
         [python, prefix[-1], "learning-status", "--project-root", str(root)],
+        # Without the bytecode prefix, a planted `.pyc` beside a module could load.
+        [python, "-I", "-B", "-S", prefix[-1], "learning-status", "--project-root", str(root)],
     ]
     return (
         "# Agent orchestration: Codex command rule for one project.\n"

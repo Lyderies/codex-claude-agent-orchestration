@@ -220,7 +220,7 @@ class RuleTests(unittest.TestCase):
         project_cli_path = str(self.project / ".codex" / "orchestration" / "cli.py")
         # The rule runs the protected copy in Codex home, never the project's CLI.
         cli_path = str(expected_copy(self.codex_home, self.project) / CLI_RELATIVE)
-        self.assertEqual(("-I", "-B", "-S"), PYTHON_FLAGS)
+        self.assertEqual(("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"), PYTHON_FLAGS)
         self.assertEqual(
             [PYTHON, *PYTHON_FLAGS, cli_path, *PRIMARY_HOST_COMMANDS], self.pattern(text)
         )
@@ -229,9 +229,13 @@ class RuleTests(unittest.TestCase):
         )
         self.assertNotIn(f'"{project_cli_path}", "learning-status"', text.split("not_match")[0])
         self.assertIn(
-            f'["{PYTHON}", "-I", "-B", "-S", "{project_cli_path}", "learning-status"',
+            f'["{PYTHON}", "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null", '
+            f'"{project_cli_path}", "learning-status"',
             text.split("not_match")[1],
         )
+        # A rule without the bytecode prefix (as written before) is not this one.
+        self.assertIn(f'["{PYTHON}", "-I", "-B", "-S", "{cli_path}", "learning-status"',
+                      text.split("not_match")[1])
         self.assertEqual(1, text.count("prefix_rule("))
         self.assertIn('    decision = "allow",\n', text)
         self.assertIn("justification = ", text)
@@ -241,7 +245,10 @@ class RuleTests(unittest.TestCase):
         self.assertIn('"learning-status"', match)
         self.assertIn('"learning-register"', not_match)
         self.assertIn('["python3", ".codex/orchestration/cli.py", "learning-status"', not_match)
-        self.assertIn(f'["{PYTHON}", "-I", "-B", "-S", ".codex/orchestration/cli.py"', not_match)
+        self.assertIn(
+            f'["{PYTHON}", "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null", '
+            '".codex/orchestration/cli.py"', not_match,
+        )
         # The isolation flags are part of the match; the bare form stays sandboxed.
         self.assertIn(f'["{PYTHON}", "{cli_path}", "learning-status"', not_match)
         for owner in OWNER_COMMANDS - {"learning-register"}:
@@ -455,6 +462,7 @@ class RuleTests(unittest.TestCase):
             [PYTHON, *PYTHON_FLAGS, ".codex/orchestration/cli.py", "dispatch"],
             [PYTHON, prefix[-1], "dispatch"],
             [PYTHON, "-I", prefix[-1], "dispatch"],
+            [PYTHON, "-I", "-B", "-S", prefix[-1], "dispatch"],
         ):
             self.assertEqual([], check(*argv)["matchedRules"], argv)
 
@@ -539,6 +547,23 @@ class ProtectedCopyTests(unittest.TestCase):
         self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
         # Setup rebuilds a copy that fails verification.
         self.assertEqual("replaced", self.install(replace=True)["runtime_copy_status"])
+        self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
+        # Bytecode, or any other entry the manifest does not list, appears in the copy.
+        for extra in (
+            copy / ".codex" / "orchestration" / "codex_agents" / "__pycache__",
+            copy / ".codex" / "orchestration" / "codex_agents" / "extra.py",
+        ):
+            with self.subTest(extra=extra.name):
+                if extra.suffix:
+                    extra.write_text("")
+                else:
+                    extra.mkdir(mode=0o700)
+                self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+                self.assertIn(
+                    "holds files it should not",
+                    runtime_copy_problem(copy, self.project.resolve()),
+                )
+                host_commands.remove_tree_at(os.open(extra.parent, os.O_RDONLY), extra.name)
         self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
         # The copy disappears.
         host_commands.remove_tree_at(os.open(copy.parent, os.O_RDONLY), copy.name)
@@ -651,6 +676,22 @@ class ProtectedCopyTests(unittest.TestCase):
         shutil.rmtree(self.project / ".codex")
         self.assertEqual(2, len(remove_rule(self.project, self.environ)))
 
+    def test_remove_cleans_up_for_a_temporary_project_too(self) -> None:
+        # Uninstall removes whatever exists, even where no rule may be installed.
+        with mock.patch.object(host_commands, "temp_roots", lambda: {self.base}):
+            self.assertEqual([], remove_rule(self.project, self.environ))
+            self.assertEqual(
+                [], remove_rule(self.base / "never-installed", self.environ)
+            )
+            rules = self.codex_home / "rules"
+            rules.mkdir(parents=True)
+            name = f"agent-orchestration-{project_digest(self.project.resolve())}.rules"
+            (rules / name).write_text("# an older rule\n")
+            self.assertEqual(
+                [str(rules / name)], remove_rule(self.project, self.environ)
+            )
+            self.assertEqual([], remove_rule(self.project, self.environ))
+
 
 @NEEDS_TRUSTED_PYTHON
 class HostCommandCliTests(unittest.TestCase):
@@ -671,7 +712,7 @@ class HostCommandCliTests(unittest.TestCase):
     ) -> dict:
         project = ["--project-root", str(self.project)] if own_project else []
         completed = subprocess.run(
-            [sys.executable, "-I", "-B", "-S", str(cli_path or ORCHESTRATION_ROOT / "cli.py"),
+            [sys.executable, *PYTHON_FLAGS, str(cli_path or ORCHESTRATION_ROOT / "cli.py"),
              *arguments, *project],
             capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
             env={
@@ -773,6 +814,16 @@ class HostCommandCliTests(unittest.TestCase):
         )
         self.assertEqual({"ready": True, "removed": []}, self.run_cli("remove-codex-rule"))
         self.assertEqual("missing", self.run_cli("host-command", expected=1)["codex_rule"])
+        # A project in a temporary folder never gets a rule, but removal still answers.
+        temporary_project = self.base / "temporary-project"
+        temporary_project.mkdir()
+        self.assertEqual(
+            {"ready": True, "removed": []},
+            self.run_cli(
+                "remove-codex-rule", "--project-root", str(temporary_project),
+                own_project=False,
+            ),
+        )
 
     def test_refusals_are_fixed_messages_without_paths(self) -> None:
         self.codex_home.mkdir()
