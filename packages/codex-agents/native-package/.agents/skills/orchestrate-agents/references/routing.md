@@ -421,6 +421,10 @@ Claude to Claude and Codex to Codex.
     rollback. The worktree is removed with `git worktree
     remove --force` and `prune` on every terminal state.
   - Every Git call disables hooks and the filesystem monitor, lazy fetch and
-    replacement objects, and uses literal pathspecs. A refused integration is not
+    replacement objects, reads attributes from the empty tree (`--attr-source`, so Git
+    2.44 or later is required) with no global attributes file, and uses literal
+    pathspecs. Commands that write an index run with an empty private work tree and an
+    index whose timestamp is zero, so Git never re-reads a racily clean file through a
+    filter that `info/attributes` could still select. A refused integration is not
     retried automatically: re-plan the task with fresh verification.
 

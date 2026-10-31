@@ -106,7 +106,7 @@ def _git(
     }
     try:
         return subprocess.run(
-            [executable, "--literal-pathspecs", "-C", str(root), *workspace._GIT_HARDENING,
+            [executable, "--literal-pathspecs", "-C", str(root), *workspace.git_hardening(root),
              *arguments],
             env=environment,
             input=stdin,
@@ -286,7 +286,34 @@ def _private_parent(root: Path) -> Path:
     if private.is_relative_to(root) or root.is_relative_to(private):
         shutil.rmtree(private, ignore_errors=True)
         raise IntegrationRefused("write_worktree_inside_repository")
+    os.mkdir(private / "empty", 0o700)
     return private
+
+
+def _no_work_tree(private: Path, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Environment for a command that writes an index: an empty private work tree.
+
+    Writing an index re-checks racily clean entries against their files,
+    which would run the repository's clean or process filter. With an empty
+    work tree there is no file to read, so the entry is only marked for a
+    later re-check.
+    """
+
+    return {"GIT_WORK_TREE": str(private / "empty"), **(extra or {})}
+
+
+def _disarm_racy_check(index: Path) -> None:
+    """Give an index file the zero timestamp, which turns off Git's racy-entry re-check.
+
+    Git compares a racily clean entry's file content when it writes an index
+    read from a file at least as new as that entry; it skips the comparison
+    when the index's own timestamp is zero. Without this, writing a copy of
+    the primary's index would hash files through the repository's clean or
+    process filter (`info/attributes` still selects one under
+    `--attr-source`).
+    """
+
+    os.utime(index, (0, 0), follow_symlinks=False)
 
 
 def remove_worktree(root: Path, private: Path) -> None:
@@ -297,10 +324,10 @@ def remove_worktree(root: Path, private: Path) -> None:
 
     with deferred_signals():
         tree = private / "tree"
-        with contextlib.suppress(IntegrationRefused):
+        with contextlib.suppress(IntegrationRefused, WorkspaceRefused):
             _git(root, "worktree", "remove", "--force", "--force", str(tree))
         shutil.rmtree(private, ignore_errors=True)
-        with contextlib.suppress(IntegrationRefused):
+        with contextlib.suppress(IntegrationRefused, WorkspaceRefused):
             _git(root, "worktree", "prune")
 
 
@@ -374,7 +401,7 @@ def _prepare_worktree(root: Path, private: Path, source: str, object_format: str
         raise IntegrationRefused("write_worktree_failed")
     tree = Path(os.path.realpath(tree))
     # The worktree's own index, read from the tree object: no working-tree file is read.
-    if _git(tree, "read-tree", source).returncode != 0:
+    if _git(tree, "read-tree", source, extra_env=_no_work_tree(private)).returncode != 0:
         raise IntegrationRefused("write_worktree_failed")
     _materialize(root, tree, source, object_format)
     return tree
@@ -427,16 +454,18 @@ def _commit_tree(
     """
 
     source = patch["source_commit"]
-    index = {"GIT_INDEX_FILE": str(private / "commit-index")}
+    index = _no_work_tree(private, {"GIT_INDEX_FILE": str(private / "commit-index")})
     if _git(tree, "read-tree", source, extra_env=index).returncode != 0:
         raise IntegrationRefused("write_commit_failed")
     blobs = _write_blobs(tree, decoded, object_format)
+    _disarm_racy_check(private / "commit-index")
     staged = _git(
         tree, "update-index", "-z", "--index-info",
         stdin=_index_lines(decoded, "0" * len(source), blobs), extra_env=index,
     )
     if staged.returncode != 0:
         raise IntegrationRefused("write_commit_failed")
+    _disarm_racy_check(private / "commit-index")
     tree_id = _output(_git(tree, "write-tree", extra_env=index))
     name, email = identity
     people = {
@@ -451,7 +480,7 @@ def _commit_tree(
     if not workspace._hex(commit, (len(source),)):
         raise IntegrationRefused("write_commit_failed")
     if (
-        _git(tree, "read-tree", commit).returncode != 0
+        _git(tree, "read-tree", commit, extra_env=_no_work_tree(private)).returncode != 0
         or _git(tree, "update-ref", "--no-deref", "HEAD", commit, source).returncode != 0
     ):
         raise IntegrationRefused("write_commit_failed")
@@ -848,6 +877,7 @@ def _promote(
     object_format: str,
     facts: dict[str, Any],
     identity: tuple[str, str],
+    private: Path,
 ) -> None:
     """Fast-forward the primary by hand, under Git's own locks; roll back on any failure.
 
@@ -896,10 +926,11 @@ def _promote(
         index_installed = False
         try:
             index_temporary = _private_index(gitdir, old_index)
+            _disarm_racy_check(index_temporary)
             staged = _git(
                 root, "-c", "core.splitIndex=false", "update-index", "-z", "--index-info",
                 stdin=_index_lines(decoded, "0" * len(source), blobs),
-                extra_env={"GIT_INDEX_FILE": str(index_temporary)},
+                extra_env=_no_work_tree(private, {"GIT_INDEX_FILE": str(index_temporary)}),
             )
             if staged.returncode != 0:
                 raise IntegrationRefused("write_promotion_failed")
@@ -1189,7 +1220,7 @@ def _integrate_locked(
         critical.enter_context(deferred_signals())
         _promote(
             ledger, project_id, root, target, patch, decoded, blobs, object_format, facts,
-            identity,
+            identity, private,
         )
         return report
     finally:

@@ -345,20 +345,60 @@ class WriteIntegrationTests(WriteVerificationTests):
             ("diff.external", f"sh -c 'touch {base}/marker-diff'"),
         ):
             git_out(self.project, "config", key, value)
+        # The repository's own attributes file, which `--attr-source` does not replace.
+        (self.project / ".git/info").mkdir(exist_ok=True)
+        (self.project / ".git/info/attributes").write_text("* filter=evil diff=evil\n")
+
+    def force_reread(self) -> None:
+        """Make every index entry racily clean, so writing an index re-reads its file.
+
+        File times move into the future and the index is refreshed before the
+        filters are configured; the content does not change. Writing any
+        index from this one then compares the files' content, as Linux timing
+        made Git do in CI.
+        """
+
+        future = time.time() + 3600
+        for path in self.project.rglob("*"):
+            if ".git" not in path.relative_to(self.project).parts and path.is_file():
+                os.utime(path, (future, future))
+        git_out(self.project, "update-index", "-q", "--refresh")
 
     def commit_attributes(self) -> None:
         (self.project / ".gitattributes").write_text("* filter=evil\n")
         git_out(self.project, "add", ".gitattributes")
         git_out(self.project, "commit", "-qm", "attributes")
 
+    def checks_without_markers(self):
+        checks = self.checks()
+
+        def run(root: Path) -> dict:
+            # Nothing ran while the disposable worktree was prepared.
+            self.assertEqual([], self.markers())
+            return checks(root)
+        return run
+
     def test_repository_filters_and_monitor_never_run(self) -> None:
         self.commit_attributes()
         binding = self.accepted()
         self.poison()
-        record = self.integrate(binding)["write_integration"]
+        record = self.integrate(binding, checks=self.checks_without_markers())["write_integration"]
         self.assertEqual([], self.markers())
         self.assertEqual(("integrated", None), (record["outcome"], record["reason"]))
         self.assertEqual("new\n", (self.project / "src/new.py").read_text())
+        self.assert_clean_up()
+
+    def test_racily_clean_entries_never_run_repository_filters(self) -> None:
+        # The CI failure on Linux: writing the promoted index re-read racily
+        # clean files through the repository's process filter.
+        self.commit_attributes()
+        binding = self.accepted()
+        self.force_reread()
+        self.poison()
+        record = self.integrate(binding, checks=self.checks_without_markers())["write_integration"]
+        self.assertEqual([], self.markers())
+        self.assertEqual(("integrated", None), (record["outcome"], record["reason"]))
+        self.assertEqual("print('changed')\n", (self.project / "src/app.py").read_text())
         self.assert_clean_up()
 
     def test_merge_options_cannot_turn_promotion_into_a_squash(self) -> None:
@@ -425,6 +465,7 @@ class WriteIntegrationTests(WriteVerificationTests):
         self.approve_checks()
         self.commit_attributes()
         binding = self.accepted()
+        self.force_reread()
         self.poison()
         record = self.integrate_with_default_checks(binding)["write_integration"]
         self.assertEqual([], self.markers())

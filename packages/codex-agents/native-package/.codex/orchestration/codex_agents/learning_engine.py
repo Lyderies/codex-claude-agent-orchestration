@@ -2033,7 +2033,7 @@ def load_operational_check_configuration(
         "GIT_LITERAL_PATHSPECS": "1",
     }
     git_prefix = [git_executable, "--literal-pathspecs", "-C", str(root),
-                  *_hardened_git_options(git_executable, git_environment)]
+                  *_hardened_git_options(git_executable, git_environment, root)]
 
     def git(*arguments: str, text: bool = True, capture: bool = True):
         return subprocess.run(
@@ -2107,25 +2107,55 @@ def load_operational_check_configuration(
 _GIT_LAZY_FETCH_SUPPORTED: bool | None = None
 
 
-def _hardened_git_options(git_executable: str, environment: dict[str, str]) -> list[str]:
-    """The global options that keep repository-side Git machinery from running."""
+def _hardened_git_options(
+    git_executable: str, environment: dict[str, str], root: Path
+) -> list[str]:
+    """The global options that keep repository-side Git machinery from running.
+
+    Attributes are read from the empty tree of the repository's object
+    format (`--attr-source`, Git 2.40) and the global attributes file is
+    `/dev/null`, so no filter, eol conversion or diff driver can be selected.
+    A Git without `--attr-source` is refused.
+    """
 
     global _GIT_LAZY_FETCH_SUPPORTED
-    if _GIT_LAZY_FETCH_SUPPORTED is None:
-        try:
-            probe = subprocess.run(
-                [git_executable, "--no-lazy-fetch", "version"],
-                env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=60, check=False,
-            )
-            _GIT_LAZY_FETCH_SUPPORTED = probe.returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            _GIT_LAZY_FETCH_SUPPORTED = False
-    return [
-        *(["--no-lazy-fetch"] if _GIT_LAZY_FETCH_SUPPORTED else []),
+    base = [
         "--no-replace-objects",
         "-c", "core.hooksPath=/dev/null",
         "-c", "core.fsmonitor=false",
+        "-c", "core.attributesFile=/dev/null",
+    ]
+
+    def run(*arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [git_executable, *arguments], env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60,
+            check=False,
+        )
+
+    empty_trees = {
+        "sha1": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "sha256": "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+    }
+    try:
+        if _GIT_LAZY_FETCH_SUPPORTED is None:
+            _GIT_LAZY_FETCH_SUPPORTED = run("--no-lazy-fetch", "version").returncode == 0
+        if run(f"--attr-source={empty_trees['sha1']}", "version").returncode != 0:
+            raise ContractError("operational check configuration trust is unavailable")
+        repository = run("-C", str(root), *base, "rev-parse", "--git-dir")
+        found = run("-C", str(root), *base, "rev-parse", "--show-object-format")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ContractError("operational check configuration trust is unavailable") from exc
+    if repository.returncode != 0:
+        # The configuration cannot be committed outside a repository.
+        raise ContractError("operational check configuration is not committed and clean")
+    object_format = found.stdout.strip() if found.returncode == 0 else ""
+    if object_format not in empty_trees:
+        raise ContractError("operational check configuration trust is unavailable")
+    return [
+        *(["--no-lazy-fetch"] if _GIT_LAZY_FETCH_SUPPORTED else []),
+        *base,
+        f"--attr-source={empty_trees[object_format]}",
     ]
 
 
