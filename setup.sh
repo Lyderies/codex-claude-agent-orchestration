@@ -2027,7 +2027,9 @@ verify_rule() {
     *)
       list_add fail "Could not check the Codex commands rule"
       list_sub "The installed orchestrator may be older than this check. Update the install, then verify again."
-      mark_step 8 fail "not checked"; FAILED_ANY=1;;
+      mark_step 8 fail "not checked"
+      LAST_RC=1
+      record_failure "Could not check the Codex commands rule" "update the install, then verify again";;
   esac
 }
 
@@ -2037,9 +2039,11 @@ verify_rule() {
 step_verify_only() {
   while :; do
     begin_step 4
+    # Each attempt replaces the last one's failures, so a saved summary shows only what is left.
+    FAILED_ANY=0; FAIL_SUMMARY=""
     render
     if verify_install; then
-      mark_step 4 ok "verified"; FAILED_ANY=0
+      mark_step 4 ok "verified"
     elif [ "$VERIFY_LIMITED" -eq 1 ]; then
       mark_step 4 ok "not ready on Linux (known limitation)"
     else
@@ -2056,7 +2060,7 @@ step_verify_only() {
   pause
 }
 
-step_done() {
+summary_screen() {
   local i s label line shown
   begin_step 9
   mark_step 9 ok "finished"
@@ -2103,17 +2107,24 @@ step_done() {
     list_plain " - The Codex commands rule is outside the project. To undo it, delete:"
     list_cmd "$(printf '%q' "$RULE_FILE")"
   fi
-  if [ "$FAILED_ANY" -eq 1 ] && [ -n "$FAIL_SUMMARY" ]; then
-    menu 0 "Exit" "Save a summary of what failed" "Back to the main menu"
-    case $MENU_IDX in
-      1) save_summary;;
-      2) GO_BACK=1;;
-    esac
-    show_cursor
-    return 0
-  fi
-  menu 0 "Exit" "Back to the main menu"
-  [ "$MENU_IDX" -eq 1 ] && GO_BACK=1
+}
+
+# The final screen: Exit, Save a summary (then the screen comes back), or Back to the menu.
+step_done() {
+  while :; do
+    summary_screen
+    if [ "$FAILED_ANY" -eq 1 ] && [ -n "$FAIL_SUMMARY" ]; then
+      menu 0 "Exit" "Save a summary of what failed" "Back to the main menu"
+      case $MENU_IDX in
+        1) save_summary; continue;;
+        2) GO_BACK=1;;
+      esac
+    else
+      menu 0 "Exit" "Back to the main menu"
+      [ "$MENU_IDX" -eq 1 ] && GO_BACK=1
+    fi
+    break
+  done
   show_cursor
   printf '\n'
 }
@@ -2125,6 +2136,21 @@ skip_rest() { # skip_rest REASON : mark collector, billing, profile and commands
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# reset_attempt : every per-project and per-attempt value goes back to its starting value, so
+# nothing from one project or mode (a rule, a commit state, provider choices) reaches the next.
+reset_attempt() {
+  local n
+  for n in 2 3 4 5 6 7 8 9; do STAT[$n]=""; NOTE[$n]=""; done
+  FAILED_ANY=0; FAIL_SUMMARY=""; FAIL_REASON=""; INSTALL_FAILED=0
+  MODE=full; INSTALL_EXISTS=0
+  PROFILE_WANTED=0; PROFILE_READY=0; CODEX_PRIMARY=0
+  RULE_FILE=""; RULE_READY=0; RULE_EXISTS=0; RULE_STATUS=""; TEMP_PROJECT=0
+  ROUTING_CONTENT=""; ROUTING_WRITE=0; INSTALL_OPTS=(); PREVIEW_FILE=""
+  CH_CODEX=on; CH_CLAUDE=on; CH_MODELS=""; CH_BRIDGE=off
+  PLAN_TEXT=""; COMMIT_PATHS=(); COMMIT_STATE=""; UNCOMMITTED=""; VERIFY_LIMITED=0
+  CODEX_CMD=""; CODEX_WHY=""
+}
+
 main() {
   local start=${1:-$PWD} n
   setup_colors
@@ -2133,9 +2159,7 @@ main() {
   step_checks
   while :; do
     GO_BACK=0
-    # A fresh pass starts from clean results, so the summary describes the last attempt only.
-    for n in 2 3 4 5 6 7 8 9; do STAT[$n]=""; NOTE[$n]=""; done
-    FAILED_ANY=0; FAIL_SUMMARY=""
+    reset_attempt
     step_project "$start"
     start=$PROJECT
     case "$MODE" in

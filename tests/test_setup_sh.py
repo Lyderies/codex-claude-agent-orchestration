@@ -918,7 +918,9 @@ class WizardTerminalTests(unittest.TestCase):
         destination = self.base / "summary.txt"
         self.send(f"{destination}\r")
         self.expect("Saved a summary")
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
         saved = destination.read_text()
         self.assertIn("exit code 2", saved)
@@ -1045,7 +1047,9 @@ class WizardTerminalTests(unittest.TestCase):
                       re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.send("\r")
         self.expect("Saved a summary")
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
         self.assertTrue((self.home / "agent-orchestration-setup-summary.txt").is_file())
         self.assertFalse((project / "agent-orchestration-setup-summary.txt").exists())
@@ -1061,7 +1065,9 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.send("\x1b[B\r")  # save it here anyway
         self.expect("Saved a summary")
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
         self.assertTrue(destination.is_file())
 
@@ -1073,7 +1079,9 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("control character")
         self.assertFalse(any(self.base.glob("sum*mary.txt")))
         self.assertFalse(destination.exists())
-        self.send("\r")
+        self.send("\r")  # Continue: saving a summary does not end the wizard
+        self.expect("Back to the main menu")
+        self.send("\r")  # Exit
         self.assertEqual(self.finish(), 0)
 
     def to_failed_billing(self, fails: int) -> None:
@@ -1213,12 +1221,63 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Continue")
         self.send("\r")
         self.expect("Back to the main menu")  # the final summary
+        self.settle()
+        self.assertNotIn("Save a summary of what failed", self.screen)  # the old failures are gone
         self.send("\x1b[B\r")
         self.expect("Project path")
         self.send("\r")
         self.expect("Update the install")
         self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
         self.expect("Stopped.")
+        self.assertEqual(self.finish(), 0)
+
+    def test_going_back_does_not_leak_the_last_attempts_choices_into_the_next(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_ATTEST": str(self.base / "attest.count"), "FAKE_ATTEST_FAILS": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        self.expect("fresh install is possible")
+        self.send("\r")
+        self.expect("Codex children")
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B \r")  # also turn on bridging to Claude
+        self.expect("Looks right")
+        self.send("\r")
+        self.expect("Install now")
+        self.send("\r")
+        self.expect("Commit now")
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 1")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("Try again")
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\r")  # a different mode: attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("attest.py ran")
+        self.send("\r")
+        self.expect("Back to the main menu")
+        self.settle()
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        # This attempt never chose bridging, so the earlier attempt's profile choice must be gone.
+        self.assertIn("bridging was not chosen", plain.replace("\r\n", " "))
+        self.assertNotIn("orchestrator profile is missing", plain.replace("\r\n", " "))
+        self.send("\r")
         self.assertEqual(self.finish(), 0)
 
     def test_linux_warns_that_operational_checks_need_macos(self) -> None:

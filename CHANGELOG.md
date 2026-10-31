@@ -7,7 +7,8 @@
   signing and the passphrase change (other failures still stop). In `setup.sh`, no failed step
   ends the wizard: after a failure the choices are Try again, Back to the main menu (the
   project menu) or Quit, the final summary also offers Back to the main menu, and only Exit or
-  Quit ends the script.
+  Quit ends the script. Saving a summary returns to the final menu, and going back starts the
+  next attempt from a clean state.
 - **Setup wizard polish.**
   - The commit step lists and commits only files that really changed; with none it says
     "Nothing to commit" and skips the question. An existing install is described as an update.

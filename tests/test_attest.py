@@ -29,6 +29,36 @@ PRIVATE_HEAD = "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETBODY\n"
 COMMENT = "someone@example.invalid"
 
 
+def _finish_child(pid: int, fd: int) -> int:
+    """Reap a pty child, killing it if it is still alive after a few seconds; close the pty.
+
+    Safe to call twice. A child that is stuck (for example a prompt that never comes) is
+    terminated, so a regression fails the test instead of hanging it.
+    """
+
+    import time
+
+    status = 0
+    end = time.time() + 5
+    try:
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.time() > end:
+                os.kill(pid, signal.SIGKILL)
+                _, status = os.waitpid(pid, 0)
+                break
+            time.sleep(0.05)
+    except (ChildProcessError, ProcessLookupError, OSError):
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return status
+
+
 def write_key(path: Path) -> None:
     path.write_text(PRIVATE_HEAD)
     path.chmod(0o600)
@@ -325,7 +355,7 @@ class AttestTests(unittest.TestCase):
         self.configure_key()
         self.world.change_rc = 1
         self.assertEqual(self.run_main([], change=True), 1)
-        self.assertIn("was not changed", self.output)
+        self.assertIn("may or may not have changed", self.output)  # not a known wrong passphrase
         self.world.change_rc = 0
         self.world.passphrase_changes.clear()
         self.world.derived = "ssh-ed25519 AAAAother\n"
@@ -408,8 +438,10 @@ class AttestTests(unittest.TestCase):
             if command[0] == "/usr/bin/ssh-keygen" and state["left"] > 0 and matcher(command):
                 state["left"] -= 1
                 self.world.calls.append([str(c) for c in command])
-                return subprocess.CompletedProcess(
-                    command, 255, "", "Load key: incorrect passphrase supplied to decrypt private key")
+                key = command[command.index("-f") + 1]
+                text = (f"Failed to load key {key}: {attest.WRONG_TEXT}" if command[1] == "-p"
+                        else f'Load key "{key}": {attest.WRONG_TEXT}')
+                return subprocess.CompletedProcess(command, 255, "", text + "\n")
             return real(command, **kwargs)
 
         self.world.run = run
@@ -423,6 +455,50 @@ class AttestTests(unittest.TestCase):
         self.scripted_failures(lambda c: c[1] == "-p", 1)
         self.assertEqual(self.run_main(["e"], change=True), 1)
         self.assertIn("was not changed", self.output)  # -p failed before writing anything
+
+    def test_only_the_exact_diagnostic_for_this_key_counts_as_a_wrong_passphrase(self) -> None:
+        key = Path("/keys/key")
+        odd = Path("/keys/incorrect passphrase")
+
+        def result(text: str, code: int = 255):
+            return subprocess.CompletedProcess(["x"], code, "", text)
+
+        load = f'Load key "{key}": {attest.WRONG_TEXT}'
+        change = f"Failed to load key {key}: {attest.WRONG_TEXT}"
+        self.assertTrue(attest.wrong_passphrase(result(load + "\n"), key, "load"))
+        self.assertTrue(attest.wrong_passphrase(result(change + "\n"), key, "change"))
+        self.assertFalse(attest.wrong_passphrase(result(load, 0), key, "load"))  # success
+        self.assertFalse(attest.wrong_passphrase(result(load), key, "change"))  # other operation
+        self.assertFalse(attest.wrong_passphrase(result(change), key, "load"))
+        self.assertFalse(attest.wrong_passphrase(result(load), Path("/other/key"), "load"))  # other path
+        self.assertFalse(attest.wrong_passphrase(result(""), key, "load"))
+        # A path that contains the phrase, with an unrelated failure: never a wrong passphrase.
+        for text in (f'Saving key "{odd}" failed: No space left on device',
+                     f'Failed to save key {odd}: incorrect passphrase supplied to decrypt private key',
+                     f'Load key "{odd}": No such file or directory'):
+            with self.subTest(text=text):
+                self.assertFalse(attest.wrong_passphrase(result(text), odd, "load"))
+                self.assertFalse(attest.wrong_passphrase(result(text), odd, "change"))
+        # Extra lines (for example a save failure after a load) make it a different failure.
+        self.assertFalse(attest.wrong_passphrase(
+            result(change + f'\nSaving key "{key}" failed: No space left on device'), key, "change"))
+
+    def test_a_save_failure_in_p_is_never_retried(self) -> None:
+        key = self.configure_key()
+        real = self.world.run
+
+        def save_failure(command, **kwargs):
+            if command[0] == "/usr/bin/ssh-keygen" and command[1] == "-p":
+                self.world.passphrase_changes.append([str(c) for c in command])
+                return subprocess.CompletedProcess(
+                    command, 255, "", f'Saving key "{key}" failed: No space left on device\n')
+            return real(command, **kwargs)
+
+        self.world.run = save_failure
+        self.assertEqual(self.run_main(["t", "t"], change=True), 1)
+        self.assertEqual(len(self.world.passphrase_changes), 1)  # one attempt, no retry prompt
+        self.assertNotIn("That passphrase did not unlock the key.", self.output)
+        self.assertIn("may or may not have changed", self.output)
 
     def test_wrong_passphrase_in_the_post_check_retries_that_check_only(self) -> None:
         self.configure_key()
@@ -798,6 +874,7 @@ class RealTerminalTests(unittest.TestCase):
         pid, fd = pty.fork()
         if pid == 0:
             os.execve(sys.executable, command, env)
+        self.addCleanup(_finish_child, pid, fd)
         transcript = ""
         sent = False
         start = time.time()
@@ -822,11 +899,7 @@ class RealTerminalTests(unittest.TestCase):
                 time.sleep(0.3)
                 os.write(fd, (secret + "\r").encode())
                 sent = True
-        try:
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
-        os.close(fd)
+        _finish_child(pid, fd)
         self.assertTrue(sent or break_echo, transcript)
         return transcript
 
@@ -899,6 +972,7 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         if pid == 0:
             os.execve(sys.executable, [sys.executable, str(_SCRIPT), "--target", str(self.project),
                                        "--state-root", str(self.state)], env)
+        self.addCleanup(_finish_child, pid, fd)
         transcript = buffer = ""
         steps = list(script)
         end = time.time() + 40
@@ -919,8 +993,7 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
                 buffer = buffer[buffer.index(expected) + len(expected):]
                 time.sleep(0.3)
                 os.write(fd, (answer + "\r").encode())
-        _, status = os.waitpid(pid, 0)
-        os.close(fd)
+        status = _finish_child(pid, fd)
         self.assertEqual(steps, [], f"never saw the prompts for {steps}: {transcript}")
         return transcript, os.WEXITSTATUS(status)
 
