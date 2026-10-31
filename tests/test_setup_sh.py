@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SETUP = ROOT / "setup.sh"
+ORCHESTRATION = ROOT / "packages" / "codex-agents" / "native-package" / ".codex" / "orchestration"
+POLICY = ORCHESTRATION / "config" / "routing-policy.json"
+
+# Constructs that bash 3.2 (macOS) does not support.
+FORBIDDEN = {
+    "associative array": r"(declare|local|typeset)\s+-[a-zA-Z]*A\b",
+    "case-conversion expansion": r"\$\{[A-Za-z_][A-Za-z_0-9]*(,,|\^\^|,|\^)\}",
+    "mapfile": r"\bmapfile\b",
+    "readarray": r"\breadarray\b",
+    "read -i": r"\bread\b[^\n]*\s-[a-zA-Z]*i\s",
+    "fractional read timeout": r"\bread\b[^\n]*-t\s+0?\.\d",
+    "&>> redirect": r"&>>",
+    "negative substring offset": r"\$\{[A-Za-z_]+:\s+-\d",
+    "coproc": r"\bcoproc\b",
+    "|& pipe": r"\|&",
+}
+
+VALIDATE = (
+    "import json, sys, tempfile\n"
+    "from pathlib import Path\n"
+    "from codex_agents.routing import load_policy, validate_provider_routing\n"
+    "raw = sys.stdin.buffer.read()\n"
+    "policy = load_policy(Path(sys.argv[1]))\n"
+    "with tempfile.TemporaryDirectory() as directory:\n"
+    "    config = validate_provider_routing(Path(directory), raw, policy)\n"
+    "print(json.dumps(config, sort_keys=True))\n"
+)
+
+
+TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789SECRETTOKEN"
+
+
+def write_routing(project: Path, codex: str = "on", claude: str = "on",
+                  models: str = "claude-opus-5-5", bridge: str = "off") -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(SETUP), "--write-provider-routing", str(project), codex, claude, models, bridge],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+
+
+def routing(*choices: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(SETUP), "--print-provider-routing", *choices],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+
+
+class SetupScriptTests(unittest.TestCase):
+    def test_syntax(self) -> None:
+        for shell in ("bash", "/bin/bash"):
+            if shutil.which(shell) or Path(shell).exists():
+                result = subprocess.run([shell, "-n", str(SETUP)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_no_bash_4_constructs(self) -> None:
+        lines = SETUP.read_text(encoding="utf-8").splitlines()
+        for name, pattern in FORBIDDEN.items():
+            for number, line in enumerate(lines, 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                with self.subTest(construct=name, line=number):
+                    self.assertIsNone(re.search(pattern, line), f"{name}: {line.strip()}")
+
+    @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck is not installed")
+    def test_shellcheck(self) -> None:
+        result = subprocess.run(
+            ["shellcheck", "-S", "warning", "-e", "SC2034,SC2155,SC2162,SC2086,SC2206,SC2207,SC2178",
+             str(SETUP)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_refuses_without_a_terminal(self) -> None:
+        result = subprocess.run(["bash", str(SETUP)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must run in a terminal", result.stderr)
+        self.assertIn("human step", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_provider_routing_matches_the_router_validator(self) -> None:
+        models = "claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5"
+        cases = [
+            ("on", "on", models, "off"),
+            ("on", "on", "claude-haiku-5-5", "on"),
+            ("on", "off", "-", "off"),
+            ("off", "on", "claude-sonnet-5-5,claude-opus-5-5", "off"),
+        ]
+        env = dict(os.environ, PYTHONPATH=str(ORCHESTRATION))
+        for case in cases:
+            with self.subTest(case=case):
+                made = routing(*case)
+                self.assertEqual(made.returncode, 0, made.stderr)
+                checked = subprocess.run(
+                    [sys.executable, "-c", VALIDATE, str(POLICY)],
+                    input=made.stdout, capture_output=True, text=True, env=env,
+                )
+                self.assertEqual(checked.returncode, 0, checked.stderr)
+                import json
+                config = json.loads(made.stdout)
+                self.assertEqual(config["providers"]["codex"]["enabled"], case[0] == "on")
+                self.assertEqual(config["providers"]["claude"]["enabled"], case[1] == "on")
+                self.assertEqual(config["codex_primary_may_bridge_to_claude"], case[3] == "on")
+                if case[1] == "on":
+                    self.assertEqual(config["providers"]["claude"]["models"], case[2].split(","))
+                else:
+                    self.assertNotIn("models", config["providers"]["claude"])
+
+    def test_invalid_provider_choices_are_rejected(self) -> None:
+        for case in (
+            ("off", "off", "-", "off"),
+            ("on", "on", "-", "off"),
+            ("on", "off", "-", "on"),
+            ("on", "on", "bad model", "off"),
+            ("maybe", "on", "claude-haiku-5-5", "off"),
+        ):
+            with self.subTest(case=case):
+                result = routing(*case)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_hook_requires_four_choices(self) -> None:
+        result = routing("on", "on")
+        self.assertEqual(result.returncode, 2)
+
+    def test_symlinked_routing_destination_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            (project / ".codex" / "orchestration").mkdir(parents=True)
+            victim = base / "victim"
+            victim.write_text("precious\n")
+            link = project / ".codex" / "orchestration" / "provider-routing.json"
+            link.symlink_to(victim)
+            result = write_routing(project)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(victim.read_text(), "precious\n")
+            self.assertTrue(link.is_symlink())
+            # A symlinked parent directory is refused too.
+            other = base / "other"
+            (other / "orchestration").mkdir(parents=True)
+            linked = base / "linked"
+            (linked).mkdir()
+            (linked / ".codex").symlink_to(other)
+            result = write_routing(linked)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(list((other / "orchestration").iterdir()), [])
+
+    def test_routing_is_written_atomically_without_leftovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            target = project / ".codex" / "orchestration"
+            target.mkdir(parents=True)
+            self.assertEqual(write_routing(project).returncode, 0)
+            self.assertEqual(
+                [p.name for p in target.iterdir()], ["provider-routing.json"])
+            self.assertTrue((target / "provider-routing.json").read_text().startswith("{"))
+            # Replacing a regular file works.
+            self.assertEqual(write_routing(project, "off", "on", "claude-haiku-5-5").returncode, 0)
+            self.assertIn("claude-haiku-5-5", (target / "provider-routing.json").read_text())
+
+
+@unittest.skipUnless(sys.platform != "win32", "needs a pseudo-terminal")
+class WizardTerminalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(os.path.realpath(self._tmp.name))
+        self.fakes = self.base / "bin"
+        self.fakes.mkdir()
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.tmpdir = self.base / "tmp"
+        self.tmpdir.mkdir()
+        (self.fakes / "codex").write_text("#!/bin/sh\nexit 0\n")
+        (self.fakes / "claude").write_text(
+            '#!/bin/sh\necho \'{"loggedIn": true, "subscriptionType": "max", "authMethod": "x"}\'\n')
+        self.py_log = self.base / "python.log"
+        self.slow_pid = self.base / "slow.pid"
+        (self.fakes / "python3").write_text(
+            "#!/bin/sh\n"
+            f'echo "$PYTHONDONTWRITEBYTECODE" >> "{self.py_log}"\n'
+            'if [ -n "$FAKE_FAIL" ]; then case "$*" in *install.py*--apply*)'
+            ' echo \'{"error": "boom ' + TOKEN + ' user@example.invalid"}\'; echo ' + TOKEN + ' >&2; exit 2;; esac; fi\n'
+            f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
+            f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
+            f'exec "{sys.executable}" "$@"\n')
+        for fake in self.fakes.iterdir():
+            fake.chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR", "PYTHONDONTWRITEBYTECODE")}
+        self.env.update(
+            PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
+            TMPDIR=str(self.tmpdir), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+            GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+            GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        self.pid = 0
+        self.fd = -1
+        self.screen = ""
+        self.transcript = ""
+
+    def start(self, cwd: Path, extra_env: dict | None = None) -> None:
+        import fcntl
+        import pty
+        import struct
+        import termios
+
+        env = dict(self.env, **(extra_env or {}))
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.chdir(cwd)
+            os.execvpe("bash", ["bash", str(SETUP)], env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        self.addCleanup(self._reap)
+
+    def _reap(self) -> None:
+        if self.pid:
+            self._kill_and_wait()
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def _kill_and_wait(self) -> None:
+        try:
+            os.kill(self.pid, 9)
+        except OSError:
+            pass
+        end = time.time() + 5
+        while time.time() < end:
+            try:
+                done, _ = os.waitpid(self.pid, os.WNOHANG)
+            except OSError:
+                return
+            if done:
+                return
+            time.sleep(0.05)
+
+    def expect(self, text: str, timeout: float = 25.0) -> None:
+        import select
+
+        end = time.time() + timeout
+        while time.time() < end:
+            if text in self.screen:
+                return
+            ready, _, _ = select.select([self.fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(self.fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self.screen += chunk.decode(errors="replace")
+                self.transcript += chunk.decode(errors="replace")
+        self.fail(f"never saw {text!r}; last screen: {re.sub(chr(27) + r'.*?[A-Za-z]', '', self.screen[-1500:])!r}")
+
+    def send(self, data: str) -> None:
+        self.screen = ""
+        os.write(self.fd, data.encode())
+
+    def finish(self, timeout: float = 10.0) -> int:
+        end = time.time() + timeout
+        import select
+
+        while time.time() < end:
+            done, status = os.waitpid(self.pid, os.WNOHANG)
+            if done:
+                self.pid = 0
+                return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
+            # Drain the terminal so the wizard never blocks on a full pty buffer.
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(self.fd, 65536).decode(errors="replace")
+                    self.screen += chunk
+                    self.transcript += chunk
+                except OSError:
+                    time.sleep(0.1)
+        self.fail("the wizard did not exit")
+
+    def make_project(self, name: str = "project") -> tuple[Path, Path]:
+        project = self.base / name
+        project.mkdir()
+        subprocess.run(["git", "init", "-q", str(project)], check=True, env=self.env)
+        (project / "qa-check").write_text("#!/usr/bin/python3\nprint(1)\n")
+        (project / "qa-check").chmod(0o700)
+        subprocess.run(["git", "-C", str(project), "add", "."], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "init"], check=True, env=self.env)
+        import hashlib
+        import json
+        interpreter = hashlib.sha256(Path("/usr/bin/python3").read_bytes()).hexdigest()
+        check = {
+            "driver": "python-wrapper", "argv": ["./qa-check"],
+            "executable_sha256": hashlib.sha256((project / "qa-check").read_bytes()).hexdigest(),
+            "interpreter_sha256": interpreter, "runtime_tree": None, "timeout_seconds": 5,
+        }
+        checks = self.base / "operational-checks.json"
+        checks.write_text(json.dumps({
+            "version": 1,
+            "deterministic_checks": [{"check_id": "tests", **check}],
+            "security_checks": [{"check_id": "security", **check}],
+        }))
+        return project, checks
+
+    def to_project_prompt(self, project: Path) -> None:
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+
+    def test_quit_on_the_first_screen_changes_nothing(self) -> None:
+        self.start(self.base)
+        self.expect("Step 1 of 8")
+        self.expect("signed in (plan: max, login: x)")
+        self.send("q")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+        self.assertEqual(list(self.home.iterdir()), [])
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+
+    def test_sigterm_during_a_slow_command_leaves_no_child(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_SLOW": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        deadline = time.time() + 20
+        while not self.slow_pid.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        child = int(self.slow_pid.read_text())
+        os.kill(child, 0)  # it is running
+        os.kill(self.pid, signal.SIGTERM)
+        self.assertEqual(self.finish(), 130)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the slow child is still running")
+        self.assertEqual(list(self.tmpdir.iterdir()), [], "the private log directory was kept")
+
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "operational checks use the macOS sandbox, so verify is not ready elsewhere")
+    def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
+        project, checks = self.make_project("my proj;x")
+        self.to_project_prompt(project)
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        self.expect("fresh install is possible")
+        self.send("\r")
+        self.expect("Codex children")
+        self.send("\r")
+        self.expect("Looks right")
+        self.send("\r")
+        self.expect("Files to add")
+        self.expect("Install now")
+        self.send("\r")
+        self.expect("Commit now")
+        self.send("\r")
+        self.expect("Verification passed")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\x1b[B\r")
+        self.expect("Not chosen")
+        self.send("\r")
+        self.expect("Press Enter to exit")
+        self.assertIn("my\\ proj\\;x", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        runs = self.py_log.read_text().split()
+        self.assertTrue(runs and set(runs) == {"1"}, runs)
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+        status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
+                                capture_output=True, text=True, env=self.env).stdout
+        self.assertEqual(status, "")
+
+    def test_failure_summary_is_an_allowlist_and_never_echoes_output(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_FAIL": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("The install failed")
+        self.expect("run it manually to see why")
+        self.expect("Continue to the summary")
+        self.send("\r")
+        self.expect("Save a summary of what failed")
+        self.send("\x1b[B\r")
+        self.expect("Save the summary to")
+        destination = self.base / "summary.txt"
+        self.send(f"{destination}\r")
+        self.expect("Saved a summary")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        saved = destination.read_text()
+        self.assertIn("exit code 2", saved)
+        self.assertIn("install failed".lower(), saved.lower())
+        for text in (saved, self.transcript):
+            self.assertNotIn(TOKEN, text)
+            self.assertNotIn("user@example.invalid", text)
+        self.assertEqual(oct(destination.stat().st_mode & 0o777), "0o600")
+
+    def test_linux_warns_that_operational_checks_need_macos(self) -> None:
+        (self.fakes / "uname").write_text('#!/bin/sh\necho Linux\n')
+        (self.fakes / "uname").chmod(0o755)
+        self.start(self.base)
+        self.expect("Operational checks need macOS today")
+        self.expect("known limitation")
+        self.assertNotIn("FAIL", self.screen)
+        self.send("q")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+
+    def test_path_starting_with_a_dash_is_resolved(self) -> None:
+        (self.base / "-odd").mkdir()
+        self.start(self.base)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("-odd\r")
+        self.expect("not inside a Git working tree")
+        self.assertNotIn("Cannot open", self.screen)
+
+
+if __name__ == "__main__":
+    unittest.main()
