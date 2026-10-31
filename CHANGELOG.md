@@ -2,6 +2,36 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
+  - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
+    which a session opened on a parent folder could rewrite. `install-codex-rule` copies
+    the installed runtime, verified byte for byte and against this package's recorded
+    runtime, to an owner-only
+    `${CODEX_HOME:-~/.codex}/agent-orchestration/<project>/<runtime>/` copy bound to its
+    project, and the rule names that copy. The copy serves only its bound project, only
+    the primary-host commands, and only while the project's installed files still match
+    it. A project without an install manifest gets no rule. `host-command` reports
+    `installed` only when rule, copy and project all match (earlier rules are `stale`),
+    and its `argv_prefix` names the copy. New owner command `remove-codex-rule
+    --project-root <root>` removes the rule and the copy and prints
+    `{"ready": true, "removed": [...]}`.
+  - Git runs from a real binary (Command Line Tools, Xcode or Homebrew on macOS, never
+    the `/usr/bin/git` xcrun shim whose cache sits in `$TMPDIR`), with `xcrun_nocache=1`
+    for git, provider clients and operational checks.
+  - A provider client is refused unless its resolved file passes the same location checks
+    as the interpreter, outside the project and every temporary directory, before it
+    runs.
+  - A worker result kept for its verifier is deleted when its orchestration closes, and
+    after seven days at most; only digests stay.
+  - Every Codex child is bridged (`codex exec --ignore-rules`, read-only), from a Codex
+    primary too, so no child shares the primary's command rule. Codex routes that need
+    write access are not eligible, and the native-only legacy fallback is refused for
+    bridged routes.
+  - `dispatch` fences a child result that does not validate and binds a keyed digest of
+    the result it returns, with its terminal state, to the run; recording any other
+    result, or dropping or inventing the fence, is refused.
+  - Both bridged launches pass `--` before the prompt, so an objective can never be read
+    as a client option.
 - **Bridged child containment (0.8.8).**
   - Bridged Codex children run with `--ignore-rules`: `--ignore-user-config` skips only
     `config.toml`, so a child still loaded the owner's execpolicy rules, and the setup-written
