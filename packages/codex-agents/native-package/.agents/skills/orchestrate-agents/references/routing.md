@@ -354,8 +354,47 @@ Claude to Claude and Codex to Codex.
   assignment context, binds the verifier, so the verifier's context stays the
   repository paths it read; any other verifier (a same-provider or native one, or one
   without a record) is refused. The check receipt has a `write_binding` with the
-  `bridge_run_id`, the `patch_digest` and `tested_tree_digest`, which stays null until
-  integration.
-- The primary does not apply the patch yet. Integration comes in a later slice and will
-  require `write_verification_state` to be `accepted`.
+  `bridge_run_id`, the `patch_digest` and `tested_tree_digest`, which stays null there:
+  that QA runs before integration, and the integration record carries the tested tree.
+- After an accepted verification the primary runs `learning-integrate-write
+  --project-root <root> --bridge-run-id <worker bridge run>`. Never apply a patch by
+  hand. The command is one serialized operation under the ledger writer lock:
+  - It refuses unless the write result's ownership passed, `write_verification_state`
+    is `accepted` (`write_not_verified`), no `integrated` record exists
+    (`write_already_integrated`) and the calling host owns the run's orchestration
+    (`host_client_mismatch`, which records nothing).
+  - The primary checkout must be on a named branch at the patch's source commit
+    (`write_base_moved`), with no staged or unmerged change and every tracked file
+    equal to that commit, compared by hashing without filters
+    (`write_primary_dirty`), and nothing (untracked or ignored) at a path the patch
+    adds (`write_primary_collision`). Unrelated untracked files are allowed.
+  - A detached disposable worktree at the source commit is created in a private
+    directory under the system temp directory, outside the repository, verified with
+    `verify_tree_at_commit`, and the patch, read only through the verified
+    `write_result_artifact`, is applied there.
+  - The project's operational checks (`.codex/orchestration/operational-checks.json`)
+    run in that worktree through the same sandboxed runner as
+    `learning-run-operational-checks`. Any unavailable or failed check refuses with
+    `write_checks_failed` and nothing is promoted.
+  - The patched tree is committed there from the patch's own bytes (no clean filter
+    runs), with the primary's configured `user.name` and `user.email`
+    (`write_identity_missing` without them); the message names the task's assignment
+    and family, the worker and verifier providers, the patch digest and the bridge run.
+    The worktree must still equal that commit (`write_tested_tree_mismatch`); its tree
+    object ID is the tested tree digest.
+  - Immediately before promotion the base, cleanliness and collision checks run again
+    (`write_promotion_race` otherwise, leaving the primary untouched); then `git merge
+    --ff-only` in the primary, with hooks disabled, moves the branch, index and working
+    tree together. Termination signals are held from that re-check until the record is
+    written. A merge that fails with the primary unchanged is `write_promotion_failed`;
+    one that leaves it anywhere but exactly the new commit is
+    `write_promotion_incomplete`.
+  - Every attempt appends a ledger-only `write_integration` (the write run, bridge run,
+    patch digest, source and new commit, tested tree digest, check report digest,
+    `outcome` `integrated` or `refused`, and the refusal `reason`). A cancelled attempt
+    records `write_integration_interrupted`. The worktree is removed with `git worktree
+    remove --force` and `prune` on every terminal state.
+  - Every Git call disables hooks and the filesystem monitor, lazy fetch and
+    replacement objects, and uses literal pathspecs. A refused integration is not
+    retried automatically: re-plan the task with fresh verification.
 
