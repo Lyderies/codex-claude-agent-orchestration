@@ -81,6 +81,7 @@ from codex_agents.learning_store import (  # noqa: E402
     require_authorized_collector_runtime,
     validate_collector_runtime,
 )
+from codex_agents.integration import integrate_write  # noqa: E402
 from codex_agents.hosts import (  # noqa: E402
     CLAUDE_HOST_CLIENT,
     CODEX_HOST_CLIENT,
@@ -733,6 +734,13 @@ def main() -> int:
     )
     _add_learning_project(learning_write_verification)
     learning_write_verification.add_argument("--bridge-run-id", required=True)
+
+    learning_integrate_write = subparsers.add_parser(
+        "learning-integrate-write",
+        help="integrate an accepted write patch into the primary checkout as one fast-forward",
+    )
+    _add_learning_project(learning_integrate_write)
+    learning_integrate_write.add_argument("--bridge-run-id", required=True)
 
     learning_bind_agent = subparsers.add_parser(
         "learning-bind-host-agent",
@@ -1669,6 +1677,31 @@ def main() -> int:
                     "write_verification_state": ledger.write_verification_state(
                         project_id, args.bridge_run_id
                     ),
+                }
+            finally:
+                _close_ledger(ledger)
+        elif args.command == "learning-integrate-write":
+            host = _host_client()
+            ledger, project_id = _learning_ledger(args)
+            try:
+                # A termination signal raises out of the checks, so the
+                # disposable worktree is still removed and the attempt recorded.
+                with bridge_signal_guard():
+                    integrated = integrate_write(
+                        ledger,
+                        project_id,
+                        project_root=args.project_root,
+                        bridge_run_id=args.bridge_run_id,
+                        host_client=host,
+                    )
+                record = integrated["write_integration"]
+                report = {
+                    "ready": record["outcome"] == "integrated",
+                    "bridge_run_id": args.bridge_run_id,
+                    "outcome": record["outcome"],
+                    "reason_code": record["reason"],
+                    "write_integration": record,
+                    "check_report": integrated["check_report"],
                 }
             finally:
                 _close_ledger(ledger)

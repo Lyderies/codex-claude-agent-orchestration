@@ -55,6 +55,7 @@ RECORD_TYPES = {
     "write_plan",
     "write_verification",
     "write_verifier_result",
+    "write_integration",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -2249,6 +2250,70 @@ def validate_write_verifier_result(data: Any) -> dict[str, Any]:
     return data
 
 
+WRITE_INTEGRATION_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "patch_digest", "source_commit", "new_commit", "tested_tree_digest",
+    "checks_receipt_digest", "branch", "outcome", "reason", "observed_at_ms",
+}
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_BRANCH_REF = re.compile(r"refs/heads/[^\x00-\x20\x7f~^:?*\[\\]{1,1000}")
+
+
+def validate_write_integration(data: Any) -> dict[str, Any]:
+    """One step of integrating a verified write patch into the primary checkout.
+
+    `outcome` is `promoting`, `integrated` or `refused`. A `promoting`
+    record is the durable intent written under Git's locks just before the
+    primary changes; a later `integrated` or `refused` record for the same
+    bridge run finishes it. `promoting` and `integrated` name the source
+    commit, the candidate (new) commit, the branch, the tested tree (the new
+    commit's tree object ID, on which the operational checks ran) and the
+    digest of the check report, with no `reason`. A refused record carries
+    the stable `reason` and whatever facts the attempt reached. Ledger-only:
+    digests, object IDs, the branch ref and codes.
+    """
+
+    data = _closed(data, WRITE_INTEGRATION_FIELDS, "write_integration")
+    _base(data, "write_integration")
+    _identifier(data["run_id"], "run_id")
+    if not isinstance(data["bridge_run_id"], str) or re.fullmatch(
+        r"brg_[0-9a-f]{32}", data["bridge_run_id"]
+    ) is None:
+        raise ContractError("write_integration bridge_run_id is invalid")
+    _digest(data["patch_digest"], "patch_digest", nullable=True)
+    _digest(data["checks_receipt_digest"], "checks_receipt_digest", nullable=True)
+    for field in ("source_commit", "new_commit", "tested_tree_digest"):
+        value = data[field]
+        if value is not None and (
+            not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None
+        ):
+            raise ContractError(f"write_integration {field} is invalid")
+    branch = data["branch"]
+    if branch is not None and (
+        not isinstance(branch, str) or _BRANCH_REF.fullmatch(branch) is None
+    ):
+        raise ContractError("write_integration branch is invalid")
+    _enum(data["outcome"], {"promoting", "integrated", "refused"}, "outcome")
+    reason = data["reason"]
+    if data["outcome"] in {"promoting", "integrated"}:
+        if reason is not None or any(
+            data[field] is None
+            for field in (
+                "patch_digest", "source_commit", "new_commit", "tested_tree_digest",
+                "checks_receipt_digest", "branch",
+            )
+        ):
+            raise ContractError(
+                "a promoting or integrated write_integration binds every digest and no reason"
+            )
+        if data["new_commit"] == data["source_commit"]:
+            raise ContractError("write_integration new_commit must differ from its source")
+    elif not isinstance(reason, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason) is None:
+        raise ContractError("a refused write_integration carries a stable reason")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -2279,6 +2344,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "write_plan": validate_write_plan,
     "write_verification": validate_write_verification,
     "write_verifier_result": validate_write_verifier_result,
+    "write_integration": validate_write_integration,
 }
 
 
