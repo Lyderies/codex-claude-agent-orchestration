@@ -6,12 +6,16 @@
   - Bridged Codex children run with `--ignore-rules`: `--ignore-user-config` skips only
     `config.toml`, so a child still loaded the owner's execpolicy rules, and the setup-written
     rule would have let it run the primary-host commands, `dispatch` among them, outside its
-    sandbox. A client whose `codex exec --help` lacks the option is refused before launch, and
-    `skill_mcp_dependency_install` is disabled as well.
-  - A child's whole process tree is killed, not just its process group: descendants are
-    tracked with a fixed-path `ps` while it runs, then stopped and killed together at the end,
-    on abort or on a termination signal, and the deadline watchdog tracks the tree too.
-    Only a process seen as a descendant with the same start time is ever signalled.
+    sandbox. A client whose `codex exec --help` lacks the option is refused before launch.
+    `approval_policy="never"` is pinned and `skill_mcp_dependency_install` is disabled.
+  - Codex system or managed configuration (`/etc/codex`, `~/.codex/managed_config.toml`, macOS
+    managed preferences) refuses a Codex dispatch (`codex_managed_config_present`).
+  - Cleanup reaches descendants outside the child's process group, conservatively: they are
+    tracked by ancestry with a fixed-path `ps`, identified by kernel birth time and re-verified
+    before each SIGKILL; the child's own group is killed before the child is reaped. The
+    deadline watchdog verifies the child's identity before the run continues and tracks the
+    tree too. A process that detaches between snapshots is left running in the sandbox rather
+    than risk killing an unrelated one.
   - Native Codex children share the primary's session and its command rule; the design's
     residual risks and the Codex skill now say so.
 - **Route-first model guidance.** The Codex skill and its routing reference no longer summarize

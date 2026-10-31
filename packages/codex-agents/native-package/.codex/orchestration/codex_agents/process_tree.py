@@ -1,13 +1,16 @@
-"""Track and kill every descendant of one bridged child, and nothing else.
+"""Track and kill the descendants of one bridged child, and never anything else.
 
-A child may start helpers in their own process group or session, and an orphan
-is reparented once its parent exits, so the tree is tracked while the child
-runs; one walk at the end would miss whatever already lost its parent. A
-process is tracked only once it is seen as a descendant: a child of a tracked
-process, or a member of a tracked process's group. A group never spans
-sessions, and every session it can belong to began inside the child's tree.
-Each process is known by its pid and start time, and is signalled only after a
-fresh snapshot shows that same process, so a reused pid is never killed.
+A process is tracked only once a snapshot shows its parent is a tracked process:
+ancestry, never a shared process group. Each process is known by its pid and
+the kernel's record of when it started (microseconds on macOS, clock ticks on
+Linux), and that birth time is read again immediately before every signal, so
+a pid that now belongs to another process is not signalled. Groups are
+signalled only when their leader is a verified tracked process, which includes
+the child itself while it is unreaped.
+
+Tracking is by polling, so it is conservative rather than complete: a
+descendant whose parent exits before any snapshot has seen it is lost, and it
+is left running rather than risk signalling an unrelated process.
 
 Standard library only: the deadline watchdog runs this file as a script.
 """
@@ -16,25 +19,38 @@ from __future__ import annotations
 
 import contextlib
 import os
+import selectors
 import signal
+import struct
 import subprocess
 import sys
 import time
 
 # Fixed paths, never a search path: macOS has /bin/ps, Linux distributions one or both.
 PS_PATHS = ("/bin/ps", "/usr/bin/ps")
-# pid, parent pid, process group and start time; a fixed locale and time zone keep
-# the start time comparable between snapshots.
-PS_COLUMNS = "pid=,ppid=,pgid=,lstart="
-PS_ENVIRONMENT = {"PATH": os.defpath, "LC_ALL": "C", "TZ": "UTC"}
+PS_COLUMNS = "pid=,ppid=,pgid=,stat="
+PS_ENVIRONMENT = {"PATH": os.defpath, "LC_ALL": "C"}
 SNAPSHOT_TIMEOUT_SECONDS = 5
 TRACK_INTERVAL_SECONDS = 0.25
 WATCHDOG_INTERVAL_SECONDS = 0.5
-# Stop-and-rescan rounds before the final kill; each round stops what it found, so
-# only a tree that keeps starting processes faster than a snapshot reaches the cap.
-MAX_FREEZE_ROUNDS = 8
+# The watchdog retries identification for this long, while the bridge holds the
+# child unreaped and waits for its acknowledgement a little longer.
+WATCHDOG_IDENTIFY_SECONDS = 5
+WATCHDOG_READY_SECONDS = 10
+WATCHDOG_READY = b"ready\n"
+# Kill rounds: each takes a fresh snapshot, adopts what the tree started since and
+# kills every live tracked process, until a round finds none left alive.
+MAX_KILL_ROUNDS = 5
+KILL_ROUND_PAUSE_SECONDS = 0.05
 
-# pid -> (parent pid, process group, start time)
+# macOS: sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid) fills one 648-byte
+# struct kinfo_proc; its first field is p_starttime (struct timeval) and p_pid
+# sits at offset 40, which is checked so a layout change fails closed.
+DARWIN_LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
+DARWIN_KINFO_PROC_SIZE = 648
+DARWIN_PID_OFFSET = 40
+
+# pid -> (parent pid, process group, ps state letters)
 Table = dict[int, tuple[int, int, str]]
 
 
@@ -65,141 +81,240 @@ def process_table() -> Table | None:
         if not fields:
             continue
         # A line that does not parse makes the whole snapshot unusable.
-        if len(fields) < 4 or not all(field.isdigit() for field in fields[:3]):
+        if len(fields) != 4 or not all(field.isdigit() for field in fields[:3]):
             return None
-        table[int(fields[0])] = (int(fields[1]), int(fields[2]), " ".join(fields[3:]))
+        table[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[3])
     return table or None
 
 
+_SYSCTL: list = []
+
+
+def _darwin_birth(pid: int) -> str | None:
+    import ctypes
+
+    if not _SYSCTL:
+        library = ctypes.CDLL(DARWIN_LIBSYSTEM, use_errno=True)
+        function = library.sysctl
+        function.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        function.restype = ctypes.c_int
+        _SYSCTL.append(function)
+    name = (ctypes.c_int * 4)(1, 14, 1, pid)
+    buffer = ctypes.create_string_buffer(DARWIN_KINFO_PROC_SIZE)
+    size = ctypes.c_size_t(DARWIN_KINFO_PROC_SIZE)
+    if _SYSCTL[0](name, 4, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value != DARWIN_KINFO_PROC_SIZE:
+        return None
+    raw = buffer.raw
+    seconds, microseconds = struct.unpack_from("=qi", raw, 0)
+    if struct.unpack_from("=i", raw, DARWIN_PID_OFFSET)[0] != pid:
+        return None
+    return f"{seconds}.{microseconds:06d}"
+
+
+def _linux_birth(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            content = handle.read()
+    except OSError:
+        return None
+    # The command name may hold spaces and parentheses; the fields follow the last ")".
+    end = content.rfind(b")")
+    if end < 0:
+        return None
+    fields = content[end + 2:].split()
+    if len(fields) < 20 or not fields[19].isdigit():
+        return None
+    return fields[19].decode("ascii")
+
+
+def birth_time(pid: int) -> str | None:
+    """When the kernel says a process started; None when it is gone or unreadable."""
+
+    if pid <= 0:
+        return None
+    try:
+        if sys.platform == "darwin":
+            return _darwin_birth(pid)
+        if sys.platform.startswith("linux"):
+            return _linux_birth(pid)
+    except (OSError, ValueError, AttributeError, struct.error):
+        return None
+    return None
+
+
+def tracking_available() -> bool:
+    """Whether both the process table and birth times can be read here."""
+
+    return process_table() is not None and birth_time(os.getpid()) is not None
+
+
+def _excluded_pid(pid: int) -> bool:
+    return pid <= 1 or pid == os.getpid()
+
+
+def _excluded_group(group: int) -> bool:
+    return group <= 1 or group == os.getpgrp()
+
+
 class ProcessTree:
-    """One child and every descendant seen so far, each known by pid and start time."""
+    """One child and every descendant seen so far, each known by pid and birth time."""
 
     def __init__(self, root: int) -> None:
         self.root = root
+        self.root_birth: str | None = None
         self.tracked: dict[int, str] = {}
-        # Until the root's start time is known nothing can be verified or signalled.
+        # Until the root's birth time is known nothing is tracked or signalled.
         self.identified = False
 
-    def identify(self, table: Table | None) -> bool:
-        """Record the root's start time from a snapshot taken while it is unreaped."""
+    def identify(self, table: Table | None, birth: str | None = None) -> bool:
+        """Record the root, which must be unreaped, and adopt what is already visible.
 
-        if table is not None and self.root in table:
-            self.tracked = {self.root: table[self.root][2]}
-            self.identified = True
-        return self.identified
+        With `birth` the root must still be that same process.
+        """
+
+        if table is None or self.root not in table:
+            return False
+        observed = birth_time(self.root)
+        if observed is None or (birth is not None and observed != birth):
+            return False
+        self.root_birth = observed
+        self.tracked = {self.root: observed}
+        self.identified = True
+        self.update(table)
+        return True
+
+    def _verified(self, pid: int) -> bool:
+        birth = self.tracked.get(pid)
+        return birth is not None and not _excluded_pid(pid) and birth_time(pid) == birth
 
     def update(self, table: Table) -> set[int]:
-        """Adopt the new descendants in a snapshot; return the tracked pids it still holds."""
+        """Adopt the children of tracked processes; return the tracked pids still present."""
 
-        live = {
-            pid for pid, start in self.tracked.items()
-            if pid in table and table[pid][2] == start
-        }
-        excluded_pids, excluded_groups = _own_identifiers()
-        groups = {table[pid][1] for pid in live} - excluded_groups
-        grew = True
-        while grew:
-            grew = False
-            for pid, (parent, group, start) in table.items():
-                if pid in live or pid in excluded_pids:
+        live = {pid for pid in self.tracked if pid in table and self._verified(pid)}
+        children: dict[int, list[int]] = {}
+        for pid, (parent, _, _) in table.items():
+            children.setdefault(parent, []).append(pid)
+        pending = sorted(live)
+        while pending:
+            for child in children.get(pending.pop(), ()):
+                if child in live or _excluded_pid(child):
                     continue
-                if parent in live or group in groups:
-                    live.add(pid)
-                    self.tracked[pid] = start
-                    if group not in excluded_groups:
-                        groups.add(group)
-                    grew = True
+                birth = birth_time(child)
+                if birth is None:
+                    continue
+                self.tracked[child] = birth
+                live.add(child)
+                pending.append(child)
         # Exited processes are forgotten; their pids may belong to anything later.
         self.tracked = {pid: self.tracked[pid] for pid in live}
         return live
 
-    def refresh(self) -> None:
-        """Adopt from a new snapshot; a failed snapshot keeps what is already tracked."""
+    def root_exited(self, table: Table) -> bool:
+        """Whether the unreaped root has exited: a zombie, or absent from the snapshot."""
 
-        if self.identified:
-            table = process_table()
-            if table is not None:
-                self.update(table)
+        entry = table.get(self.root)
+        return entry is None or entry[2].startswith("Z")
 
-    def terminate(self) -> bool:
-        """Stop every tracked process, adopt what they started, then kill them all.
+    def terminate(self) -> None:
+        """Kill every tracked process in rounds, each verified just before its signal.
 
-        A stopped process starts nothing new, so once a snapshot finds no new
-        descendant the kill reaches the whole tree. Without a snapshot nothing is
-        signalled, because a pid that cannot be verified again is never killed;
-        the return value says whether the kill went ahead.
+        A group is killed only through a verified leader: the root, whose group is
+        its own for life, or a tracked process that leads its group in the
+        snapshot. Nothing is stopped, so nothing is ever left stopped.
         """
 
         if not self.identified:
-            return False
-        stopped: set[int] = set()
-        last: tuple[set[int], Table] | None = None
-        for _ in range(MAX_FREEZE_ROUNDS):
+            return
+        for round_number in range(MAX_KILL_ROUNDS):
+            if round_number:
+                time.sleep(KILL_ROUND_PAUSE_SECONDS)
             table = process_table()
+            if table is not None:
+                self.update(table)
+            running = [
+                pid for pid in sorted(self.tracked)
+                if table is None or (pid in table and not table[pid][2].startswith("Z"))
+            ]
+            if round_number and not running:
+                return
+            leaders = {self.root} | {
+                pid for pid in self.tracked
+                if table is not None and pid in table and table[pid][1] == pid
+            }
+            for group in sorted(leaders):
+                if not _excluded_group(group) and self._verified(group):
+                    with contextlib.suppress(OSError):
+                        os.killpg(group, signal.SIGKILL)
+            for pid in running:
+                if self._verified(pid):
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGKILL)
+            # Without a snapshot nothing new can be adopted or seen to have died.
             if table is None:
-                break
-            live = self.update(table)
-            last = (live, table)
-            fresh = live - stopped
-            if not fresh:
-                break
-            _signal(fresh, table, signal.SIGSTOP)
-            stopped |= fresh
-        if last is None:
-            return False
-        _signal(*last, signal.SIGKILL)
-        return True
+                return
 
 
-def _own_identifiers() -> tuple[set[int], set[int]]:
-    """The pids and groups that are never adopted or signalled: init and this process."""
+def await_ready(stream, seconds: float) -> bool:
+    """Whether the watchdog acknowledged on `stream` within `seconds`."""
 
-    return {0, 1, os.getpid()}, {0, 1, os.getpgrp()}
-
-
-def _signal(pids: set[int], table: Table, signum: int) -> None:
-    excluded_pids, excluded_groups = _own_identifiers()
-    for group in sorted({table[pid][1] for pid in pids} - excluded_groups):
-        with contextlib.suppress(OSError):
-            os.killpg(group, signum)
-    for pid in sorted(pids - excluded_pids):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signum)
-
-
-def _group_exists(group: int) -> bool:
-    try:
-        os.killpg(group, 0)
-    except OSError:
-        return False
-    return True
+    received = b""
+    deadline = time.monotonic() + seconds
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        while len(received) < len(WATCHDOG_READY):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                return False
+            chunk = os.read(stream.fileno(), len(WATCHDOG_READY) - len(received))
+            if not chunk:
+                return False
+            received += chunk
+    return received == WATCHDOG_READY
 
 
-def watch(root: int, deadline: float) -> None:
+def watch(root: int, birth: str, deadline: float, announce) -> None:
     """The detached deadline watchdog for one bridged child.
 
-    It tracks the tree on its own, so a crash of the bridge still ends it: the
-    whole tree is killed at the deadline, and what is left is killed once the
-    child itself is gone. Without snapshots it falls back to the child's group.
+    It verifies the child's identity from the bridge, which keeps the child
+    unreaped until `announce` acknowledges, and gives up silently if it cannot.
+    It then tracks the tree on its own, so a crash of the bridge still ends it:
+    the tree is killed at the deadline, or once the child itself has exited.
     """
 
     tree = ProcessTree(root)
-    tree.identify(process_table())
+    give_up = time.monotonic() + WATCHDOG_IDENTIFY_SECONDS
+    while not tree.identify(process_table(), birth):
+        if time.monotonic() >= give_up:
+            return
+        time.sleep(0.1)
+    announce()
     while True:
-        table = process_table() if tree.identified else None
+        table = process_table()
         if table is not None:
-            if root not in tree.update(table):
+            live = tree.update(table)
+            if root not in live or tree.root_exited(table):
                 tree.terminate()
                 return
-        elif not _group_exists(root):
-            return
         if time.time() >= deadline:
-            if not tree.terminate():
-                with contextlib.suppress(OSError):
-                    os.killpg(root, signal.SIGKILL)
+            tree.terminate()
             return
         time.sleep(WATCHDOG_INTERVAL_SECONDS)
 
 
+def _announce() -> None:
+    # A bridge that died before reading this leaves the watchdog to clean up alone.
+    with contextlib.suppress(OSError):
+        os.write(1, WATCHDOG_READY)
+    # Replace the pipe with /dev/null so the bridge sees it close.
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, 1)
+    os.close(null)
+
+
 if __name__ == "__main__":
-    watch(int(sys.argv[1]), float(sys.argv[2]))
+    watch(int(sys.argv[1]), sys.argv[2], float(sys.argv[3]), _announce)

@@ -43,7 +43,15 @@ from .host_paths import (
     temp_roots,
 )
 from .learning_contracts import SUPPORTED_MODELS
-from .process_tree import TRACK_INTERVAL_SECONDS, ProcessTree, process_table
+from .process_tree import (
+    TRACK_INTERVAL_SECONDS,
+    WATCHDOG_READY_SECONDS,
+    ProcessTree,
+    Table,
+    await_ready,
+    process_table,
+    tracking_available,
+)
 from .providers import (
     api_keys_present,
     client_environment,
@@ -83,6 +91,9 @@ CODEX_DISABLED_FEATURES = (
     "computer_use", "in_app_browser", "hooks", "skill_mcp_dependency_install",
 )
 CODEX_WEB_SEARCH_SETTING = 'web_search="disabled"'
+# `codex exec` already defaults to never asking; pinning it means no escalation request
+# can ever be granted, whatever a later client or configuration layer defaults to.
+CODEX_APPROVAL_SETTING = 'approval_policy="never"'
 # `--ignore-user-config` skips only config.toml. Without `--ignore-rules` Codex still
 # loads the owner's execpolicy rules, and an `allow` rule (setup writes one for the
 # primary's lifecycle commands) runs a matching command outside the sandbox. A client
@@ -129,6 +140,28 @@ MANAGED_PREFERENCE_PATHS = {
         "/Library/Managed Preferences/{user}/com.anthropic.claudecode.plist",
     ),
     "linux": (),
+}
+# Codex system and managed configuration applies despite --ignore-user-config and can
+# add MCP servers or hooks, which run outside the sandbox, so its presence refuses a
+# Codex launch, like Claude's managed settings above. `{home}` is the account's home,
+# whose default CODEX_HOME the child uses; `{user}` is the account name. Any TOML file
+# in the system directory refuses too.
+CODEX_SYSTEM_DIRECTORY = "/etc/codex"
+CODEX_MANAGED_PATHS = {
+    "darwin": (
+        "/etc/codex/config.toml",
+        "/etc/codex/requirements.toml",
+        "/etc/codex/managed_config.toml",
+        "{home}/.codex/managed_config.toml",
+        "/Library/Managed Preferences/com.openai.codex.plist",
+        "/Library/Managed Preferences/{user}/com.openai.codex.plist",
+    ),
+    "linux": (
+        "/etc/codex/config.toml",
+        "/etc/codex/requirements.toml",
+        "/etc/codex/managed_config.toml",
+        "{home}/.codex/managed_config.toml",
+    ),
 }
 # Exports, control files and a child's temporary directory live in a host-private
 # directory that the sandboxed primary cannot write (the system temp directory is
@@ -330,30 +363,46 @@ def export_committed_paths(
 # Each running child's process and its tracked tree, for the signal guard.
 _ACTIVE_CHILDREN: dict[int, tuple[Any, ProcessTree]] = {}
 # A detached watchdog enforces the deadline even if the bridge is SIGKILLed: it
-# tracks the child's whole tree itself, kills it at the deadline, and once the
-# child is gone kills whatever it left and exits. It runs the standard-library
-# process_tree module as a script, from the same installed directory as this one.
+# verifies the child's identity, tracks its tree itself, and kills the tree at the
+# deadline or once the child has exited. It runs the standard-library process_tree
+# module as a script, from the same installed directory as this one.
 WATCHDOG_SCRIPT = Path(__file__).resolve().with_name("process_tree.py")
 
 
-def _start_watchdog(group: int, deadline_epoch: float) -> None:
+def _start_watchdog(root: int, birth: str, deadline_epoch: float) -> None:
+    """Start the watchdog and wait until it has verified the child.
+
+    The child stays unreaped meanwhile, so its pid cannot pass to another
+    process. Without the acknowledgement the run is aborted: no child runs on
+    without a verified watchdog.
+    """
+
     try:
-        subprocess.Popen(
+        watchdog = subprocess.Popen(
             [
                 sys.executable, *PYTHON_ISOLATION_FLAGS, str(WATCHDOG_SCRIPT),
-                str(group), repr(deadline_epoch),
+                str(root), birth, repr(deadline_epoch),
             ],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
             env={"PATH": os.defpath},
         )
     except OSError as exc:
-        # Without the watchdog the deadline would rest on this process alone.
-        os.killpg(group, signal.SIGKILL)
         raise _Abort("watchdog_unavailable") from exc
+    try:
+        ready = await_ready(watchdog.stdout, WATCHDOG_READY_SECONDS)
+    finally:
+        watchdog.stdout.close()
+    if not ready:
+        # Still unreaped, so this pid is the watchdog's.
+        with contextlib.suppress(OSError):
+            watchdog.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            watchdog.wait(timeout=5)
+        raise _Abort("watchdog_unavailable")
 
 
 class BridgeInterrupted(SystemExit):
@@ -382,10 +431,10 @@ def signal_guard():
 
 
 def _kill_child(process: Any, tree: ProcessTree) -> None:
-    """Kill the child's tracked tree, and its own group while the child is unreaped.
+    """Kill the child's tracked tree, then its own process group.
 
-    Until the child is reaped its pid, and so its group's id, cannot belong to
-    anything else, so the group is signalled by id only then.
+    The child is reaped only after this, so its pid, and with it its group's
+    id, still cannot belong to anything else when the group is signalled.
     """
 
     tree.terminate()
@@ -415,14 +464,14 @@ def run_child(
 ) -> dict[str, Any]:
     """Run one child in its own session, feeding each JSON line to `on_frame`.
 
-    The child's whole tree, including descendants that left its process group or
-    session, is killed on timeout, overflow, an unparseable line or an aborting
-    frame, and always once the child has exited. Descendants are tracked while it
-    runs, so the child is never launched when the process table cannot be read.
+    The child's process group and every descendant tracked while it ran are
+    killed on timeout, overflow, an unparseable line or an aborting frame, and
+    always once the child has exited. The child is reaped only after that, and
+    it is never launched when its tree or its watchdog cannot be tracked.
     """
 
     outcome: dict[str, Any] = {"returncode": None, "abort": None}
-    if process_table() is None:
+    if not tracking_available():
         return {"returncode": None, "abort": "process_tracking_unavailable"}
     try:
         process = popen(
@@ -445,7 +494,8 @@ def run_child(
         if not tree.identify(process_table()):
             raise _Abort("process_tracking_unavailable")
         _start_watchdog(
-            process.pid, time.time() + deadline_seconds + WATCHDOG_GRACE_SECONDS
+            process.pid, tree.root_birth,
+            time.time() + deadline_seconds + WATCHDOG_GRACE_SECONDS,
         )
         next_track = time.monotonic() + TRACK_INTERVAL_SECONDS
         with selectors.DefaultSelector() as selector:
@@ -456,7 +506,7 @@ def run_child(
                     raise _Abort("timed_out")
                 ready = selector.select(min(remaining, TRACK_INTERVAL_SECONDS))
                 if time.monotonic() >= next_track:
-                    tree.refresh()
+                    _track(tree)
                     next_track = time.monotonic() + TRACK_INTERVAL_SECONDS
                 if not ready:
                     continue
@@ -480,22 +530,33 @@ def run_child(
                 raise _Abort("stream_too_large")
             if buffer.strip():
                 _deliver(buffer, on_frame)
-        # One more snapshot while the child is still unreaped, so anything it started
-        # since the last one is tracked before the wait reaps it.
-        tree.refresh()
-        try:
-            outcome["returncode"] = process.wait(
-                timeout=max(deadline - time.monotonic(), 0.1)
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise _Abort("timed_out") from exc
+        # The output is closed. Wait for the child to exit without reaping it; an
+        # exit first seen after the deadline (a snapshot can block) is a timeout.
+        while True:
+            table = _track(tree)
+            if time.monotonic() >= deadline:
+                raise _Abort("timed_out")
+            if table is not None and tree.root_exited(table):
+                break
+            time.sleep(min(TRACK_INTERVAL_SECONDS, max(deadline - time.monotonic(), 0.0)))
     except _Abort as abort:
         outcome["abort"] = abort.reason
     finally:
         _stop_child(process, tree)
         _ACTIVE_CHILDREN.pop(process.pid, None)
         process.stdout.close()
+    if outcome["abort"] is None:
+        outcome["returncode"] = process.returncode
     return outcome
+
+
+def _track(tree: ProcessTree) -> Table | None:
+    """Adopt from a new snapshot and return it; a failed snapshot changes nothing."""
+
+    table = process_table()
+    if table is not None:
+        tree.update(table)
+    return table
 
 
 def _deliver(line: bytes, on_frame: Callable[[dict[str, Any]], None]) -> None:
@@ -939,6 +1000,7 @@ def run_codex(
             for part in ("--disable", feature)
         ),
         "-c", CODEX_WEB_SEARCH_SETTING,
+        "-c", CODEX_APPROVAL_SETTING,
         "--skip-git-repo-check",
         "-C", str(export),
         "--json",
@@ -1043,6 +1105,27 @@ def managed_configuration_present() -> bool:
         os.path.lexists(path)
         for path in (*managed_settings_paths(), *managed_preference_paths())
     )
+
+
+def codex_managed_configuration_present() -> bool:
+    """Whether Codex system or managed configuration, or MDM preferences, exist."""
+
+    import pwd
+
+    account = pwd.getpwuid(os.getuid())
+    platform = "darwin" if sys.platform == "darwin" else "linux"
+    if any(
+        os.path.lexists(path.format(home=account.pw_dir, user=account.pw_name))
+        for path in CODEX_MANAGED_PATHS[platform]
+    ):
+        return True
+    try:
+        names = os.listdir(CODEX_SYSTEM_DIRECTORY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return any(name.endswith(".toml") for name in names)
 
 
 def scratch_base() -> Path:
@@ -1254,6 +1337,8 @@ def dispatch(
     if provider == "claude":
         if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
+    elif codex_managed_configuration_present():
+        raise BridgeRefused("codex_managed_config_present")
     workspace = private_workspace(
         "dispatch-", claude=provider == "claude", project_root=project_root
     )
