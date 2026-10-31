@@ -31,6 +31,11 @@ children are in development. See the [delivery plan](docs/delivery/plan.md) for 
 You need macOS or Linux, Python 3.11 or later, Git, and the Codex and Claude Code clients signed in
 with their subscriptions. API keys are refused.
 
+**Before you run it:** a project that has never been set up needs a prepared
+`operational-checks.json`, which names the exact test and security commands, with their hashes,
+that operational QA may run. See the recipe under "Advanced: manual setup" below. The wizard asks
+for the file's path. A future wizard step will generate it; that is planned, not done yet.
+
 From the root of this repository, run one command:
 
 ```sh
@@ -51,13 +56,37 @@ It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to
 Run it again on an installed project to update, verify or re-attest. It needs an interactive
 terminal and refuses to run piped or scripted. Full command output goes to a private temporary log,
 shown only if something fails. Set `NO_COLOR=1` for plain output. In Claude Code, use the
-`agent-orchestration` skill afterwards. In Codex, start with `codex -p orchestrator`.
+`agent-orchestration` skill afterwards. In Codex, start with `codex -p orchestrator` if the optional
+orchestrator profile (step 7) was created or already exists; otherwise start plain `codex`.
 
 ### Advanced: manual setup
 
 The wizard runs these commands. The installer also needs the project's
 `.codex/orchestration/project-agent-routing.json` and `operational-checks.json`, passed with
 `--project-agent-routing` and `--operational-checks` on the first install.
+
+**Operational checks recipe.** In the project, write two small wrapper scripts (one runs your
+tests, one runs a security or secret scan), commit them, then compute the hashes. The wrapper
+must be committed, because the installer checks that the file matches a clean commit:
+
+```sh
+cd /path/to/project
+printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["python3", "-m", "unittest", "discover"]))\n' > qa-check
+printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["git", "diff", "--check"]))\n' > qa-security
+chmod 700 qa-check qa-security
+git add qa-check qa-security && git commit -m "Add QA check wrappers"
+INTERP=$(shasum -a 256 /usr/bin/python3 | cut -d' ' -f1)   # sha256sum on Linux
+check() { # check ID WRAPPER
+  printf '{"check_id": "%s", "driver": "python-wrapper", "argv": ["./%s"], "executable_sha256": "%s", "interpreter_sha256": "%s", "runtime_tree": null, "timeout_seconds": 600}' \
+    "$1" "$2" "$(shasum -a 256 "$2" | cut -d' ' -f1)" "$INTERP"
+}
+printf '{"version": 1, "deterministic_checks": [%s], "security_checks": [%s]}\n' \
+  "$(check tests qa-check)" "$(check security qa-security)" > ../operational-checks.json
+```
+
+Pass `../operational-checks.json` to the wizard when it asks, or to the installer with
+`--operational-checks`. The format is the one used by `tests/test_install.py` and described by
+`packages/codex-agents/native-package/.codex/orchestration/schemas/operational-checks.schema.json`.
 
 1. **Install** into the top of a Git project. Without `--apply` the command only previews:
 
@@ -102,7 +131,7 @@ The wizard runs these commands. The installer also needs the project's
    ```
 
    Then start orchestrating sessions with `codex -p orchestrator`. Ordinary sessions keep network
-   off.
+   off. Without this profile, start plain `codex`.
 
 ## Development
 

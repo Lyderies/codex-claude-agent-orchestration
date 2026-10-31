@@ -15,7 +15,9 @@
 # where CODEX, CLAUDE and BRIDGE are "on" or "off" and MODELS is a comma-separated
 # list of Claude model names, or "-" for none. It prints provider-routing.json.
 
-ROOT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+# Never let Python write bytecode into the project (it would dirty managed paths).
+export PYTHONDONTWRITEBYTECODE=1
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 SETUP_VERSION=1
 CLAUDE_MODELS_ALL="claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5"
 STEP_NAMES=("Checks" "Project" "Providers" "Install" "Collector" "Billing" "Profile" "Done")
@@ -74,6 +76,32 @@ routing_json() {
   printf '%s\n' "$out"
 }
 
+# write_project_routing PROJECT CONTENT : atomic, symlink-safe write of provider-routing.json.
+# Refuses a symlinked destination or any parent that is not a real directory in the project.
+write_project_routing() {
+  local project=$1 content=$2 part cur dest tmp
+  cur=$project
+  for part in .codex orchestration; do
+    cur="$cur/$part"
+    if [ -L "$cur" ] || [ ! -d "$cur" ]; then
+      echo "refused: $part is not a real directory inside the project" >&2; return 1
+    fi
+  done
+  if [ "$(CDPATH= cd -- "$cur" && pwd -P)" != "$(CDPATH= cd -- "$project" && pwd -P)/.codex/orchestration" ]; then
+    echo "refused: the configuration directory resolves outside the project" >&2; return 1
+  fi
+  dest="$cur/provider-routing.json"
+  if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -f "$dest" ]; }; then
+    echo "refused: provider-routing.json is a symlink or not a regular file" >&2; return 1
+  fi
+  tmp=$(umask 022; mktemp "$cur/.provider-routing.XXXXXX") || return 1
+  if printf '%s\n' "$content" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$dest"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./setup.sh [PROJECT_PATH]
@@ -90,6 +118,12 @@ case "${1:-}" in
       echo "usage: setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE" >&2; exit 2
     fi
     routing_json "$2" "$3" "$4" "$5"; exit $?;;
+  --write-provider-routing)
+    if [ $# -ne 6 ]; then
+      echo "usage: setup.sh --write-provider-routing PROJECT CODEX CLAUDE MODELS BRIDGE" >&2; exit 2
+    fi
+    content=$(routing_json "$3" "$4" "$5" "$6") || exit 1
+    write_project_routing "$2" "$content"; exit $?;;
   -h|--help) usage; exit 0;;
 esac
 
@@ -141,7 +175,11 @@ term_size() {
 
 REDRAW=0
 LOGDIR=""
-LOG_KEPT=0
+FAILED_ANY=0
+ACTIVE_PID=""
+INSTALL_FAILED=0
+FAIL_REASON=""
+PROFILE_READY=0
 CURSOR_HIDDEN=0
 STEP=0
 BODY=""
@@ -161,17 +199,24 @@ show_cursor() { printf '\033[?25h'; CURSOR_HIDDEN=0; }
 cleanup() {
   [ "$CURSOR_HIDDEN" -eq 1 ] && show_cursor
   printf '%s' "$C_RESET"
-  if [ -n "$LOGDIR" ] && [ -d "$LOGDIR" ]; then
-    if [ "$LOG_KEPT" -eq 1 ]; then
-      printf 'Log kept in %s (private, delete it when done).\n' "$LOGDIR"
-    else
-      rm -rf "$LOGDIR"
-    fi
-  fi
+  stop_active
+  [ -n "$LOGDIR" ] && [ -d "$LOGDIR" ] && rm -rf "$LOGDIR"
 }
+# Stop the running child's whole process group, then reap it.
+stop_active() {
+  local pid=$ACTIVE_PID
+  [ -n "$pid" ] || return 0
+  ACTIVE_PID=""
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  sleep 0.3
+  kill -KILL -- "-$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 0
+}
+on_signal() { printf '\n'; show_cursor; exit 130; }
 trap cleanup EXIT
 trap 'REDRAW=1' WINCH
-trap 'printf "\n"; exit 130' INT TERM
+trap on_signal INT TERM
 
 # ---------------------------------------------------------------------------
 # Screen drawing
@@ -399,16 +444,26 @@ init_logdir() {
   mkdir "$LOGDIR/inputs"
 }
 
-# run_cmd LABEL CMD... : runs with a spinner, output kept in the private log directory.
+# run_cmd LABEL CMD... : runs with a spinner in its own process group. Output stays in the
+# private log directory (deleted on exit), except when RUN_QUIET=1 (git, project hooks),
+# whose output is discarded because it may carry identity details.
+RUN_QUIET=0
 run_cmd() {
   local label=$1 pid i=0 frames='|/-\'
   shift
   CMD_N=$((CMD_N + 1))
-  LAST_OUT="$LOGDIR/cmd$CMD_N.out"
-  LAST_ERR="$LOGDIR/cmd$CMD_N.err"
-  ( umask 077; : >"$LAST_OUT"; : >"$LAST_ERR" )
+  if [ "$RUN_QUIET" -eq 1 ]; then
+    LAST_OUT=/dev/null; LAST_ERR=/dev/null
+  else
+    LAST_OUT="$LOGDIR/cmd$CMD_N.out"
+    LAST_ERR="$LOGDIR/cmd$CMD_N.err"
+    ( umask 077; : >"$LAST_OUT"; : >"$LAST_ERR" )
+  fi
+  set -m
   "$@" >"$LAST_OUT" 2>"$LAST_ERR" </dev/null &
   pid=$!
+  set +m
+  ACTIVE_PID=$pid
   hide_cursor
   while kill -0 "$pid" 2>/dev/null; do
     printf '\r  %s%s%s %s ' "$C_CYAN" "${frames:$((i % 4)):1}" "$C_RESET" "$label"
@@ -416,28 +471,52 @@ run_cmd() {
     sleep 0.15
   done
   wait "$pid"; LAST_RC=$?
+  ACTIVE_PID=""
   printf '\r\033[K'
   show_cursor
-  {
-    printf '== %s (exit %s)\n' "$label" "$LAST_RC"
-    cat "$LAST_OUT" "$LAST_ERR"
-  } >>"$LOGDIR/setup.log" 2>/dev/null
+  if [ "$RUN_QUIET" -ne 1 ]; then
+    {
+      printf '== %s (exit %s)\n' "$label" "$LAST_RC"
+      cat "$LAST_OUT" "$LAST_ERR"
+    } >>"$LOGDIR/setup.log" 2>/dev/null
+  fi
   return $LAST_RC
 }
 
-# run_quiet_identity CMD... : for identity commands; output is parsed, never logged or shown.
+# run_identity CMD... : for identity commands; output is parsed, never logged or shown.
 run_identity() {
   "$@" 2>/dev/null </dev/null
 }
 
-failure_detail() { # failure_detail LABEL : last lines of the error, and the log path
-  LOG_KEPT=1
-  list_add fail "$1"
-  local line
-  while IFS= read -r line; do
-    list_sub "${line:0:$((COLS - 12))}"
-  done < <( (cat "$LAST_ERR"; [ -s "$LAST_ERR" ] || tail -n 6 "$LAST_OUT") | tail -n 6 )
-  list_sub "Full output: $LOGDIR/setup.log"
+# failure_detail LABEL [HINT] : never prints raw command output, only the exit code and a
+# fixed hint. A redacted log can be saved from the final screen.
+failure_detail() {
+  FAILED_ANY=1
+  list_add fail "$1 (exit $LAST_RC)"
+  list_sub "${2:-Run the same command yourself for details, or save a redacted log on the last screen.}"
+}
+
+# Mask emails, long hex or base64-like tokens and home directories.
+redact_log() {
+  sed -E -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/[email]/g' \
+         -e 's/[0-9A-Fa-f]{32,}/[hex]/g' \
+         -e 's#[A-Za-z0-9+/=_-]{40,}#[token]#g' \
+         -e 's#/(Users|home)/[^/ ]+#/~#g'
+}
+
+save_redacted_log() {
+  local dest
+  ask_text "Save redacted log to (new file)" "$PWD/agent-orchestration-setup.log"
+  dest=$ANSWER
+  screen_reset; begin_step 8
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    list_add fail "$dest already exists; nothing written"
+  elif [ -f "$LOGDIR/setup.log" ] && ( umask 077; set -C; redact_log <"$LOGDIR/setup.log" >"$dest" ) 2>/dev/null; then
+    list_add ok "Saved a redacted log (emails, tokens and home paths masked)"
+  else
+    list_add fail "Could not write the log"
+  fi
+  menu 0 "Continue"
 }
 
 # ---------------------------------------------------------------------------
@@ -489,28 +568,38 @@ elif op == "claude":
         print("yes|%s|%s" % (safe(data.get("subscriptionType")), safe(data.get("authMethod"))))
     else:
         print("no||")
-elif op == "preview":
+elif op == "plan":
+    import hashlib
     data = load(sys.argv[2]) or {}
-    target = sys.argv[3]
+    target, bundle = sys.argv[3], sys.argv[4]
     codex = data.get("codex") or {}
     claude = data.get("claude") or {}
-    add = present = update = 0
-    for rel in codex.get("files") or []:
-        if os.path.lexists(os.path.join(target, rel)):
-            present += 1
+
+    def digest(path):
+        try:
+            with open(path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            return None
+
+    files = codex.get("files") or []
+    for rel in files:
+        installed = os.path.join(target, rel)
+        if not os.path.lexists(installed):
+            print("ADD %s" % rel)
+        elif digest(installed) == digest(os.path.join(bundle, rel)):
+            print("KEEP %s" % rel)
         else:
-            add += 1
+            print("UPDATE %s" % rel)
+    manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
+    old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
+    if isinstance(old, dict):
+        for rel in sorted(set(old) - set(files)):
+            print("REMOVE %s" % rel)
     for rel in claude.get("changed_paths") or []:
-        if os.path.lexists(os.path.join(target, rel)):
-            update += 1
-        else:
-            add += 1
-    print("ADD %d" % add)
-    print("UPDATE %d" % update)
-    print("PRESENT %d" % present)
-    print("ACTION %s" % fmt(codex.get("action")))
+        print(("UPDATE %s" if os.path.lexists(os.path.join(target, rel)) else "ADD %s") % rel)
     for rel, action in sorted((codex.get("project_configuration") or {}).items()):
-        print("CONFIG %s %s" % (rel, action))
+        print("CONFIG %s -> %s" % (rel, action))
 elif op == "problems":
     data = load(sys.argv[2]) or {}
     seen = []
@@ -593,7 +682,7 @@ step_checks() {
       [ -n "${ANTHROPIC_API_KEY:-}" ] && list_sub "ANTHROPIC_API_KEY is set"
       [ -n "${OPENAI_API_KEY:-}" ] && list_sub "OPENAI_API_KEY is set"
       list_sub "Metered billing is never used, so child runs would be refused while these are set."
-      list_sub "Fix: unset ANTHROPIC_API_KEY OPENAI_API_KEY   (then choose Re-check)"
+      list_sub "Fix: quit (q), run 'unset ANTHROPIC_API_KEY OPENAI_API_KEY' in your shell, then run ./setup.sh again."
       soft=1
     else
       list_add ok "No ANTHROPIC_API_KEY or OPENAI_API_KEY set"
@@ -625,10 +714,11 @@ step_checks() {
 # ---------------------------------------------------------------------------
 # Step 2: choose the project
 # ---------------------------------------------------------------------------
-resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+resolve_dir() { (CDPATH= cd -- "$1" 2>/dev/null && pwd -P); }
 
-project_problem() { # project_problem DIR -> prints reason, returns 1 if not usable
-  local dir=$1 top dirty
+# basic_problem DIR : the directory must be the top of a Git working tree.
+basic_problem() {
+  local dir=$1 top
   [ -d "$dir" ] || { echo "That path is not a directory."; return 1; }
   top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || {
     echo "That directory is not inside a Git working tree. Run: git init"; return 1; }
@@ -637,7 +727,13 @@ project_problem() { # project_problem DIR -> prints reason, returns 1 if not usa
     echo "That is inside a Git project but not its top. Use the project root instead: $top"
     return 1
   fi
-  dirty=$(git -C "$dir" status --porcelain --untracked-files=all -- .codex .agents .claude 2>/dev/null | head -n 3)
+  return 0
+}
+
+# managed_problem DIR : an install or update needs clean managed paths.
+managed_problem() {
+  local dirty
+  dirty=$(git -C "$1" status --porcelain --untracked-files=all -- .codex .agents .claude 2>/dev/null | head -n 3)
   if [ -n "$dirty" ]; then
     echo "Uncommitted changes exist in managed paths (.codex, .agents, .claude). Commit or discard them first."
     return 1
@@ -657,12 +753,12 @@ prepare_project_inputs() {
     while :; do
       screen_reset
       begin_step 2
-      body "This project has no operational checks file yet. The installer needs one: it names the exact test and security commands (with their hashes) that operational QA may run. It cannot be guessed. The format is described by the schema at packages/codex-agents/native-package/.codex/orchestration/schemas/operational-checks.schema.json in this repository."
+      body "This project has no operational checks file yet. The installer needs one: it names the exact test and security commands, with their hashes, that operational QA may run. It cannot be guessed. README.md, section 'Advanced: manual setup', has a short recipe to build it (a wrapper script plus two hashes). A future wizard step will generate it; for now it is a manual preparation step."
       body "Enter the path to your prepared operational-checks.json (it is copied into the project), or type q to quit."
       ask_text "Path to operational-checks.json" ""
       path=$ANSWER
       if [ -f "$path" ]; then
-        path="$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")"
+        path="$(CDPATH= cd -- "$(dirname -- "$path")" && pwd -P)/$(basename -- "$path")"
         INSTALL_OPTS+=(--operational-checks "$path")
         return 0
       fi
@@ -675,7 +771,7 @@ prepare_project_inputs() {
 }
 
 step_project() {
-  local default dir reason out rc summary
+  local default dir reason out rc
   default=${1:-$PWD}
   while :; do
     begin_step 2
@@ -689,7 +785,38 @@ step_project() {
       [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
       continue
     fi
-    if reason=$(project_problem "$dir"); then :; else
+    if reason=$(basic_problem "$dir"); then :; else
+      list_add fail "$dir"; list_sub "$reason"
+      menu 0 "Choose another path" "Quit"
+      [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
+      default=$dir
+      continue
+    fi
+    # Existing installs are detected first, so verify and re-attest never need an update preview.
+    MODE=full
+    if [ -f "$dir/.codex/orchestration/install-manifest.json" ]; then
+      list_add ok "Project: $dir"
+      body "An existing install was found in this project. Choose what to do."
+      menu 0 "Update the install and walk through every step" \
+             "Verify the install only" \
+             "Re-run the billing attestation only" \
+             "Choose another path" \
+             "Quit"
+      case $MENU_IDX in
+        0) MODE=full;;
+        1) MODE=verify;;
+        2) MODE=attest;;
+        3) default=$dir; continue;;
+        4) echo "Stopped."; exit 0;;
+      esac
+      screen_reset; begin_step 2
+    fi
+    if [ "$MODE" != full ]; then
+      PROJECT=$dir
+      mark_step 2 ok "$PROJECT"
+      return 0
+    fi
+    if reason=$(managed_problem "$dir"); then :; else
       list_add fail "$dir"; list_sub "$reason"
       menu 0 "Choose another path" "Quit"
       [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
@@ -697,7 +824,7 @@ step_project() {
       continue
     fi
     prepare_project_inputs "$dir"
-    begin_step 2
+    screen_reset; begin_step 2
     body "Previewing the install for: $dir"
     render
     PREVIEW_FILE="$LOGDIR/preview.json"
@@ -720,30 +847,14 @@ step_project() {
       continue
     fi
     PROJECT=$dir
-    summary=$(pj preview "$PREVIEW_FILE" "$PROJECT")
+    PLAN_TEXT=$(pj plan "$PREVIEW_FILE" "$PROJECT" "$ROOT_DIR/packages/codex-agents/native-package")
     list_add ok "Project: $PROJECT"
-    printf -v PREVIEW_TEXT '%s' "$summary"
-    if [ -f "$PROJECT/.codex/orchestration/install-manifest.json" ]; then
-      body "An existing install was found in this project. Choose what to do."
-      menu 0 "Update the install and walk through every step" \
-             "Verify the install only" \
-             "Re-run the billing attestation only" \
-             "Quit"
-      case $MENU_IDX in
-        0) MODE=full;;
-        1) MODE=verify;;
-        2) MODE=attest;;
-        3) echo "Stopped."; exit 0;;
-      esac
-    else
-      MODE=full
-      body "A fresh install is possible. Continue to choose providers."
-      menu 0 "Continue" "Choose another path" "Quit"
-      case $MENU_IDX in
-        1) default=$dir; continue;;
-        2) echo "Stopped."; exit 0;;
-      esac
-    fi
+    body "A fresh install is possible. Continue to choose providers."
+    menu 0 "Continue" "Choose another path" "Quit"
+    case $MENU_IDX in
+      1) default=$dir; continue;;
+      2) echo "Stopped."; exit 0;;
+    esac
     mark_step 2 ok "$PROJECT"
     return 0
   done
@@ -759,6 +870,14 @@ step_providers() {
   existing="$PROJECT/.codex/orchestration/provider-routing.json"
   ROUTING_WRITE=1
   begin_step 3
+  if [ -L "$existing" ] || { [ -e "$existing" ] && [ ! -f "$existing" ]; }; then
+    list_add fail "provider-routing.json is a symlink or not a regular file; refused"
+    list_sub "Replace it with a regular file in the project, commit, and run setup again."
+    mark_step 3 fail "provider-routing.json refused"
+    FAIL_REASON="provider configuration refused"
+    menu 0 "Continue to the summary"
+    return 1
+  fi
   if [ -f "$existing" ]; then
     body "This project already has a provider configuration (.codex/orchestration/provider-routing.json). Keep it, or choose providers again and replace it."
     menu 0 "Keep the existing configuration" "Choose providers again"
@@ -822,21 +941,34 @@ step_providers() {
 # ---------------------------------------------------------------------------
 COMMIT_MSG_1="Install agent orchestration packages"
 COMMIT_MSG_2="Adds the managed Codex and Claude agent packages and the provider routing configuration."
+PLAN_TEXT=""
 
-show_preview_summary() {
-  local line key rest
-  while IFS= read -r line; do
-    key=${line%% *}; rest=${line#* }
-    case "$key" in
-      ADD) list_add info "Files to add: $rest";;
-      UPDATE) list_add info "Files to update: $rest";;
-      PRESENT) list_add info "Files already present (kept unless different): $rest";;
-      ACTION) [ -n "$rest" ] && [ "$rest" != ACTION ] && list_add info "Codex package action: $rest";;
-      CONFIG) list_add info "Project config: ${rest% *} -> ${rest##* }";;
+list_cmd() { LIST="${LIST}    $1
+"; }
+
+# The per-path plan: add, update (content differs), remove (obsolete), keep (unchanged).
+show_plan() {
+  local kind line n shown cap label
+  for kind in ADD UPDATE REMOVE; do
+    n=$(printf '%s\n' "$PLAN_TEXT" | grep -c "^$kind ")
+    case $kind in
+      ADD) label="Files to add"; cap=6;;
+      UPDATE) label="Files to update (content differs)"; cap=15;;
+      REMOVE) label="Obsolete files to remove"; cap=15;;
     esac
-  done <<EOF
-$PREVIEW_TEXT
-EOF
+    list_add info "$label: $n"
+    shown=0
+    while IFS= read -r line; do
+      [ $shown -ge $cap ] && break
+      list_sub "${kind} ${line#* }"
+      shown=$((shown + 1))
+    done < <(printf '%s\n' "$PLAN_TEXT" | grep "^$kind ")
+    [ "$n" -gt "$shown" ] && list_sub "... and $((n - shown)) more"
+  done
+  list_add info "Files unchanged: $(printf '%s\n' "$PLAN_TEXT" | grep -c '^KEEP ')"
+  while IFS= read -r line; do
+    list_add info "Project config: ${line#CONFIG }"
+  done < <(printf '%s\n' "$PLAN_TEXT" | grep '^CONFIG ')
 }
 
 verify_install() { # verify_install -> sets LAST_* and records problems in LIST
@@ -852,11 +984,12 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 }
 
 step_install() {
-  local routing_path line commit_done=0 verify_ok=0
+  local routing_path line commit_done=0 verify_ok=0 q_project
+  q_project=$(printf '%q' "$PROJECT")
   begin_step 4
   body "Install into: $PROJECT"
-  show_preview_summary
-  body "This adds files under .codex, .agents and .claude, then writes .codex/orchestration/provider-routing.json. Nothing outside the project is touched."
+  show_plan
+  body "This adds or updates files under .codex, .agents and .claude, then writes .codex/orchestration/provider-routing.json. Nothing outside the project is touched."
   menu 0 "Install now" "Skip the install" "Quit"
   case $MENU_IDX in
     1) mark_step 4 skip "install skipped"; return 0;;
@@ -870,18 +1003,21 @@ step_install() {
     while IFS= read -r line; do list_sub "$line"; done < <(pj problems "$LAST_OUT")
     list_sub "The installer rolls back a partial install where it can."
     mark_step 4 fail "install failed"
+    FAIL_REASON="install failed"
     menu 0 "Continue to the summary"
     return 1
   fi
   screen_reset; begin_step 4
   list_add ok "Packages installed"
-  routing_path="$PROJECT/.codex/orchestration/provider-routing.json"
   if [ "$ROUTING_WRITE" -eq 1 ]; then
-    if ( umask 022; printf '%s\n' "$ROUTING_CONTENT" >"$routing_path" ); then
+    if write_project_routing "$PROJECT" "$ROUTING_CONTENT" 2>"$LOGDIR/routing.err"; then
       list_add ok "Wrote .codex/orchestration/provider-routing.json"
     else
       list_add fail "Could not write provider-routing.json"
+      list_sub "$(head -n 1 "$LOGDIR/routing.err")"
+      FAILED_ANY=1
       mark_step 4 fail "provider routing not written"
+      FAIL_REASON="provider routing not written"
       menu 0 "Continue to the summary"
       return 1
     fi
@@ -889,20 +1025,22 @@ step_install() {
     list_add ok "Kept the existing provider-routing.json"
   fi
   body "Next: commit the installed files in the project. Only these paths are committed, nothing is pushed. The exact commands are:"
-  body "git -C $(printf '%q' "$PROJECT") add -- .agents .claude .codex
-git -C $(printf '%q' "$PROJECT") commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- .agents .claude .codex"
+  list_cmd "git -C $q_project add -- .agents .claude .codex"
+  list_cmd "git -C $q_project commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- .agents .claude .codex"
   menu 0 "Commit now (recommended)" "I will commit myself"
   screen_reset; begin_step 4
   list_add ok "Packages installed"
   if [ "$MENU_IDX" -eq 0 ]; then
     render
+    RUN_QUIET=1
     if run_cmd "Committing" git -C "$PROJECT" add -- .agents .claude .codex &&
        run_cmd "Committing" git -C "$PROJECT" commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- .agents .claude .codex; then
+      RUN_QUIET=0
       commit_done=1
       list_add ok "Committed the installed files (not pushed)"
     else
-      failure_detail "The commit failed (a project hook may have refused it)"
-      list_sub "Commit the files yourself, then run ./setup.sh again and choose Verify."
+      RUN_QUIET=0
+      failure_detail "The commit failed" "Check your Git identity (user.name, user.email) and any commit hooks. Commit the files yourself, then run ./setup.sh again and choose Verify."
     fi
   else
     list_add skip "Commit left to you; verification needs the files committed"
@@ -915,6 +1053,7 @@ git -C $(printf '%q' "$PROJECT") commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\
     mark_step 4 ok "installed; commit, then verify"
   else
     mark_step 4 fail "installed but verification failed"
+    FAILED_ANY=1
   fi
   menu 0 "Continue"
   return 0
@@ -923,8 +1062,15 @@ git -C $(printf '%q' "$PROJECT") commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\
 # ---------------------------------------------------------------------------
 # Step 5: learning collector
 # ---------------------------------------------------------------------------
+version_hint() {
+  case "$(cat "$LAST_OUT" "$LAST_ERR" 2>/dev/null)" in
+    *runtime*|*newer*|*authorized*|*conflict*)
+      list_sub "The shared collector is authorised for a different version, so other projects on the old version need updating (run this setup there).";;
+  esac
+}
+
 step_collector() {
-  local cli ready reg_text
+  local cli ready
   begin_step 5
   cli="$PROJECT/.codex/orchestration/cli.py"
   if [ ! -f "$cli" ]; then
@@ -943,12 +1089,8 @@ step_collector() {
   render
   run_cmd "Registering the collector" python3 "$cli" learning-register --project-root "$PROJECT"
   if [ $? -ne 0 ]; then
-    reg_text=$(cat "$LAST_OUT" "$LAST_ERR")
     failure_detail "Collector registration failed"
-    case "$reg_text" in
-      *runtime*|*newer*|*authorized*|*conflict*)
-        list_sub "The shared collector is authorised for a different version, so other projects on the old version need updating (run this setup there)." ;;
-    esac
+    version_hint
     mark_step 5 fail "registration failed"
     pause; return 1
   fi
@@ -961,11 +1103,7 @@ step_collector() {
     mark_step 5 ok "registered, ready"
   else
     failure_detail "Collector status: not ready"
-    reg_text=$(cat "$LAST_OUT" "$LAST_ERR")
-    case "$reg_text" in
-      *runtime*|*newer*|*authorized*|*conflict*)
-        list_sub "The shared collector is authorised for a different version, so other projects on the old version need updating (run this setup there)." ;;
-    esac
+    version_hint
     mark_step 5 fail "not ready"
   fi
   pause
@@ -993,13 +1131,15 @@ step_billing() {
   printf '\033[H\033[2J'
   python3 "$ROOT_DIR/scripts/attest.py" --target "$PROJECT"
   rc=$?
-  printf '\n'
+  # Keep attest.py's own summary on screen until the owner has read it.
+  printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
+  IFS= read -r _ || true
   screen_reset; begin_step 6
   if [ $rc -eq 0 ]; then
-    list_add ok "attest.py finished successfully"
-    mark_step 6 ok "attestation completed"
+    list_add ok "attest.py ran. Check its summary for which providers it listed as attested."
+    mark_step 6 ok "attestation ran; check which providers were attested"
   else
-    list_add fail "attest.py stopped with exit code $rc (see its message above)"
+    list_add fail "attest.py stopped with exit code $rc (see its message)"
     list_sub "Run it again later: ./setup.sh, then choose the attestation option."
     mark_step 6 fail "attestation incomplete"
   fi
@@ -1015,15 +1155,15 @@ PROFILE_CONTENT='sandbox_mode = "workspace-write"
 network_access = true'
 
 step_profile() {
-  local dir file line
-  dir="$HOME/.codex"; file="$dir/orchestrator.config.toml"
+  local dir file
+  dir="${CODEX_HOME:-$HOME/.codex}"; file="$dir/orchestrator.config.toml"
   begin_step 7
   if [ "$PROFILE_WANTED" -ne 1 ]; then
     list_add skip "Not chosen in step 3, so no profile is needed."
     mark_step 7 skip "not chosen"
     pause; return 0
   fi
-  body "Codex runs commands without network access by default, so a Codex session cannot reach Claude. The orchestrator profile turns network on for sessions you start with: codex -p orchestrator. Ordinary sessions keep network off. Your main ~/.codex/config.toml is never edited."
+  body "Codex runs commands without network access by default, so a Codex session cannot reach Claude. The orchestrator profile turns network on for sessions you start with: codex -p orchestrator. Ordinary sessions keep network off. Your main config.toml is never edited."
   body "File: $file (mode 0600)
 
 $PROFILE_CONTENT"
@@ -1035,11 +1175,11 @@ $PROFILE_CONTENT"
   if [ -f "$file" ]; then
     if [ "$(cat "$file")" = "$PROFILE_CONTENT" ]; then
       list_add ok "The profile already exists with this content."
+      PROFILE_READY=1
       mark_step 7 ok "already present"
       pause; return 0
     fi
-    list_add warn "The profile exists with different content; it is left unchanged. Difference (yours -, proposed +):"
-    while IFS= read -r line; do list_sub "$line"; done < <(printf '%s\n' "$PROFILE_CONTENT" | diff -u "$file" - 2>/dev/null | tail -n +3 | head -n 12)
+    list_add warn "The profile exists and differs from the proposed content. It is left unchanged and its contents are not shown."
     mark_step 7 skip "exists, differs, left alone"
     pause; return 0
   fi
@@ -1052,6 +1192,7 @@ $PROFILE_CONTENT"
   if ( umask 077; mkdir -p "$dir"; set -C; printf '%s\n' "$PROFILE_CONTENT" >"$file" ) 2>/dev/null; then
     chmod 600 "$file"
     list_add ok "Created $file (mode 0600)"
+    PROFILE_READY=1
     mark_step 7 ok "created"
   else
     list_add fail "Could not create $file"
@@ -1066,12 +1207,12 @@ $PROFILE_CONTENT"
 step_verify_only() {
   begin_step 4
   render
-  if verify_install; then mark_step 4 ok "verified"; else mark_step 4 fail "verification failed"; fi
+  if verify_install; then mark_step 4 ok "verified"; else mark_step 4 fail "verification failed"; FAILED_ANY=1; fi
   pause
 }
 
 step_done() {
-  local i s label
+  local i s label codex_cmd
   begin_step 8
   mark_step 8 ok "finished"
   i=1
@@ -1085,15 +1226,39 @@ step_done() {
     esac
     i=$((i+1))
   done
+  [ "$PROFILE_READY" -eq 1 ] && codex_cmd="codex -p orchestrator" || codex_cmd="codex"
   body "How to use it:
  - In Claude Code, open the project and use the agent-orchestration skill.
- - In Codex, start a session with: codex -p orchestrator
- - To remove everything: python3 $ROOT_DIR/scripts/install.py remove --target $PROJECT --apply"
+ - In Codex, start a session with: $codex_cmd
+ - To remove everything, run:"
+  list_cmd "python3 $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
+  if [ "$FAILED_ANY" -eq 1 ] && [ -f "$LOGDIR/setup.log" ]; then
+    menu 0 "Exit" "Save a redacted log to a file"
+    [ "$MENU_IDX" -eq 1 ] && save_redacted_log
+    show_cursor
+    return 0
+  fi
   render
   show_cursor
   printf '  %sPress Enter to exit.%s ' "$C_DIM" "$C_RESET"
   IFS= read -r _ || true
   printf '\n'
+}
+
+# Some nested Python processes started by the installed CLI scrub their environment and still
+# write bytecode. Remove untracked __pycache__ directories from managed paths so setup never
+# leaves the project dirty.
+clean_bytecode() {
+  local d
+  [ -n "$PROJECT" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$(git -C "$PROJECT" ls-files -- "$d" 2>/dev/null)" ] || rm -rf -- "$PROJECT/$d"
+  done < <(cd "$PROJECT" 2>/dev/null && find .codex .agents .claude -type d -name __pycache__ -prune -print 2>/dev/null)
+  return 0
+}
+
+skip_rest() { # skip_rest REASON : mark collector, billing and profile as skipped
+  mark_step 5 skip "$1"; mark_step 6 skip "$1"; mark_step 7 skip "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -1107,16 +1272,24 @@ main() {
   step_project "${1:-$PWD}"
   case "$MODE" in
     full)
-      step_providers
-      step_install
-      step_collector
-      step_billing
-      step_profile;;
+      if ! step_providers; then
+        mark_step 4 skip "$FAIL_REASON"; skip_rest "$FAIL_REASON"
+      elif ! step_install; then
+        skip_rest "$FAIL_REASON"
+      else
+        step_collector
+        clean_bytecode
+        step_billing
+        clean_bytecode
+        step_profile
+      fi;;
     verify)
       step_verify_only;;
     attest)
-      step_billing;;
+      step_billing
+      clean_bytecode;;
   esac
+  clean_bytecode
   step_done
 }
 
