@@ -3160,6 +3160,57 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         refused = self.cli("learning-route", "--task", self.write("v.json", task), expected=2)
         self.assertIn("is unavailable", refused["error"])
 
+    def stored_worker_results(self) -> list:
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        try:
+            return ledger._connection.execute(
+                "SELECT relative_path,expires_at_ms FROM stored_files WHERE project_id=? "
+                "AND kind='artifact'",
+                (self.project_id,),
+            ).fetchall()
+        finally:
+            ledger.close()
+
+    def test_a_kept_worker_result_lives_only_while_its_orchestration_is_open(self) -> None:
+        before = time.time_ns() // 1_000_000
+        worker = self.run_native_worker()
+        digest = worker["recorded"]["host_outcome_digest"]
+        stored = next(self.state.artifacts.rglob(f"host_result_{digest}.json"))
+        rows = self.stored_worker_results()
+        self.assertEqual(1, len(rows))
+        # Never longer than seven days, even if the orchestration stays open.
+        week = 7 * 24 * 60 * 60 * 1000
+        self.assertLessEqual(int(rows[0]["expires_at_ms"]), time.time_ns() // 1_000_000 + week)
+        self.assertGreaterEqual(int(rows[0]["expires_at_ms"]), before + week)
+        self.cli(
+            "learning-close-orchestration", "--orchestration-handle",
+            worker["orchestration"]["orchestration_handle"], "--status", "completed",
+        )
+        # The raw result is gone with its registration; the outcome keeps its digest.
+        self.assertFalse(stored.exists())
+        self.assertEqual([], self.stored_worker_results())
+        self.assertEqual([], list(self.state.artifacts.rglob("host_result_*")))
+
+    def test_an_expired_worker_result_is_deleted_at_the_next_ledger_start(self) -> None:
+        worker = self.run_native_worker()
+        digest = worker["recorded"]["host_outcome_digest"]
+        stored = next(self.state.artifacts.rglob(f"host_result_{digest}.json"))
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        with ledger._connection:
+            ledger._connection.execute(
+                "UPDATE stored_files SET expires_at_ms=? WHERE project_id=?",
+                (time.time_ns() // 1_000_000 - 1, self.project_id),
+            )
+        ledger.close()
+        self.assertTrue(stored.exists())
+        self.assertEqual([], self.stored_worker_results())
+        self.assertFalse(stored.exists())
+        refused = self.cli(
+            "learning-route", "--task", self.write("v.json", self.verifier_task(digest)),
+            expected=2,
+        )
+        self.assertIn("is unavailable", refused["error"])
+
     def test_a_native_claude_verifier_of_codex_work_passes_qa(self) -> None:
         # A bridged Codex worker, then a native Claude verifier for it.
         self.admit("codex")

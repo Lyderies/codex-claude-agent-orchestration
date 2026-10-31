@@ -104,6 +104,20 @@ COLLECTOR_RUNTIME_DIGEST = _collector_runtime_digest()
 PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
 DEFAULT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
+# A worker result kept for its verifier is raw child text, so it lives only while
+# its orchestration is open, and never longer than this; only digests stay.
+WORKER_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+# Registered worker results: their raw text, kept for a verifier in the same
+# orchestration; the select yields project, path and orchestration status.
+_WORKER_RESULT_FILES = (
+    "SELECT s.project_id,s.relative_path,s.expires_at_ms,o.status FROM stored_files s "
+    "LEFT JOIN records r ON r.project_id=s.project_id AND r.record_id=s.source_record_id "
+    "LEFT JOIN host_run_bindings b ON b.project_id=r.project_id "
+    "AND b.run_id=json_extract(CAST(r.content AS TEXT),'$.run_id') "
+    "LEFT JOIN orchestrations o ON o.project_id=b.project_id "
+    "AND o.orchestration_id=b.orchestration_id "
+    "WHERE s.kind='artifact' AND substr(s.file_id,1,12)='host_result_'"
+)
 REPAIR_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000
 MAX_PENDING_REPAIR_RECEIPTS = 4096
 MAX_PENDING_HOST_RUNS = 4096
@@ -1264,8 +1278,23 @@ class LearningLedger:
         return connection
 
     def _reconcile_managed_files(self) -> None:
-        """Reconcile crash-orphaned files and registrations before serving work."""
+        """Reconcile crash-orphaned files and registrations before serving work.
 
+        A worker result whose orchestration has closed, or that is past its
+        retention, loses its registration here, so the sweep below deletes it.
+        """
+
+        now = self._clock_ms()
+        with self._connection:
+            for row in self._connection.execute(_WORKER_RESULT_FILES).fetchall():
+                if row["status"] in {"active", "paused"} and (
+                    row["expires_at_ms"] is None or int(row["expires_at_ms"]) > now
+                ):
+                    continue
+                self._connection.execute(
+                    "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
+                    (str(row["project_id"]), str(row["relative_path"])),
+                )
         rows = self._connection.execute(
             "SELECT project_id,relative_path FROM stored_files"
         ).fetchall()
@@ -2639,6 +2668,19 @@ class LearningLedger:
                 goal_time_used_seconds=resolved_goal_time,
                 observed_at_ms=timestamp,
             )
+            # The boundary's worker results were kept only for its verifiers.
+            results = self._connection.execute(
+                _WORKER_RESULT_FILES + " AND s.project_id=? AND b.orchestration_id=?",
+                (project_id, orchestration_id),
+            ).fetchall()
+            for result_row in results:
+                self._connection.execute(
+                    "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
+                    (project_id, str(result_row["relative_path"])),
+                )
+        for result_row in results:
+            with contextlib.suppress(OSError, LedgerError):
+                self._remove_registered_path(project_id, str(result_row["relative_path"]))
         self.state.harden_database_files()
         return self.orchestration_report(project_id, orchestration_id)
 
@@ -5135,7 +5177,7 @@ class LearningLedger:
                             stored_result["relative_path"],
                             stored_result["result_digest"],
                             outcome["record_id"],
-                            timestamp + DEFAULT_RETENTION_MS,
+                            timestamp + WORKER_RESULT_RETENTION_MS,
                         ),
                     )
                 self._connection.execute("COMMIT")
