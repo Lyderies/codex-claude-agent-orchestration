@@ -10,17 +10,12 @@ mappings may select workspace-write coding and verification agents within the ac
 parent grant. Use the primary agent as manager when one owner must preserve requirements
 and synthesize results.
 
-The accepted version 5 routing policy is:
-
-- GPT-6 Luna/high for reconnaissance, bounded mechanical or implementation work with
-  deterministic or executable acceptance, and bounded deterministic verification;
-- GPT-6.1 Sol at medium or high for exploration, diagnosis, planning, cross-system
-  synthesis, architecture, and judgment-heavy independent verification;
-- GPT-6 Astra/high for security review, through an explicit provider candidate;
-- Astra/medium for other work only when it is evidenced end-to-end work that is
-  extreme-complexity, high-ambiguity, and cross-system; and
-- GPT-5.6 Sol/high as the sole legacy fallback, available only through the trusted,
-  finite, single-use receipt lifecycle after a native GPT-6 host rejection.
+The accepted version 5 routing policy lists, for each family and route key, an ordered
+list of provider candidates (Codex and Claude models with their efforts); the route names
+the first candidate that passes the static eligibility checks. Follow the route's
+provider, model and effort rather than any summary. GPT-5.6 Sol/high remains the sole
+legacy fallback, available only through the trusted, finite, single-use receipt
+lifecycle after a native GPT-6 host rejection.
 
 Every task supplies operation, ambiguity, context breadth, acceptance strength, and
 safe routing-evidence references. Unknown ambiguity or context breadth routes to a

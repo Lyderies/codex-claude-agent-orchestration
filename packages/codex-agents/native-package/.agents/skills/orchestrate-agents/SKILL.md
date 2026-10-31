@@ -167,11 +167,9 @@ not used exactly.
    a canary, promotion, release, or authority change.
 9. Synthesize only supported findings. Report failed, blocked, and unverified work
    plainly. Record failed output attempts with one typed reason and safe evidence
-   references, never raw prompts, output, secrets, or unrestricted tool data. Bounded
-   mechanical or implementation work with executable QA prefers GPT-6 Luna/high;
-   bounded deterministic verification does too. Exploration, diagnosis, planning,
-   cross-system synthesis, and judgment-heavy verification use GPT-6.1 Sol at the
-   policy-selected effort; security review uses GPT-6 Astra/high. Risk never raises
+   references, never raw prompts, output, secrets, or unrestricted tool data. Take the
+   provider, model and effort from the route `learning-route` returns; the policy's
+   ordered provider candidates per family decide them, not this text. Risk never raises
    model or effort. Otherwise Astra is valid only for an evidenced `end_to_end`
    operation with
    extreme complexity, high ambiguity, and cross-system context; its initial effort is

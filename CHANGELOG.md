@@ -2,6 +2,9 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **Route-first model guidance.** The Codex skill and its routing reference no longer summarize
+  per-family models, which had drifted from policy v5's provider candidates; they defer to the
+  route's provider, model and effort.
 - **Codex agent paths bind (0.8.7).** Codex 0.164 names a spawned child by its agent path
   (for example `/root/<task_name>`); `learning-bind-host-agent` accepts slash-separated paths of
   the same bounded tokens, and the Codex skill says to bind that path.
