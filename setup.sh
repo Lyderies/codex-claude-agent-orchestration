@@ -19,6 +19,7 @@
 #   ./setup.sh --print-codex-hint WANTED READY prints the Codex command and why (1 or 0 each)
 #   ./setup.sh --print-codex-primary FILE      prints yes when a Codex session may orchestrate
 #   ./setup.sh --print-changed-paths PROJECT PATH...  NUL-delimited PATHs with real changes
+#   ./setup.sh --print-ignored-paths PROJECT PATH...  NUL-delimited PATHs ignored by .gitignore
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
@@ -311,7 +312,7 @@ elif op in ("netprofile", "profilecmp"):
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
                     return None
-                return os.read(fd, 65536)
+                return os.read(fd, 65537)  # one byte past the limit shows a larger file
             finally:
                 os.close(fd)
         finally:
@@ -325,6 +326,8 @@ elif op in ("netprofile", "profilecmp"):
             import tomllib
             raw = read_profile(sys.argv[2])
             if raw is None:
+                raise ValueError
+            if len(raw) > 65536:
                 raise ValueError
             data = tomllib.loads(raw.decode("utf-8"))
             box = data.get("sandbox_workspace_write")
@@ -342,7 +345,7 @@ elif op in ("netprofile", "profilecmp"):
     try:
         raw = read_profile(sys.argv[2])
         section, net = "", False
-        for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        for line in (raw or b"")[:65536].decode("utf-8", "replace").splitlines():
             compact = re.sub(r"\s+", "", line.split("#", 1)[0])
             if compact.startswith("[") and compact.endswith("]"):
                 section = compact[1:-1]
@@ -398,22 +401,40 @@ $name"; fi
 # (modified, staged, deleted or untracked) according to `git status -z` with literal pathspecs.
 # If Git cannot answer, every PATH is printed, so a failure never hides a needed commit.
 changed_paths() {
-  local project=$1 rec st name bad=0 cand
+  local project=$1 rec st name src bad=0 cand
   shift
   [ "$#" -gt 0 ] || return 0
   while IFS= read -r -d '' rec; do
     if [ "$rec" = '!' ]; then bad=1; continue; fi
-    st=${rec:0:2}; name=${rec:3}
+    st=${rec:0:2}; name=${rec:3}; src=""
     case "$st" in
-      *R*|*C*) IFS= read -r -d '' _;;
+      *R*|*C*) IFS= read -r -d '' src;;
     esac
+    # A rename's source is kept when it is also a candidate, so the commit includes the
+    # deletion. A copy's source is unchanged, so it is never kept.
+    case "$st" in *R*) ;; *) src="";; esac
     for cand in "$@"; do
-      if [ "$cand" = "$name" ]; then printf '%s\0' "$name"; break; fi
+      if [ "$cand" = "$name" ]; then printf '%s\0' "$name"; fi
+      if [ -n "$src" ] && [ "$cand" = "$src" ]; then printf '%s\0' "$src"; fi
     done
   done < <(git -C "$project" --literal-pathspecs status --porcelain -z --untracked-files=all -- "$@" 2>/dev/null || printf '!\0')
   if [ "$bad" -eq 1 ]; then
     for cand in "$@"; do printf '%s\0' "$cand"; done
   fi
+}
+
+# ignored_paths PROJECT PATH... : prints, NUL-delimited, the PATHs that exist untracked but
+# are ignored by the project's .gitignore, which `git status` never lists and `git add`
+# would refuse. Silent when Git cannot answer (status already covers that case).
+ignored_paths() {
+  local project=$1 rec cand
+  shift
+  [ "$#" -gt 0 ] || return 0
+  while IFS= read -r -d '' rec; do
+    for cand in "$@"; do
+      if [ "$cand" = "$rec" ]; then printf '%s\0' "$rec"; break; fi
+    done
+  done < <(git -C "$project" --literal-pathspecs ls-files -z --others --ignored --exclude-standard -- "$@" 2>/dev/null)
 }
 
 # codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
@@ -491,6 +512,9 @@ case "${1:-}" in
   --print-changed-paths)
     if [ "$#" -lt 2 ]; then echo "usage: setup.sh --print-changed-paths PROJECT PATH..." >&2; exit 2; fi
     changed_paths "${@:2}"; exit 0;;
+  --print-ignored-paths)
+    if [ "$#" -lt 2 ]; then echo "usage: setup.sh --print-ignored-paths PROJECT PATH..." >&2; exit 2; fi
+    ignored_paths "${@:2}"; exit 0;;
   --helper)
     shift; pj "$@"; exit "$?";;
   -h|--help) usage; exit 0;;
@@ -921,6 +945,12 @@ save_summary() {
   ask_text "Save the summary to (new file)" "$HOME/agent-orchestration-setup-summary.txt"
   dest=$ANSWER
   screen_reset; begin_step 9
+  case "$dest" in
+    *[[:cntrl:]]*)
+      list_add fail "That location has a control character in it (such as a newline); nothing written"
+      menu 0 "Continue"
+      return 0;;
+  esac
   dir=$(dirname -- "$dest")
   if [ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
     list_add warn "That folder is inside a Git working tree, so the summary could be committed by accident."
@@ -1407,7 +1437,7 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 
 step_install() {
   local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
-  local commit_note paths_ok paths_rc nothing_to_commit candidates
+  local commit_note paths_ok paths_rc nothing_to_commit candidates ignored_n=0
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
   body "Install into: $PROJECT"
@@ -1476,9 +1506,30 @@ step_install() {
       COMMIT_PATHS+=("$path")
     done < <(changed_paths "$PROJECT" "${candidates[@]}")
     n_paths=${#COMMIT_PATHS[@]}
-    if [ "$n_paths" -eq 0 ]; then nothing_to_commit=1; fi
+    IGNORED=()
+    while IFS= read -r -d '' path; do
+      IGNORED+=("$path")
+    done < <(ignored_paths "$PROJECT" "${candidates[@]}")
+    ignored_n=${#IGNORED[@]}
+    if [ "$n_paths" -eq 0 ] && [ "$ignored_n" -eq 0 ]; then nothing_to_commit=1; fi
+    if [ "$ignored_n" -gt 0 ]; then
+      list_add warn "Some installed files are ignored by the project's .gitignore, so Git will not commit them:"
+      shown=0
+      for path in "${IGNORED[@]}"; do
+        [ "$shown" -ge 5 ] && break
+        list_sub "${path//[[:cntrl:]]/}"
+        shown=$((shown + 1))
+      done
+      [ "$ignored_n" -gt "$shown" ] && list_sub "... and $((ignored_n - shown)) more"
+    fi
   fi
-  if [ "$nothing_to_commit" -eq 1 ]; then
+  if [ "$paths_ok" -eq 1 ] && [ "$n_paths" -eq 0 ] && [ "$ignored_n" -gt 0 ]; then
+    COMMIT_STATE=failed
+    commit_done=0
+    LAST_RC=1
+    record_failure "installed files are ignored by .gitignore" "remove them from .gitignore or add them with git add -f yourself, then choose Verify"
+    list_sub "Nothing was committed. Remove them from .gitignore or add them yourself with git add -f, then run ./setup.sh again and choose Verify."
+  elif [ "$nothing_to_commit" -eq 1 ]; then
     list_add ok "Nothing to commit: the project already has these files committed"
     COMMIT_STATE=nothing
     commit_done=1
@@ -1535,12 +1586,19 @@ step_install() {
     commit_done=0
     failure_detail "The commit left files uncommitted" "Some managed files are still uncommitted. Commit them yourself, then run ./setup.sh again and choose Verify."
   fi
+  if [ "$ignored_n" -gt 0 ] && [ "$COMMIT_STATE" != failed ]; then
+    COMMIT_STATE=failed
+    commit_done=0
+    LAST_RC=1
+    record_failure "installed files are ignored by .gitignore" "remove them from .gitignore or add them with git add -f yourself, then choose Verify"
+    list_sub "The ignored files were not committed. Remove them from .gitignore or add them yourself with git add -f, then run ./setup.sh again and choose Verify."
+  fi
   case "$COMMIT_STATE" in
     committed) list_add ok "Committed the installed files (not pushed)"; commit_note="committed";;
     nothing) commit_note="nothing to commit";;
     not_committed) list_add skip "Commit left to you; verification needs the files committed"
       commit_note="not committed (you chose to commit yourself)";;
-    *) commit_note="commit failed";;
+    *) if [ "$ignored_n" -gt 0 ]; then commit_note="installed files ignored by .gitignore"; else commit_note="commit failed"; fi;;
   esac
   render
   if verify_install; then verify_ok=1; fi
@@ -1671,9 +1729,10 @@ step_passphrase() {
     list_add ok "The owner key passphrase was changed."
     mark_step 6 ok "owner key passphrase changed"
   else
-    list_add fail "The passphrase was not changed (exit code $rc, see its message)"
+    list_add fail "The passphrase change did not finish cleanly (exit code $rc, see its message)"
+    list_sub "If ssh-keygen got as far as the new passphrase, the key may already have changed. Run the change again and choose a non-empty passphrase."
     list_sub "Run it again later: ./setup.sh, then choose Change the owner key passphrase."
-    mark_step 6 fail "passphrase not changed"
+    mark_step 6 fail "passphrase change incomplete; key may have changed"
   fi
   pause
 }

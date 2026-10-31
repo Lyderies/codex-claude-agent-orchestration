@@ -145,7 +145,8 @@ class AttestTests(unittest.TestCase):
         (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
         return key
 
-    def run_main(self, answers: list[str], *, terminal: bool = True, change: bool = False):
+    def run_main(self, answers: list[str], *, terminal: bool = True, change: bool = False,
+                 trust_temp: bool = True):
         out, err = io.StringIO(), io.StringIO()
         prompts: list[str] = []
 
@@ -156,6 +157,8 @@ class AttestTests(unittest.TestCase):
         with mock.patch.object(attest, "_is_terminal", return_value=terminal), \
                 mock.patch.object(attest.subprocess, "run", self.world.run), \
                 mock.patch("builtins.input", fake_input), \
+                mock.patch.object(attest.getpass, "getpass", fake_input), \
+                mock.patch.object(attest, "_in_temp_root", return_value=not trust_temp), \
                 mock.patch.object(attest.Path, "home", return_value=self.home), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             argv = ["--state-root", str(self.state)]
@@ -324,9 +327,93 @@ class AttestTests(unittest.TestCase):
         self.assertEqual(self.run_main([], change=True), 1)
         self.assertIn("was not changed", self.output)
         self.world.change_rc = 0
+        self.world.passphrase_changes.clear()
         self.world.derived = "ssh-ed25519 AAAAother\n"
         self.assertEqual(self.run_main([], change=True), 1)
         self.assertIn("does not match", self.output)
+        self.assertEqual(self.world.passphrase_changes, [])  # -p never ran on the wrong key
+
+    def test_a_failed_check_after_the_change_says_the_key_may_have_changed(self) -> None:
+        self.configure_key()
+        real = self.world.run
+        state = {"derives": 0}
+
+        def cancelled_second_derive(command, **kwargs):
+            if command[0] == "/usr/bin/ssh-keygen" and command[1] == "-y" and "-P" not in command:
+                state["derives"] += 1
+                if state["derives"] == 2:  # the check after -p is cancelled
+                    self.world.calls.append([str(c) for c in command])
+                    return subprocess.CompletedProcess(command, 1, "", "")
+            return real(command, **kwargs)
+
+        self.world.run = cancelled_second_derive
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertEqual(len(self.world.passphrase_changes), 1)
+        self.assertIn("may already have a new passphrase", self.output)
+        self.assertIn("non-empty", self.output)
+        self.assertNotIn("was not changed", self.output)
+
+    def test_an_empty_new_passphrase_is_reported_as_possibly_changed(self) -> None:
+        self.configure_key()
+        real = self.world.run
+
+        def empties_the_passphrase(command, **kwargs):
+            if command[0] == "/usr/bin/ssh-keygen" and command[1] == "-p":
+                self.world.encrypted = False
+            return real(command, **kwargs)
+
+        self.world.run = empties_the_passphrase
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("may already have a new passphrase", self.output)
+
+    def test_every_ssh_keygen_call_drops_askpass_and_agent_variables(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        planted = {"SSH_ASKPASS": "/evil/helper", "SSH_ASKPASS_REQUIRE": "force",
+                   "SSH_AUTH_SOCK": "/agent.sock"}
+        with mock.patch.dict(os.environ, planted):
+            self.run_main(["y", "y", "y"])
+            self.run_main([], change=True)
+        self.assertTrue(self.world.envs)
+        for env in self.world.envs:
+            self.assertNotIn("SSH_ASKPASS", env)
+            self.assertNotIn("SSH_AUTH_SOCK", env)
+            self.assertEqual(env["SSH_ASKPASS_REQUIRE"], "never")
+
+    def test_change_passphrase_refuses_untrusted_state(self) -> None:
+        key = self.configure_key()
+        signers = self.state / "owner-allowed-signers"
+        # A temporary-folder state directory (the real check, not patched).
+        self.assertEqual(self.run_main([], change=True, trust_temp=False), 1)
+        self.assertIn("temporary folder or a project", self.output)
+        # Writable by others.
+        signers.chmod(0o666)
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("not writable by others", self.output)
+        signers.chmod(0o644)
+        # A symbolic link.
+        real = self.root / "real-signers"
+        real.write_text(signers.read_text())
+        signers.unlink()
+        signers.symlink_to(real)
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("symbolic link", self.output)
+        signers.unlink()
+        # Inside a Git working tree.
+        project_state = self.home / "work" / "state"
+        project_state.mkdir(parents=True)
+        (self.home / "work" / ".git").mkdir()
+        (project_state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
+        with mock.patch.object(attest, "default_state_root", return_value=project_state):
+            out = io.StringIO()
+            with mock.patch.object(attest, "_is_terminal", return_value=True), \
+                    mock.patch.object(attest, "_in_temp_root", return_value=False), \
+                    mock.patch.object(attest.Path, "home", return_value=self.home / "other"), \
+                    contextlib.redirect_stderr(out):
+                self.assertEqual(attest.main(["--change-passphrase"]), 1)
+        self.assertIn("temporary folder or a project", out.getvalue())
+        self.assertEqual(self.world.passphrase_changes, [])
+        self.assertTrue(key.exists())
 
     def test_change_passphrase_refuses_an_unencrypted_key(self) -> None:
         self.configure_key()
@@ -598,6 +685,62 @@ class AttestTests(unittest.TestCase):
         self.run_main(["y", "y", "y", "y"])
         self.assertNotIn(COMMENT, self.output)
         self.assertNotIn("codex-agents-owner (", self.output)
+
+
+class RealTerminalTests(unittest.TestCase):
+    """A mocked input() cannot show what the terminal echoes, so use a real pseudo-terminal."""
+
+    @unittest.skipUnless(Path("/usr/bin/ssh-keygen").exists(), "needs the system ssh-keygen")
+    def test_a_rejected_key_location_entry_is_never_echoed(self) -> None:
+        import pty
+        import select
+        import time
+
+        root = Path(tempfile.mkdtemp(prefix="attest-pty-")).resolve()
+        self.addCleanup(shutil.rmtree, root, True)
+        home, state, project = root / "home", root / "state", root / "project"
+        for directory in (home, state):
+            directory.mkdir(mode=0o755)
+        (project / ".codex/orchestration").mkdir(parents=True)
+        (project / ".codex/orchestration/cli.py").write_text("")
+        # A throwaway key pair for this test only; it is never used to sign anything.
+        subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(root / "throwaway")],
+                       check=True, capture_output=True)
+        fields = (root / "throwaway.pub").read_text().split()
+        (state / "owner-allowed-signers").write_text(f"codex-agents-owner {fields[0]} {fields[1]}\n")
+        secret = "tangerine-Violin-8842-sample"
+        env = dict(os.environ, HOME=str(home))
+        env.pop("SSH_AUTH_SOCK", None)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve(sys.executable, [sys.executable, str(_SCRIPT), "--target", str(project),
+                                       "--state-root", str(state)], env)
+        transcript = ""
+        sent = False
+        end = time.time() + 30
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536).decode(errors="replace")
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                transcript += chunk
+            if not sent and "file location" in transcript and "Press Enter to use" in transcript:
+                time.sleep(0.3)
+                os.write(fd, (secret + "\r").encode())
+                sent = True
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        os.close(fd)
+        self.assertTrue(sent, transcript)
+        self.assertIn("That is not a file location.", transcript)
+        self.assertNotIn(secret, transcript)
+        self.assertNotIn("Violin", transcript)
 
 
 if __name__ == "__main__":

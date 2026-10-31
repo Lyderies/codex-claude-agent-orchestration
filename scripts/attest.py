@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
 import os
 import shutil
@@ -127,9 +128,15 @@ def check_ssh_keygen() -> None:
 
 
 def _env() -> dict[str, str]:
-    """Environment without ssh-agent, so a key loaded in an agent cannot sign silently."""
+    """Environment without ssh-agent or a passphrase helper program.
 
-    return {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
+    A key loaded in an agent cannot sign silently, and SSH_ASKPASS cannot hand the passphrase
+    prompt to another program: ssh-keygen asks on the terminal only.
+    """
+
+    env = {k: v for k, v in os.environ.items() if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS")}
+    env["SSH_ASKPASS_REQUIRE"] = "never"
+    return env
 
 
 def ssh(args: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -309,10 +316,27 @@ def choose_new_key() -> Path:
         key = _expand(DEFAULT_KEY)
         _create_key(key)
         return key
-    entered = input("Path of an existing private key to use (blank to stop): ").strip()
+    print("This asks for a file location, not your passphrase. What you type is not shown.")
+    entered = read_location("File location of an existing private key (blank to stop): ")
     if not entered:
         raise AttestError("no owner key chosen")
-    return _expand(entered)
+    return _accept_location(entered)
+
+
+def read_location(prompt: str) -> str:
+    """Read a file location with terminal echo off, so a mistyped passphrase is not shown."""
+
+    return getpass.getpass(prompt).strip()
+
+
+def _accept_location(entered: str) -> Path:
+    """Expand an entry that looks like a file location; refuse anything else without echo."""
+
+    if not entered.startswith("~/") and not os.path.isabs(entered):
+        raise AttestError(NOT_A_PATH)
+    key = _expand(entered)
+    print(f"Using the file location {key}")  # shown only now that it is a path
+    return key
 
 
 def configured_public_key(state_root: Path) -> tuple[str, str] | None:
@@ -397,30 +421,87 @@ def locate_key_file(configured: tuple[str, str]) -> Path:
     else:
         print("Where is the private key file for this owner key?")
         print("This asks for a file location, not your passphrase.")
-        entered = input(f"Press Enter to use {DEFAULT_KEY}, or type another file location: ").strip()
-        if entered and not entered.startswith("~/") and not os.path.isabs(entered):
-            raise AttestError(NOT_A_PATH)  # never echo the entry: it may be a passphrase
-        key = _expand(entered or DEFAULT_KEY)
+        print("What you type is not shown.")
+        entered = read_location(f"Press Enter to use {DEFAULT_KEY}, or type another file location: ")
+        key = _accept_location(entered) if entered else _expand(DEFAULT_KEY)
     validate_private_key(key)
     return key
+
+
+_TEMP_ROOTS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders")
+
+
+def _in_temp_root(path: Path) -> bool:
+    roots = {os.path.realpath(r) for r in (*_TEMP_ROOTS, tempfile.gettempdir())}
+    real = os.path.realpath(path)
+    return any(real == root or real.startswith(root + os.sep) for root in roots)
+
+
+def _in_working_tree(path: Path) -> bool:
+    """Whether a Git working tree contains path (home itself is not searched)."""
+
+    home = Path.home()
+    for parent in Path(os.path.realpath(path)).parents:
+        if parent == home or parent == Path(parent.anchor):
+            break
+        if os.path.lexists(parent / ".git"):
+            return True
+    return False
+
+
+def check_trusted_state(state_root: Path) -> None:
+    """Trust the owner-key record only if an agent could not have written it.
+
+    The standalone passphrase change has no project to anchor on, so the state directory and
+    the signer file must be real, yours, not writable by others, and outside every temporary
+    folder and Git working tree (places an agent or a project could plant a forged file).
+    """
+
+    signers = state_root / "owner-allowed-signers"
+    if not os.path.lexists(signers):
+        return  # nothing to trust; the caller reports that no key is configured
+    check_path_safe(state_root)
+    for path in (state_root, signers):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise AttestError("the owner key record may not be a symbolic link")
+        if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise AttestError("the owner key record must be owned by you and not writable by others")
+    if not stat.S_ISREG(signers.lstat().st_mode):
+        raise AttestError("the owner key record is not a regular file")
+    if _in_temp_root(state_root) or _in_working_tree(state_root):
+        raise AttestError("the owner key record is in a temporary folder or a project; refusing to trust it")
+
+
+CHANGE_UNSURE = (
+    "ssh-keygen had already finished, so the key may already have a new passphrase. If you "
+    "cancelled or left the new passphrase empty, run the change again and choose a non-empty one."
+)
 
 
 def change_passphrase(state_root: Path) -> None:
     """Hand the terminal to ssh-keygen -p for the configured owner key, then re-verify it."""
 
+    check_trusted_state(state_root)
     configured = configured_public_key(state_root)
     if configured is None:
         raise AttestError("no owner key is configured yet; run the billing attestation first")
     print(f"Owner key: {describe_key(*configured)}")
     key = locate_key_file(configured)
-    print("ssh-keygen will now ask for the current passphrase, then the new one twice.")
+    print("First, ssh-keygen checks that this file is the owner key. Enter the current passphrase.")
+    if derive_public(key) != configured:
+        raise AttestError("that private key does not match the configured owner key")
+    print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
     result = ssh(["-p", "-f", str(key)])
     if result.returncode != 0:
         raise AttestError("the passphrase was not changed")
-    validate_private_key(key)  # still encrypted, still safe
-    print("Checking the key with the new passphrase. Enter it when asked.")
-    if derive_public(key) != configured:
-        raise AttestError("that private key does not match the configured owner key")
+    try:
+        validate_private_key(key)  # still encrypted, still safe
+        print("Checking the key with the new passphrase. Enter it when asked.")
+        if derive_public(key) != configured:
+            raise AttestError("that private key no longer matches the configured owner key")
+    except AttestError as exc:
+        raise AttestError(f"{exc}. {CHANGE_UNSURE}") from exc
     print("Passphrase changed. The owner key is unchanged.")
 
 

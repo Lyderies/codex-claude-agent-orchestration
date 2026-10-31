@@ -8,6 +8,10 @@
   - `scripts/attest.py` finds the owner key at its default location without asking, and an entry
     that is not a file location is refused without being echoed. `--change-passphrase` (also in
     the wizard's existing-install menu) changes the owner key passphrase through `ssh-keygen -p`.
+  - Key-location prompts are read with echo off, `ssh-keygen` never receives `SSH_ASKPASS`, the
+    standalone passphrase change refuses an unsafe or temporary state folder and checks the key
+    before changing it, and the commit step reports files that `.gitignore` hides and keeps a
+    rename's deleted source.
   - The Codex profile step compares effective settings, so a profile with comments and the same
     settings is reported as matching, and a differing setting is named.
   - The saved failure summary defaults to the home folder and asks before saving into a Git

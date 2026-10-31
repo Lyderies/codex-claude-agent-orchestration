@@ -441,6 +441,50 @@ class SetupScriptTests(unittest.TestCase):
         self.assertEqual(self.profile_compare(None), "unreadable")
         self.assertNotIn(TOKEN, self.profile_compare(same))
 
+    def test_changed_paths_keeps_a_rename_source_that_is_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            (project / ".codex").mkdir()
+            (project / ".codex" / "old.txt").write_text("same content for rename detection\n" * 5)
+            (project / ".codex" / "kept.txt").write_text("copy source\n" * 5)
+            git = ["git", "-C", str(project)]
+            subprocess.run(git + ["add", "-A"], check=True, env=env)
+            subprocess.run(git + ["commit", "-qm", "i"], check=True, env=env)
+            subprocess.run(git + ["mv", ".codex/old.txt", ".codex/new.txt"], check=True, env=env)
+            status = subprocess.run(git + ["status", "--porcelain", "-z"], capture_output=True, env=env)
+            self.assertEqual(status.stdout, b"R  .codex/new.txt\0.codex/old.txt\0")
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-changed-paths", str(project),
+                 ".codex/new.txt", ".codex/old.txt", ".codex/kept.txt"],
+                capture_output=True, env=env)
+        self.assertEqual(sorted(result.stdout.split(b"\0")[:-1]), [b".codex/new.txt", b".codex/old.txt"])
+
+    def test_ignored_untracked_candidates_are_reported_not_called_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            (project / ".gitignore").write_text(".codex/\n")
+            (project / ".codex").mkdir()
+            (project / ".codex" / "ours.json").write_text("x\n")
+            (project / ".codex" / "sp ace.json").write_text("x\n")
+            candidates = [".codex/ours.json", ".codex/sp ace.json", ".codex/absent.json"]
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            changed = subprocess.run(["bash", str(SETUP), "--print-changed-paths", str(project), *candidates],
+                                     capture_output=True, env=env)
+            ignored = subprocess.run(["bash", str(SETUP), "--print-ignored-paths", str(project), *candidates],
+                                     capture_output=True, env=env)
+        self.assertEqual(changed.stdout, b"")  # status never lists them: the reason for the check
+        self.assertEqual(sorted(ignored.stdout.split(b"\0")[:-1]), [b".codex/ours.json", b".codex/sp ace.json"])
+
+    def test_profile_larger_than_the_read_limit_is_unreadable(self) -> None:
+        good = 'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = true\n'
+        padded = good + "# pad\n" * 12000 + "network_access = false\n"
+        self.assertGreater(len(padded), 65536)
+        self.assertEqual(self.profile_compare(padded), "unreadable")
+        self.assertEqual(self.profile_compare(good + "# pad\n" * 100), "same")
+
     def test_wizard_messages_for_the_polished_screens(self) -> None:
         text = SETUP.read_text(encoding="utf-8")
         self.assertIn("Nothing to commit: the project already has these files committed", text)
@@ -974,6 +1018,17 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.assertEqual(self.finish(), 0)
         self.assertTrue(destination.is_file())
+
+    def test_summary_path_with_a_control_character_is_refused(self) -> None:
+        project, checks = self.make_project()
+        self.failed_install_to_summary_menu(project, checks)
+        destination = self.base / "summary-bad.txt"
+        self.send(f"{self.base}/sum\x16\x01mary.txt\r")  # Ctrl-V Ctrl-A types a control character
+        self.expect("control character")
+        self.assertFalse(any(self.base.glob("sum*mary.txt")))
+        self.assertFalse(destination.exists())
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
 
     def test_linux_warns_that_operational_checks_need_macos(self) -> None:
         (self.fakes / "uname").write_text('#!/bin/sh\necho Linux\n')
