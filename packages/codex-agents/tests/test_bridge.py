@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -34,6 +35,7 @@ from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_contracts import content_digest
 from codex_agents.learning_engine import installed_execution_configuration
 from codex_agents.learning_store import (
+    CollectorServer,
     LearningLedger,
     LearningState,
     LedgerError,
@@ -356,6 +358,9 @@ class ClaudeBridgeTests(BridgeTestCase):
         # The prompt, last, states one evidence entry per criterion at its most severe outcome.
         self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
         self.assertIn("(fail, then not_run, then observed, then pass)", argv[-1])
+        # Each criterion's description reaches the child, not only its id.
+        for item in assigned["required_evidence"]:
+            self.assertIn(f"- {item['id']}: {item['description']}\n", argv[-1])
         # `--` ends the options, so the objective-led prompt is never read as one.
         self.assertEqual("--", argv[-2])
         self.assertNotIn("--bare", argv)
@@ -1649,6 +1654,19 @@ class CodexBridgeTests(BridgeTestCase):
                 if record["provider"] == "codex"
             ])
 
+    def test_a_changed_codex_agent_refuses_the_launch(self) -> None:
+        self.admit("codex")
+        route = self.bridged_route("codex")
+        assigned = self.assignment_for(route)
+        handle = self.open(route, assigned)
+        agent = self.bundle / f".codex/agents/{route['role']}.toml"
+        agent.write_text(agent.read_text().replace(
+            "developer_instructions", "developer_instructions_note = \"x\"\ndeveloper_instructions", 1
+        ))
+        with self.assertRaisesRegex(BridgeRefused, "differs from the routed configuration"):
+            self.dispatch(route, assigned, handle)
+        self.assertFalse([i for i in self.invocations("codex") if "exec" in i["argv"]])
+
     def test_happy_path_observes_before_and_after(self) -> None:
         route, assigned, handle = self.codex_run()
         self.frames("codex", [
@@ -1676,6 +1694,23 @@ class CodexBridgeTests(BridgeTestCase):
         self.assertEqual("read-only", argv[argv.index("-s") + 1])
         self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
         self.assertEqual("--", argv[-2])
+        for item in assigned["required_evidence"]:
+            self.assertIn(f"- {item['id']}: {item['description']}\n", argv[-1])
+        # The routed role's verified developer instructions reach the child as config.
+        overrides = [
+            argv[index + 1] for index, value in enumerate(argv[:-2]) if value == "-c"
+        ]
+        instructions = [
+            item for item in overrides if item.startswith("developer_instructions=")
+        ]
+        self.assertEqual(1, len(instructions))
+        agent = tomllib.loads(
+            (self.bundle / f".codex/agents/{route['role']}.toml").read_text()
+        )
+        self.assertEqual(
+            agent["developer_instructions"],
+            tomllib.loads(instructions[0])["developer_instructions"],
+        )
         for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules",
                      "--skip-git-repo-check", "--json"):
             self.assertIn(flag, argv)
@@ -3210,6 +3245,60 @@ class VerifierHandoffTests(ClaudePrimaryCase):
             expected=2,
         )
         self.assertIn("is unavailable", refused["error"])
+
+    def test_a_result_kept_under_the_old_retention_is_clamped_and_swept(self) -> None:
+        worker = self.run_native_worker()
+        digest = worker["recorded"]["host_outcome_digest"]
+        stored = next(self.state.artifacts.rglob(f"host_result_{digest}.json"))
+        day = 24 * 60 * 60 * 1000
+        now = time.time_ns() // 1_000_000
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        with ledger._connection:
+            # As an earlier version left it: recorded ten days ago, kept for 90.
+            ledger._connection.execute(
+                "UPDATE records SET ingested_at_ms=? WHERE project_id=? "
+                "AND record_type='outcome'",
+                (now - 10 * day, self.project_id),
+            )
+            ledger._connection.execute(
+                "UPDATE stored_files SET expires_at_ms=? WHERE project_id=?",
+                (now + 80 * day, self.project_id),
+            )
+        ledger.close()
+        # The next ledger start clamps it to seven days after its outcome and sweeps it.
+        self.assertEqual([], self.stored_worker_results())
+        self.assertFalse(stored.exists())
+
+    def test_the_collector_sweeps_expired_results_and_reads_refuse_them(self) -> None:
+        worker = self.run_native_worker()
+        digest = worker["recorded"]["host_outcome_digest"]
+        stored = next(self.state.artifacts.rglob(f"host_result_{digest}.json"))
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        self.addCleanup(ledger.close)
+        with ledger._connection:
+            ledger._connection.execute(
+                "UPDATE stored_files SET expires_at_ms=? WHERE project_id=?",
+                (time.time_ns() // 1_000_000 - 1, self.project_id),
+            )
+        # Past its retention a result is never handed on, even before any sweep.
+        with self.assertRaisesRegex(LedgerError, "it expired"):
+            ledger.verification_worker_result(self.project_id, self.verifier_task(digest))
+        self.assertTrue(stored.exists())
+        # A long-running collector deletes it on its own schedule.
+        with mock.patch.object(learning_store, "WORKER_RESULT_SWEEP_SECONDS", 0.05):
+            server = CollectorServer(ledger, client_capabilities=self.clients)
+            server.start()
+            try:
+                deadline = time.monotonic() + 10
+                while stored.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            finally:
+                server.stop()
+        self.assertFalse(stored.exists())
+        rows = ledger._connection.execute(
+            "SELECT COUNT(*) FROM stored_files WHERE project_id=?", (self.project_id,)
+        ).fetchone()[0]
+        self.assertEqual(0, rows)
 
     def test_a_native_claude_verifier_of_codex_work_passes_qa(self) -> None:
         # A bridged Codex worker, then a native Claude verifier for it.
