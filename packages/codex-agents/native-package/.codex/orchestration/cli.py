@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +71,7 @@ from codex_agents.learning_store import (  # noqa: E402
     CollectorMaintenance,
     CollectorRestartError,
     CollectorServer,
+    CollectorVersionError,
     LearningLedger,
     LearningState,
     LedgerError,
@@ -84,10 +87,20 @@ from codex_agents.learning_store import (  # noqa: E402
 from codex_agents.hosts import (  # noqa: E402
     CLAUDE_HOST_CLIENT,
     CODEX_HOST_CLIENT,
+    CODEX_THREAD_MARKERS,
     HOST_CLIENTS,
     HostClientMismatch,
     HostClientUnknown,
     resolve_host_client,
+)
+from codex_agents.host_commands import (  # noqa: E402
+    PRIMARY_HOST_COMMANDS,
+    HostCommandError,
+    argv_prefix as codex_argv_prefix,
+    render_rule as render_codex_rule,
+    rule_path as codex_rule_path,
+    rule_status as codex_rule_status,
+    write_rule as write_codex_rule,
 )
 from codex_agents.claude_host import (  # noqa: E402
     ClaudeHostDenied,
@@ -224,13 +237,61 @@ def _close_ledger(ledger: LearningLedger | _RestartingLedger) -> None:
         ledger.close()
 
 
+# Codex's sandbox blocks the collector's socket and state, so a sandboxed primary
+# gets this alongside the unchanged error.
+CODEX_SANDBOX_HINT = (
+    "If this ran inside the Codex sandbox: run host-command --project-root "
+    "<exact-root> and repeat this command with its argv_prefix; if codex_rule is not "
+    "installed, ask the owner to run ./setup.sh (Codex commands step)."
+)
+# Set when this invocation failed to reach the learning state or collector.
+_COLLECTOR_UNREACHED = False
+
+
+def _note_collector_failure(exc: BaseException) -> None:
+    """Note a failure to reach the learning state or collector.
+
+    A collector that answered (a rejection code or a version mismatch) was reached.
+    """
+
+    global _COLLECTOR_UNREACHED
+    if isinstance(exc, OSError) or (
+        isinstance(exc, CollectorError)
+        and exc.code is None
+        and not isinstance(exc, CollectorVersionError)
+    ):
+        _COLLECTOR_UNREACHED = True
+
+
+@contextlib.contextmanager
+def _collector_contact() -> Iterator[None]:
+    try:
+        yield
+    except (OSError, CollectorError) as exc:
+        _note_collector_failure(exc)
+        raise
+
+
+def _with_codex_hint(command: str, report: dict) -> dict:
+    """Add the sandbox hint when a Codex primary-host command missed the collector."""
+
+    if (
+        _COLLECTOR_UNREACHED
+        and command in PRIMARY_HOST_COMMANDS
+        and any(os.environ.get(name) for name in CODEX_THREAD_MARKERS)
+    ):
+        return {**report, "hint": CODEX_SANDBOX_HINT}
+    return report
+
+
 def _learning_ledger(args: argparse.Namespace) -> tuple[_RestartingLedger, str]:
-    state = LearningState(args.state_root, create=False)
-    maintenance = CollectorMaintenance.acquire(
-        state,
-        ORCHESTRATION_ROOT / "cli.py",
-        args.project_root,
-    )
+    with _collector_contact():
+        state = LearningState(args.state_root, create=False)
+        maintenance = CollectorMaintenance.acquire(
+            state,
+            ORCHESTRATION_ROOT / "cli.py",
+            args.project_root,
+        )
     try:
         ledger = LearningLedger(state)
     except Exception:
@@ -480,7 +541,7 @@ def _trusted_host_route(
     return route, capability
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1021,15 +1082,40 @@ def main() -> int:
     learning_attach_signature.add_argument("--request", required=True)
     learning_attach_signature.add_argument("--signature", required=True, type=Path)
 
+    # Read-only and collector-free, so a sandboxed Codex primary can run it first.
+    host_command = subparsers.add_parser(
+        "host-command",
+        help="print the exact command prefix a Codex primary uses and its rule status",
+    )
+    host_command.add_argument("--project-root", required=True, type=Path)
+
+    install_codex_rule = subparsers.add_parser(
+        "install-codex-rule",
+        help="owner setup: write the Codex command rule for one project",
+    )
+    install_codex_rule.add_argument("--project-root", required=True, type=Path)
+    install_codex_rule.add_argument(
+        "--replace", action="store_true", help="replace a differing rule for this project"
+    )
+    install_codex_rule.add_argument(
+        "--print", dest="print_only", action="store_true",
+        help="print the rule that would be written, without writing it",
+    )
+
     for subparser in subparsers.choices.values():
         subparser.add_argument(
             "--host-client",
             choices=HOST_CLIENTS,
             help="expected host client; refused unless it matches the detected host",
         )
-    args = parser.parse_args()
-    global _EXPLICIT_HOST_CLIENT
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    global _EXPLICIT_HOST_CLIENT, _COLLECTOR_UNREACHED
     _EXPLICIT_HOST_CLIENT = args.host_client
+    _COLLECTOR_UNREACHED = False
     try:
         if args.command == "validate":
             report = validate_package(args.root)
@@ -1231,16 +1317,16 @@ def main() -> int:
                             exc.reason_code,
                         )
                         learning_ready = True
-                    except (CollectorError, StateError, OSError):
-                        pass
+                    except (CollectorError, StateError, OSError) as failure:
+                        _note_collector_failure(failure)
                 _print(
-                    {
+                    _with_codex_hint(args.command, {
                         "ready": False,
                         "error": "result validation failed",
                         "reason_code": exc.reason_code,
                         "repair_receipt": repair_receipt,
                         "learning_ready": learning_ready,
-                    }
+                    })
                 )
                 return 2
         elif args.command == "evaluate":
@@ -1307,14 +1393,16 @@ def main() -> int:
                 _close_ledger(ledger)
             report = {"ready": True, "stopped": True}
         elif args.command == "learning-status":
-            state = LearningState(args.state_root, create=False)
+            with _collector_contact():
+                state = LearningState(args.state_root, create=False)
             try:
-                ensure_collector(
-                    state,
-                    ORCHESTRATION_ROOT / "cli.py",
-                    project_root=args.project_root,
-                )
-                health = CollectorClient(state.socket).health(args.project_root)
+                with _collector_contact():
+                    ensure_collector(
+                        state,
+                        ORCHESTRATION_ROOT / "cli.py",
+                        project_root=args.project_root,
+                    )
+                    health = CollectorClient(state.socket).health(args.project_root)
                 client_failures = client_health_snapshot(state, args.project_root)
                 report = {
                     "ready": True,
@@ -1329,7 +1417,7 @@ def main() -> int:
                 }
             except CollectorError as exc:
                 client_failures = client_health_snapshot(state, args.project_root)
-                report = {
+                report = _with_codex_hint(args.command, {
                     "ready": False,
                     "active": False,
                     "error": "collector or project registration is unavailable",
@@ -1337,7 +1425,7 @@ def main() -> int:
                     "ingestion": empty_ingestion_snapshot(
                         registered=exc.code != "project_unregistered"
                     ),
-                }
+                })
         elif args.command == "learning-backup-project":
             if args.expires_in_seconds < 60:
                 raise ContractError("backup expiry must be at least 60 seconds")
@@ -2695,10 +2783,35 @@ def main() -> int:
                 request, args.signature.read_bytes()
             )
             report = {"ready": True, "record": record}
+        elif args.command == "host-command":
+            status = codex_rule_status(args.project_root)
+            report = {
+                "ready": status == "installed",
+                "argv_prefix": codex_argv_prefix(args.project_root),
+                "codex_rule": status,
+                "rule_file": str(codex_rule_path(args.project_root)),
+            }
+        elif args.command == "install-codex-rule":
+            rule_file = str(codex_rule_path(args.project_root))
+            if args.print_only:
+                report = {
+                    "ready": True,
+                    "rule_file": rule_file,
+                    "rule_text": render_codex_rule(args.project_root),
+                }
+            else:
+                outcome = write_codex_rule(args.project_root, replace=args.replace)
+                report = {
+                    "ready": outcome != "differs",
+                    "codex_rule": outcome,
+                    "rule_file": rule_file,
+                }
         else:  # pragma: no cover - argparse restricts commands.
             raise ContractError("unsupported command")
     except OSError:
-        _print({"ready": False, "error": "filesystem operation failed"})
+        _print(_with_codex_hint(
+            args.command, {"ready": False, "error": "filesystem operation failed"}
+        ))
         return 2
     except HostClientMismatch:
         _print({
@@ -2738,12 +2851,13 @@ def main() -> int:
     except (
         CatalogError,
         CollectorError,
+        HostCommandError,
         LedgerError,
         PolicyError,
         StateError,
         json.JSONDecodeError,
     ) as exc:
-        _print({"ready": False, "error": str(exc)})
+        _print(_with_codex_hint(args.command, {"ready": False, "error": str(exc)}))
         return 2
     _print(report)
     successful = report.get("ready", True)

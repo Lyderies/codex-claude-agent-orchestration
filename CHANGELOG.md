@@ -69,6 +69,17 @@
   opened for its exact worker outcome. A verification-required result too large to keep as
   canonical JSON is refused before the run is consumed, instead of being recorded without
   the copy its verifier needs.
+- **Codex host command boundary (0.8.6).** A Codex primary runs the CLI inside Codex's
+  sandbox, which blocks the learning collector, so every collector-backed command failed.
+  A new wizard step, Commands, offers a per-project Codex command rule in the user's rules
+  layer. It lets only the primary-host subcommands, run with the absolute interpreter and
+  the absolute project `cli.py`, run outside the sandbox; owner commands stay sandboxed.
+  `host-command` reports that exact command prefix and whether the rule is installed, and
+  the Codex skill runs it first and stops until the rule is in place. A sandboxed
+  collector failure now carries a hint. The result template states one evidence entry per
+  criterion, at its most severe outcome, so a repair cannot soften a `fail`. The
+  orchestration report's `runs.native_agent_bound` is now `agent_bound`, because it
+  counts bridged runs too.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the

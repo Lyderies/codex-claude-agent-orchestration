@@ -205,6 +205,36 @@ class SetupScriptTests(unittest.TestCase):
             self.assertLess(time.time() - started, 15)
         self.assertEqual(result.stdout.splitlines()[0], "codex")
 
+    def test_codex_primary_follows_the_provider_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            def primary(path: Path) -> str:
+                result = subprocess.run(
+                    ["bash", str(SETUP), "--print-codex-primary", str(path)],
+                    capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout.strip()
+
+            # Without the file only Codex is enabled, so a Codex session may orchestrate.
+            self.assertEqual(primary(base / "absent.json"), "yes")
+            for choices, expected in (
+                (("on", "off", "-", "off"), "yes"),
+                (("off", "on", "claude-opus-5-5", "on"), "yes"),
+                (("on", "on", "claude-opus-5-5", "off"), "yes"),
+                (("off", "on", "claude-opus-5-5", "off"), "no"),
+            ):
+                with self.subTest(choices=choices):
+                    path = base / ("-".join(choices) + ".json")
+                    path.write_text(routing(*choices).stdout)
+                    self.assertEqual(primary(path), expected)
+            (base / "broken.json").write_text("{")
+            self.assertEqual(primary(base / "broken.json"), "no")
+            (base / "linked.json").symlink_to(base / "on-off---off.json")
+            self.assertEqual(primary(base / "linked.json"), "no")
+            os.mkfifo(base / "fifo.json")
+            self.assertEqual(primary(base / "fifo.json"), "no")
+
     def test_uncommitted_summary_keeps_rename_source_names_whole(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = self.git_project(directory)
@@ -448,8 +478,10 @@ class WizardTerminalTests(unittest.TestCase):
             f'exec "{sys.executable}" "$@"\n')
         for fake in self.fakes.iterdir():
             fake.chmod(0o755)
+        # CODEX_HOME is dropped so the commands step can only write under the test's HOME.
         self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR", "PYTHONDONTWRITEBYTECODE")}
+                    if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR",
+                                 "PYTHONDONTWRITEBYTECODE", "CODEX_HOME")}
         self.env.update(
             PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
             TMPDIR=str(self.tmpdir), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
@@ -583,7 +615,7 @@ class WizardTerminalTests(unittest.TestCase):
 
     def test_quit_on_the_first_screen_changes_nothing(self) -> None:
         self.start(self.base)
-        self.expect("Step 1 of 8")
+        self.expect("Step 1 of 9")
         self.expect("signed in (plan: max, login: x)")
         self.send("q")
         self.expect("Quit setup?")
@@ -646,17 +678,38 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\r")
         self.expect("Not chosen")
         self.send("\r")
+        self.expect("Yes, allow these commands")
+        self.assertIn("owner commands", self.screen)
+        self.send("\x1b[B\x1b[B\r")
+        self.expect("Codex commands rule: lines")
+        self.send("q")
+        self.expect("Yes, allow these commands")
+        self.send("\x1b[B\r")
+        self.expect("Rule created")
+        self.send("\r")
         self.expect("Press Enter to exit")
         self.assertIn("my\\ proj\\;x", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
         final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen.split("\x1b[2J")[-1]).replace("\r", "")
         self.assertIn("4. Install: installed and verified; committed", final)
-        self.assertLess(final.index("7. Profile"), final.index("How to use it"))
+        self.assertLess(final.index("7. Profile"), final.index("8. Commands: created"))
+        self.assertLess(final.index("8. Commands"), final.index("How to use it"))
         self.assertLess(final.index("How to use it"), final.index("To remove everything, run:"))
         self.assertRegex(final, r"To remove everything, run:\n\s+python3 .*install\.py.* remove --target ")
         self.assertEqual(final.count("To remove everything"), 1)
+        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-[0-9a-f]{12}\.rules")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
+        rules = list((self.home / ".codex" / "rules").iterdir())
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(oct(rules[0].stat().st_mode & 0o777), "0o600")
+        cli = project / ".codex" / "orchestration" / "cli.py"
+        expected = subprocess.run(
+            [sys.executable, str(cli), "install-codex-rule", "--project-root", str(project), "--print"],
+            capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1"), check=True)
+        import json
+        self.assertEqual(rules[0].read_text(), json.loads(expected.stdout)["rule_text"])
+        self.assertIn(json.dumps(str(cli)), rules[0].read_text())
         runs = self.py_log.read_text().split()
         self.assertTrue(runs and set(runs) == {"1"}, runs)
         self.assertEqual(list(self.tmpdir.iterdir()), [])
@@ -768,7 +821,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Commit now")
 
     def finish_after_install(self) -> str:
-        """Skip the collector, billing and profile steps, and return the final screen."""
+        """Skip the collector, billing, profile and commands steps; return the final screen."""
         self.expect("Continue")
         self.send("\r")
         self.expect("Register now")
@@ -776,6 +829,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Start the attestation")
         self.send("\x1b[B\r")
         self.expect("Not chosen")
+        self.send("\r")
+        self.expect("No, not now")
         self.send("\r")
         self.expect("remove --target")
         self.settle()
@@ -891,6 +946,38 @@ class WizardTerminalTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
+
+    def test_verify_reports_the_codex_commands_rule_without_writing_it(self) -> None:
+        import json
+        project, checks = self.make_project()
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("Codex commands rule: missing")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("remove --target")
+        self.settle()
+        final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "",
+                       self.screen.split("\x1b[2J")[-1]).replace("\r", "")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertIn("8. Commands: missing", final)
+        self.assertIn("Codex sessions cannot reach the orchestrator", final)
+        self.assertNotIn("To undo it, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:
         (self.base / "-odd").mkdir()

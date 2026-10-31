@@ -4,8 +4,9 @@
 #   ./setup.sh [PROJECT_PATH]
 #
 # Walks through: checks, project, providers, install, collector, billing attestation,
-# the optional Codex orchestrator profile, and a summary. It needs a real terminal,
-# because the billing attestation is a human step that must never be automated.
+# the optional Codex orchestrator profile, the optional Codex commands rule, and a summary.
+# It needs a real terminal, because the billing attestation is a human step that must
+# never be automated.
 #
 # Written for bash 3.2 (macOS): no associative arrays, no case-conversion expansions,
 # no mapfile or readarray. Only standard tools plus tput/stty and python3.
@@ -16,14 +17,15 @@
 # list of Claude model names, or "-" for none. It prints provider-routing.json.
 #   ./setup.sh --print-expanded-path VALUE     prints VALUE with a leading ~ or $HOME expanded
 #   ./setup.sh --print-codex-hint WANTED READY prints the Codex command and why (1 or 0 each)
+#   ./setup.sh --print-codex-primary FILE      prints yes when a Codex session may orchestrate
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 SETUP_VERSION=1
 CLAUDE_MODELS_ALL="claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5"
-STEP_NAMES=("Checks" "Project" "Providers" "Install" "Collector" "Billing" "Profile" "Done")
-STEP_TOTAL=8
+STEP_NAMES=("Checks" "Project" "Providers" "Install" "Collector" "Billing" "Profile" "Commands" "Done")
+STEP_TOTAL=9
 
 # ---------------------------------------------------------------------------
 # provider-routing.json (the closed key set the router validates)
@@ -378,6 +380,18 @@ codex_network_on() {
   [ "$(pj netprofile "$1" 2>/dev/null)" = yes ]
 }
 
+# codex_primary_enabled FILE : succeeds when a Codex session may orchestrate the project, that
+# is when provider-routing.json enables Codex children or lets Codex sessions bridge to Claude.
+# Without the file only Codex is enabled, so it succeeds; a symlink or any other non-regular
+# file never does (and is never opened).
+codex_primary_enabled() {
+  [ -L "$1" ] && return 1
+  [ -e "$1" ] || return 0
+  [ -f "$1" ] || return 1
+  [ "$(pj get "$1" providers.codex.enabled)" = true ] ||
+    [ "$(pj get "$1" codex_primary_may_bridge_to_claude)" = true ]
+}
+
 # codex_hint WANTED READY -> CODEX_CMD, CODEX_WHY : which command starts a Codex session
 # that can reach Claude children, and why.
 CODEX_CMD=""
@@ -424,6 +438,9 @@ case "${1:-}" in
   --print-codex-hint)
     if [ "$#" -ne 3 ]; then echo "usage: setup.sh --print-codex-hint WANTED READY" >&2; exit 2; fi
     codex_hint "$2" "$3"; printf '%s\n%s\n' "$CODEX_CMD" "$CODEX_WHY"; exit 0;;
+  --print-codex-primary)
+    if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-codex-primary FILE" >&2; exit 2; fi
+    if codex_primary_enabled "$2"; then echo yes; else echo no; fi; exit 0;;
   --print-uncommitted)
     if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-uncommitted PROJECT" >&2; exit 2; fi
     uncommitted_managed "$2"; printf '\n'; exit 0;;
@@ -493,6 +510,9 @@ declare -a STAT NOTE
 PROJECT=""
 MODE="full"
 PROFILE_WANTED=0
+CODEX_PRIMARY=0
+RULE_FILE=""
+RULE_READY=0
 ROUTING_CONTENT=""
 ROUTING_WRITE=0
 INSTALL_OPTS=()
@@ -554,27 +574,31 @@ repeat_char() { # repeat_char CHAR COUNT
 }
 
 draw_header() {
-  local i name line plain width filled bar
+  local i name line plain width filled bar sep="  "
   printf '%s%s Agent orchestration setup %s' "$C_BOLD" "$C_MAGENTA" "$C_RESET"
   if [ "$STEP" -gt 0 ]; then
     printf '%s Step %d of %d%s' "$C_DIM" "$STEP" "$STEP_TOTAL" "$C_RESET"
   fi
   printf '\n'
   if [ "$STEP" -gt 0 ]; then
+    # Two spaces between step names, or one when that keeps the strip on an 80-column line.
+    plain=""
+    for name in "${STEP_NAMES[@]}"; do plain="${plain}${sep}${name}"; done
+    [ "${#plain}" -lt "$COLS" ] || sep=" "
     plain=""; line=""
     i=1
     for name in "${STEP_NAMES[@]}"; do
-      plain="${plain}  ${name}"
+      plain="${plain}${sep}${name}"
       if [ "$i" -eq "$STEP" ]; then
-        line="${line}  ${C_CYAN}${C_BOLD}[${name}]${C_RESET}"
+        line="${line}${sep}${C_CYAN}${C_BOLD}[${name}]${C_RESET}"
       elif [ "${STAT[$i]:-}" = ok ]; then
-        line="${line}  ${C_GREEN}${name}${C_RESET}"
+        line="${line}${sep}${C_GREEN}${name}${C_RESET}"
       elif [ "${STAT[$i]:-}" = fail ]; then
-        line="${line}  ${C_RED}${name}${C_RESET}"
+        line="${line}${sep}${C_RED}${name}${C_RESET}"
       elif [ "${STAT[$i]:-}" = skip ]; then
-        line="${line}  ${C_YELLOW}${name}${C_RESET}"
+        line="${line}${sep}${C_YELLOW}${name}${C_RESET}"
       else
-        line="${line}  ${C_DIM}${name}${C_RESET}"
+        line="${line}${sep}${C_DIM}${name}${C_RESET}"
       fi
       i=$((i+1))
     done
@@ -845,7 +869,7 @@ save_summary() {
   local dest
   ask_text "Save the summary to (new file)" "$PWD/agent-orchestration-setup-summary.txt"
   dest=$ANSWER
-  screen_reset; begin_step 8
+  screen_reset; begin_step 9
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     list_add fail "$dest already exists; nothing written"
   elif ( umask 077; set -C; printf 'Agent orchestration setup: what failed\n%s' "$FAIL_SUMMARY" >"$dest" ) 2>/dev/null; then
@@ -1157,6 +1181,7 @@ step_providers() {
       ROUTING_WRITE=0
       ROUTING_CONTENT=$(cat "$existing")
       if grep -q '"codex_primary_may_bridge_to_claude": *true' "$existing"; then PROFILE_WANTED=1; fi
+      if codex_primary_enabled "$existing"; then CODEX_PRIMARY=1; fi
       mark_step 3 ok "kept existing configuration"
       return 0
     fi
@@ -1206,6 +1231,8 @@ step_providers() {
     1) step_providers; return;;
     2) echo "Stopped."; exit 0;;
   esac
+  CODEX_PRIMARY=0
+  if [ "$CH_CODEX" = on ] || [ "$CH_BRIDGE" = on ]; then CODEX_PRIMARY=1; fi
   mark_step 3 ok "codex=$CH_CODEX claude=$CH_CLAUDE bridge=$CH_BRIDGE"
 }
 
@@ -1254,9 +1281,10 @@ manual_installer() {
   printf 'python3 %q %s --target %q%s' "$ROOT_DIR/scripts/install.py" "$1" "$2" "${3:+ $3}"
 }
 
-# view_plan : every add, update and remove path in a scrollable view.
+# view_plan [TEXT [TITLE]] : TEXT (default: every add, update and remove path) in a scrollable
+# view headed TITLE (default: Full plan).
 view_plan() {
-  local text off=0 page n i end k
+  local text off=0 page n i end k title=${2:-Full plan}
   local lines=()
   if [ "$#" -gt 0 ]; then
     text=$1
@@ -1274,7 +1302,7 @@ view_plan() {
     [ "$off" -lt 0 ] && off=0
     printf '\033[H\033[2J'
     draw_header
-    printf '\n  %sFull plan: lines %d-%d of %d%s\n\n' "$C_BOLD" "$((off + 1))" "$((off + page > n ? n : off + page))" "$n" "$C_RESET"
+    printf '\n  %s%s: lines %d-%d of %d%s\n\n' "$C_BOLD" "$title" "$((off + 1))" "$((off + page > n ? n : off + page))" "$n" "$C_RESET"
     i=$off; end=$((off + page))
     while [ "$i" -lt "$end" ] && [ "$i" -lt "$n" ]; do
       printf '    %s\n' "${lines[$i]}"
@@ -1595,7 +1623,143 @@ $PROFILE_CONTENT"
 }
 
 # ---------------------------------------------------------------------------
-# Verify-only mode and step 8: done
+# Step 8: Codex commands rule
+# ---------------------------------------------------------------------------
+# The project CLI does the work: host-command only reads, install-codex-rule writes the rule
+# file. The wizard never builds the rule itself.
+RULE_STATUS=""
+check_rule() { # check_rule CLI -> RULE_STATUS (installed, missing, stale or empty), RULE_FILE
+  run_cmd "Checking the Codex commands rule" python3 "$1" host-command --project-root "$PROJECT"
+  RULE_STATUS=$(pj get "$LAST_OUT" codex_rule)
+  RULE_FILE=$(pj get "$LAST_OUT" rule_file)
+  case "$RULE_STATUS" in
+    installed|missing|stale) ;;
+    *) RULE_STATUS="";;
+  esac
+}
+
+commands_screen() {
+  screen_reset; begin_step 8
+  body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it, delete the rule file shown below."
+  body "File: $RULE_FILE (mode 0600). It applies to Codex sessions started after it is written. Your Codex config.toml is never edited."
+  if [ "$RULE_STATUS" = stale ]; then
+    list_add warn "A rule for this project already exists and differs from this one, for example because Python moved or the package was updated. It stays unchanged unless you replace it."
+  fi
+}
+
+# explain_rule_refusal : map the CLI's fixed refusal to a plain message; its text is only matched.
+explain_rule_refusal() {
+  local msg
+  case "$(pj raw "$LAST_OUT")" in
+    *symlink*|*"not a regular file"*|*"not a directory"*)
+      msg="The Codex rules folder or the rule file is a symlink or not a regular file, so it was left alone. Replace it with a real folder or file, then run setup again.";;
+    *"another user"*)
+      msg="The Codex rules folder belongs to another user, so it was left alone.";;
+    *"cannot hold"*)
+      msg="The project or Python path contains a line break or another control character, which a Codex rule cannot hold. Move the project to a plain path.";;
+    *)
+      msg="The rule could not be written. Check that your Codex folder is writable, then run setup again.";;
+  esac
+  failure_detail "The Codex commands rule was not written" "$msg"
+}
+
+step_commands() {
+  local cli text outcome replace=""
+  begin_step 8
+  if [ "$CODEX_PRIMARY" -ne 1 ]; then
+    mark_step 8 skip "Codex sessions do not orchestrate this project"
+    return 0
+  fi
+  cli="$PROJECT/.codex/orchestration/cli.py"
+  if [ ! -f "$cli" ]; then
+    list_add skip "The project CLI is not installed, so there is nothing to allow yet."
+    mark_step 8 skip "no installed CLI"
+    pause; return 0
+  fi
+  render
+  check_rule "$cli"
+  if [ -z "$RULE_STATUS" ]; then
+    screen_reset; begin_step 8
+    failure_detail "Could not check the Codex commands rule" "The installed orchestrator may be older than this step. Update the install (step 4), then run setup again."
+    mark_step 8 fail "not checked"
+    pause; return 1
+  fi
+  commands_screen
+  if [ "$RULE_STATUS" = installed ]; then
+    list_add ok "The rule already exists for this project with this content."
+    RULE_READY=1
+    mark_step 8 ok "already present"
+    pause; return 0
+  fi
+  while :; do
+    if [ "$RULE_STATUS" = stale ]; then
+      menu 0 "Leave it unchanged" "Replace it" "Show the new rule" "Quit"
+    else
+      menu 0 "No, not now" "Yes, allow these commands" "Show the exact rule" "Quit"
+    fi
+    case $MENU_IDX in
+      0)
+        if [ "$RULE_STATUS" = stale ]; then mark_step 8 skip "exists, differs, left alone"
+        else mark_step 8 skip "not created"; fi
+        return 0;;
+      1) break;;
+      2)
+        run_cmd "Preparing the rule" python3 "$cli" install-codex-rule --project-root "$PROJECT" --print
+        text=$(pj get "$LAST_OUT" rule_text)
+        [ -n "$text" ] && view_plan "$text" "Codex commands rule"
+        commands_screen;;
+      *) echo "Stopped."; exit 0;;
+    esac
+  done
+  [ "$RULE_STATUS" = stale ] && replace=--replace
+  screen_reset; begin_step 8
+  render
+  run_cmd "Writing the Codex commands rule" python3 "$cli" install-codex-rule --project-root "$PROJECT" ${replace:+"$replace"}
+  outcome=$(pj get "$LAST_OUT" codex_rule)
+  screen_reset; begin_step 8
+  case "$outcome" in
+    created|replaced|unchanged)
+      list_add ok "Rule $outcome: $RULE_FILE (mode 0600)"
+      list_sub "Start a new Codex session to use it."
+      RULE_READY=1
+      mark_step 8 ok "$outcome";;
+    differs)
+      failure_detail "The Codex commands rule was not written" "Another rule appeared for this project while setup ran. Run setup again to review it."
+      mark_step 8 fail "not written";;
+    *)
+      explain_rule_refusal
+      mark_step 8 fail "not written";;
+  esac
+  pause
+}
+
+# verify_rule : verify mode only reports the Codex commands rule; it never writes it.
+verify_rule() {
+  local cli="$PROJECT/.codex/orchestration/cli.py"
+  if ! codex_primary_enabled "$PROJECT/.codex/orchestration/provider-routing.json"; then
+    mark_step 8 skip "Codex sessions do not orchestrate this project"; return 0
+  fi
+  CODEX_PRIMARY=1
+  if [ ! -f "$cli" ]; then mark_step 8 skip "no installed CLI"; return 0; fi
+  check_rule "$cli"
+  case "$RULE_STATUS" in
+    installed)
+      RULE_READY=1
+      list_add ok "Codex commands rule: installed"
+      mark_step 8 ok "installed";;
+    missing|stale)
+      list_add warn "Codex commands rule: $RULE_STATUS"
+      list_sub "Codex sessions cannot reach the orchestrator without it. Run ./setup.sh, choose 'Update the install and walk through every step', and allow it in step 8."
+      mark_step 8 skip "$RULE_STATUS";;
+    *)
+      list_add fail "Could not check the Codex commands rule"
+      list_sub "The installed orchestrator may be older than this check. Update the install, then verify again."
+      mark_step 8 fail "not checked"; FAILED_ANY=1;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Verify-only mode and step 9: done
 # ---------------------------------------------------------------------------
 step_verify_only() {
   begin_step 4
@@ -1607,13 +1771,14 @@ step_verify_only() {
   else
     mark_step 4 fail "verification failed"; FAILED_ANY=1
   fi
+  verify_rule
   pause
 }
 
 step_done() {
   local i s label line shown
-  begin_step 8
-  mark_step 8 ok "finished"
+  begin_step 9
+  mark_step 9 ok "finished"
   i=1
   for label in "${STEP_NAMES[@]}"; do
     s=${STAT[$i]:-}
@@ -1642,8 +1807,15 @@ step_done() {
   list_plain " - In Claude Code, open the project and use the agent-orchestration skill."
   list_plain " - In Codex, start a session with: $CODEX_CMD"
   list_sub "$CODEX_WHY"
+  if [ "$CODEX_PRIMARY" -eq 1 ] && [ "$RULE_READY" -ne 1 ]; then
+    list_sub "Codex sessions cannot reach the orchestrator until the Codex commands rule exists. Run ./setup.sh again and allow it in step 8."
+  fi
   list_plain " - To remove everything, run:"
   list_cmd "python3 $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
+  if [ "$RULE_READY" -eq 1 ] && [ -n "$RULE_FILE" ]; then
+    list_plain " - The Codex commands rule is outside the project. To undo it, delete:"
+    list_cmd "$(printf '%q' "$RULE_FILE")"
+  fi
   if [ "$FAILED_ANY" -eq 1 ] && [ -n "$FAIL_SUMMARY" ]; then
     menu 0 "Exit" "Save a summary of what failed"
     [ "$MENU_IDX" -eq 1 ] && save_summary
@@ -1657,8 +1829,8 @@ step_done() {
   printf '\n'
 }
 
-skip_rest() { # skip_rest REASON : mark collector, billing and profile as skipped
-  mark_step 5 skip "$1"; mark_step 6 skip "$1"; mark_step 7 skip "$1"
+skip_rest() { # skip_rest REASON : mark collector, billing, profile and commands as skipped
+  mark_step 5 skip "$1"; mark_step 6 skip "$1"; mark_step 7 skip "$1"; mark_step 8 skip "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -1680,6 +1852,7 @@ main() {
         step_collector
         step_billing
         step_profile
+        step_commands
       fi;;
     verify)
       step_verify_only;;

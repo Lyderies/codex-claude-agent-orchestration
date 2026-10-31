@@ -197,6 +197,53 @@ build.
   primary.
 - Tag toolchain v1.
 
+### S5b: Codex host command boundary
+
+- **Problem.** A Codex primary runs `cli.py` inside Codex's workspace-write sandbox. The
+  sandbox denies connecting to the collector's local socket and writing the collector's
+  runtime lock in the per-user state directory, so every collector-backed command failed
+  (`filesystem operation failed`). `validate` and `learning-run-operational-checks` also
+  refuse inside a sandbox, because the operational checks need their own nested one. The
+  package assumed an approved unsandboxed command boundary but never provided one for a
+  headless Codex primary.
+- **Rule.** With the owner's consent, the wizard's Commands step writes one Codex command
+  rule per project: a `prefix_rule` with `decision = "allow"`, which runs a matching
+  command outside the sandbox without a prompt. The pattern is the absolute interpreter,
+  then the absolute `<root>/.codex/orchestration/cli.py`, then one allowlisted subcommand.
+  The file carries `match` and `not_match` examples that Codex checks when it loads it: an
+  owner command and the relative forms must not match. It is written atomically with mode
+  0600, symlinks are refused, identical content is left alone, and a differing rule is
+  replaced only after the owner confirms.
+- **Allowlist.** `PRIMARY_HOST_COMMANDS` in `codex_agents/host_commands.py`, tested to be
+  real subcommands and disjoint from the owner commands: `validate`, `inventory`, `route`,
+  `learning-route`, `validate-assignment`, `result-preflight`, `validate-result`,
+  `learning-status`, the orchestration open, checkpoint, pause, resume, close and report
+  commands, the host-run open, bind, observe, classify-abandoned and record commands,
+  `dispatch`, `provider-observe`, `learning-run-operational-checks` and
+  `learning-record-operational-qa`.
+- **Why the user layer.** Codex loads `${CODEX_HOME:-~/.codex}/rules/*.rules` in every
+  session. A project's `.codex/rules/` loads only when that project's `.codex/` layer is
+  trusted, which is unreliable for worktrees.
+- **Why absolute paths.** Inside the workspace, the sandbox keeps `.codex/`, `.agents/` and
+  `.git` read-only, but the model can write elsewhere in the workspace and in temporary
+  directories. A relative `cli.py` would let it plant a look-alike and run it unsandboxed.
+- **Host command.** `host-command` is read-only and needs no collector, so it works inside
+  the sandbox. It prints the exact `argv_prefix` and whether the rule is `installed`,
+  `missing` or `stale` (it differs from what setup would write now). The Codex skill runs it
+  first and stops unless the rule is installed. A collector-backed command that cannot
+  reach the collector under a Codex host keeps its error and adds a hint.
+- **Residual risks.**
+  - The rule trusts the interpreter at its path.
+  - Every argument after the subcommand is left to the CLI's own checks of
+    `--project-root` and the other options. This includes `--state-root`: a sandboxed
+    model can build a state directory in a temporary directory, and an allowlisted command
+    pointed at it runs outside the sandbox against that ledger instead of the owner's, so
+    `dispatch` could start a bridged child without the owner's attestation. Refusing a
+    non-default state root for primary-host commands is the follow-up.
+  - Owner commands stay unreachable from a sandboxed Codex primary; registration,
+    attestation and the rule itself come from the owner's terminal.
+  - The Claude primary's permission rules are a separate follow-up.
+
 ## Deferred to G4
 
 - Headroom tie-breaking between equally ranked candidates.

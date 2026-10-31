@@ -97,6 +97,25 @@ misuse; they are not proof of identity. Admission, the bridge flag and the read-
 authority gates. The Claude primary's skill is `.claude/skills/agent-orchestration`,
 installed with this package.
 
+## Command boundary
+
+A Codex primary runs the CLI inside Codex's workspace-write sandbox, which denies the
+learning collector's local socket and the writes its state needs, so collector-backed
+commands fail there (`filesystem operation failed`, plus a `hint` under a Codex host).
+`./setup.sh` (Codex commands step) offers, with the owner's consent, one Codex command
+rule per project in the user's rules layer:
+`${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<12 hex digits>.rules`, named by a
+digest of the resolved project root. It allows, outside the sandbox and without a prompt,
+exactly the absolute interpreter, then the absolute project `cli.py`, then one of the
+primary-host subcommands (`PRIMARY_HOST_COMMANDS` in `codex_agents/host_commands.py`).
+Owner commands (registration, attestation, owner keys, grants, backups, canaries,
+promotion, rollback, upgrade reconciliation and `install-codex-rule` itself) are not
+listed and stay sandboxed. `host-command --project-root <exact-root>` reads only and needs
+no collector. It prints `argv_prefix` and `codex_rule`: `installed`, `missing`, or `stale`
+when the file differs from what setup would write now, as after a Python or package
+change, or is a symlink. The rule leaves every argument after the subcommand to the CLI's
+own checks. A Claude primary does not use it.
+
 ## Provider admission
 
 `learning-open-host-run` admits a run for its route's provider before opening it, and a

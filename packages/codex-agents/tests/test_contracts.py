@@ -11,6 +11,8 @@ from pathlib import Path
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
 from codex_agents.contracts import (
+    EVIDENCE_OUTCOME_SEVERITY,
+    EVIDENCE_OUTCOMES,
     ContractError,
     ResultContractError,
     model_selection_slice,
@@ -373,6 +375,19 @@ class ContractTests(unittest.TestCase):
             item["criterion_id"] for item in preflight["template"]["evidence"]
         ])
         self.assertEqual("unverified", preflight["template"]["admission_state"])
+
+    def test_result_preflight_states_one_evidence_entry_per_criterion(self) -> None:
+        # Several findings for one criterion share its entry, at the most severe
+        # outcome, so a repair never collapses a fail into a milder label.
+        self.assertEqual(sorted(EVIDENCE_OUTCOMES), sorted(EVIDENCE_OUTCOME_SEVERITY))
+        self.assertEqual("fail", EVIDENCE_OUTCOME_SEVERITY[0])
+        rules = result_preflight(self.assignment())["consistency_rules"]
+        self.assertIn(
+            "each required criterion has exactly one evidence entry: put several "
+            "findings for it in that entry's details, and set its outcome to the most "
+            "severe of them (fail, then not_run, then observed, then pass)",
+            rules,
+        )
 
     def test_result_preflight_binds_retry_predecessor(self) -> None:
         assigned = self.assignment()

@@ -3335,7 +3335,8 @@ class LearningLedger:
                     if orchestration["status"] == "active"
                     else 0
                 ),
-                "native_agent_bound": sum(
+                # Native or bridged: a bridged run binds its bridge run ID here.
+                "agent_bound": sum(
                     row["native_assignment_id"] is not None for row in bindings
                 ),
                 "deadlines_observed": sum(

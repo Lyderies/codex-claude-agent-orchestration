@@ -31,7 +31,9 @@ Every result reports:
 
 - assignment identifier and terminal status;
 - concise outcome and artifacts or changed files;
-- evidence with a required criterion ID and commands, tests, or sources;
+- evidence with a required criterion ID and commands, tests, or sources: exactly one
+  entry per required criterion, with several findings in its `details` and the most
+  severe of their outcomes (`fail`, then `not_run`, then `observed`, then `pass`);
 - assumptions requested from the owner, if any;
 - failures, unverified claims, and remaining risks; and
 - measured usage when the host exposes it.

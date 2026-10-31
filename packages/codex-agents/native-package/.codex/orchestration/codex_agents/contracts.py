@@ -55,6 +55,8 @@ SEMANTIC_VERDICTS = {
 ADMISSION_STATES = {"unverified", "accepted", "rejected", "pending"}
 EVIDENCE_TYPES = {"command", "source", "artifact", "review", "observation"}
 EVIDENCE_OUTCOMES = {"pass", "fail", "observed", "not_run"}
+# Most severe first: one criterion's entry takes the most severe of its findings.
+EVIDENCE_OUTCOME_SEVERITY = ("fail", "not_run", "observed", "pass")
 FAILURE_REASONS = {
     "result_contract",
     "transient",
@@ -663,6 +665,9 @@ def result_preflight(assignment: Any) -> dict[str, Any]:
             "only completed execution may carry a substantive semantic verdict",
             "accepted admission requires completed execution; verdict remains independent",
             "completed execution must cover every required criterion",
+            "each required criterion has exactly one evidence entry: put several "
+            "findings for it in that entry's details, and set its outcome to the most "
+            "severe of them (" + ", then ".join(EVIDENCE_OUTCOME_SEVERITY) + ")",
             "negative verdicts may contain fail or not_run evidence",
         ],
     }

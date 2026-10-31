@@ -1634,7 +1634,7 @@ class LearningStoreTests(unittest.TestCase):
         )
         self.assertEqual({
             "opened": 1, "terminal": 1, "pending": 0, "abandoned": 0,
-            "current_active": 0, "native_agent_bound": 1,
+            "current_active": 0, "agent_bound": 1,
             "deadlines_observed": 0,
         }, report["runs"])
         self.assertEqual({"gpt-6.1-sol": 1}, report["by_model"])

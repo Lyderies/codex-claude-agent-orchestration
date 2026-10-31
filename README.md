@@ -54,7 +54,10 @@ It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to
 5. registers the learning collector;
 6. hands the terminal to the billing attestation, which only you can sign;
 7. optionally creates the Codex orchestrator profile;
-8. summarises the result and how to use it.
+8. when Codex sessions may orchestrate the project, offers the Codex commands rule, which lets
+   only this project's everyday orchestrator commands run outside Codex's sandbox (owner
+   commands stay blocked; delete the rule file to undo it);
+9. summarises the result and how to use it.
 
 Run it again on an installed project to update, verify or re-attest. It needs an interactive
 terminal and refuses to run piped or scripted. Full command output goes to a private temporary log,
@@ -62,8 +65,10 @@ shown only if something fails. Set `NO_COLOR=1` for plain output. In Claude Code
 `agent-orchestration` skill afterwards. In Codex, start with `codex -p orchestrator` if the optional
 orchestrator profile (step 7) was created, or if `~/.codex/orchestrator.config.toml` already sets
 `network_access = true` under `[sandbox_workspace_write]` (only that setting is read); otherwise
-start plain `codex`. Paths accept a leading `~`, `$HOME`, or surrounding quotes, and the wizard
-offers the `$HOME` match when a path with a lost `~` does not exist.
+start plain `codex`. Either way, a Codex session can orchestrate only once the Codex commands
+rule (step 8) exists, because Codex's sandbox blocks the orchestrator's background service. Paths
+accept a leading `~`, `$HOME`, or surrounding quotes, and the wizard offers the `$HOME` match
+when a path with a lost `~` does not exist.
 
 ### Advanced: manual setup
 
@@ -140,6 +145,17 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
 
    Then start orchestrating sessions with `codex -p orchestrator`. Ordinary sessions keep network
    off. Without this profile, start plain `codex`.
+6. **Let a Codex session reach the orchestrator.** Codex's sandbox blocks the learning
+   collector, so a Codex primary needs a Codex command rule that lets only this project's
+   everyday orchestrator commands run outside the sandbox. From the project:
+
+   ```sh
+   python3 .codex/orchestration/cli.py install-codex-rule --project-root "$PWD"
+   ```
+
+   It writes `${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<digest>.rules` and prints
+   its path; `--print` shows the rule without writing it. The rule names the `python3` that
+   ran it, so use the one your Codex sessions find first on `PATH`. Delete the file to undo it.
 
 ## Development
 

@@ -46,7 +46,10 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
      route, assignment, parent grant and the exact `--run-handle`, and use its
      `result`. Never dispatch a handle twice or retry a fenced outcome.
 6. **Validate and record.** Run `validate-result` on the child's result, allowing at
-   most one structural repair with the returned receipt. Always finish with
+   most one structural repair with the returned receipt. A `duplicate_criterion` repair
+   merges entries: one entry per criterion, every finding kept in its `details`, and the
+   most severe outcome (`fail`, then `not_run`, then `observed`, then `pass`); never
+   soften a `fail`. Always finish with
    `learning-record-host-result`, even for a failed or timed-out child. For a bridged
    run, pass `bridge_report.terminal_state`, when set, as the observation's
    `terminal_state`, and treat `reviewed: false` as unverified. Keep the printed

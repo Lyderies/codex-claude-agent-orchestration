@@ -2421,6 +2421,9 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         # Only the native worker's usage is unknown now; the bridged run's is not.
         self.assertEqual(1, summary["usage"]["unknown_runs"]["input_tokens"])
         self.assertEqual(1, summary["qa"]["passed"])
+        # Both the native worker and the bridged verifier count as agent-bound.
+        self.assertEqual(2, summary["runs"]["agent_bound"])
+        self.assertNotIn("native_agent_bound", summary["runs"])
 
     def ledger_value(self, read):
         ledger = LearningLedger(self.state, client_capabilities=self.clients)
