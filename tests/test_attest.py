@@ -398,6 +398,64 @@ class AttestTests(unittest.TestCase):
             with self.assertRaises(attest.AttestError):
                 attest.check_trusted_state(direct)
 
+    def scripted_failures(self, matcher, count: int):
+        """Make the first `count` ssh-keygen calls that match fail with a wrong-passphrase error."""
+
+        real = self.world.run
+        state = {"left": count}
+
+        def run(command, **kwargs):
+            if command[0] == "/usr/bin/ssh-keygen" and state["left"] > 0 and matcher(command):
+                state["left"] -= 1
+                self.world.calls.append([str(c) for c in command])
+                return subprocess.CompletedProcess(
+                    command, 255, "", "Load key: incorrect passphrase supplied to decrypt private key")
+            return real(command, **kwargs)
+
+        self.world.run = run
+
+    def test_wrong_current_passphrase_for_p_can_be_retried_or_abandoned(self) -> None:
+        self.configure_key()
+        self.scripted_failures(lambda c: c[1] == "-p", 1)
+        self.assertEqual(self.run_main(["t"], change=True), 0)
+        self.assertIn("That passphrase did not unlock the key.", self.output)
+        self.world.calls.clear()
+        self.scripted_failures(lambda c: c[1] == "-p", 1)
+        self.assertEqual(self.run_main(["e"], change=True), 1)
+        self.assertIn("was not changed", self.output)  # -p failed before writing anything
+
+    def test_wrong_passphrase_in_the_post_check_retries_that_check_only(self) -> None:
+        self.configure_key()
+        seen = {"derives": 0}
+
+        def second_derive(command):
+            if command[1] == "-y" and "-P" not in command:
+                seen["derives"] += 1
+                return seen["derives"] == 2
+            return False
+
+        self.scripted_failures(second_derive, 1)
+        self.assertEqual(self.run_main(["t"], change=True), 0)
+        self.assertEqual(len(self.world.passphrase_changes), 1)  # -p ran once, not repeated
+        self.world.calls.clear()
+        self.world.passphrase_changes.clear()
+        seen["derives"] = 0
+        self.scripted_failures(second_derive, 1)
+        self.assertEqual(self.run_main(["e"], change=True), 1)
+        self.assertIn("may already have a new passphrase", self.output)
+
+    def test_wrong_passphrase_while_signing_can_be_retried(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        self.scripted_failures(lambda c: c[1:3] == ["-Y", "sign"], 1)
+        self.assertEqual(self.run_main(["y", "y", "y", "t"]), 0)
+        self.assertEqual(self.world.recorded, ["codex"])
+        self.world.recorded.clear()
+        self.scripted_failures(lambda c: c[1:3] == ["-Y", "sign"], 1)
+        self.assertEqual(self.run_main(["y", "y", "y", "e"]), 1)
+        self.assertEqual(self.world.recorded, [])
+        self.assertIn("stopped: the passphrase did not unlock the key", self.output)
+
     def test_change_passphrase_refuses_untrusted_state(self) -> None:
         key = self.configure_key()
         signers = self.state / "owner-allowed-signers"
@@ -795,6 +853,116 @@ class RealTerminalTests(unittest.TestCase):
         transcript = self.run_in_pty(secret, break_echo=True)
         self.assertNotIn(secret, transcript)
         self.assertIn("cannot hide what you type", transcript)
+
+
+class PassphraseRetryTerminalTests(unittest.TestCase):
+    """A wrong passphrase offers Try again / Exit, checked with the real ssh-keygen and a pty."""
+
+    WRONG = "Wrong-Horse-1"
+    RIGHT = "Right-Horse-2"
+
+    def setUp(self) -> None:
+        if not Path("/usr/bin/ssh-keygen").exists():
+            self.skipTest("needs the system ssh-keygen")
+        self.root = Path(tempfile.mkdtemp(prefix="attest-retry-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.home, self.state, self.project = (self.root / n for n in ("home", "state", "project"))
+        (self.home / ".ssh").mkdir(parents=True, mode=0o700)
+        self.state.mkdir(mode=0o755)
+        (self.project / ".codex/orchestration").mkdir(parents=True)
+        # Every CLI call reports a logged-out provider, so a success ends with "not logged in".
+        (self.project / ".codex/orchestration/cli.py").write_text(
+            "import json\nprint(json.dumps({'ready': True, 'records': []}))\n")
+        # Throwaway keys for these tests only; they never sign anything real.
+        self.key = self.home / ".ssh" / "codex-agents-owner"
+        self.make_key(self.key, self.RIGHT)
+        self.write_signers(self.key)
+
+    def make_key(self, path: Path, passphrase: str) -> None:
+        subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", passphrase, "-f", str(path)],
+                       check=True, capture_output=True)
+        Path(str(path) + ".pub").unlink()  # the wizard must not rely on a .pub next to the key
+
+    def write_signers(self, key: Path) -> None:
+        pub = subprocess.run(["/usr/bin/ssh-keygen", "-y", "-P", self.RIGHT, "-f", str(key)],
+                             check=True, capture_output=True, text=True).stdout.split()
+        (self.state / "owner-allowed-signers").write_text(f"codex-agents-owner {pub[0]} {pub[1]}\n")
+
+    def drive(self, script: list[tuple[str, str]]) -> tuple[str, int]:
+        import pty
+        import select
+        import time
+
+        env = dict(os.environ, HOME=str(self.home))
+        env.pop("SSH_AUTH_SOCK", None)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve(sys.executable, [sys.executable, str(_SCRIPT), "--target", str(self.project),
+                                       "--state-root", str(self.state)], env)
+        transcript = buffer = ""
+        steps = list(script)
+        end = time.time() + 40
+        status = 0
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536).decode(errors="replace")
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                transcript += chunk
+                buffer += chunk
+            if steps and steps[0][0] in buffer:
+                expected, answer = steps.pop(0)
+                buffer = buffer[buffer.index(expected) + len(expected):]
+                time.sleep(0.3)
+                os.write(fd, (answer + "\r").encode())
+        _, status = os.waitpid(pid, 0)
+        os.close(fd)
+        self.assertEqual(steps, [], f"never saw the prompts for {steps}: {transcript}")
+        return transcript, os.WEXITSTATUS(status)
+
+    def no_passphrase_in(self, transcript: str) -> None:
+        for text in (self.WRONG, self.RIGHT):
+            self.assertNotIn(text, transcript)
+
+    def test_wrong_passphrase_then_try_again_succeeds(self) -> None:
+        transcript, code = self.drive([
+            ("Enter passphrase", self.WRONG), ("Try again or Exit?", ""),
+            ("Enter passphrase", self.RIGHT)])
+        self.assertIn("That passphrase did not unlock the key.", transcript)
+        self.assertIn("is not logged in", transcript)  # past the unlock
+        self.assertEqual(code, 1)  # nothing was attested
+        self.no_passphrase_in(transcript)
+
+    def test_wrong_passphrase_twice_then_right(self) -> None:
+        transcript, _ = self.drive([
+            ("Enter passphrase", self.WRONG), ("Try again or Exit?", "t"),
+            ("Enter passphrase", self.WRONG), ("Try again or Exit?", ""),
+            ("Enter passphrase", self.RIGHT)])
+        self.assertEqual(transcript.count("That passphrase did not unlock the key."), 2)
+        self.assertIn("is not logged in", transcript)
+        self.no_passphrase_in(transcript)
+
+    def test_wrong_passphrase_then_exit_stops_cleanly(self) -> None:
+        transcript, code = self.drive([("Enter passphrase", self.WRONG), ("Try again or Exit?", "e")])
+        self.assertIn("stopped: the passphrase did not unlock the key", transcript)
+        self.assertNotIn("is not logged in", transcript)
+        self.assertEqual(code, 1)
+        self.no_passphrase_in(transcript)
+
+    def test_a_key_that_is_not_the_owner_key_stops_without_the_retry_menu(self) -> None:
+        other = self.root / "other-key"
+        self.make_key(other, self.RIGHT)
+        self.write_signers(other)  # the configured owner key is a different key
+        transcript, code = self.drive([("Enter passphrase", self.RIGHT)])
+        self.assertIn("does not match the configured owner key", transcript)
+        self.assertNotIn("Try again or Exit", transcript)
+        self.assertNotIn("did not unlock", transcript)
+        self.assertEqual(code, 1)
+        self.no_passphrase_in(transcript)
 
 
 if __name__ == "__main__":

@@ -287,13 +287,41 @@ def validate_private_key(key: Path) -> None:
         )
 
 
-def derive_public(key: Path) -> tuple[str, str]:
-    """Ask ssh-keygen for the key's public half; it prompts once for the passphrase."""
+def wrong_passphrase(result: subprocess.CompletedProcess) -> bool:
+    """Whether ssh-keygen failed only because the passphrase did not unlock the key.
 
-    result = ssh(["-y", "-f", str(key)], stdout=subprocess.PIPE, text=True)
-    if result.returncode != 0:
+    ssh-keygen asks on the terminal (/dev/tty) and reports on stderr, so capturing stderr does
+    not hide the prompt and the passphrase itself is never read here. Only the fixed OpenSSH
+    wording is matched; nothing from stderr is shown or kept.
+    """
+
+    return result.returncode != 0 and "incorrect passphrase" in (result.stderr or "").lower()
+
+
+def offer_retry() -> bool:
+    """After a wrong passphrase: True to try again (the default), False to give up."""
+
+    print("That passphrase did not unlock the key.")
+    while True:
+        answer = input("Try again or Exit? [T/e] ").strip().lower()
+        if answer in ("", "t", "try", "try again"):
+            return True
+        if answer in ("e", "exit"):
+            return False
+
+
+def derive_public(key: Path) -> tuple[str, str]:
+    """Ask ssh-keygen for the key's public half; it prompts for the passphrase, with retries."""
+
+    while True:
+        result = ssh(["-y", "-f", str(key)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            return _split_public(result.stdout)
+        if wrong_passphrase(result) and offer_retry():
+            continue
+        if wrong_passphrase(result):
+            raise AttestError("stopped: the passphrase did not unlock the key")
         raise AttestError("could not unlock the private key")
-    return _split_public(result.stdout)
 
 
 def _create_key(path: Path) -> None:
@@ -498,8 +526,13 @@ def change_passphrase(state_root: Path) -> None:
     if derive_public(key) != configured:
         raise AttestError("that private key does not match the configured owner key")
     print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
-    result = ssh(["-p", "-f", str(key)])
-    if result.returncode != 0:
+    while True:
+        result = ssh(["-p", "-f", str(key)], stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            break
+        # A wrong current passphrase fails before anything is written, so retrying is safe.
+        if wrong_passphrase(result) and offer_retry():
+            continue
         raise AttestError("the passphrase was not changed")
     try:
         validate_private_key(key)  # still encrypted, still safe
@@ -579,9 +612,16 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
         payload_path = work / "payload"
         payload_path.write_bytes(payload)
         print("Now sign the statement. Enter your key's passphrase when asked.")
-        signed = ssh(["-Y", "sign", "-f", str(key), "-n", NAMESPACE, str(payload_path)])
         signature = Path(str(payload_path) + ".sig")
-        if signed.returncode != 0 or not signature.is_file():
+        while True:
+            signed = ssh(["-Y", "sign", "-f", str(key), "-n", NAMESPACE, str(payload_path)],
+                         stderr=subprocess.PIPE, text=True)
+            if signed.returncode == 0 and signature.is_file():
+                break
+            if wrong_passphrase(signed):
+                if offer_retry():
+                    continue
+                raise AttestError("stopped: the passphrase did not unlock the key")
             raise AttestError("signing did not finish")
         run_cli(target, [*base, "--signature", str(signature)], cli_state)
     finally:

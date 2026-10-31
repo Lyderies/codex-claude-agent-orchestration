@@ -970,6 +970,30 @@ save_summary() {
   menu 0 "Continue"
 }
 
+# After a failure no option ends the wizard except Quit. GO_BACK=1 sends main() back to the
+# project menu (the existing-install menu, or the path prompt for a fresh install).
+GO_BACK=0
+RETRY=""
+failure_menu() {
+  menu 0 "Continue to the summary" "Back to the main menu" "Quit"
+  case $MENU_IDX in
+    1) GO_BACK=1;;
+    2) echo "Stopped."; exit 0;;
+  esac
+}
+
+# retry_menu : after a step that did not finish. Sets RETRY to try, skip (full run only) or
+# back; Quit ends the wizard.
+retry_menu() {
+  if [ "$MODE" = full ]; then
+    menu 0 "Try again" "Skip for now" "Back to the main menu" "Quit"
+    case $MENU_IDX in 0) RETRY=try;; 1) RETRY=skip;; 2) RETRY=back;; *) echo "Stopped."; exit 0;; esac
+  else
+    menu 0 "Try again" "Back to the main menu" "Quit"
+    case $MENU_IDX in 0) RETRY=try;; 1) RETRY=back;; *) echo "Stopped."; exit 0;; esac
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Step bookkeeping
 # ---------------------------------------------------------------------------
@@ -1269,7 +1293,7 @@ step_providers() {
     list_sub "Replace it with a regular file in the project, commit, and run setup again."
     mark_step 3 fail "provider-routing.json refused"
     FAIL_REASON="provider configuration refused"
-    menu 0 "Continue to the summary"
+    failure_menu
     return 1
   fi
   if [ -f "$existing" ]; then
@@ -1462,7 +1486,7 @@ step_install() {
     list_sub "The installer rolls back a partial install where it can."
     mark_step 4 fail "install failed"
     FAIL_REASON="install failed"
-    menu 0 "Continue to the summary"
+    failure_menu
     return 1
   fi
   screen_reset; begin_step 4
@@ -1476,7 +1500,7 @@ step_install() {
       record_failure "provider-routing.json not written" "destination refused or not writable"
       mark_step 4 fail "provider routing not written"
       FAIL_REASON="provider routing not written"
-      menu 0 "Continue to the summary"
+      failure_menu
       return 1
     fi
   else
@@ -1690,27 +1714,42 @@ step_billing() {
   fi
   body "No child agent runs until you confirm that each account cannot be charged beyond its subscription. This is a statement about your own billing settings, which only you can check."
   body "Only you can sign it: attest.py asks for your owner key's passphrase, and a passphrase is what stops a program, including an AI agent, from signing in your name. The next screens belong to attest.py; this wizard will not touch them."
-  menu 0 "Start the attestation" "Skip for now" "Quit"
-  case $MENU_IDX in
-    1) mark_step 6 skip "not attested yet"; return 0;;
-    2) echo "Stopped."; exit 0;;
-  esac
-  show_cursor
-  printf '\033[H\033[2J'
-  python3 "$ROOT_DIR/scripts/attest.py" --target "$PROJECT"
-  rc=$?
-  # Keep attest.py's own summary on screen until the owner has read it.
-  printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
-  IFS= read -r _ || true
-  screen_reset; begin_step 6
-  if [ "$rc" -eq 0 ]; then
-    list_add ok "attest.py ran. Check its summary for which providers it listed as attested."
-    mark_step 6 ok "attestation ran; check which providers were attested"
+  if [ "$MODE" = full ]; then
+    menu 0 "Start the attestation" "Skip for now" "Quit"
+    case $MENU_IDX in
+      1) mark_step 6 skip "not attested yet"; return 0;;
+      2) echo "Stopped."; exit 0;;
+    esac
   else
-    list_add fail "attest.py stopped with exit code $rc (see its message)"
-    list_sub "Run it again later: ./setup.sh, then choose the attestation option."
-    mark_step 6 fail "attestation incomplete"
+    menu 0 "Start the attestation" "Back to the main menu" "Quit"
+    case $MENU_IDX in
+      1) GO_BACK=1; return 0;;
+      2) echo "Stopped."; exit 0;;
+    esac
   fi
+  while :; do
+    show_cursor
+    printf '\033[H\033[2J'
+    python3 "$ROOT_DIR/scripts/attest.py" --target "$PROJECT"
+    rc=$?
+    # Keep attest.py's own summary on screen until the owner has read it.
+    printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
+    IFS= read -r _ || true
+    screen_reset; begin_step 6
+    if [ "$rc" -eq 0 ]; then
+      list_add ok "attest.py ran. Check its summary for which providers it listed as attested."
+      mark_step 6 ok "attestation ran; check which providers were attested"
+      break
+    fi
+    list_add fail "attest.py stopped with exit code $rc (see its message)"
+    mark_step 6 fail "attestation incomplete"
+    retry_menu
+    case $RETRY in
+      try) screen_reset; begin_step 6;;
+      skip) return 0;;
+      back) GO_BACK=1; return 0;;
+    esac
+  done
   pause
 }
 
@@ -1719,27 +1758,33 @@ step_passphrase() {
   local rc
   begin_step 6
   body "This changes the passphrase on your owner key, the key you sign the billing statement with. You will be asked for the current passphrase, then a new one twice. You type them straight into ssh-keygen; this wizard never sees them."
-  menu 0 "Change the passphrase" "Skip for now" "Quit"
+  menu 0 "Change the passphrase" "Back to the main menu" "Quit"
   case $MENU_IDX in
-    1) mark_step 6 skip "passphrase not changed"; return 0;;
+    1) GO_BACK=1; return 0;;
     2) echo "Stopped."; exit 0;;
   esac
-  show_cursor
-  printf '\033[H\033[2J'
-  python3 "$ROOT_DIR/scripts/attest.py" --change-passphrase
-  rc=$?
-  printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
-  IFS= read -r _ || true
-  screen_reset; begin_step 6
-  if [ "$rc" -eq 0 ]; then
-    list_add ok "The owner key passphrase was changed."
-    mark_step 6 ok "owner key passphrase changed"
-  else
+  while :; do
+    show_cursor
+    printf '\033[H\033[2J'
+    python3 "$ROOT_DIR/scripts/attest.py" --change-passphrase
+    rc=$?
+    printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
+    IFS= read -r _ || true
+    screen_reset; begin_step 6
+    if [ "$rc" -eq 0 ]; then
+      list_add ok "The owner key passphrase was changed."
+      mark_step 6 ok "owner key passphrase changed"
+      break
+    fi
     list_add fail "The passphrase change did not finish cleanly (exit code $rc, see its message)"
-    list_sub "If ssh-keygen got as far as the new passphrase, the key may already have changed. Run the change again and choose a non-empty passphrase."
-    list_sub "Run it again later: ./setup.sh, then choose Change the owner key passphrase."
+    list_sub "If ssh-keygen got as far as the new passphrase, the key may already have changed. Try again and choose a non-empty passphrase."
     mark_step 6 fail "passphrase change incomplete; key may have changed"
-  fi
+    retry_menu
+    case $RETRY in
+      try) screen_reset; begin_step 6;;
+      *) GO_BACK=1; return 0;;
+    esac
+  done
   pause
 }
 
@@ -1990,15 +2035,23 @@ verify_rule() {
 # Verify-only mode and step 9: done
 # ---------------------------------------------------------------------------
 step_verify_only() {
-  begin_step 4
-  render
-  if verify_install; then
-    mark_step 4 ok "verified"
-  elif [ "$VERIFY_LIMITED" -eq 1 ]; then
-    mark_step 4 ok "not ready on Linux (known limitation)"
-  else
-    mark_step 4 fail "verification failed"; FAILED_ANY=1
-  fi
+  while :; do
+    begin_step 4
+    render
+    if verify_install; then
+      mark_step 4 ok "verified"
+    elif [ "$VERIFY_LIMITED" -eq 1 ]; then
+      mark_step 4 ok "not ready on Linux (known limitation)"
+    else
+      mark_step 4 fail "verification failed"; FAILED_ANY=1
+      retry_menu
+      case $RETRY in
+        try) continue;;
+        *) GO_BACK=1; return 0;;
+      esac
+    fi
+    break
+  done
   verify_rule
   pause
 }
@@ -2071,30 +2124,41 @@ skip_rest() { # skip_rest REASON : mark collector, billing, profile and commands
 # Main
 # ---------------------------------------------------------------------------
 main() {
+  local start=${1:-$PWD} n
   setup_colors
   term_size
   init_logdir
   step_checks
-  step_project "${1:-$PWD}"
-  case "$MODE" in
-    full)
-      if ! step_providers; then
-        mark_step 4 skip "$FAIL_REASON"; skip_rest "$FAIL_REASON"
-      elif ! step_install; then
-        skip_rest "$FAIL_REASON"
-      else
-        step_collector
-        step_billing
-        step_profile
-        step_commands
-      fi;;
-    verify)
-      step_verify_only;;
-    attest)
-      step_billing;;
-    passphrase)
-      step_passphrase;;
-  esac
+  while :; do
+    GO_BACK=0
+    # A fresh pass starts from clean results, so the summary describes the last attempt only.
+    for n in 2 3 4 5 6 7 8 9; do STAT[$n]=""; NOTE[$n]=""; done
+    FAILED_ANY=0; FAIL_SUMMARY=""
+    step_project "$start"
+    start=$PROJECT
+    case "$MODE" in
+      full)
+        if ! step_providers; then
+          mark_step 4 skip "$FAIL_REASON"; skip_rest "$FAIL_REASON"
+        elif ! step_install; then
+          skip_rest "$FAIL_REASON"
+        else
+          step_collector
+          step_billing
+          if [ "$GO_BACK" -eq 0 ]; then
+            step_profile
+            step_commands
+          fi
+        fi;;
+      verify)
+        step_verify_only;;
+      attest)
+        step_billing;;
+      passphrase)
+        step_passphrase;;
+    esac
+    [ "$GO_BACK" -eq 1 ] || break
+  done
   step_done
 }
 

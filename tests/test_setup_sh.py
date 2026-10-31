@@ -627,6 +627,9 @@ class WizardTerminalTests(unittest.TestCase):
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
             'for a in "$@"; do if [ "$a" = paths ] && [ -n "$FAKE_PJ_FAIL" ]; then exit 1; fi; done\n'
+            'if [ -n "$FAKE_ATTEST" ]; then case "$*" in *attest.py*)'
+            ' n=$(cat "$FAKE_ATTEST" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_ATTEST";'
+            ' echo "attest stub run $n"; [ "$n" -le "${FAKE_ATTEST_FAILS:-0}" ] && exit 1; exit 0;; esac; fi\n'
             'if [ -n "$FAKE_UNTRUSTED" ]; then case "$*" in *host-command*)'
             ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
             ' exit 2;; esac; fi\n'
@@ -1071,6 +1074,77 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertFalse(any(self.base.glob("sum*mary.txt")))
         self.assertFalse(destination.exists())
         self.send("\r")
+        self.assertEqual(self.finish(), 0)
+
+    def to_failed_billing(self, fails: int) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks, {
+            "FAKE_ATTEST": str(self.base / "attest.count"), "FAKE_ATTEST_FAILS": str(fails)})
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 1")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("Try again")
+
+    def test_a_failed_attestation_offers_try_again_and_succeeds_on_retry(self) -> None:
+        self.to_failed_billing(1)
+        self.settle()
+        self.assertIn("Skip for now", self.screen)
+        self.assertIn("Back to the main menu", self.screen)
+        self.send("\r")  # Try again is the default
+        self.expect("attest stub run 2")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("attest.py ran")
+
+    def test_back_to_the_main_menu_after_a_failure_then_another_option_works(self) -> None:
+        self.to_failed_billing(1)
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")  # the existing-install menu, not the summary
+        self.assertNotIn("Press Enter to exit", self.screen)
+        self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 2")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("attest.py ran")
+        self.send("\r")
+        self.expect("Press Enter to exit")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+
+    def test_the_wizard_only_ends_on_quit_after_failures(self) -> None:
+        self.to_failed_billing(2)
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("attest stub run 2")
+        self.expect("Press Enter to continue")
+        self.send("\r")
+        self.expect("Try again")
+        self.settle()
+        self.assertNotIn("Skip for now", self.screen)  # attestation-only has nothing to skip to
+        self.send("\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.settle()
+        self.assertGreater(self.pid, 0)  # still running: a failure never ended the wizard
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.expect("Stopped.")
         self.assertEqual(self.finish(), 0)
 
     def test_linux_warns_that_operational_checks_need_macos(self) -> None:
