@@ -53,6 +53,8 @@ RECORD_TYPES = {
     "provider_usage",
     "write_result",
     "write_plan",
+    "write_verification",
+    "write_verifier_result",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -2160,6 +2162,93 @@ def validate_write_plan(data: Any) -> dict[str, Any]:
     return data
 
 
+WRITE_VERIFICATION_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "patch_digest", "worker_provider", "verifier_bridge_run_id", "verifier_provider",
+    "verifier_model", "result_status", "execution_state", "semantic_verdict",
+    "result_digest", "observed_at_ms",
+}
+# How a recorded verification counts for `write_verification_state`, by verdict.
+# Only a completed run's verdict counts; the values are the result contract's.
+POSITIVE_VERDICTS = frozenset({"pass", "ready", "ready-with-corrections"})
+NEGATIVE_VERDICTS = frozenset({"not-ready", "reject"})
+BLOCKED_VERDICTS = frozenset({"blocked"})
+
+
+def validate_write_verification(data: Any) -> dict[str, Any]:
+    """One other-provider verification of one write result's exact patch.
+
+    `run_id` is the verifier's run; `bridge_run_id` and `patch_digest` name
+    the worker's write result. `result_digest` is the keyed digest of the
+    verifier's validated result, which the run's committed result must equal.
+    Ledger-only: digests, codes and the verdict.
+    """
+
+    from .contracts import RESULT_STATUSES, legacy_result_status
+
+    data = _closed(data, WRITE_VERIFICATION_FIELDS, "write_verification")
+    _base(data, "write_verification")
+    _identifier(data["run_id"], "run_id")
+    for field in ("bridge_run_id", "verifier_bridge_run_id"):
+        if not isinstance(data[field], str) or re.fullmatch(
+            r"brg_[0-9a-f]{32}", data[field]
+        ) is None:
+            raise ContractError(f"write_verification {field} is invalid")
+    if data["bridge_run_id"] == data["verifier_bridge_run_id"]:
+        raise ContractError("a write result is never its own verification")
+    _digest(data["patch_digest"], "patch_digest")
+    _enum(data["worker_provider"], PROVIDER_NAMES, "worker_provider")
+    _enum(data["verifier_provider"], PROVIDER_NAMES, "verifier_provider")
+    if data["worker_provider"] == data["verifier_provider"]:
+        raise ContractError("a write result is verified only by the other provider")
+    _enum(data["verifier_model"], SUPPORTED_MODELS, "verifier_model")
+    if provider_for_model(data["verifier_model"]) != data["verifier_provider"]:
+        raise ContractError("write_verification model and provider disagree")
+    _enum(data["result_status"], RESULT_STATUSES, "result_status")
+    _enum(data["execution_state"], EXECUTION_STATES, "execution_state")
+    _enum(data["semantic_verdict"], SEMANTIC_VERDICTS, "semantic_verdict")
+    if data["result_status"] != legacy_result_status(
+        data["execution_state"], data["semantic_verdict"]
+    ):
+        raise ContractError("write_verification status disagrees with its axes")
+    _digest(data["result_digest"], "result_digest")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
+WRITE_VERIFIER_RESULT_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "patch_digest", "verifier_bridge_run_id", "result_digest", "write_verification",
+    "observed_at_ms",
+}
+
+
+def validate_write_verifier_result(data: Any) -> dict[str, Any]:
+    """The digest of the result one write-bound verifier run actually returned.
+
+    Written by the bridge for every execution of a verifier bound to a write
+    result, failed and refused ones included, so the run's committed host
+    result can always be compared with it. `write_verification` is
+    `recorded` or the stable code why no verification was recorded.
+    """
+
+    data = _closed(data, WRITE_VERIFIER_RESULT_FIELDS, "write_verifier_result")
+    _base(data, "write_verifier_result")
+    _identifier(data["run_id"], "run_id")
+    for field in ("bridge_run_id", "verifier_bridge_run_id"):
+        if not isinstance(data[field], str) or re.fullmatch(
+            r"brg_[0-9a-f]{32}", data[field]
+        ) is None:
+            raise ContractError(f"write_verifier_result {field} is invalid")
+    _digest(data["patch_digest"], "patch_digest")
+    _digest(data["result_digest"], "result_digest")
+    code = data["write_verification"]
+    if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
+        raise ContractError("write_verifier_result write_verification is invalid")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -2188,6 +2277,8 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "provider_usage": validate_provider_usage,
     "write_result": validate_write_result,
     "write_plan": validate_write_plan,
+    "write_verification": validate_write_verification,
+    "write_verifier_result": validate_write_verifier_result,
 }
 
 

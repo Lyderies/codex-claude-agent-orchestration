@@ -130,7 +130,16 @@
     "verification_for_family": {
       "enum": ["inventory", "research", "planning", "coding", "security"]
     },
-    "verification_for_provider": {"enum": ["codex", "claude"]}
+    "verification_for_provider": {"enum": ["codex", "claude"]},
+    "verification_for_write": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bridge_run_id", "patch_digest"],
+      "properties": {
+        "bridge_run_id": {"type": "string", "pattern": "^brg_[0-9a-f]{32}$"},
+        "patch_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
   },
   "allOf": [
     {
@@ -154,6 +163,13 @@
     {
       "if": {"required": ["verification_for_provider"]},
       "then": {"properties": {"family": {"const": "verification"}}}
+    },
+    {
+      "if": {"required": ["verification_for_write"]},
+      "then": {
+        "required": ["verification_for_family", "verification_for_provider"],
+        "properties": {"family": {"const": "verification"}}
+      }
     },
     {
       "if": {"properties": {"failed_attempts": {"const": 0}}},

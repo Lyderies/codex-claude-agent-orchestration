@@ -147,6 +147,54 @@ def validate_parent_grant(data: Any) -> dict[str, Any]:
     return _validate_permissions(data, "parent_grant")
 
 
+WRITE_BINDING_FIELDS = {"bridge_run_id", "patch_digest"}
+BRIDGE_RUN_ID = re.compile(r"^brg_[0-9a-f]{32}$")
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_write_binding(data: Any) -> dict[str, Any]:
+    """`verification_for_write`: the worker's bridge run and the exact patch digest."""
+
+    if not isinstance(data, dict) or set(data) != WRITE_BINDING_FIELDS:
+        raise ContractError(
+            "verification_for_write must hold exactly bridge_run_id and patch_digest"
+        )
+    if not isinstance(data["bridge_run_id"], str) or not BRIDGE_RUN_ID.fullmatch(
+        data["bridge_run_id"]
+    ):
+        raise ContractError("verification_for_write bridge_run_id is invalid")
+    if not isinstance(data["patch_digest"], str) or not SHA256_HEX.fullmatch(
+        data["patch_digest"]
+    ):
+        raise ContractError("verification_for_write patch_digest is invalid")
+    return data
+
+
+# A verifier of a write result states the patch it reviewed as exactly one
+# `artifacts` entry `reviewed_patch_digest:<sha256>`, copied from its envelope.
+REVIEWED_PATCH_ARTIFACT_PREFIX = "reviewed_patch_digest:"
+
+
+def reviewed_patch_digest(result: Any) -> str | None:
+    """The single patch digest a verifier result states it reviewed, or None.
+
+    None when the result names no reviewed digest, names more than one, or
+    names a malformed one; a verification is then never recorded as positive.
+    """
+
+    artifacts = result.get("artifacts") if isinstance(result, dict) else None
+    if not isinstance(artifacts, list):
+        return None
+    stated = [
+        item[len(REVIEWED_PATCH_ARTIFACT_PREFIX):]
+        for item in artifacts
+        if isinstance(item, str) and item.startswith(REVIEWED_PATCH_ARTIFACT_PREFIX)
+    ]
+    if len(stated) != 1 or not SHA256_HEX.fullmatch(stated[0]):
+        return None
+    return stated[0]
+
+
 def validate_task(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ContractError("task must be an object")
@@ -174,6 +222,7 @@ def validate_task(data: Any) -> dict[str, Any]:
         "prohibited_actions",
         "verification_for_family",
         "verification_for_provider",
+        "verification_for_write",
     }
     _required(data, required, "task")
     unknown = sorted(data.keys() - allowed)
@@ -204,6 +253,18 @@ def validate_task(data: Any) -> dict[str, Any]:
             verification_for_provider not in {"codex", "claude"}
         ):
             raise ContractError("verification_for_provider is unsupported")
+    verification_for_write = data.get("verification_for_write")
+    if verification_for_write is not None:
+        validate_write_binding(verification_for_write)
+        if (
+            data["family"] != "verification"
+            or verification_for_family is None
+            or verification_for_provider is None
+        ):
+            raise ContractError(
+                "verification_for_write needs a verification task that names the "
+                "worker's family and provider"
+            )
     if not isinstance(data["complexity"], str) or data["complexity"] not in COMPLEXITIES:
         raise ContractError(f"unsupported complexity: {data['complexity']}")
     if not isinstance(data["risk"], str) or data["risk"] not in RISKS:

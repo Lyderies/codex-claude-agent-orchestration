@@ -309,6 +309,53 @@ Claude to Claude and Codex to Codex.
   only when its lease names a run of this ledger that is terminal or past its handle
   expiry and quiescence is proved; anything else stays and is reported in
   `bridge_report.layout_sweep`.
-- The primary does not apply the patch yet: integration and mandatory verification by
-  the other provider come in later slices.
+- A write result must be verified by the other provider. The verification task names
+  the worker as usual (`verification_for_family`, `verification_for_provider`) and adds
+  `verification_for_write`, an object holding exactly the worker's `bridge_run_id` and
+  `patch_digest`. The router then considers only the other provider's verifier, which
+  must be read-only and bridged; for now a Claude write child is verified by Codex from
+  a Claude primary. Anything else (the worker's own provider, a native verifier or no
+  eligible candidate) is denied with `write_verifier_unavailable`. The route carries the
+  same `verification_for_write`, so the run's admission is bound to it.
+- Opening the verifier's run refuses unless the binding names a recorded
+  `write_result` whose ownership passed with exactly that patch digest, the task's
+  worker family and provider match the write run's, and the route is of the other
+  provider, read-only and bridged.
+- `dispatch` fetches the verified envelope bytes from the ledger and, after the export,
+  writes them to `.orchestration-input/envelope.json` in the verifier's read-only
+  export. `.orchestration-input` is reserved: no assignment path may name it in any
+  letter case (the bridge refuses), and it is a protected name a write child may never
+  create. The verifier's prompt tells it to review the patch in that envelope against
+  the task, the source files and the resulting files, and to state the digest it
+  reviewed as exactly one `artifacts` entry `reviewed_patch_digest:<patch_digest>`.
+- After every execution of such a verifier, failed and fenced ones included, the bridge
+  records a ledger-only `write_verifier_result` with the keyed digest of the result it
+  returns and either `recorded` or the reason no verification was recorded
+  (`result_invalid`, `result_unreviewed`, `result_not_completed`,
+  `reviewed_patch_digest_mismatch`). The run's committed host result must equal that
+  result, so a failed or refused verification cannot be replaced afterwards, and a
+  write-bound run with no recorded result cannot be committed at all.
+- A `write_verification` (worker `bridge_run_id` and `patch_digest`, worker provider,
+  verifier bridge run, provider and model, result status, execution state, semantic
+  verdict and result digest) is recorded with it only when the result validates, was
+  produced by the routed model, completed, and states exactly the bound digest; the
+  run must be open on a route bound to `verification_for_write` and dispatched to the
+  other provider. The report says `write_verification: recorded` or `not_recorded`
+  with `write_verification_refusal`.
+- `write_verification_state(project_id, bridge_run_id)` (CLI
+  `learning-write-verification-state`) counts only completed verifications of the
+  current patch by the other provider: any `not-ready` or `reject` verdict gives
+  `rejected`, otherwise any `blocked` gives `blocked`, otherwise any `pass`, `ready` or
+  `ready-with-corrections` gives `accepted`; anything else is `missing`.
+- Operational QA accepts the routed verifier role of either provider. For a write
+  result the supplied verifier run must hold a positive, completed, other-provider
+  `write_verification` of exactly that write result and patch, the patch's state must
+  be `accepted`, and the verifier result must be the recorded one. That record, not the
+  assignment context, binds the verifier, so the verifier's context stays the
+  repository paths it read; any other verifier (a same-provider or native one, or one
+  without a record) is refused. The check receipt has a `write_binding` with the
+  `bridge_run_id`, the `patch_digest` and `tested_tree_digest`, which stays null until
+  integration.
+- The primary does not apply the patch yet. Integration comes in a later slice and will
+  require `write_verification_state` to be `accepted`.
 
