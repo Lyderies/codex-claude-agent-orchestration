@@ -15,7 +15,9 @@ list of provider candidates (Codex and Claude models with their efforts); the ro
 the first candidate that passes the static eligibility checks. Follow the route's
 provider, model and effort rather than any summary. GPT-5.6 Sol/high remains the sole
 legacy fallback, available only through the trusted, finite, single-use receipt
-lifecycle after a native GPT-6 host rejection.
+lifecycle after a native GPT-6 host rejection. Every Codex child is now bridged, so
+`learning-route --fallback-from-run-handle` refuses a bridged route and a bridged child
+whose model is unavailable ends fenced instead.
 
 Every task supplies operation, ambiguity, context breadth, acceptance strength, and
 safe routing-evidence references. Unknown ambiguity or context breadth routes to a
@@ -42,7 +44,11 @@ Version 5 also lists Claude models and roles and, for each family and route key,
 ordered list of provider candidates. The first candidate that the committed project
 configuration allows is selected; if none is allowed, routing is denied rather than
 falling back. `.codex/orchestration/provider-routing.json` is optional. Without it,
-only Codex is enabled, so every route is Codex with `native` dispatch. A Codex primary
+only Codex is enabled, so every route is Codex. Every Codex child is dispatched through
+the bridge (`dispatch: bridge`), from either primary: a native Codex child would share
+the Codex primary's session and the owner's command rule. Only a Claude primary spawns
+natively, and only Claude children. A Codex route that needs `workspace-write` is
+therefore never eligible until write containment exists. A Codex primary
 reaches Claude only when that file sets `codex_primary_may_bridge_to_claude`. Each route
 records its `provider`, its `dispatch` (`native` or `bridge`) and the digest of the
 provider configuration it used. The verifier prefers the other provider, then the
@@ -101,32 +107,45 @@ commands fail there (`filesystem operation failed`, plus a `hint` under a Codex 
 rule per project in the user's rules layer:
 `${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<12 hex digits>.rules`, named by a
 digest of the resolved project root. It allows, outside the sandbox and without a prompt,
-exactly the resolved base interpreter (never a virtual environment's, and refused when it
-or its standard library is in the project, in a temporary directory, behind a symlink or
-writable by another user), the isolation flags `-I -B -S`, the absolute project `cli.py`,
-then one of the primary-host subcommands (`PRIMARY_HOST_COMMANDS` in
-`codex_agents/host_commands.py`). A project in a temporary directory never gets a rule.
-Owner commands (registration, attestation, owner keys, grants, backups, canaries,
-promotion, rollback, upgrade reconciliation and `install-codex-rule` itself) are not
-listed and stay sandboxed. `host-command --project-root <exact-root>` reads only and needs
-no collector. It prints `argv_prefix` and `codex_rule`: `installed`, `missing`, or `stale`
-when the file differs from what setup would write now, as after a Python or package
-change, or is a symlink. The rule leaves every argument after the subcommand to the CLI,
-so for these commands an installed CLI refuses a `--project-root` or `--root` other than
-its own project, a `--state-root` other than the default learning state, and any
-`--policy`, before doing any other work. Commands it runs outside the sandbox never use a
+exactly the resolved base interpreter (never a virtual environment's or a macOS xcrun
+shim, and refused when it or its standard library is in the project, in a temporary
+directory, behind a symlink or writable by another user), the isolation flags
+`-I -B -S`, the absolute `cli.py` of an owner-only copy of the installed runtime, then
+one of the primary-host subcommands (`PRIMARY_HOST_COMMANDS` in
+`codex_agents/host_commands.py`). The copy lives at
+`${CODEX_HOME:-~/.codex}/agent-orchestration/<12 hex digits>/<manifest SHA-256>/`, next
+to the rules directory: Codex keeps `.codex` read-only only at the top of a session's
+workspace, so a session opened on a parent folder could rewrite the project's own
+`cli.py`, while a session that could change the copy could already write any rule.
+Setup copies every file the install manifest lists, verifies the copy byte for byte and
+that the runtime is this package's recorded build, and records the project root in the
+copy's binding; a project without an install manifest gets no copy and no rule. The
+copy runs only the primary-host commands (and the collector it starts), for its bound
+project, and only while the project's installed files are still byte for byte the copy;
+after a package update it refuses until setup runs again. A project in a temporary
+directory never gets a rule. Owner commands (registration, attestation, owner keys,
+grants, backups, canaries, promotion, rollback, upgrade reconciliation,
+`install-codex-rule` and `remove-codex-rule`) are not listed and stay sandboxed.
+`host-command --project-root <exact-root>` reads only and needs no collector. It prints
+`argv_prefix` (naming the copy), `runtime_copy` and `codex_rule`: `installed` only when
+the rule, the copy and the project's installed runtime all match; `missing` without a
+rule file; `stale` otherwise, as after a Python or package change, for a rule that names
+the project's own `cli.py`, without an install manifest, or for a symlink. The rule
+leaves every argument after the subcommand to the CLI, so for these commands the copy
+refuses a `--project-root` or `--root` other than its bound project, a `--state-root`
+other than the default learning state, and any `--policy`, before doing any other work. Commands it runs outside the sandbox never use a
 sandbox-writable location: trust checks read the repository with git plumbing only (no
 index refresh, fsmonitor, filters, diff drivers, hooks, pager, transport or lazy fetch)
 and refuse a git directory inside the working tree or in a temporary directory and a
-partial clone; the collector and watchdog start with `-I -B -S`; bridge exports, control
+partial clone, through a real git binary (never the macOS `/usr/bin/git` xcrun shim,
+whose lookup cache sits in `$TMPDIR`); provider clients must resolve outside the project
+and every temporary directory; the collector and watchdog start with `-I -B -S`; bridge
+exports, control
 files and child temporary directories live in an owner-only directory under the per-user
 cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere); operational-check snapshots and
 provider clients' temporary directories live under the learning state. A Claude primary
-does not use the rule. Native Codex children share the primary's Codex session, so the
-rule matches their commands too: a native child could run the primary-host commands
-outside its own sandbox, still held to this project and the owner's state by the same
-refusals and to ledger admission. Bridged Codex children start with `--ignore-rules` and
-load no rule.
+does not use the rule. A Codex primary has no native children: every child is bridged,
+and a Codex child starts with `--ignore-rules`, so no child can use the rule.
 
 ## Provider admission
 
@@ -240,6 +259,14 @@ provider API key, and a run handle that was already dispatched.
   no billing yet, so a late dispatch probes first. The run cap is not counted again. A durable `dispatch_intent` is then written, and the bridge run ID is bound as
   the run's agent; there is no second launch for that run. A bridged run binds no other
   agent ID, and its result cannot be committed without that `dispatch_intent`.
+- `dispatch` validates the child's result: one that does not validate
+  (`invalid_result`), or that would be too large to keep for its verifier
+  (`result_too_large`), is replaced by a fenced failure. It then records a
+  `dispatch_result` lifecycle record: a keyed digest of the `result` it returns, never
+  its text, with the fenced, reviewed and terminal-state facts. Recording the run
+  requires exactly that result and terminal state, so a primary can neither substitute
+  a result (a made-up verifier verdict, say) nor drop or invent a fence; a bridged
+  result has no repair.
 - The child runs in its own session. The tighter of the route's and the assignment's
   `timeout_seconds` is a hard deadline, and the tighter `max_tool_calls` sets Claude's
   `--max-turns`. On timeout, on a contract violation, on an over-long line and after it
@@ -325,7 +352,10 @@ provider API key, and a run handle that was already dispatched.
   typed codes, never prompts or file contents. A host result whose route requires
   verification is kept, as its validated JSON, in an owner-only file under the
   learning state's `artifacts/` directory (at most 1 MiB), registered under the keyed
-  result digest; it expires and is deleted with its outcome and with the project. A
+  result digest. It exists only to hand the result to a verifier in the same
+  orchestration: it is deleted when the orchestration closes, at most seven days after
+  it was recorded (at the next ledger start), and with the project. Only digests and
+  closed metadata stay in the ledger. A
   bridged run's recorded `provider_usage` becomes its outcome usage
   (`client_observed`): Claude cache reads and writes are added to the input total,
   and counts the client did not report stay unknown.

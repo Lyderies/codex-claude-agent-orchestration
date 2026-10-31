@@ -1286,6 +1286,12 @@ def main() -> int:
                     _require_host_owner(
                         ledger, project_id, run_handle=args.fallback_from_run_handle
                     )
+                    if base_route.get("dispatch") == "bridge":
+                        # The fallback answers a native host's model rejection; a
+                        # bridged child (every Codex child) ends fenced instead.
+                        raise ContractError(
+                            "the legacy fallback applies only to native children"
+                        )
                     receipt = ledger.issue_legacy_fallback_receipt(
                         project_id,
                         run_handle=args.fallback_from_run_handle,

@@ -2040,9 +2040,60 @@ class BridgeLifecycleTests(CliTestCase):
                     rate_limit_info=RATE_LIMIT["rate_limit_info"],
                 )
 
+    def test_codex_primary_bridges_a_codex_child_through_the_cli(self) -> None:
+        # A native Codex child would share the primary's session and command
+        # rule, so a Codex primary dispatches its Codex children like Claude's.
+        self.admit("codex")
+        self.ledger.close()
+        task = self.write("task.json", self.task())
+        route = self.cli("learning-route", "--task", task)
+        self.assertEqual(("codex", "bridge"), (route["provider"], route["dispatch"]))
+        assigned = self.assignment_for(route)
+        context = (
+            "--task", task,
+            "--assignment", self.write("assignment.json", assigned),
+            "--parent-grant", self.write("grant.json", PARENT_GRANT),
+        )
+        route_path = self.write("route.json", route)
+        orchestration = self.cli("learning-open-orchestration")
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration["orchestration_handle"],
+        )
+        self.assertEqual("advisory", opened["read_containment"])
+        self.assertNotIn("native_spawn", opened)
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 1}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        dispatched = self.cli(
+            "dispatch", *context, "--route", route_path,
+            "--run-handle", opened["run_handle"],
+        )
+        self.assertEqual("result", dispatched["bridge_report"]["outcome"])
+        argv = [i for i in self.invocations("codex") if "exec" in i["argv"]][0]["argv"]
+        self.assertIn("--ignore-rules", argv)
+        self.assertEqual("read-only", argv[argv.index("-s") + 1])
+        observation = self.write("observation.json", {
+            "run_handle": opened["run_handle"], "result_attempts": ACCEPTED,
+        })
+        # A result the child did not return is refused, and the run stays open.
+        made_up = {**dispatched["result"], "summary": "A verdict the child never gave."}
+        refused = self.cli(
+            "learning-record-host-result", *context,
+            "--result", self.write("made-up.json", made_up),
+            "--observation", observation, expected=2,
+        )
+        self.assertIn("differs from the bridged child's result", refused["error"])
+        recorded = self.cli(
+            "learning-record-host-result", *context,
+            "--result", self.write("result.json", dispatched["result"]),
+            "--observation", observation,
+        )
+        self.assertEqual("gpt-6.1-sol", recorded["outcome"]["model"])
+
     def test_codex_open_dispatch_validate_and_record(self) -> None:
-        # A Codex child is bridged only from a Claude primary, whose host client
-        # arrives in S3; this exercises the same lifecycle through the ledger.
+        # The same lifecycle through the ledger, as a Claude primary bridges it.
         self.admit("codex")
         route = self.bridged_route("codex")
         assigned = self.assignment_for(route)
@@ -2066,6 +2117,71 @@ class BridgeLifecycleTests(CliTestCase):
             execution_configuration=route["execution_configuration"],
         )
         self.assertEqual("gpt-6.1-sol", committed["outcome"]["model"])
+
+    def commit(self, route: dict, assigned: dict, handle: str, result_value: dict,
+               terminal_state: str | None = None) -> dict:
+        observation = {"run_handle": handle, "result_attempts": ACCEPTED}
+        if terminal_state is not None:
+            observation["terminal_state"] = terminal_state
+        return self.ledger.commit_host_result(
+            self.project_id, assignment=assigned, task=self.task(), route=route,
+            result=result_value, observation=observation,
+            execution_configuration=route["execution_configuration"],
+        )
+
+    def test_a_fence_cannot_be_dropped_or_invented(self) -> None:
+        route, assigned, handle = self.claude_run(timeout_seconds=1)
+        self.frames("claude", [init_frame(), {"sleep": 60}])
+        output = self.dispatch(route, assigned, handle)
+        self.assertEqual("timed_out", output["bridge_report"]["terminal_state"])
+        with self.assertRaisesRegex(LedgerError, "authoritative host fact"):
+            self.commit(route, assigned, handle, output["result"])
+        with self.assertRaisesRegex(LedgerError, "terminal state differs|conflicts"):
+            self.commit(route, assigned, handle, output["result"], "failed")
+        # The ledger keeps a keyed digest and the bridge's flags, never the text.
+        with self.ledger.repository(self.project_id) as repository:
+            records = repository.records("dispatch_result")
+        self.assertEqual(1, len(records))
+        self.assertEqual(
+            {"fenced": True, "reviewed": True, "terminal_state": "timed_out"},
+            {key: records[0][key] for key in ("fenced", "reviewed", "terminal_state")},
+        )
+        self.assertNotIn("summary", records[0])
+        self.assertNotIn(output["result"]["summary"], json.dumps(records[0]))
+        committed = self.commit(route, assigned, handle, output["result"], "timed_out")
+        self.assertEqual("timed_out", committed["outcome"]["execution_state"])
+        # A child that ended on its own carries no host terminal fact to add.
+        route, assigned, handle = self.claude_run()
+        self.frames("claude", [init_frame(), RATE_LIMIT, result_frame()])
+        output = self.dispatch(route, assigned, handle)
+        self.assertIsNone(output["bridge_report"]["terminal_state"])
+        with self.assertRaisesRegex(LedgerError, "terminal state differs"):
+            self.commit(
+                route, assigned, handle, output["result"],
+                "completed",
+            )
+        with self.assertRaisesRegex(LedgerError, "differs from the bridged child's result"):
+            self.commit(
+                route, assigned, handle,
+                {**output["result"], "status": "failed", "execution_state": "timed_out"},
+                "timed_out",
+            )
+        self.commit(route, assigned, handle, output["result"])
+
+    def test_an_invalid_child_result_comes_back_fenced(self) -> None:
+        route, assigned, handle = self.claude_run()
+        invalid = {**result(), "evidence": []}
+        self.frames("claude", [init_frame(), RATE_LIMIT, result_frame(json.dumps(invalid))])
+        output = self.dispatch(route, assigned, handle)
+        self.assertEqual("invalid_result", output["bridge_report"]["outcome"])
+        self.assertEqual("failed", output["bridge_report"]["terminal_state"])
+        self.assertEqual("failed", output["result"]["status"])
+        validate_result(output["result"], assignment=assigned)
+        # The fence is the bridge's fact: recording without it is refused.
+        with self.assertRaisesRegex(LedgerError, "terminal state differs"):
+            self.commit(route, assigned, handle, output["result"])
+        committed = self.commit(route, assigned, handle, output["result"], "failed")
+        self.assertFalse(committed["outcome"]["accepted"])
 
     def test_fenced_outcome_records_as_failed(self) -> None:
         route, assigned, handle = self.claude_run(timeout_seconds=1)
@@ -2756,10 +2872,15 @@ class HostOwnershipTests(CliTestCase):
                     self.cli(*command, "--host-client", "claude-host-v1",
                              expected=2)["reason_code"],
                 )
-        # The owning host still binds and records the run it opened.
-        self.cli(*commands["bind"])
-        recorded = self.cli(*commands["record"])
-        self.assertEqual(route["model"], recorded["outcome"]["model"])
+        # The owning host gets past the host check, but a Codex child is bridged:
+        # only its own dispatch binds it, and only that child's result records.
+        self.assertEqual("bridge", route["dispatch"])
+        self.assertIn(
+            "binds only its dispatched child", self.cli(*commands["bind"], expected=2)["error"]
+        )
+        self.assertIn(
+            "must be dispatched", self.cli(*commands["record"], expected=2)["error"]
+        )
 
 
 

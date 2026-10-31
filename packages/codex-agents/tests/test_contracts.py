@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
@@ -23,6 +24,7 @@ from codex_agents.contracts import (
     validate_result,
     validate_task,
 )
+from codex_agents import routing
 from codex_agents.routing import load_effective_policy, load_policy, route_task
 
 
@@ -408,7 +410,9 @@ class ContractTests(unittest.TestCase):
             ],
         )
 
-    def test_result_preflight_uses_project_mapped_workspace_write_agent(self) -> None:
+    def test_result_preflight_uses_project_mapped_agent(self) -> None:
+        # Every Codex child is bridged and read-only, so a mapped agent that
+        # needs workspace-write is never routed (see test_write_agents_are_never_routed).
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temporary:
             root = Path(temporary)
             agents = root / ".codex/agents"
@@ -418,7 +422,7 @@ class ContractTests(unittest.TestCase):
             (agents / "implementation_worker.toml").write_text(
                 'name = "implementation_worker"\n'
                 'description = "Bounded implementation worker"\n'
-                'sandbox_mode = "workspace-write"\n'
+                'sandbox_mode = "read-only"\n'
                 'developer_instructions = "Complete the bounded assignment."\n'
                 'mcp_servers = []\n'
                 'skills = []\n'
@@ -456,9 +460,9 @@ class ContractTests(unittest.TestCase):
                 effort=route["effort"],
                 owned_paths=["source.txt"],
             )
-            assignment["permissions"]["filesystem"] = ["source.txt:write"]
+            assignment["permissions"]["filesystem"] = ["source.txt:read"]
             grant = self.parent_grant()
-            grant["filesystem"] = ["source.txt:write"]
+            grant["filesystem"] = ["source.txt:read"]
             for name, value in {
                 "task.json": task,
                 "assignment.json": assignment,
@@ -651,6 +655,21 @@ class ContractTests(unittest.TestCase):
                 parent_grant=grant,
             )
 
+    def test_write_agents_are_never_routed(self) -> None:
+        task = self.task()
+        task.update(family="coding", owned_paths=["source.txt"])
+        policy = deepcopy(self.policy)
+        policy["project_agent_roles"] = {"coding": "implementation_worker"}
+        policy["project_agent_role_sandboxes"] = {"coding": "workspace-write"}
+        policy["project_agent_mapping_digest"] = "a" * 64
+        # A Codex child is always bridged (read-only) from either primary, so a
+        # mapped write agent has no eligible route until write containment exists.
+        for primary in ("codex", "claude"):
+            with self.subTest(primary=primary), self.assertRaisesRegex(
+                ContractError, "no provider candidate is eligible"
+            ):
+                route_task(task, policy, primary_provider=primary)
+
     def test_assignment_accepts_mapped_coding_write_within_parent_grant(self) -> None:
         task = self.task()
         task.update(family="coding", owned_paths=["source.txt"])
@@ -658,7 +677,10 @@ class ContractTests(unittest.TestCase):
         policy["project_agent_roles"] = {"coding": "implementation_worker"}
         policy["project_agent_role_sandboxes"] = {"coding": "workspace-write"}
         policy["project_agent_mapping_digest"] = "a" * 64
-        route = route_task(task, policy)
+        # The contract keeps checking write grants for a native write route, which
+        # no primary is routed today (see test_write_agents_are_never_routed).
+        with mock.patch.object(routing, "_dispatch", lambda primary, provider: "native"):
+            route = route_task(task, policy)
         assignment = self.assignment()
         assignment.update(
             role=route["role"],

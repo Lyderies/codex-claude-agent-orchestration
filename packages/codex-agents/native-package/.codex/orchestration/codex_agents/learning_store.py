@@ -2202,7 +2202,8 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile", "probe_admission", "verification_binding",
+            "dispatch_result", "host_run_profile", "probe_admission",
+            "verification_binding",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -4586,6 +4587,80 @@ class LearningLedger:
             "deadline_at_ms": record["deadline_at_ms"],
         }
 
+    def record_dispatch_result(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        bridge_run_id: str,
+        result: dict[str, Any],
+        fenced: bool,
+        reviewed: bool,
+        terminal_state: str | None,
+    ) -> dict[str, Any]:
+        """Bind what a dispatched child returned to its run, once.
+
+        The ledger keeps a keyed digest of the result, never its text, with the
+        bridge's fence, review and terminal-state facts. Recording the run's
+        result later requires exactly this result and terminal state, so a
+        primary can neither substitute a result nor drop a fence.
+        """
+
+        timestamp = self._clock_ms()
+        handle_digest = keyed_digest(self.state.digest_key(), run_handle)
+        with self._lock, self._connection:
+            binding = self._connection.execute(
+                "SELECT run_id,binding_state,consumed_at_ms FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if (
+                binding is None
+                or binding["binding_state"] != "pending"
+                or binding["consumed_at_ms"] is not None
+            ):
+                raise LedgerError("host run is not pending")
+            run_id = str(binding["run_id"])
+            intents = self._connection.execute(
+                "SELECT content FROM records WHERE project_id=? "
+                "AND record_type='dispatch_intent' AND source='lifecycle' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchall()
+            if (
+                len(intents) != 1
+                or json.loads(bytes(intents[0]["content"]))["bridge_run_id"] != bridge_run_id
+            ):
+                raise LedgerError("only the dispatched run records its child's result")
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_result' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("the dispatched child's result is already recorded")
+            material = {
+                "schema_version": 1,
+                "record_type": "dispatch_result",
+                "run_id": run_id,
+                "bridge_run_id": bridge_run_id,
+                "result_digest": keyed_digest(self.state.digest_key(), canonical_json(result)),
+                "fenced": fenced,
+                "reviewed": reviewed,
+                "terminal_state": terminal_state,
+                "observed_at_ms": timestamp,
+            }
+            try:
+                record = validate_learning_record(
+                    {**material, "record_id": f"dispatch_result:{content_digest(material)}"}
+                )
+            except ContractError as exc:
+                raise LedgerError("dispatch result is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="lifecycle", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return {"run_id": run_id, "bridge_run_id": bridge_run_id}
+
     def host_owner(
         self,
         project_id: str,
@@ -4850,6 +4925,27 @@ class LearningLedger:
             ).fetchone() is None:
                 # A bridged run's result can only come from its dispatched child.
                 raise LedgerError("a bridged run must be dispatched before its result")
+            if client_version == BRIDGE_CLIENT_VERSION:
+                # ... and it must be exactly what that child returned, with the
+                # bridge's terminal state: neither may be made up or dropped.
+                dispatched = self._connection.execute(
+                    "SELECT content FROM records WHERE project_id=? "
+                    "AND record_type='dispatch_result' AND source='lifecycle' "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                    (project_id, checked_observation["run_id"]),
+                ).fetchall()
+                if len(dispatched) != 1:
+                    raise LedgerError("a bridged run has no recorded child result")
+                recorded = json.loads(bytes(dispatched[0]["content"]))
+                if not secrets.compare_digest(
+                    keyed_digest(self.state.digest_key(), canonical_json(result)),
+                    recorded["result_digest"],
+                ):
+                    raise LedgerError("host result differs from the bridged child's result")
+                if terminal_state != recorded["terminal_state"]:
+                    raise LedgerError(
+                        "host terminal state differs from the bridged child's outcome"
+                    )
             if trusted_handle is not None and client_version == BRIDGE_CLIENT_VERSION:
                 # A bridged run's usage is what the bridge itself recorded for
                 # it in the ledger; the primary never supplies it.
