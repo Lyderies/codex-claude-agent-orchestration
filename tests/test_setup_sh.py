@@ -380,6 +380,139 @@ class SetupScriptTests(unittest.TestCase):
                 with self.subTest(line=line.strip()):
                     self.assertIn("--literal-pathspecs", line)
 
+    def test_changed_paths_lists_only_paths_with_real_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            (project / ".codex").mkdir()
+            for name in ("a.json", "b c.json", "gone.json", "star*.json"):
+                (project / ".codex" / name).write_text("x\n")
+            git = ["git", "-C", str(project)]
+            subprocess.run(git + ["add", "-A"], check=True, env=env)
+            subprocess.run(git + ["commit", "-qm", "i"], check=True, env=env)
+            candidates = [".codex/a.json", ".codex/b c.json", ".codex/gone.json", ".codex/star*.json",
+                          ".codex/new.json"]
+
+            def changed() -> list[bytes]:
+                result = subprocess.run(
+                    ["bash", str(SETUP), "--print-changed-paths", str(project), *candidates],
+                    capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout.split(b"\0")[:-1]
+
+            self.assertEqual(changed(), [])  # clean project: nothing to commit
+            (project / ".codex" / "b c.json").write_text("changed\n")
+            (project / ".codex" / "gone.json").unlink()
+            (project / ".codex" / "new.json").write_text("new\n")
+            (project / ".codex" / "unrelated.json").write_text("not a candidate\n")
+            self.assertEqual(sorted(changed()),
+                             [b".codex/b c.json", b".codex/gone.json", b".codex/new.json"])
+
+    def test_changed_paths_prints_every_candidate_when_git_cannot_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-changed-paths", directory, ".codex/a", ".codex/b"],
+                capture_output=True, env=dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null",
+                                              GIT_CEILING_DIRECTORIES=str(Path(directory).parent)))
+        self.assertEqual(result.stdout, b".codex/a\0.codex/b\0")
+
+    def profile_compare(self, text: str | None) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "orchestrator.config.toml"
+            if text is not None:
+                profile.write_text(text)
+            result = self.helper("profilecmp", str(profile))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.decode().strip()
+
+    def test_profile_compares_effective_settings_not_bytes(self) -> None:
+        header = f"# written by hand {TOKEN}\n\n"
+        same = (header + 'sandbox_mode = "workspace-write"  # keep\n\n'
+                "[sandbox_workspace_write]\nnetwork_access = true\n")
+        self.assertEqual(self.profile_compare(same), "same")
+        extra = same + 'writable_roots = ["x"]\n'
+        self.assertEqual(self.profile_compare(extra), "same")
+        self.assertEqual(self.profile_compare(same.replace("= true", "= false")), "network_access")
+        self.assertEqual(self.profile_compare(same.replace("workspace-write", "read-only")), "sandbox_mode")
+        self.assertEqual(self.profile_compare('sandbox_mode = "workspace-write"\n'), "network_access")
+        self.assertEqual(self.profile_compare("this is [not toml"), "unreadable")
+        self.assertEqual(self.profile_compare(None), "unreadable")
+        self.assertNotIn(TOKEN, self.profile_compare(same))
+
+    def test_changed_paths_keeps_a_rename_source_that_is_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            (project / ".codex").mkdir()
+            (project / ".codex" / "old.txt").write_text("same content for rename detection\n" * 5)
+            (project / ".codex" / "kept.txt").write_text("copy source\n" * 5)
+            git = ["git", "-C", str(project)]
+            subprocess.run(git + ["add", "-A"], check=True, env=env)
+            subprocess.run(git + ["commit", "-qm", "i"], check=True, env=env)
+            subprocess.run(git + ["mv", ".codex/old.txt", ".codex/new.txt"], check=True, env=env)
+            status = subprocess.run(git + ["status", "--porcelain", "-z"], capture_output=True, env=env)
+            self.assertEqual(status.stdout, b"R  .codex/new.txt\0.codex/old.txt\0")
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-changed-paths", str(project),
+                 ".codex/new.txt", ".codex/old.txt", ".codex/kept.txt"],
+                capture_output=True, env=env)
+        self.assertEqual(sorted(result.stdout.split(b"\0")[:-1]), [b".codex/new.txt", b".codex/old.txt"])
+
+    def test_ignored_untracked_candidates_are_reported_not_called_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            (project / ".gitignore").write_text(".codex/\n")
+            (project / ".codex").mkdir()
+            (project / ".codex" / "ours.json").write_text("x\n")
+            (project / ".codex" / "sp ace.json").write_text("x\n")
+            candidates = [".codex/ours.json", ".codex/sp ace.json", ".codex/absent.json"]
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            changed = subprocess.run(["bash", str(SETUP), "--print-changed-paths", str(project), *candidates],
+                                     capture_output=True, env=env)
+            ignored = subprocess.run(["bash", str(SETUP), "--print-ignored-paths", str(project), *candidates],
+                                     capture_output=True, env=env)
+        self.assertEqual(changed.stdout, b"")  # status never lists them: the reason for the check
+        self.assertEqual(sorted(ignored.stdout.split(b"\0")[:-1]), [b".codex/ours.json", b".codex/sp ace.json"])
+
+    def test_a_failed_ignored_file_query_is_reported_not_read_as_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            stubs = Path(directory) / "bin"
+            stubs.mkdir()
+            real_git = shutil.which("git")
+            (stubs / "git").write_text(
+                f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
+            (stubs / "git").chmod(0o755)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       PATH=f"{stubs}:{os.environ['PATH']}")
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-ignored-paths", str(project), ".codex/a"],
+                capture_output=True, env=env)
+        self.assertEqual(result.stdout, b"!\0")
+
+    def test_profile_larger_than_the_read_limit_is_unreadable(self) -> None:
+        good = 'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = true\n'
+        padded = good + "# pad\n" * 12000 + "network_access = false\n"
+        self.assertGreater(len(padded), 65536)
+        self.assertEqual(self.profile_compare(padded), "unreadable")
+        self.assertEqual(self.profile_compare(good + "# pad\n" * 100), "same")
+
+    def test_wizard_messages_for_the_polished_screens(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        self.assertIn("Nothing to commit: the project already has these files committed", text)
+        self.assertIn("The install can be updated.", text)
+        self.assertIn("A fresh install is possible.", text)
+        self.assertIn("Profile: exists with the same settings", text)
+        self.assertIn("network_access is off", text)
+        self.assertIn('"Change the owner key passphrase"', text)
+        self.assertIn("attest.py\" --change-passphrase", text)
+        self.assertIn('"$HOME/agent-orchestration-setup-summary.txt"', text)
+        self.assertNotIn('"$PWD/agent-orchestration-setup-summary.txt"', text)
+
     def test_refuses_without_a_terminal(self) -> None:
         result = subprocess.run(["bash", str(SETUP)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
         self.assertEqual(result.returncode, 2)
@@ -792,6 +925,154 @@ class WizardTerminalTests(unittest.TestCase):
             self.assertNotIn("user@example.invalid", text)
         self.assertEqual(oct(destination.stat().st_mode & 0o777), "0o600")
 
+    def commit_count(self, project: Path) -> int:
+        return int(subprocess.run(["git", "-C", str(project), "rev-list", "--count", "HEAD"],
+                                  capture_output=True, text=True, env=self.env).stdout.strip())
+
+    def test_an_update_that_changes_nothing_offers_no_commit(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        self.finish_after_install()
+        before = self.commit_count(project)
+        self.assertEqual(before, 2)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\r")
+        for wait in ("install can be updated", "Keep the existing configuration", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Nothing to commit: the project already has these files committed")
+        self.assertNotIn("Commit now", self.screen)
+        self.assertNotIn("Next: commit the installed files", self.screen)
+        final = self.finish_after_install()
+        self.assertIn("nothing to commit", final)
+        self.assertNotIn("commit failed", final)
+        self.assertNotIn("The commit", final)
+        self.assertEqual(self.commit_count(project), before)
+
+    def test_a_failed_ignored_file_query_never_says_nothing_to_commit(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        self.finish_after_install()
+        real_git = shutil.which("git", path=os.environ["PATH"])
+        (self.fakes / "git").write_text(
+            f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
+        (self.fakes / "git").chmod(0o755)
+        before = self.commit_count(project)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\r")
+        for wait in ("install can be updated", "Keep the existing configuration", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("could not check whether installed files are ignored")
+        self.assertNotIn("Nothing to commit", self.screen)
+        final = self.finish_after_install()
+        self.assertNotIn("nothing to commit", final)
+        self.assertIn("could not be checked", final)
+        self.assertEqual(self.commit_count(project), before)
+
+    def test_only_paths_with_changes_are_committed(self) -> None:
+        import json
+        project, checks = self.make_project()
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "adopt"], check=True, env=self.env)
+        before = self.commit_count(project)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\r")
+        for wait in ("install can be updated", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Commit now")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        self.assertIn("Only these 1 paths", plain)
+        self.assertIn(".codex/orchestration/provider-routing.json", plain)
+        self.assertNotIn("install-manifest.json", plain)
+        self.send("\r")
+        final = self.finish_after_install()
+        self.assertIn("; committed", final)
+        self.assertEqual(self.commit_count(project), before + 1)
+        changed = subprocess.run(
+            ["git", "-C", str(project), "show", "--name-only", "--format=", "HEAD"],
+            capture_output=True, text=True, env=self.env).stdout.split()
+        self.assertEqual(changed, [".codex/orchestration/provider-routing.json"])
+
+    def failed_install_to_summary_menu(self, project: Path, checks: Path) -> None:
+        self.start(project, {"FAKE_FAIL": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Continue to the summary")
+        self.send("\r")
+        self.expect("Save a summary of what failed")
+        self.send("\x1b[B\r")
+        self.expect("Save the summary to")
+
+    def test_summary_defaults_to_the_home_folder(self) -> None:
+        project, checks = self.make_project()
+        self.failed_install_to_summary_menu(project, checks)
+        self.assertIn(str(self.home / "agent-orchestration-setup-summary.txt"),
+                      re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.send("\r")
+        self.expect("Saved a summary")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertTrue((self.home / "agent-orchestration-setup-summary.txt").is_file())
+        self.assertFalse((project / "agent-orchestration-setup-summary.txt").exists())
+        self.assertFalse((ROOT / "agent-orchestration-setup-summary.txt").exists())
+
+    def test_summary_inside_a_git_working_tree_asks_first(self) -> None:
+        project, checks = self.make_project()
+        self.failed_install_to_summary_menu(project, checks)
+        destination = project / "summary.txt"
+        self.send(f"{destination}\r")
+        self.expect("inside a Git working tree")
+        self.expect("Save it here anyway")
+        self.assertFalse(destination.exists())
+        self.send("\x1b[B\r")  # save it here anyway
+        self.expect("Saved a summary")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertTrue(destination.is_file())
+
+    def test_summary_path_with_a_control_character_is_refused(self) -> None:
+        project, checks = self.make_project()
+        self.failed_install_to_summary_menu(project, checks)
+        destination = self.base / "summary-bad.txt"
+        self.send(f"{self.base}/sum\x16\x01mary.txt\r")  # Ctrl-V Ctrl-A types a control character
+        self.expect("control character")
+        self.assertFalse(any(self.base.glob("sum*mary.txt")))
+        self.assertFalse(destination.exists())
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+
     def test_linux_warns_that_operational_checks_need_macos(self) -> None:
         (self.fakes / "uname").write_text('#!/bin/sh\necho Linux\n')
         (self.fakes / "uname").chmod(0o755)
@@ -951,7 +1232,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.expect("Update the install")
         self.send("\r")
-        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+        for wait in ("install can be updated", "Codex children", "Looks right", "Install now"):
             self.expect(wait)
             self.send("\r")
         self.expect("Commit now")
