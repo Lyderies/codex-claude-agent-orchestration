@@ -14,6 +14,8 @@
 #   ./setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE
 # where CODEX, CLAUDE and BRIDGE are "on" or "off" and MODELS is a comma-separated
 # list of Claude model names, or "-" for none. It prints provider-routing.json.
+#   ./setup.sh --print-expanded-path VALUE     prints VALUE with a leading ~ or $HOME expanded
+#   ./setup.sh --print-codex-hint WANTED READY prints the Codex command and why (1 or 0 each)
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
@@ -30,6 +32,7 @@ STEP_TOTAL=8
 # routing_json CODEX CLAUDE MODELS_CSV BRIDGE -> prints the JSON, returns 1 on bad input.
 routing_json() {
   local codex=$1 claude=$2 models=$3 bridge=$4 first m out
+  local -a parts
   case "$codex" in on|off) ;; *) echo "codex must be on or off" >&2; return 1;; esac
   case "$claude" in on|off) ;; *) echo "claude must be on or off" >&2; return 1;; esac
   case "$bridge" in on|off) ;; *) echo "bridge must be on or off" >&2; return 1;; esac
@@ -51,18 +54,17 @@ routing_json() {
     if [ -z "$models" ]; then echo "choose at least one Claude model" >&2; return 1; fi
     out="${out}true, \"models\": ["
     first=1
-    local oldifs=$IFS
-    IFS=,
-    for m in $models; do
-      IFS=$oldifs
+    case "$models" in
+      ,*|*,|*,,*) echo "invalid model list: empty model name" >&2; return 1;;
+    esac
+    IFS=, read -ra parts <<<"$models"
+    for m in "${parts[@]}"; do
       case "$m" in
         ''|*[!A-Za-z0-9._-]*) echo "invalid model name: $m" >&2; return 1;;
       esac
-      if [ $first -eq 1 ]; then first=0; else out="${out}, "; fi
+      if [ "$first" -eq 1 ]; then first=0; else out="${out}, "; fi
       out="${out}\"$m\""
-      IFS=,
     done
-    IFS=$oldifs
     out="${out}]"
   else
     out="${out}false"
@@ -102,6 +104,298 @@ write_project_routing() {
   return 1
 }
 
+# expand_home VALUE -> EXPANDED : trims surrounding blanks and one pair of matching quotes
+# (as a pasted or dragged path often has), then expands a leading ~, ~/ , $HOME or ${HOME}.
+EXPANDED=""
+expand_home() {
+  local v=$1
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in
+    \'*\'|\"*\") if [ "${#v}" -ge 2 ]; then v=${v:1:$((${#v} - 2))}; fi;;
+  esac
+  case "$v" in
+    \~) v=$HOME;;
+    \~/*) v="$HOME/${v:2}";;
+    '$HOME') v=$HOME;;
+    '$HOME'/*) v="$HOME/${v:6}";;
+    '${HOME}') v=$HOME;;
+    '${HOME}'/*) v="$HOME/${v:8}";;
+  esac
+  EXPANDED=$v
+}
+
+# ---------------------------------------------------------------------------
+# JSON helper (python3 is required anyway)
+# ---------------------------------------------------------------------------
+IFS= read -r -d '' PY_HELPER <<'PY'
+import json, os, re, stat, subprocess, sys, unicodedata
+
+def load(path):
+    try:
+        if path == "-":
+            return json.load(sys.stdin)
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+def walk(data, path):
+    for key in path.split("."):
+        if key == "":
+            continue
+        if isinstance(data, dict) and key in data:
+            data = data[key]
+        else:
+            return None
+    return data
+
+def fmt(value):
+    if value is None:
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (list, dict)):
+        return str(len(value))
+    return str(value)
+
+def safe(value):
+    text = re.sub(r"[^A-Za-z0-9_ .+-]", "", str(value or ""))[:30]
+    return text or "unknown"
+
+op = sys.argv[1]
+if op == "get":
+    print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
+elif op == "claude":
+    data = load("-")
+    if isinstance(data, dict) and data.get("loggedIn") is True:
+        print("yes|%s|%s" % (safe(data.get("subscriptionType")), safe(data.get("authMethod"))))
+    else:
+        print("no||")
+elif op in ("plan", "planpaths", "paths"):
+    import hashlib
+
+    def unsafe(rel):
+        """A managed file name must be a plain, printable, relative UTF-8 path."""
+        if not isinstance(rel, str) or not rel or rel[0] == " " or rel[-1] == " ":
+            return True
+        try:
+            rel.encode("utf-8")
+        except UnicodeEncodeError:
+            return True
+        if any(unicodedata.category(ch) in ("Cc", "Cs") for ch in rel):
+            return True
+        return rel.startswith(("-", "/")) or ".." in rel.split("/")
+
+    def digest(path):
+        try:
+            with open(path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            return None
+
+    def entries(report_path, target, bundle):
+        data = load(report_path) or {}
+        codex = data.get("codex") or {}
+        claude = data.get("claude") or {}
+        out = []
+        files = codex.get("files") or []
+        for rel in files:
+            if unsafe(rel):
+                out.append(("UNSAFE", None))
+                continue
+            installed = os.path.join(target, rel)
+            if not os.path.lexists(installed):
+                out.append(("ADD", rel))
+            elif digest(installed) == digest(os.path.join(bundle, rel)):
+                out.append(("KEEP", rel))
+            else:
+                out.append(("UPDATE", rel))
+        manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
+        old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
+        if isinstance(old, dict):
+            for rel in sorted(set(old) - set(f for f in files if isinstance(f, str))):
+                out.append(("UNSAFE", None) if unsafe(rel) else ("REMOVE", rel))
+        for rel in claude.get("changed_paths") or []:
+            if unsafe(rel):
+                out.append(("UNSAFE", None))
+            else:
+                out.append(("UPDATE" if os.path.lexists(os.path.join(target, rel)) else "ADD", rel))
+        for rel, action in sorted((codex.get("project_configuration") or {}).items()):
+            out.append(("UNSAFE", None) if unsafe(rel) else ("CONFIG", "%s -> %s" % (rel, safe(action))))
+        return out
+
+    if op == "plan":
+        for kind, rel in entries(sys.argv[2], sys.argv[3], sys.argv[4]):
+            print(kind if rel is None else "%s %s" % (kind, rel))
+    elif op == "planpaths":
+        found = entries(sys.argv[2], sys.argv[3], sys.argv[4])
+        if any(kind == "UNSAFE" for kind, _ in found):
+            sys.exit(3)
+        for rel in sorted(set(r for k, r in found if k in ("ADD", "UPDATE", "REMOVE"))):
+            sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
+    else:
+        data = load(sys.argv[2]) or {}
+        project, plan_file = sys.argv[3], sys.argv[4]
+        found = set()
+        try:
+            with open(plan_file, "rb") as handle:
+                found.update(item.decode("utf-8") for item in handle.read().split(b"\0") if item)
+        except (OSError, UnicodeDecodeError):
+            sys.exit(3)
+        codex = data.get("codex") or {}
+        claude = data.get("claude") or {}
+        for rel, action in (codex.get("project_configuration") or {}).items():
+            if action != "preserve":
+                found.add(rel)
+        found.update(claude.get("changed_paths") or [])
+        found.add(".codex/orchestration/install-manifest.json")
+        found.add(".codex/orchestration/provider-routing.json")
+        if any(unsafe(rel) for rel in found):
+            sys.exit(3)
+        keep = []
+        for rel in sorted(found):
+            result = subprocess.run(
+                ["git", "--literal-pathspecs", "-C", project, "ls-files", "-z", "--", rel],
+                capture_output=True)
+            if result.returncode != 0:
+                sys.exit(4)
+            if os.path.lexists(os.path.join(project, rel)) or result.stdout:
+                keep.append(rel)
+        for rel in keep:
+            sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
+elif op == "netprofile":
+    def read_profile(path):
+        uid = os.geteuid()
+        full = os.path.abspath(path)
+        # Pre-pass: only root-owned system links (such as /var on macOS) may be resolved, and
+        # only here. Any other symlink is refused; the walk below never follows one.
+        for _ in range(40):
+            parts = [part for part in full.split("/") if part]
+            cur = "/"
+            for index, part in enumerate(parts):
+                cur = os.path.join(cur, part)
+                if stat.S_ISLNK(os.lstat(cur).st_mode):
+                    if index == len(parts) - 1 or os.lstat(cur).st_uid != 0:
+                        return None
+                    full = os.path.join(os.path.realpath(cur), *parts[index + 1:])
+                    break
+            else:
+                break
+        else:
+            return None
+        parts = [part for part in full.split("/") if part]
+        if not parts:
+            return None
+        # Walk by directory descriptors: each component is opened relative to its verified
+        # parent with O_NOFOLLOW, so a swapped parent cannot redirect the read.
+        dirfd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+                os.close(dirfd)
+                dirfd = nxt
+                if os.fstat(dirfd).st_uid not in (0, uid):
+                    return None
+            leaf = parts[-1]
+            # Check the leaf type before opening so a FIFO or device is never opened.
+            info = os.stat(leaf, dir_fd=dirfd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+                return None
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+                    return None
+                return os.read(fd, 65536)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dirfd)
+
+    result = "no"
+    try:
+        raw = read_profile(sys.argv[2])
+        section, net = "", False
+        for line in (raw or b"").decode("utf-8", "replace").splitlines():
+            compact = re.sub(r"\s+", "", line.split("#", 1)[0])
+            if compact.startswith("[") and compact.endswith("]"):
+                section = compact[1:-1]
+            elif section == "sandbox_workspace_write" and compact == "network_access=true":
+                net = True
+            elif section == "sandbox_workspace_write" and compact == "network_access=false":
+                net = False
+        if net:
+            result = "yes"
+    except Exception:
+        pass
+    print(result)
+elif op == "raw":
+    data = load(sys.argv[2]) or {}
+    parts = []
+    for key in ("refused", "error"):
+        if isinstance(data.get(key), str):
+            parts.append(data[key])
+    for source in (data.get("codex") or {}, data.get("claude") or {}):
+        for key in ("errors", "project_errors", "package_errors"):
+            for item in source.get(key) or []:
+                if isinstance(item, str):
+                    parts.append(item)
+        for key in ("error", "required_action"):
+            if isinstance(source.get(key), str):
+                parts.append(source[key])
+    print(" ".join(parts).lower().replace("\n", " "))
+PY
+pj() { python3 -I -c "$PY_HELPER" "$@"; }
+
+# uncommitted_managed PROJECT : the paths still uncommitted in the managed folders, one per
+# line, for display. `git status -z` records are `XY path` and, for a rename or copy (R or C),
+# `XY new` followed by a bare `old` field; both names are kept whole. Only control characters
+# are removed, so a name cannot drive the terminal.
+uncommitted_managed() {
+  local rec st name src out=""
+  while IFS= read -r -d '' rec; do
+    st=${rec:0:2}; name=${rec:3}
+    name=${name//[[:cntrl:]]/}
+    case "$st" in
+      *R*|*C*)
+        IFS= read -r -d '' src
+        src=${src//[[:cntrl:]]/}
+        name="$name (from $src)";;
+    esac
+    if [ -z "$out" ]; then out=$name; else out="$out
+$name"; fi
+  done < <(git -C "$1" status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null)
+  printf '%s' "$out"
+}
+
+# codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
+# [sandbox_workspace_write]. The Python helper walks every path component with lstat (no
+# user-owned symlinks, owners must be root or you), opens the file with O_NOFOLLOW, reads at
+# most 64 KiB from that descriptor, and prints only yes or no, never the contents.
+codex_network_on() {
+  [ "$(pj netprofile "$1" 2>/dev/null)" = yes ]
+}
+
+# codex_hint WANTED READY -> CODEX_CMD, CODEX_WHY : which command starts a Codex session
+# that can reach Claude children, and why.
+CODEX_CMD=""
+CODEX_WHY=""
+codex_hint() {
+  local file="${CODEX_HOME:-$HOME/.codex}/orchestrator.config.toml"
+  if [ "$2" -eq 1 ] || codex_network_on "$file"; then
+    CODEX_CMD="codex -p orchestrator"
+    CODEX_WHY="The profile turns network on for these sessions, which Claude children need."
+  elif [ "$1" -eq 1 ]; then
+    CODEX_CMD="codex"
+    CODEX_WHY="The orchestrator profile is missing or does not set network_access = true under [sandbox_workspace_write], so Codex sessions cannot reach Claude children yet."
+  else
+    CODEX_CMD="codex"
+    CODEX_WHY="Codex-to-Claude bridging was not chosen, so no profile is needed."
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./setup.sh [PROJECT_PATH]
@@ -114,16 +408,27 @@ EOF
 
 case "${1:-}" in
   --print-provider-routing)
-    if [ $# -ne 5 ]; then
+    if [ "$#" -ne 5 ]; then
       echo "usage: setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE" >&2; exit 2
     fi
-    routing_json "$2" "$3" "$4" "$5"; exit $?;;
+    routing_json "$2" "$3" "$4" "$5"; exit "$?";;
   --write-provider-routing)
-    if [ $# -ne 6 ]; then
+    if [ "$#" -ne 6 ]; then
       echo "usage: setup.sh --write-provider-routing PROJECT CODEX CLAUDE MODELS BRIDGE" >&2; exit 2
     fi
     content=$(routing_json "$3" "$4" "$5" "$6") || exit 1
-    write_project_routing "$2" "$content"; exit $?;;
+    write_project_routing "$2" "$content"; exit "$?";;
+  --print-expanded-path)
+    if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-expanded-path VALUE" >&2; exit 2; fi
+    expand_home "$2"; printf '%s\n' "$EXPANDED"; exit 0;;
+  --print-codex-hint)
+    if [ "$#" -ne 3 ]; then echo "usage: setup.sh --print-codex-hint WANTED READY" >&2; exit 2; fi
+    codex_hint "$2" "$3"; printf '%s\n%s\n' "$CODEX_CMD" "$CODEX_WHY"; exit 0;;
+  --print-uncommitted)
+    if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-uncommitted PROJECT" >&2; exit 2; fi
+    uncommitted_managed "$2"; printf '\n'; exit 0;;
+  --helper)
+    shift; pj "$@"; exit "$?";;
   -h|--help) usage; exit 0;;
 esac
 
@@ -244,7 +549,7 @@ screen_reset() { BODY=""; LIST=""; }
 
 repeat_char() { # repeat_char CHAR COUNT
   local s="" i=0
-  while [ $i -lt "$2" ]; do s="${s}$1"; i=$((i+1)); done
+  while [ "$i" -lt "$2" ]; do s="${s}$1"; i=$((i+1)); done
   printf '%s' "$s"
 }
 
@@ -260,7 +565,7 @@ draw_header() {
     i=1
     for name in "${STEP_NAMES[@]}"; do
       plain="${plain}  ${name}"
-      if [ $i -eq "$STEP" ]; then
+      if [ "$i" -eq "$STEP" ]; then
         line="${line}  ${C_CYAN}${C_BOLD}[${name}]${C_RESET}"
       elif [ "${STAT[$i]:-}" = ok ]; then
         line="${line}  ${C_GREEN}${name}${C_RESET}"
@@ -278,12 +583,12 @@ draw_header() {
     else
       printf ' %s%s%s\n' "$C_CYAN$C_BOLD" "${STEP_NAMES[$((STEP-1))]}" "$C_RESET"
     fi
-    width=$((COLS - 4)); [ $width -gt 40 ] && width=40
+    width=$((COLS - 4)); [ "$width" -gt 40 ] && width=40
     filled=$((STEP * width / STEP_TOTAL))
-    bar="$(repeat_char '#' $filled)$(repeat_char '-' $((width - filled)))"
+    bar="$(repeat_char '#' "$filled")$(repeat_char '-' "$((width - filled))")"
     printf ' %s%s%s\n' "$C_GREEN" "$bar" "$C_RESET"
   fi
-  printf '%s%s%s\n' "$C_DIM" "$(repeat_char '-' $((COLS - 1)))" "$C_RESET"
+  printf '%s%s%s\n' "$C_DIM" "$(repeat_char '-' "$((COLS - 1))")" "$C_RESET"
 }
 
 render() {
@@ -292,7 +597,7 @@ render() {
   draw_header
   printf '\n'
   if [ -n "$BODY" ]; then
-    printf '%s\n\n' "$BODY" | fold -s -w $((COLS - 4)) | sed 's/^/  /'
+    printf '%s\n\n' "$BODY" | fold -s -w "$((COLS - 4))" | sed 's/^/  /'
   fi
   [ -n "$LIST" ] && printf '%s\n' "$LIST"
 }
@@ -308,12 +613,12 @@ read_key() {
     k=""
     started=$SECONDS
     IFS= read -rsn1 -t 1 k; rc=$?
-    if [ $rc -ne 0 ]; then
+    if [ "$rc" -ne 0 ]; then
       # A resize signal can interrupt read with any non-zero status.
       if [ "$REDRAW" -eq 1 ]; then REDRAW=0; KEY=WINCH; return; fi
       # Some bash 3.2 builds report the 1-second timeout as status 1. A failure that
       # returns at once, with no wait, means the terminal is gone.
-      if [ $rc -gt 128 ] || [ "$SECONDS" -gt "$started" ]; then continue; fi
+      if [ "$rc" -gt 128 ] || [ "$SECONDS" -gt "$started" ]; then continue; fi
       KEY=EOF; return
     fi
     break
@@ -358,7 +663,7 @@ menu() { # menu DEFAULT_INDEX ITEM...
     width=$((COLS - 8))
     i=0
     for it in "${items[@]}"; do
-      if [ $i -eq $sel ]; then
+      if [ "$i" -eq "$sel" ]; then
         printf '   %s%s> %s%s\n' "$C_CYAN" "$C_BOLD" "${it:0:$width}" "$C_RESET"
       else
         printf '     %s\n' "${it:0:$width}"
@@ -390,7 +695,7 @@ toggles() { # toggles STATE ITEM...  (STATE like 1101; Space toggles, Enter acce
     i=0
     for it in "${items[@]}"; do
       if [ "${state:$i:1}" = 1 ]; then mark="[x]"; else mark="[ ]"; fi
-      if [ $i -eq $sel ]; then
+      if [ "$i" -eq "$sel" ]; then
         printf '   %s%s> %s %s%s\n' "$C_CYAN" "$C_BOLD" "$mark" "${it:0:$width}" "$C_RESET"
       else
         printf '     %s %s\n' "$mark" "${it:0:$width}"
@@ -416,17 +721,19 @@ toggles() { # toggles STATE ITEM...  (STATE like 1101; Space toggles, Enter acce
 }
 
 ANSWER=""
-ask_text() { # ask_text PROMPT DEFAULT -> ANSWER
+ANSWER_RAW=""
+ask_text() { # ask_text PROMPT DEFAULT -> ANSWER (expanded), ANSWER_RAW (as typed)
   render
   show_cursor
   printf '  %s%s%s [%s]\n  > ' "$C_BOLD" "$1" "$C_RESET" "$2"
   IFS= read -r -e ANSWER || { echo "Input closed; stopping." >&2; exit 1; }
   [ -z "$ANSWER" ] && ANSWER=$2
   case "$ANSWER" in
-    q|Q) confirm_quit; ask_text "$1" "$2";;
-    \~) ANSWER=$HOME;;
-    \~/*) ANSWER="$HOME/${ANSWER#\~/}";;
+    q|Q) confirm_quit; ask_text "$1" "$2"; return;;
   esac
+  ANSWER_RAW=$ANSWER
+  expand_home "$ANSWER"
+  ANSWER=$EXPANDED
 }
 
 pause() { menu 0 "Continue"; }
@@ -476,7 +783,7 @@ run_cmd() {
   ACTIVE_PID=""
   printf '\r\033[K'
   show_cursor
-  return $LAST_RC
+  return "$LAST_RC"
 }
 
 # run_identity CMD... : for identity commands; output is parsed, never logged or shown.
@@ -548,105 +855,6 @@ save_summary() {
   fi
   menu 0 "Continue"
 }
-
-# ---------------------------------------------------------------------------
-# JSON helper (python3 is required anyway)
-# ---------------------------------------------------------------------------
-IFS= read -r -d '' PY_HELPER <<'PY'
-import json, os, re, sys
-
-def load(path):
-    try:
-        if path == "-":
-            return json.load(sys.stdin)
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except Exception:
-        return None
-
-def walk(data, path):
-    for key in path.split("."):
-        if key == "":
-            continue
-        if isinstance(data, dict) and key in data:
-            data = data[key]
-        else:
-            return None
-    return data
-
-def fmt(value):
-    if value is None:
-        return ""
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, (list, dict)):
-        return str(len(value))
-    return str(value)
-
-def safe(value):
-    text = re.sub(r"[^A-Za-z0-9_ .+-]", "", str(value or ""))[:30]
-    return text or "unknown"
-
-op = sys.argv[1]
-if op == "get":
-    print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
-elif op == "claude":
-    data = load("-")
-    if isinstance(data, dict) and data.get("loggedIn") is True:
-        print("yes|%s|%s" % (safe(data.get("subscriptionType")), safe(data.get("authMethod"))))
-    else:
-        print("no||")
-elif op == "plan":
-    import hashlib
-    data = load(sys.argv[2]) or {}
-    target, bundle = sys.argv[3], sys.argv[4]
-    codex = data.get("codex") or {}
-    claude = data.get("claude") or {}
-
-    def digest(path):
-        try:
-            with open(path, "rb") as handle:
-                return hashlib.sha256(handle.read()).hexdigest()
-        except OSError:
-            return None
-
-    files = codex.get("files") or []
-    for rel in files:
-        installed = os.path.join(target, rel)
-        if not os.path.lexists(installed):
-            print("ADD %s" % rel)
-        elif digest(installed) == digest(os.path.join(bundle, rel)):
-            print("KEEP %s" % rel)
-        else:
-            print("UPDATE %s" % rel)
-    manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
-    old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
-    if isinstance(old, dict):
-        for rel in sorted(set(old) - set(files)):
-            print("REMOVE %s" % rel)
-    for rel in claude.get("changed_paths") or []:
-        print(("UPDATE %s" if os.path.lexists(os.path.join(target, rel)) else "ADD %s") % rel)
-    for rel, action in sorted((codex.get("project_configuration") or {}).items()):
-        print("CONFIG %s -> %s" % (rel, action))
-elif op == "raw":
-    data = load(sys.argv[2]) or {}
-    parts = []
-    for key in ("refused", "error"):
-        if isinstance(data.get(key), str):
-            parts.append(data[key])
-    for source in (data.get("codex") or {}, data.get("claude") or {}):
-        for key in ("errors", "project_errors", "package_errors"):
-            for item in source.get(key) or []:
-                if isinstance(item, str):
-                    parts.append(item)
-        for key in ("error", "required_action"):
-            if isinstance(source.get(key), str):
-                parts.append(source[key])
-    print(" ".join(parts).lower().replace("\n", " "))
-PY
-pj() { python3 -I -c "$PY_HELPER" "$@"; }
 
 # ---------------------------------------------------------------------------
 # Step bookkeeping
@@ -722,13 +930,13 @@ step_checks() {
     else
       list_add ok "No ANTHROPIC_API_KEY or OPENAI_API_KEY set"
     fi
-    if [ $hard -eq 1 ]; then
+    if [ "$hard" -eq 1 ]; then
       body "Fix the failures above, then re-check. Setup cannot continue without them."
       menu 0 "Re-check" "Quit"
       [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
       continue
     fi
-    if [ $soft -eq 1 ]; then
+    if [ "$soft" -eq 1 ]; then
       body "Some checks failed. You can continue now, but providers that are not signed in cannot be attested or used until fixed."
       menu 0 "Re-check" "Continue anyway" "Quit"
       case $MENU_IDX in
@@ -806,7 +1014,7 @@ prepare_project_inputs() {
 }
 
 step_project() {
-  local default dir reason out rc
+  local default dir reason out rc guess
   default=${1:-$PWD}
   while :; do
     begin_step 2
@@ -815,10 +1023,28 @@ step_project() {
     dir=$(resolve_dir "$ANSWER")
     screen_reset; begin_step 2
     if [ -z "$dir" ]; then
-      list_add fail "Cannot open: $ANSWER"
-      menu 0 "Choose another path" "Quit"
-      [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
-      continue
+      list_add fail "Cannot open: [$ANSWER]"
+      if [ "$ANSWER_RAW" != "$ANSWER" ]; then
+        list_sub "You typed: [$ANSWER_RAW]"
+      fi
+      list_sub "Type the full path, for example /Users/<you>/projects/app. Tab completes paths."
+      # The usual slip: the leading ~ was lost, leaving /Code/app for $HOME/Code/app.
+      guess=""
+      [ -n "$ANSWER" ] && guess=$(resolve_dir "$HOME/${ANSWER#/}")
+      if [ -n "$guess" ]; then
+        list_sub "That path does not exist, but this one does: $guess"
+        menu 0 "Use the path shown above" "Choose another path" "Quit"
+        case $MENU_IDX in
+          0) dir=$guess;;
+          1) continue;;
+          *) echo "Stopped."; exit 1;;
+        esac
+        screen_reset; begin_step 2
+      else
+        menu 0 "Choose another path" "Quit"
+        [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
+        continue
+      fi
     fi
     if reason=$(basic_problem "$dir"); then :; else
       list_add fail "$dir"; list_sub "$reason"
@@ -874,6 +1100,23 @@ step_project() {
       default=$dir
       continue
     fi
+    # File names reach bash only through the helper, which refuses unsafe ones (newlines or
+    # other control characters, edge spaces, invalid UTF-8, absolute or .. paths).
+    pj planpaths "$PREVIEW_FILE" "$dir" "$ROOT_DIR/packages/codex-agents/native-package" >"$LOGDIR/plan-paths.nul"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      list_add fail "$dir"
+      if [ "$rc" -eq 3 ]; then
+        list_sub "Unsafe file name in managed paths (a control character, edge space or invalid text in a file name). Nothing was changed."
+      else
+        list_sub "The install plan could not be read. Nothing was changed."
+      fi
+      record_failure "unsafe file name in managed paths" "refused before any change"
+      menu 0 "Choose another path" "Quit"
+      [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
+      default=$dir
+      continue
+    fi
     PROJECT=$dir
     PLAN_TEXT=$(pj plan "$PREVIEW_FILE" "$PROJECT" "$ROOT_DIR/packages/codex-agents/native-package")
     list_add ok "Project: $PROJECT"
@@ -895,6 +1138,7 @@ CH_CODEX=on CH_CLAUDE=on CH_MODELS="" CH_BRIDGE=off
 
 step_providers() {
   local state="111110" m i err existing
+  local -a all_models
   existing="$PROJECT/.codex/orchestration/provider-routing.json"
   ROUTING_WRITE=1
   begin_step 3
@@ -934,7 +1178,8 @@ step_providers() {
     [ "${state:0:1}" = 1 ] && CH_CODEX=on
     [ "${state:1:1}" = 1 ] && CH_CLAUDE=on
     i=2
-    for m in $CLAUDE_MODELS_ALL; do
+    read -ra all_models <<<"$CLAUDE_MODELS_ALL"
+    for m in "${all_models[@]}"; do
       if [ "${state:$i:1}" = 1 ]; then
         if [ -z "$CH_MODELS" ]; then CH_MODELS=$m; else CH_MODELS="$CH_MODELS,$m"; fi
       fi
@@ -970,8 +1215,13 @@ step_providers() {
 COMMIT_MSG_1="Install agent orchestration packages"
 COMMIT_MSG_2="Adds the managed Codex and Claude agent packages and the provider routing configuration."
 PLAN_TEXT=""
+COMMIT_PATHS=()
+COMMIT_STATE=""
+UNCOMMITTED=""
 
 list_cmd() { LIST="${LIST}    $1
+"; }
+list_plain() { LIST="${LIST}  $1
 "; }
 
 # The per-path plan: add, update (content differs), remove (obsolete), keep (unchanged).
@@ -987,7 +1237,7 @@ show_plan() {
     list_add info "$label: $n"
     shown=0
     while IFS= read -r line; do
-      [ $shown -ge $cap ] && break
+      [ "$shown" -ge "$cap" ] && break
       list_sub "${kind} ${line#* }"
       shown=$((shown + 1))
     done < <(printf '%s\n' "$PLAN_TEXT" | grep "^$kind ")
@@ -1008,21 +1258,25 @@ manual_installer() {
 view_plan() {
   local text off=0 page n i end k
   local lines=()
-  text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE) ')
+  if [ "$#" -gt 0 ]; then
+    text=$1
+  else
+    text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE) ')
+  fi
   hide_cursor
   while :; do
     term_size
     lines=()
-    while IFS= read -r k; do lines+=("$k"); done < <(printf '%s\n' "$text" | fold -s -w $((COLS - 6)))
+    while IFS= read -r k; do lines+=("$k"); done < <(printf '%s\n' "$text" | fold -s -w "$((COLS - 6))")
     n=${#lines[@]}
-    page=$((LINES_N - 9)); [ $page -lt 3 ] && page=3
-    [ $off -gt $((n - page)) ] && off=$((n - page))
-    [ $off -lt 0 ] && off=0
+    page=$((LINES_N - 9)); [ "$page" -lt 3 ] && page=3
+    [ "$off" -gt "$((n - page))" ] && off=$((n - page))
+    [ "$off" -lt 0 ] && off=0
     printf '\033[H\033[2J'
     draw_header
-    printf '\n  %sFull plan: lines %d-%d of %d%s\n\n' "$C_BOLD" $((off + 1)) $((off + page > n ? n : off + page)) "$n" "$C_RESET"
+    printf '\n  %sFull plan: lines %d-%d of %d%s\n\n' "$C_BOLD" "$((off + 1))" "$((off + page > n ? n : off + page))" "$n" "$C_RESET"
     i=$off; end=$((off + page))
-    while [ $i -lt $end ] && [ $i -lt "$n" ]; do
+    while [ "$i" -lt "$end" ] && [ "$i" -lt "$n" ]; do
       printf '    %s\n' "${lines[$i]}"
       i=$((i + 1))
     done
@@ -1043,7 +1297,7 @@ VERIFY_LIMITED=0
 verify_install() { # verify_install -> sets LAST_* and records problems in LIST
   run_cmd "Verifying the install" python3 "$ROOT_DIR/scripts/install.py" verify --target "$PROJECT"
   local rc=$? line
-  if [ $rc -eq 0 ]; then
+  if [ "$rc" -eq 0 ]; then
     list_add ok "Verification passed: the install is ready"
     return 0
   fi
@@ -1058,7 +1312,8 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 }
 
 step_install() {
-  local routing_path line commit_done=0 verify_ok=0 q_project
+  local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
+  local commit_note paths_ok paths_rc
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
   body "Install into: $PROJECT"
@@ -1101,38 +1356,97 @@ step_install() {
   else
     list_add ok "Kept the existing provider-routing.json"
   fi
-  body "Next: commit the installed files in the project. Only these paths are committed, nothing is pushed. The exact commands are:"
-  list_cmd "git -C $q_project add -- .agents .claude .codex"
-  list_cmd "git -C $q_project commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- .agents .claude .codex"
-  menu 0 "Commit now (recommended)" "I will commit myself"
-  screen_reset; begin_step 4
-  list_add ok "Packages installed"
-  if [ "$MENU_IDX" -eq 0 ]; then
-    render
-    RUN_QUIET=1
-    if run_cmd "Committing" git -C "$PROJECT" add -- .agents .claude .codex &&
-       run_cmd "Committing" git -C "$PROJECT" commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- .agents .claude .codex; then
-      RUN_QUIET=0
-      commit_done=1
-      list_add ok "Committed the installed files (not pushed)"
-    else
-      RUN_QUIET=0
-      failure_detail "The commit failed" "Check your Git identity (user.name, user.email) and any commit hooks. Commit the files yourself, then run ./setup.sh again and choose Verify."
-    fi
-  else
-    list_add skip "Commit left to you; verification needs the files committed"
+  # Stage exactly what the installer reported (changed files, the manifests, project
+  # configuration it wrote) plus provider-routing.json, never a whole directory.
+  cp "$LAST_OUT" "$LOGDIR/apply.json" 2>/dev/null
+  COMMIT_PATHS=()
+  paths_ok=1
+  pj paths "$LOGDIR/apply.json" "$PROJECT" "$LOGDIR/plan-paths.nul" >"$LOGDIR/commit-paths.nul"
+  paths_rc=$?
+  while IFS= read -r -d '' path; do
+    COMMIT_PATHS+=("$path")
+  done <"$LOGDIR/commit-paths.nul"
+  n_paths=${#COMMIT_PATHS[@]}
+  if [ "$paths_rc" -ne 0 ] || [ "$n_paths" -eq 0 ]; then
+    paths_ok=0
+    COMMIT_PATHS=()
+    n_paths=0
   fi
+  if [ "$paths_ok" -eq 0 ]; then
+    # Never run git add with an empty or untrustworthy path list: that would stage everything.
+    if [ "$paths_rc" -eq 3 ]; then
+      LAST_RC=$paths_rc
+      record_failure "commit refused" "unsafe file name in managed paths"
+      list_add fail "Unsafe file name in managed paths; nothing was staged or committed"
+    else
+      LAST_RC=$paths_rc
+      record_failure "commit failed: no paths to commit" "the path list could not be built"
+      list_add fail "commit failed: no paths to commit (nothing was staged)"
+    fi
+    COMMIT_STATE=failed
+  else
+    body "Next: commit the installed files in the project. Only these $n_paths paths are staged and committed, nothing is pushed. The exact commands are below; choose 'Show every path' for the full list."
+    list_cmd "git -C $q_project --literal-pathspecs add -A -- <the $n_paths paths below>"
+    list_cmd "git -C $q_project --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
+    shown=0
+    for path in "${COMMIT_PATHS[@]}"; do
+      [ "$shown" -ge 10 ] && break
+      list_sub "$path"
+      shown=$((shown + 1))
+    done
+    [ "$n_paths" -gt "$shown" ] && list_sub "... and $((n_paths - shown)) more"
+    while :; do
+      menu 0 "Commit now (recommended)" "I will commit myself" "Show every path"
+      [ "$MENU_IDX" -eq 2 ] || break
+      view_plan "$(printf 'git --literal-pathspecs add -A -- %s\n' "${COMMIT_PATHS[@]}")"
+    done
+    screen_reset; begin_step 4
+    list_add ok "Packages installed"
+    COMMIT_STATE=not_committed
+    if [ "$MENU_IDX" -eq 0 ]; then
+      render
+      RUN_QUIET=1
+      COMMIT_STATE=failed
+      if run_cmd "Staging" git -C "$PROJECT" --literal-pathspecs add -A -- "${COMMIT_PATHS[@]}" &&
+         run_cmd "Committing" git -C "$PROJECT" --literal-pathspecs commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- "${COMMIT_PATHS[@]}"; then
+        RUN_QUIET=0
+        commit_done=1
+        COMMIT_STATE=committed
+      else
+        RUN_QUIET=0
+        failure_detail "The commit failed" "Check your Git identity (user.name, user.email) and any commit hooks. Commit the files yourself, then run ./setup.sh again and choose Verify."
+      fi
+    fi
+  fi
+  # Whatever is still uncommitted in the managed paths is listed in the final summary.
+  UNCOMMITTED=$(uncommitted_managed "$PROJECT")
+  if [ "$COMMIT_STATE" = committed ] && [ -n "$UNCOMMITTED" ]; then
+    COMMIT_STATE=failed
+    commit_done=0
+    failure_detail "The commit left files uncommitted" "Some managed files are still uncommitted. Commit them yourself, then run ./setup.sh again and choose Verify."
+  fi
+  case "$COMMIT_STATE" in
+    committed) list_add ok "Committed the installed files (not pushed)"; commit_note="committed";;
+    not_committed) list_add skip "Commit left to you; verification needs the files committed"
+      commit_note="not committed (you chose to commit yourself)";;
+    *) commit_note="commit failed";;
+  esac
   render
   if verify_install; then verify_ok=1; fi
-  if [ $verify_ok -eq 1 ]; then
-    mark_step 4 ok "installed and verified"
+  if [ "$verify_ok" -eq 1 ]; then
+    base="installed and verified"
   elif [ "$VERIFY_LIMITED" -eq 1 ]; then
-    mark_step 4 ok "installed; verify not ready on Linux (known limitation)"
-  elif [ $commit_done -eq 0 ]; then
-    mark_step 4 ok "installed; commit, then verify"
+    base="installed; verify not ready on Linux (known limitation)"
+  elif [ "$commit_done" -eq 0 ]; then
+    base="installed, not yet verified"
   else
-    mark_step 4 fail "installed but verification failed"
+    base="installed but verification failed"
+  fi
+  if [ "$COMMIT_STATE" = failed ] || { [ "$verify_ok" -eq 0 ] && [ "$VERIFY_LIMITED" -eq 0 ] && [ "$commit_done" -eq 1 ]; }; then
+    mark_step 4 fail "$base; $commit_note"
     FAILED_ANY=1
+  else
+    mark_step 4 ok "$base; $commit_note"
   fi
   menu 0 "Continue"
   return 0
@@ -1167,7 +1481,7 @@ step_collector() {
   screen_reset; begin_step 5
   render
   run_cmd "Registering the collector" python3 "$cli" learning-register --project-root "$PROJECT"
-  if [ $? -ne 0 ]; then
+  if [ "$?" -ne 0 ]; then
     failure_detail "Collector registration failed"
     version_hint
     mark_step 5 fail "registration failed"
@@ -1214,7 +1528,7 @@ step_billing() {
   printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
   IFS= read -r _ || true
   screen_reset; begin_step 6
-  if [ $rc -eq 0 ]; then
+  if [ "$rc" -eq 0 ]; then
     list_add ok "attest.py ran. Check its summary for which providers it listed as attested."
     mark_step 6 ok "attestation ran; check which providers were attested"
   else
@@ -1297,7 +1611,7 @@ step_verify_only() {
 }
 
 step_done() {
-  local i s label codex_cmd
+  local i s label line shown
   begin_step 8
   mark_step 8 ok "finished"
   i=1
@@ -1309,13 +1623,26 @@ step_done() {
       skip) list_add skip "$i. $label: ${NOTE[$i]}";;
       *) list_add skip "$i. $label: skipped";;
     esac
+    if [ "$i" -eq 4 ] && [ -n "$UNCOMMITTED" ] && [ "$COMMIT_STATE" != committed ]; then
+      list_sub "Left uncommitted in the project:"
+      shown=0
+      while IFS= read -r line; do
+        [ "$shown" -ge 10 ] && break
+        list_sub "  $line"
+        shown=$((shown + 1))
+      done < <(printf '%s\n' "$UNCOMMITTED")
+      [ "$(printf '%s\n' "$UNCOMMITTED" | grep -c .)" -gt "$shown" ] &&
+        list_sub "  ... and $(( $(printf '%s\n' "$UNCOMMITTED" | grep -c .) - shown )) more"
+    fi
     i=$((i+1))
   done
-  [ "$PROFILE_READY" -eq 1 ] && codex_cmd="codex -p orchestrator" || codex_cmd="codex"
-  body "How to use it:
- - In Claude Code, open the project and use the agent-orchestration skill.
- - In Codex, start a session with: $codex_cmd
- - To remove everything, run:"
+  codex_hint "$PROFILE_WANTED" "$PROFILE_READY"
+  list_plain ""
+  list_plain "${C_BOLD}How to use it${C_RESET}"
+  list_plain " - In Claude Code, open the project and use the agent-orchestration skill."
+  list_plain " - In Codex, start a session with: $CODEX_CMD"
+  list_sub "$CODEX_WHY"
+  list_plain " - To remove everything, run:"
   list_cmd "python3 $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
   if [ "$FAILED_ANY" -eq 1 ] && [ -n "$FAIL_SUMMARY" ]; then
     menu 0 "Exit" "Save a summary of what failed"
