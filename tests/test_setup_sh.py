@@ -45,6 +45,25 @@ VALIDATE = (
 TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789SECRETTOKEN"
 
 
+def interpreter_trusted() -> bool:
+    """Whether the Codex rule may name this Python (CI toolcaches can be world-writable)."""
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from codex_agents.host_commands import interpreter_path; interpreter_path()",
+         str(ORCHESTRATION)],
+        capture_output=True, stdin=subprocess.DEVNULL, check=False,
+    )
+    return completed.returncode == 0
+
+
+TRUSTED_PYTHON = interpreter_trusted()
+NEEDS_TRUSTED_PYTHON = unittest.skipUnless(
+    TRUSTED_PYTHON, "this machine's Python cannot be named by the Codex rule"
+)
+
+
 def write_routing(project: Path, codex: str = "on", claude: str = "on",
                   models: str = "claude-opus-5-5", bridge: str = "off") -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -475,6 +494,9 @@ class WizardTerminalTests(unittest.TestCase):
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
             'for a in "$@"; do if [ "$a" = paths ] && [ -n "$FAKE_PJ_FAIL" ]; then exit 1; fi; done\n'
+            'if [ -n "$FAKE_UNTRUSTED" ]; then case "$*" in *host-command*)'
+            ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
+            ' exit 2;; esac; fi\n'
             f'exec "{sys.executable}" "$@"\n')
         for fake in self.fakes.iterdir():
             fake.chmod(0o755)
@@ -653,6 +675,7 @@ class WizardTerminalTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
+    @NEEDS_TRUSTED_PYTHON
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
         project, checks = self.make_project("my proj;x")
         self.to_project_prompt(project)
@@ -820,7 +843,7 @@ class WizardTerminalTests(unittest.TestCase):
             self.send("\r")
         self.expect("Commit now")
 
-    def finish_after_install(self) -> str:
+    def finish_after_install(self, trusted: bool = TRUSTED_PYTHON) -> str:
         """Skip the collector, billing, profile and commands steps; return the final screen."""
         self.expect("Continue")
         self.send("\r")
@@ -830,7 +853,10 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\r")
         self.expect("Not chosen")
         self.send("\r")
-        self.expect("No, not now")
+        if trusted:
+            self.expect("No, not now")
+        else:
+            self.expect("This Python cannot be trusted")
         self.send("\r")
         self.expect("remove --target")
         self.settle()
@@ -947,6 +973,43 @@ class WizardTerminalTests(unittest.TestCase):
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
 
+    @NEEDS_TRUSTED_PYTHON
+    def test_a_stale_rule_left_unchanged_keeps_its_undo_instruction(self) -> None:
+        import hashlib
+        project, checks = self.make_project()
+        digest = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:12]
+        rules = self.home / ".codex" / "rules"
+        rules.mkdir(parents=True, mode=0o700)
+        stale = rules / f"agent-orchestration-{digest}.rules"
+        stale.write_text("# an older rule for this project\n")
+        stale.chmod(0o600)
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\x1b[B\r")
+        self.expect("Not chosen")
+        self.send("\r")
+        self.expect("Leave it unchanged")
+        self.assertIn("differs", self.screen)
+        self.send("\r")
+        self.expect("remove --target")
+        self.settle()
+        final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "",
+                       self.screen.split("\x1b[2J")[-1]).replace("\r", "")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertIn("8. Commands: exists, differs, left alone", final)
+        self.assertIn("rule for this project is stale", final)
+        self.assertNotIn("until the Codex commands rule exists", final)
+        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
+                         + digest + r"\.rules")
+        self.assertEqual("# an older rule for this project\n", stale.read_text())
+
+    @NEEDS_TRUSTED_PYTHON
     def test_verify_reports_the_codex_commands_rule_without_writing_it(self) -> None:
         import json
         project, checks = self.make_project()
@@ -976,6 +1039,16 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertEqual(self.finish(), 0)
         self.assertIn("8. Commands: missing", final)
         self.assertIn("Codex sessions cannot reach the orchestrator", final)
+        self.assertNotIn("To undo it, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
+
+    def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks, {"FAKE_UNTRUSTED": "1"})
+        self.send("\r")
+        final = self.finish_after_install(trusted=False)
+        self.assertIn("8. Commands: not checked", final)
+        self.assertIn("until the Codex commands rule exists", final)
         self.assertNotIn("To undo it, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
 

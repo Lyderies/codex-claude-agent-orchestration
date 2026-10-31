@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,10 +22,13 @@ from unittest import mock
 from tests.support import BUNDLE_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 import cli
+from codex_agents import host_commands
 from codex_agents.host_commands import (
     PRIMARY_HOST_COMMANDS,
+    PYTHON_FLAGS,
     HostCommandError,
     argv_prefix,
+    interpreter_path,
     render_rule,
     rule_file_name,
     rule_path,
@@ -65,6 +69,25 @@ OWNER_COMMANDS = {
     "install-codex-rule",
 }
 PYTHON = "/opt/example/bin/python3"
+# The interpreter the rule names when tests run: the base one, never a venv's.
+BASE_PYTHON = (
+    getattr(sys, "_base_executable", sys.executable)
+    if sys.prefix != sys.base_prefix else sys.executable
+)
+
+
+def _python_trusted() -> bool:
+    try:
+        interpreter_path()
+    except HostCommandError:
+        return False
+    return True
+
+
+# CI toolcaches can be world-writable, and such a Python is rightly refused.
+NEEDS_TRUSTED_PYTHON = unittest.skipUnless(
+    _python_trusted(), "this machine's Python cannot be named by the Codex rule"
+)
 
 
 def cli_subcommands() -> set[str]:
@@ -119,8 +142,11 @@ class RuleTests(unittest.TestCase):
     def test_rule_pins_absolute_paths_and_only_the_allowlist(self) -> None:
         text = render_rule(self.project, PYTHON)
         cli_path = str(self.project / ".codex" / "orchestration" / "cli.py")
-        self.assertEqual([PYTHON, cli_path, *PRIMARY_HOST_COMMANDS], self.pattern(text))
-        self.assertEqual([PYTHON, cli_path], argv_prefix(self.project, PYTHON))
+        self.assertEqual(("-I", "-B", "-S"), PYTHON_FLAGS)
+        self.assertEqual(
+            [PYTHON, *PYTHON_FLAGS, cli_path, *PRIMARY_HOST_COMMANDS], self.pattern(text)
+        )
+        self.assertEqual([PYTHON, *PYTHON_FLAGS, cli_path], argv_prefix(self.project, PYTHON))
         self.assertEqual(1, text.count("prefix_rule("))
         self.assertIn('    decision = "allow",\n', text)
         self.assertIn("justification = ", text)
@@ -130,7 +156,9 @@ class RuleTests(unittest.TestCase):
         self.assertIn('"learning-status"', match)
         self.assertIn('"learning-register"', not_match)
         self.assertIn('["python3", ".codex/orchestration/cli.py", "learning-status"', not_match)
-        self.assertIn(f'["{PYTHON}", ".codex/orchestration/cli.py"', not_match)
+        self.assertIn(f'["{PYTHON}", "-I", "-B", "-S", ".codex/orchestration/cli.py"', not_match)
+        # The isolation flags are part of the match; the bare form stays sandboxed.
+        self.assertIn(f'["{PYTHON}", "{cli_path}", "learning-status"', not_match)
         for owner in OWNER_COMMANDS - {"learning-register"}:
             self.assertNotIn(f'"{owner}"', text)
         header = text.split("prefix_rule(", 1)[0]
@@ -142,7 +170,7 @@ class RuleTests(unittest.TestCase):
         project = self.make_project('odd "name" \\ dir')
         text = render_rule(project, PYTHON)
         cli_path = str(project / ".codex" / "orchestration" / "cli.py")
-        self.assertEqual(cli_path, self.pattern(text)[1])
+        self.assertEqual(cli_path, self.pattern(text)[1 + len(PYTHON_FLAGS)])
         self.assertIn('odd \\"name\\" \\\\ dir', text)
 
     def test_line_breaks_and_control_characters_are_refused(self) -> None:
@@ -156,9 +184,10 @@ class RuleTests(unittest.TestCase):
                 with self.assertRaises(HostCommandError):
                     render_rule(self.project, interpreter)
 
+    @NEEDS_TRUSTED_PYTHON
     def test_the_interpreter_is_the_running_one_unresolved(self) -> None:
-        self.assertEqual(sys.executable, argv_prefix(self.project)[0])
-        self.assertIn(_quoted(sys.executable), render_rule(self.project))
+        self.assertEqual(BASE_PYTHON, argv_prefix(self.project)[0])
+        self.assertIn(_quoted(BASE_PYTHON), render_rule(self.project))
 
     def test_project_cli_must_be_a_regular_installed_file(self) -> None:
         with self.assertRaisesRegex(HostCommandError, "not installed"):
@@ -217,6 +246,60 @@ class RuleTests(unittest.TestCase):
         self.assertEqual("installed", rule_status(self.project, self.environ, other))
         self.assertEqual([path.name], os.listdir(path.parent))
 
+    def test_a_rule_that_appears_after_the_read_is_never_overwritten(self) -> None:
+        path = rule_path(self.project, self.environ)
+        real_read = host_commands._read_rule
+
+        def late_writer(directory: int, name: str):
+            current = real_read(directory, name)
+            if current is None:
+                # Another setup publishes its rule between this read and the write.
+                descriptor = os.open(
+                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
+                )
+                with os.fdopen(descriptor, "w") as handle:
+                    handle.write(render_rule(self.project, "/opt/other/bin/python3"))
+            return current
+
+        with mock.patch.object(host_commands, "_read_rule", side_effect=late_writer):
+            self.assertEqual("differs", write_rule(self.project, self.environ, PYTHON))
+        self.assertEqual(render_rule(self.project, "/opt/other/bin/python3"), path.read_text())
+        self.assertEqual([path.name], os.listdir(path.parent))
+
+    def test_concurrent_setups_create_exactly_one_rule(self) -> None:
+        interpreters = [f"/opt/python-{index}/bin/python3" for index in range(6)]
+        barrier = threading.Barrier(len(interpreters))
+        real_read = host_commands._read_rule
+        outcomes: dict[str, str] = {}
+        waited: set[int] = set()
+
+        def synchronized(directory: int, name: str):
+            current = real_read(directory, name)
+            if threading.get_ident() not in waited:
+                # Every setup reads "missing" before any of them writes.
+                waited.add(threading.get_ident())
+                barrier.wait(timeout=10)
+            return current
+
+        def setup(interpreter: str) -> None:
+            try:
+                outcomes[interpreter] = write_rule(self.project, self.environ, interpreter)
+            except Exception as exc:  # noqa: BLE001 - reported by the assertion below
+                outcomes[interpreter] = repr(exc)
+
+        with mock.patch.object(host_commands, "_read_rule", side_effect=synchronized):
+            threads = [threading.Thread(target=setup, args=(item,)) for item in interpreters]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        created = [item for item, outcome in outcomes.items() if outcome == "created"]
+        self.assertEqual(1, len(created), outcomes)
+        self.assertEqual({"created", "differs"}, set(outcomes.values()))
+        path = rule_path(self.project, self.environ)
+        self.assertEqual(render_rule(self.project, created[0]), path.read_text())
+        self.assertEqual([path.name], os.listdir(path.parent))
+
     def test_a_symlinked_rules_directory_is_refused(self) -> None:
         elsewhere = self.base / "elsewhere"
         elsewhere.mkdir()
@@ -269,7 +352,9 @@ class RuleTests(unittest.TestCase):
             [*prefix, "learning-register"],
             [*prefix, "host-command"],
             ["python3", ".codex/orchestration/cli.py", "dispatch"],
-            [PYTHON, ".codex/orchestration/cli.py", "dispatch"],
+            [PYTHON, *PYTHON_FLAGS, ".codex/orchestration/cli.py", "dispatch"],
+            [PYTHON, prefix[-1], "dispatch"],
+            [PYTHON, "-I", prefix[-1], "dispatch"],
         ):
             self.assertEqual([], check(*argv)["matchedRules"], argv)
 
@@ -278,6 +363,7 @@ def _quoted(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+@NEEDS_TRUSTED_PYTHON
 class HostCommandCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
@@ -302,7 +388,7 @@ class HostCommandCliTests(unittest.TestCase):
         report = self.run_cli("host-command", expected=1)
         cli_path = str(self.project / ".codex" / "orchestration" / "cli.py")
         self.assertEqual(
-            {"ready": False, "argv_prefix": [sys.executable, cli_path],
+            {"ready": False, "argv_prefix": [BASE_PYTHON, *PYTHON_FLAGS, cli_path],
              "codex_rule": "missing",
              "rule_file": str(rule_path(self.project, {"CODEX_HOME": str(self.codex_home)}))},
             report,
@@ -544,9 +630,42 @@ class OwnRootTests(unittest.TestCase):
         for arguments in ((), ("--root", str(self.project))):
             code, report = self.run_cli("validate", *arguments)
             self.assertIn("package_ready", report)
-        # Owner commands and the source tree are not pinned.
+        # host-command is not pinned (it needs no state), and reads only.
         code, report = self.run_cli("host-command", "--project-root", str(self.project))
-        self.assertIn("argv_prefix", report)
+        self.assertTrue("argv_prefix" in report or "cannot be trusted" in report["error"])
+
+    @NEEDS_TRUSTED_PYTHON
+    def test_every_allowlisted_command_runs_under_the_exact_prefix(self) -> None:
+        prefix = argv_prefix(self.project)
+        self.assertEqual([BASE_PYTHON, *PYTHON_FLAGS, str(self.cli)], prefix)
+        for command in PRIMARY_HOST_COMMANDS:
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    [*prefix, command, "--help"], capture_output=True, text=True,
+                    env=self.env, stdin=subprocess.DEVNULL, check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+        state = LearningState(self.default_state)
+        authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
+        ledger = LearningLedger(
+            state,
+            client_capabilities=load_client_capabilities(
+                ORCHESTRATION_ROOT / "config" / "learning-clients.json"
+            ),
+        )
+        ledger.register_project(self.project, now_ms=1)
+        ledger.close()
+        for arguments in (
+            ("learning-open-orchestration", "--project-root", str(self.project)),
+            ("validate",),
+            ("inventory",),
+        ):
+            completed = subprocess.run(
+                [*prefix, *arguments], capture_output=True, text=True, env=self.env,
+                stdin=subprocess.DEVNULL, check=False,
+            )
+            self.assertIn('"ready"', completed.stdout, completed.stderr)
+        self.assertEqual([], list(self.project.rglob("__pycache__")))
 
     def test_source_tree_cli_keeps_its_options(self) -> None:
         completed = subprocess.run(

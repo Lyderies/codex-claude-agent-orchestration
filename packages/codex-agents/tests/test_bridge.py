@@ -277,7 +277,11 @@ class BridgeTestCase(unittest.TestCase):
             os.killpg(invocation["pgid"], 0)
 
     def workspace_entries(self) -> list[Path]:
-        return list(self.dispatch_parent.iterdir())
+        """What a dispatch left in its scratch: nothing, once it has finished."""
+
+        container = self.dispatch_parent / bridge.SCRATCH_CONTAINER
+        outside = [path for path in self.dispatch_parent.iterdir() if path != container]
+        return outside + (list(container.iterdir()) if container.exists() else [])
 
 
 class CliTestCase(BridgeTestCase):
@@ -2392,7 +2396,7 @@ class VerifierHandoffTests(ClaudePrimaryCase):
             "--verifier-result", self.write("verifier-result.json", dispatched["result"]),
         )
         with mock.patch.object(
-            cli, "run_operational_check_suite", side_effect=lambda _: passing_check_report()
+            cli, "run_operational_check_suite", side_effect=lambda _root, **_scratch: passing_check_report()
         ):
             refused = self.cli(
                 "learning-run-operational-checks",
@@ -2567,7 +2571,7 @@ class VerifierHandoffTests(ClaudePrimaryCase):
 
     def run_checks(self, worker: str, verifier: str, expected: int = 0) -> dict:
         with mock.patch.object(
-            cli, "run_operational_check_suite", side_effect=lambda _: passing_check_report()
+            cli, "run_operational_check_suite", side_effect=lambda _root, **_scratch: passing_check_report()
         ):
             return self.cli(
                 "learning-run-operational-checks", "--host-outcome-digest", worker,

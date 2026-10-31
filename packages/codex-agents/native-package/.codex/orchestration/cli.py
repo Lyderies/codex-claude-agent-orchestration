@@ -2116,7 +2116,9 @@ def main() -> int:
                     host_outcome_digest=args.host_outcome_digest,
                     verifier_host_outcome_digest=args.verifier_host_outcome_digest,
                 )
-                check_report = run_operational_check_suite(args.project_root)
+                check_report = run_operational_check_suite(
+                    args.project_root, scratch_root=ledger.state.root
+                )
                 receipt = ledger.issue_operational_check_receipt(
                     project_id,
                     host_outcome_digest=args.host_outcome_digest,

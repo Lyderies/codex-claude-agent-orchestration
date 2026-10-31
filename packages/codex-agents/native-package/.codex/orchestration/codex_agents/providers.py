@@ -15,7 +15,6 @@ import selectors
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -223,8 +222,13 @@ def resolve_client(name: str) -> tuple[str, str]:
     return real, digest.hexdigest()
 
 
-def client_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """A minimal child environment: no caller overrides such as CODEX_HOME."""
+def client_environment(environ: Mapping[str, str], tmpdir: Path) -> dict[str, str]:
+    """A minimal child environment: no caller overrides such as CODEX_HOME.
+
+    TMPDIR is a host-private directory the caller created, never the system
+    temp directory, which a sandboxed Codex primary can write: a client run
+    outside the sandbox must not load or trust files from there.
+    """
 
     account = pwd.getpwuid(os.getuid()).pw_name
     return {
@@ -235,7 +239,7 @@ def client_environment(environ: Mapping[str, str]) -> dict[str, str]:
         "LOGNAME": account,
         "PATH": trusted_search_path(),
         "LANG": environ.get("LANG") or "C.UTF-8",
-        "TMPDIR": environ.get("TMPDIR") or tempfile.gettempdir(),
+        "TMPDIR": str(tmpdir),
     }
 
 
@@ -312,6 +316,7 @@ def read_client_version(
     executable: str,
     *,
     environ: Mapping[str, str],
+    tmpdir: Path,
     popen: Callable[..., Any] = subprocess.Popen,
     timeout: float = OBSERVATION_TIMEOUT_SECONDS,
 ) -> str | None:
@@ -323,7 +328,7 @@ def read_client_version(
     try:
         output = _bounded_output(
             [executable, "--version"],
-            environment=client_environment(environ),
+            environment=client_environment(environ, tmpdir),
             timeout=timeout,
             popen=popen,
         )
@@ -336,6 +341,7 @@ def observe_claude(
     *,
     digest_key: bytes,
     observed_at_ms: int,
+    tmpdir: Path,
     environ: Mapping[str, str] | None = None,
     popen: Callable[..., Any] = subprocess.Popen,
     timeout: float = OBSERVATION_TIMEOUT_SECONDS,
@@ -345,12 +351,12 @@ def observe_claude(
     executable, client_sha256 = resolve_client("claude")
     output = _bounded_output(
         [executable, "auth", "status", "--json"],
-        environment=client_environment(caller),
+        environment=client_environment(caller, tmpdir),
         timeout=timeout,
         popen=popen,
     )
     version = read_client_version(
-        "claude", executable, environ=caller, popen=popen, timeout=timeout
+        "claude", executable, environ=caller, tmpdir=tmpdir, popen=popen, timeout=timeout
     )
     return [
         parse_claude_auth_status(
@@ -371,13 +377,14 @@ class AppServerSession:
         project_root: Path,
         *,
         environ: Mapping[str, str],
+        tmpdir: Path,
         popen: Callable[..., Any] = subprocess.Popen,
         timeout: float = OBSERVATION_TIMEOUT_SECONDS,
     ) -> None:
         _require_no_api_keys(environ)
         executable, self.client_sha256 = resolve_client("codex")
         self.client_path = executable
-        environment = client_environment(environ)
+        environment = client_environment(environ, tmpdir)
         self._timeout = timeout
         self._next_id = 0
         self._buffer = b""
@@ -573,13 +580,14 @@ def observe_codex(
     *,
     digest_key: bytes,
     observed_at_ms: int,
+    tmpdir: Path,
     environ: Mapping[str, str] | None = None,
     popen: Callable[..., Any] = subprocess.Popen,
     run_id: str | None = None,
     phase: str | None = None,
 ) -> list[dict[str, Any]]:
     caller = os.environ if environ is None else environ
-    session = AppServerSession(project_root, environ=caller, popen=popen)
+    session = AppServerSession(project_root, environ=caller, tmpdir=tmpdir, popen=popen)
     try:
         session.request(
             "initialize",
@@ -595,7 +603,7 @@ def observe_codex(
         session.close()
     # The version comes from the same resolved client the session ran.
     version = read_client_version(
-        "codex", session.client_path, environ=caller, popen=popen
+        "codex", session.client_path, environ=caller, tmpdir=tmpdir, popen=popen
     )
     return parse_codex_rate_limits(
         result,

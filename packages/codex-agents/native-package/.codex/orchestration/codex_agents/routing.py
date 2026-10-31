@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 from copy import deepcopy
@@ -17,6 +16,8 @@ import tomllib
 
 from .catalog import discover, load_discovery_policy
 from .contracts import ContractError, validate_task
+from .git_plumbing import git_executable as find_git
+from .git_plumbing import repository_layout_problem, run_git
 from .learning_contracts import (
     content_digest,
     parse_bounded_json_value,
@@ -106,22 +107,17 @@ def _bind_committed_project_bytes(
     *,
     subject: str = "project agent mapping and mapped agents",
 ) -> None:
-    git_executable = shutil.which("git", path=os.defpath)
+    git_executable = find_git()
     if git_executable is None:
         raise PolicyError("project agent mapping trust is unavailable")
-    environment = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    if repository_layout_problem(git_executable, root) is not None:
+        raise PolicyError(f"{subject} are not committed and clean")
 
     def run(arguments: list[str], *, text: bool = False) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [git_executable, "-C", str(root), *arguments],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=text,
-            check=False,
-        )
+        return run_git(git_executable, root, *arguments, text=text, timeout=None)
 
+    # Only plumbing: the committed blob is compared with the bytes the caller read
+    # from the working tree, so no command refreshes the index or runs a helper.
     try:
         top = run(["rev-parse", "--show-toplevel"], text=True)
         head_before = run(["rev-parse", "--verify", "HEAD^{commit}"], text=True)
@@ -140,13 +136,11 @@ def _bind_committed_project_bytes(
             blob = run(["cat-file", "blob", reference]) if (
                 0 <= byte_count <= 1_048_576
             ) else None
-            clean = run(["diff", "--quiet", commit, "--", relative])
             if (
                 size.returncode != 0
                 or blob is None
                 or blob.returncode != 0
                 or blob.stdout != expected
-                or clean.returncode != 0
             ):
                 raise PolicyError(
                     f"{subject} are not committed and clean"
@@ -180,22 +174,14 @@ def _committed_in_head(root: Path, relative: str) -> bool:
     """
 
     unavailable = "project provider routing trust is unavailable"
-    git_executable = shutil.which("git", path=os.defpath)
+    git_executable = find_git()
     if git_executable is None:
         raise ContractError(unavailable)
-    environment = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    if repository_layout_problem(git_executable, root) is not None:
+        raise ContractError(unavailable)
 
     def run(arguments: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [git_executable, "-C", str(root), *arguments],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        return run_git(git_executable, root, *arguments, text=True, timeout=10)
 
     try:
         head = run(["rev-parse", "--verify", "--quiet", "HEAD"])

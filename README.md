@@ -66,7 +66,8 @@ shown only if something fails. Set `NO_COLOR=1` for plain output. In Claude Code
 orchestrator profile (step 7) was created, or if `~/.codex/orchestrator.config.toml` already sets
 `network_access = true` under `[sandbox_workspace_write]` (only that setting is read); otherwise
 start plain `codex`. Either way, a Codex session can orchestrate only once the Codex commands
-rule (step 8) exists, because Codex's sandbox blocks the orchestrator's background service. Paths
+rule (step 8) exists, because Codex's sandbox blocks the orchestrator's background service, and
+only when the session starts in the project's root folder. Paths
 accept a leading `~`, `$HOME`, or surrounding quotes, and the wizard offers the `$HOME` match
 when a path with a lost `~` does not exist.
 
@@ -154,8 +155,11 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    ```
 
    It writes `${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<digest>.rules` and prints
-   its path; `--print` shows the rule without writing it. The rule names the `python3` that
-   ran it, so use the one your Codex sessions find first on `PATH`. Delete the file to undo it.
+   its path; `--print` shows the rule without writing it. The rule names the base interpreter
+   of the `python3` that ran it, with the isolation flags `-I -B -S`, so use the one your
+   Codex sessions find first on `PATH`. It refuses an interpreter inside the project, in a
+   temporary directory or writable by another user. Start Codex sessions in the project's
+   root folder, where Codex keeps `.codex` read-only. Delete the file to undo it.
 
 ## Development
 

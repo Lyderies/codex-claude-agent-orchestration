@@ -13,7 +13,6 @@ import re
 import resource
 import secrets
 import select
-import shutil
 import signal
 import stat
 import statistics
@@ -66,6 +65,9 @@ from .learning_contracts import (
     validate_promotion,
     validate_qa_evidence,
 )
+from .git_plumbing import git_executable as find_git
+from .git_plumbing import repository_layout_problem, run_git
+from .host_paths import HostPathError, private_directory, remove_private_directory
 from .routing import provider_model_allowed
 
 COMPARISON_MIN_CASES = 20
@@ -2008,84 +2010,33 @@ def load_operational_check_configuration(
         if descriptor >= 0:
             os.close(descriptor)
 
-    git_executable = shutil.which("git", path=os.defpath)
+    git_executable = find_git()
     if git_executable is None:
         raise ContractError("operational check configuration trust is unavailable")
-    git_environment = {
-        "PATH": os.defpath,
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-    }
+    if repository_layout_problem(git_executable, root) is not None:
+        raise ContractError("operational check configuration is not committed and clean")
+    # Only plumbing: the committed blob is compared with the bytes read above, so no
+    # command refreshes the index or runs a helper the repository configures.
     try:
-        top = subprocess.run(
-            [git_executable, "-C", str(root), "rev-parse", "--show-toplevel"],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-        head_before = subprocess.run(
-            [
-                git_executable, "-C", str(root), "rev-parse", "--verify",
-                "HEAD^{commit}",
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
+        top = run_git(git_executable, root, "rev-parse", "--show-toplevel", text=True)
+        head_before = run_git(
+            git_executable, root, "rev-parse", "--verify", "HEAD^{commit}", text=True
         )
         commit = head_before.stdout.strip()
         config_ref = f"{commit}:.codex/orchestration/operational-checks.json"
-        blob_size = subprocess.run(
-            [git_executable, "-C", str(root), "cat-file", "-s", config_ref],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
+        blob_size = run_git(git_executable, root, "cat-file", "-s", config_ref, text=True)
         try:
             committed_size = int(blob_size.stdout.strip())
         except ValueError:
             committed_size = -1
-        committed = subprocess.run(
-            [git_executable, "-C", str(root), "cat-file", "blob", config_ref],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE if 0 <= committed_size <= 65_536
-            else subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        committed = (
+            run_git(git_executable, root, "cat-file", "blob", config_ref)
+            if 0 <= committed_size <= 65_536 else None
         )
-        clean = subprocess.run(
-            [
-                git_executable, "-C", str(root), "diff", "--quiet", commit, "--",
-                ".codex/orchestration/operational-checks.json",
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        head_after = run_git(
+            git_executable, root, "rev-parse", "--verify", "HEAD^{commit}", text=True
         )
-        head_after = subprocess.run(
-            [
-                git_executable, "-C", str(root), "rev-parse", "--verify",
-                "HEAD^{commit}",
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise ContractError("operational check configuration trust is unavailable") from exc
     try:
         exact_root = Path(top.stdout.strip()).resolve(strict=True) == root
@@ -2097,10 +2048,9 @@ def load_operational_check_configuration(
         or head_before.returncode != 0
         or not re.fullmatch(r"[0-9a-f]{40,64}", commit)
         or blob_size.returncode != 0
-        or not 0 <= committed_size <= 65_536
+        or committed is None
         or committed.returncode != 0
         or committed.stdout != raw
-        or clean.returncode != 0
         or head_after.returncode != 0
         or head_after.stdout.strip() != commit
     ):
@@ -2114,35 +2064,66 @@ def load_operational_check_configuration(
         if not executable.startswith("./"):
             continue
         relative = executable.removeprefix("./")
-        tracked_executable = subprocess.run(
-            [
-                git_executable, "-C", str(root), "ls-files", "--error-unmatch",
-                "--", relative,
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        clean_executable = subprocess.run(
-            [
-                git_executable, "-C", str(root), "diff", "--quiet", "HEAD",
-                "--", relative,
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if tracked_executable.returncode != 0 or clean_executable.returncode != 0:
+        if not _committed_and_clean(git_executable, root, commit, relative):
             raise ContractError("operational check executable is not committed and clean")
     return normalized
 
 
-def run_operational_check_suite(project_root: Path) -> dict[str, Any]:
-    """Run the exact project-approved QA commands without a shell or inherited secrets."""
+MAX_COMMITTED_EXECUTABLE_BYTES = 16 * 1024 * 1024
+
+
+def _committed_and_clean(git_executable: str, root: Path, commit: str, relative: str) -> bool:
+    """Whether a working-tree file equals its blob and mode in `commit`, by plumbing only.
+
+    The file is opened without following any component; its bytes and executable
+    bit must match the committed regular blob exactly.
+    """
+
+    try:
+        listing = run_git(git_executable, root, "ls-tree", "-z", commit, "--", relative)
+        entries = [item for item in listing.stdout.split(b"\x00") if item]
+        if listing.returncode != 0 or len(entries) != 1:
+            return False
+        header, _, name = entries[0].partition(b"\t")
+        mode, kind, object_id = header.decode("ascii").split(" ")
+        if name.decode("utf-8") != relative or kind != "blob":
+            return False
+        if mode not in {"100644", "100755"}:
+            return False
+        size = run_git(git_executable, root, "cat-file", "-s", object_id, text=True)
+        if size.returncode != 0 or int(size.stdout.strip()) > MAX_COMMITTED_EXECUTABLE_BYTES:
+            return False
+        blob = run_git(git_executable, root, "cat-file", "blob", object_id)
+        if blob.returncode != 0:
+            return False
+        descriptor = _open_regular_no_follow(root / relative)
+    except (ContractError, OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size != len(blob.stdout):
+            return False
+        if bool(metadata.st_mode & stat.S_IXUSR) != (mode == "100755"):
+            return False
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 65_536):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > len(blob.stdout):
+                return False
+        return b"".join(chunks) == blob.stdout
+    finally:
+        os.close(descriptor)
+
+
+def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> dict[str, Any]:
+    """Run the exact project-approved QA commands without a shell or inherited secrets.
+
+    Each check's sealed snapshot and work directory are a fresh owner-only
+    directory under `scratch_root` (the learning state), never the system temp
+    directory, which a sandboxed Codex primary could write and race.
+    """
 
     if not operational_sandbox_preflight():
         raise ContractError(
@@ -2157,7 +2138,6 @@ def run_operational_check_suite(project_root: Path) -> dict[str, Any]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "TMPDIR": tempfile.gettempdir(),
     }
     report: dict[str, Any] = {
         "deterministic_checks": [],
@@ -2169,8 +2149,11 @@ def run_operational_check_suite(project_root: Path) -> dict[str, Any]:
             status = "failed"
             return_code: int | None = None
             process: subprocess.Popen[bytes] | None = None
-            with tempfile.TemporaryDirectory(prefix="codex-agents-qa-") as directory:
-                temporary = Path(directory).resolve(strict=True)
+            try:
+                temporary = private_directory(scratch_root, "scratch", "qa-")
+            except HostPathError as exc:
+                raise ContractError("a private operational check directory is unavailable") from exc
+            try:
                 sealed = temporary / "sealed"
                 work = temporary / "work"
                 sealed.mkdir(mode=0o700)
@@ -2255,6 +2238,8 @@ def run_operational_check_suite(project_root: Path) -> dict[str, Any]:
                         guard.close()
                     if cleanup_error is not None:
                         raise cleanup_error
+            finally:
+                remove_private_directory(temporary)
             evidence_digest = content_digest(
                 {
                     "check_id": check["check_id"],

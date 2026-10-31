@@ -208,12 +208,14 @@ build.
   headless Codex primary.
 - **Rule.** With the owner's consent, the wizard's Commands step writes one Codex command
   rule per project: a `prefix_rule` with `decision = "allow"`, which runs a matching
-  command outside the sandbox without a prompt. The pattern is the absolute interpreter,
-  then the absolute `<root>/.codex/orchestration/cli.py`, then one allowlisted subcommand.
-  The file carries `match` and `not_match` examples that Codex checks when it loads it: an
-  owner command and the relative forms must not match. It is written atomically with mode
-  0600, symlinks are refused, identical content is left alone, and a differing rule is
-  replaced only after the owner confirms.
+  command outside the sandbox without a prompt. The pattern is the absolute base interpreter,
+  the isolation flags `-I -B -S`, the absolute `<root>/.codex/orchestration/cli.py`, then
+  one allowlisted subcommand. The file carries `match` and `not_match` examples that Codex
+  checks when it loads it: an owner command, the relative forms and the form without the
+  flags must not match. It is written with mode 0600 and symlinks are refused. A new rule is
+  published with a hard link, which never overwrites, so a rule another setup wrote in the
+  meantime is reported as differing; identical content is left alone, and a differing rule
+  is replaced only after the owner confirms.
 - **Allowlist.** `PRIMARY_HOST_COMMANDS` in `codex_agents/host_commands.py`, tested to be
   real subcommands and disjoint from the owner commands: `validate`, `inventory`, `route`,
   `learning-route`, `validate-assignment`, `result-preflight`, `validate-result`,
@@ -232,6 +234,41 @@ build.
   `missing` or `stale` (it differs from what setup would write now). The Codex skill runs it
   first and stops unless the rule is installed. A collector-backed command that cannot
   reach the collector under a Codex host keeps its error and adds a hint.
+- **Governing rule.** A rule-matched command runs outside the sandbox, so nothing it
+  executes or loads may come from a sandbox-writable location, and nothing it writes and
+  later trusts or hands to a child may live in one. Sandbox-writable means the workspace
+  (except its top-level `.git`, `.codex` and `.agents`), `/tmp` and `$TMPDIR`. On codex-cli
+  0.164 the per-user cache directory, `/var/tmp`, `~/Library/Caches` and the learning state
+  were shown not writable from the workspace-write sandbox.
+- **Interpreter.** The rule names the base interpreter, never a virtual environment's (a
+  project `.venv` would let the model replace the executable or add `.pth` startup code).
+  It is refused when the interpreter, its standard-library prefix, or any component or
+  symlink target on the way lies in the project or a temporary directory, belongs to
+  another user, or is writable by another user. One exception: on macOS a directory
+  writable by the `admin` group is accepted, because Homebrew and python.org install that
+  way and admin members can already administer the machine. `-I` ignores the environment
+  and user site-packages and keeps the script directory off the path, `-S` skips
+  site-packages entirely (the CLI needs only the standard library and its own package),
+  and `-B` writes no bytecode into `.codex`.
+- **Git plumbing only.** Every git call reached from the allowlisted commands uses only
+  `rev-parse`, `ls-tree` and `cat-file`; committed blobs are compared with working-tree
+  bytes read through no-follow opens, including an operational-check executable's mode.
+  No call refreshes the index, so an fsmonitor, filters, textconv, an external diff,
+  hooks and a pager configured in the repository never run. Each call also passes
+  `--no-pager`, `--no-optional-locks`, literal pathspecs and `-c` overrides
+  (`core.fsmonitor=false`, `core.hooksPath=/dev/null` and others), with
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_TERMINAL_PROMPT=0`.
+  A git directory or common directory inside the working tree (other than `<root>/.git`),
+  or in a temporary directory while the project is not, is refused before any other call:
+  that closes a linked worktree whose shared repository the model could rewrite.
+- **Host-private scratch.** Bridge exports, control files (including Claude's settings),
+  child and probe temporary directories live in an owner-only directory under the per-user
+  cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere; dispatch refuses without one).
+  Claude's workspace must stay outside home, where `~/.claude` would sit above it.
+  Operational-check snapshots and work directories, and provider clients' temporary
+  directories, live under the learning state's `scratch` directory. Each directory is
+  created through retained directory descriptors with no-follow opens at every component,
+  owner-only, and removed afterwards; a planted symlink refuses.
 - **Own-root invariant.** The rule fixes only the start of a command, so the arguments
   after the subcommand are the model's. An installed CLI therefore pins every allowlisted
   command, before any git, process or collector work: `--state-root` must resolve to the
@@ -258,11 +295,17 @@ build.
     let `dispatch` start a bridged child without the owner's attestation. Both are
     unreachable now: every allowlisted command uses this project and the owner's state.
 - **Residual risks.**
-  - The rule trusts the interpreter at its path.
-  - Git still reads this project's own repository configuration. Codex keeps the
-    workspace's `.git` read-only, but a linked worktree's configuration lives in the
-    main checkout, which the model can change if that checkout is inside a writable
-    root of the session.
+  - The project must be the Codex session's workspace root: Codex keeps `.codex` read-only
+    only at the top of a writable root, and the rule runs that `cli.py`. A project kept in
+    a temporary directory is wholly sandbox-writable and must not get a rule.
+  - The interpreter check accepts admin-group-writable directories on macOS, and trusts
+    the interpreter's standard library and dynamic libraries where they are installed.
+  - A shared repository in a writable root other than the project and the temporary
+    directories (one added to the session explicitly) is not detected; git then only
+    reads its objects and refs, with every helper off.
+  - The cache-directory and learning-state locations were verified unwritable only on
+    codex-cli 0.164's macOS sandbox; `$XDG_RUNTIME_DIR` on Linux was not tested live.
+    A crash can leave a private scratch directory behind; it stays owner-only.
   - Input files (task, assignment, grant, route, result) remain caller-chosen data,
     validated as before.
   - Owner commands stay unreachable from a sandboxed Codex primary; registration,

@@ -5,16 +5,17 @@ blocks the learning collector's local socket and its state directory. A Codex
 command rule (``prefix_rule`` with ``decision = "allow"``) in the user's rules
 layer runs a matching command outside that sandbox without prompting.
 
-The rule matches an exact argument prefix, so it pins the absolute interpreter
-and the absolute project CLI: the sandboxed model can write files elsewhere in
-the workspace and in temporary directories, and a relative path would let it run
-a look-alike outside the sandbox. It allows only the primary-host subcommands
-below. Owner commands (registration, attestation, owner keys, grants, backups,
-canaries, promotion and the like) are never listed, so they stay sandboxed.
+The rule matches an exact argument prefix, so it pins an absolute, trusted base
+interpreter, its isolation flags and the absolute project CLI: the sandboxed
+model can write files elsewhere in the workspace and in temporary directories,
+so a relative path, a virtual environment's interpreter or a startup that reads
+the environment or site-packages would let it run its own code outside the
+sandbox. It allows only the primary-host subcommands below. Owner commands
+(registration, attestation, owner keys, grants, backups, canaries, promotion and
+the like) are never listed, so they stay sandboxed.
 
-What the rule cannot check: it trusts the interpreter at that path, and it
-leaves every later argument to the CLI. An installed CLI therefore pins these
-commands to its own project, the default learning state and its installed
+The rule leaves every later argument to the CLI. An installed CLI therefore pins
+these commands to its own project, the default learning state and its installed
 policy, refusing ``--project-root``, ``--root``, ``--state-root`` or ``--policy``
 values that would move them (``cli._require_own_roots``).
 """
@@ -29,6 +30,8 @@ import sys
 import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
+
+from .host_paths import temp_roots, trusted_location_problem, within
 
 # The subcommands a primary host runs during an orchestration. Defined once; the
 # rule's allowlist and its tests read it from here.
@@ -58,6 +61,10 @@ PRIMARY_HOST_COMMANDS = (
     "learning-record-operational-qa",
 )
 CLI_RELATIVE = Path(".codex") / "orchestration" / "cli.py"
+# Isolated mode (no environment variables, user site-packages or script directory
+# on the path), no bytecode written into `.codex`, and no site-packages at all:
+# the CLI needs only the standard library and its own package.
+PYTHON_FLAGS = ("-I", "-B", "-S")
 RULE_FILE_PREFIX = "agent-orchestration-"
 RULE_JUSTIFICATION = (
     "Agent orchestration: this project's everyday orchestrator commands need the "
@@ -116,26 +123,52 @@ def project_cli(project_root: Path) -> tuple[Path, Path]:
     return root, cli
 
 
-def interpreter_path(interpreter: str | None = None) -> str:
-    """The interpreter running this code: ``sys.executable`` as Python reports it.
+def interpreter_path(
+    interpreter: str | None = None, *, project_root: Path | None = None
+) -> str:
+    """The trusted base interpreter the rule names, as Python reports it.
 
-    It is never resolved further; a realpath names a versioned build directory
-    that the next patch upgrade replaces. The wizard and a Codex primary both
-    start ``python3`` from PATH, so they report the same path, and any other
-    interpreter makes the rule stale.
+    It is ``sys.executable``, or the base interpreter of a virtual environment,
+    whose files the project or the model could change. It is never resolved
+    further; a realpath names a versioned build directory that the next patch
+    upgrade replaces. It is refused when it, its standard library prefix or any
+    component or symlink target on the way is inside the project or a temporary
+    directory, belongs to another user, or is writable by anyone else. The
+    wizard and a Codex primary both start ``python3`` from PATH, so they report
+    the same path, and any other interpreter makes the rule stale.
+
+    An explicit `interpreter` is a test seam: it is checked as text only.
     """
 
-    value = sys.executable if interpreter is None else interpreter
+    if interpreter is not None:
+        if not os.path.isabs(interpreter):
+            raise HostCommandError("interpreter path is not absolute")
+        return _checked_text(interpreter, "interpreter path")
+    value = sys.executable
+    if sys.prefix != sys.base_prefix:
+        value = getattr(sys, "_base_executable", "") or ""
+        if not value or within(
+            Path(os.path.realpath(value)), Path(os.path.realpath(sys.prefix))
+        ):
+            raise HostCommandError(
+                "Python runs in a virtual environment; run setup with the base Python"
+            )
     if not value or not os.path.isabs(value):
         raise HostCommandError("interpreter path is not absolute")
-    return _checked_text(value, "interpreter path")
+    _checked_text(value, "interpreter path")
+    untrusted = [*temp_roots(), *([project_root] if project_root is not None else [])]
+    for path in (Path(value), Path(sys.base_prefix)):
+        problem = trusted_location_problem(path, untrusted)
+        if problem is not None:
+            raise HostCommandError(f"the Python interpreter cannot be trusted: {problem}")
+    return value
 
 
 def argv_prefix(project_root: Path, interpreter: str | None = None) -> list[str]:
     """The exact command prefix a Codex primary must use for every CLI call."""
 
-    _root, cli = project_cli(project_root)
-    return [interpreter_path(interpreter), str(cli)]
+    root, cli = project_cli(project_root)
+    return [interpreter_path(interpreter, project_root=root), *PYTHON_FLAGS, str(cli)]
 
 
 def codex_home(environ: Mapping[str, str] | None = None) -> Path:
@@ -161,8 +194,8 @@ def render_rule(project_root: Path, interpreter: str | None = None) -> str:
     """The complete rule file for one project, with Codex's own load-time self-tests."""
 
     root, cli = project_cli(project_root)
-    python = interpreter_path(interpreter)
-    prefix = [python, str(cli)]
+    prefix = argv_prefix(root, interpreter)
+    python = prefix[0]
     relative_cli = CLI_RELATIVE.as_posix()
     commands = "".join(
         f"            {_starlark_string(command)},\n" for command in PRIMARY_HOST_COMMANDS
@@ -173,7 +206,9 @@ def render_rule(project_root: Path, interpreter: str | None = None) -> str:
         [*prefix, "learning-register", "--project-root", str(root)],
         # Relative forms could name a look-alike the model wrote.
         ["python3", relative_cli, "learning-status", "--project-root", str(root)],
-        [python, relative_cli, "learning-status", "--project-root", str(root)],
+        [python, *PYTHON_FLAGS, relative_cli, "learning-status", "--project-root", str(root)],
+        # Without the isolation flags, startup could load code the model wrote.
+        [python, str(cli), "learning-status", "--project-root", str(root)],
     ]
     return (
         "# Agent orchestration: Codex command rule for one project.\n"
@@ -185,9 +220,8 @@ def render_rule(project_root: Path, interpreter: str | None = None) -> str:
         "\n"
         "prefix_rule(\n"
         "    pattern = [\n"
-        f"        {_starlark_string(python)},\n"
-        f"        {_starlark_string(str(cli))},\n"
-        "        [\n"
+        + "".join(f"        {_starlark_string(token)},\n" for token in prefix)
+        + "        [\n"
         f"{commands}"
         "        ],\n"
         "    ],\n"
@@ -217,7 +251,10 @@ def _open_rules_directory(home: Path, *, create: bool) -> int | None:
         if not create:
             return None
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.mkdir(rules, 0o700)
+        try:
+            os.mkdir(rules, 0o700)
+        except FileExistsError:
+            pass  # another setup created it first; it is checked below like any other
         info = os.lstat(rules)
     if stat.S_ISLNK(info.st_mode):
         raise HostCommandError("Codex rules directory is a symlink")
@@ -289,7 +326,9 @@ def write_rule(
 
     ``unchanged`` when the file already holds this rule, ``created`` or
     ``replaced`` after a write, and ``differs`` when another rule is there and
-    ``replace`` was not given. Symlinks are refused, never followed.
+    ``replace`` was not given, including one that appears while this call runs:
+    a new rule is published with a hard link, which never overwrites. Symlinks
+    are refused, never followed.
     """
 
     content = render_rule(project_root, interpreter).encode("utf-8")
@@ -319,14 +358,29 @@ def write_rule(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-            os.rename(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
-        except BaseException:
+            if current is None:
+                # Publish without replacing: another setup may have written a rule
+                # since it was read, and only --replace may overwrite one.
+                try:
+                    os.link(
+                        temporary, name, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    outcome = (
+                        "unchanged" if _read_rule(directory, name) == content else "differs"
+                    )
+                else:
+                    outcome = "created"
+            else:
+                os.rename(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+                outcome = "replaced"
+        finally:
             try:
                 os.unlink(temporary, dir_fd=directory)
-            except OSError:
+            except FileNotFoundError:
                 pass
-            raise
         os.fsync(directory)
-        return "created" if current is None else "replaced"
+        return outcome
     finally:
         os.close(directory)

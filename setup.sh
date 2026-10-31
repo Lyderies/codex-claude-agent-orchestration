@@ -513,6 +513,7 @@ PROFILE_WANTED=0
 CODEX_PRIMARY=0
 RULE_FILE=""
 RULE_READY=0
+RULE_EXISTS=0
 ROUTING_CONTENT=""
 ROUTING_WRITE=0
 INSTALL_OPTS=()
@@ -1641,7 +1642,7 @@ check_rule() { # check_rule CLI -> RULE_STATUS (installed, missing, stale or emp
 commands_screen() {
   screen_reset; begin_step 8
   body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it, delete the rule file shown below."
-  body "File: $RULE_FILE (mode 0600). It applies to Codex sessions started after it is written. Your Codex config.toml is never edited."
+  body "File: $RULE_FILE (mode 0600). It applies to Codex sessions started in this project's root folder after it is written. Your Codex config.toml is never edited."
   if [ "$RULE_STATUS" = stale ]; then
     list_add warn "A rule for this project already exists and differs from this one, for example because Python moved or the package was updated. It stays unchanged unless you replace it."
   fi
@@ -1679,12 +1680,17 @@ step_commands() {
   render
   check_rule "$cli"
   if [ -z "$RULE_STATUS" ]; then
+    case "$(pj raw "$LAST_OUT")" in
+      *python*) text="This Python cannot be trusted to run outside Codex's sandbox: it is a virtual environment's, sits in the project or a temporary folder, or other users can change it. Run setup with a system Python, such as Homebrew's or python.org's.";;
+      *) text="The installed orchestrator may be older than this step. Update the install (step 4), then run setup again.";;
+    esac
     screen_reset; begin_step 8
-    failure_detail "Could not check the Codex commands rule" "The installed orchestrator may be older than this step. Update the install (step 4), then run setup again."
+    failure_detail "Could not check the Codex commands rule" "$text"
     mark_step 8 fail "not checked"
     pause; return 1
   fi
   commands_screen
+  [ "$RULE_STATUS" = missing ] || RULE_EXISTS=1
   if [ "$RULE_STATUS" = installed ]; then
     list_add ok "The rule already exists for this project with this content."
     RULE_READY=1
@@ -1721,9 +1727,10 @@ step_commands() {
     created|replaced|unchanged)
       list_add ok "Rule $outcome: $RULE_FILE (mode 0600)"
       list_sub "Start a new Codex session to use it."
-      RULE_READY=1
+      RULE_READY=1; RULE_EXISTS=1; RULE_STATUS=installed
       mark_step 8 ok "$outcome";;
     differs)
+      RULE_EXISTS=1; RULE_STATUS=stale
       failure_detail "The Codex commands rule was not written" "Another rule appeared for this project while setup ran. Run setup again to review it."
       mark_step 8 fail "not written";;
     *)
@@ -1742,6 +1749,7 @@ verify_rule() {
   CODEX_PRIMARY=1
   if [ ! -f "$cli" ]; then mark_step 8 skip "no installed CLI"; return 0; fi
   check_rule "$cli"
+  case "$RULE_STATUS" in installed|stale) RULE_EXISTS=1;; esac
   case "$RULE_STATUS" in
     installed)
       RULE_READY=1
@@ -1805,14 +1813,18 @@ step_done() {
   list_plain ""
   list_plain "${C_BOLD}How to use it${C_RESET}"
   list_plain " - In Claude Code, open the project and use the agent-orchestration skill."
-  list_plain " - In Codex, start a session with: $CODEX_CMD"
+  list_plain " - In Codex, start a session in the project's root folder with: $CODEX_CMD"
   list_sub "$CODEX_WHY"
   if [ "$CODEX_PRIMARY" -eq 1 ] && [ "$RULE_READY" -ne 1 ]; then
-    list_sub "Codex sessions cannot reach the orchestrator until the Codex commands rule exists. Run ./setup.sh again and allow it in step 8."
+    if [ "$RULE_STATUS" = stale ]; then
+      list_sub "The Codex commands rule for this project is stale: it differs from what setup would write now, so Codex sessions may not reach the orchestrator. Run ./setup.sh again and replace it in step 8."
+    else
+      list_sub "Codex sessions cannot reach the orchestrator until the Codex commands rule exists. Run ./setup.sh again and allow it in step 8."
+    fi
   fi
   list_plain " - To remove everything, run:"
   list_cmd "python3 $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
-  if [ "$RULE_READY" -eq 1 ] && [ -n "$RULE_FILE" ]; then
+  if [ "$RULE_EXISTS" -eq 1 ] && [ -n "$RULE_FILE" ]; then
     list_plain " - The Codex commands rule is outside the project. To undo it, delete:"
     list_cmd "$(printf '%q' "$RULE_FILE")"
   fi
