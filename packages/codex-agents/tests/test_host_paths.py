@@ -27,6 +27,20 @@ from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_store import LearningLedger, LearningState
 
 
+def _python_trusted() -> bool:
+    try:
+        interpreter_path()
+    except HostCommandError:
+        return False
+    return True
+
+
+# CI toolcaches can be world-writable, and such a Python is rightly refused.
+NEEDS_TRUSTED_PYTHON = unittest.skipUnless(
+    _python_trusted(), "this machine's Python cannot be named by the Codex rule"
+)
+
+
 def mode(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
@@ -123,6 +137,7 @@ class TrustedLocationTests(unittest.TestCase):
             Path(os.path.realpath(link)), []
         ))
 
+    @NEEDS_TRUSTED_PYTHON
     def test_the_rule_pins_the_resolved_interpreter_past_any_link_chain(self) -> None:
         # alias -> hop (in a directory the model could write) -> trusted target.
         hop_directory = self.base / "hop"
