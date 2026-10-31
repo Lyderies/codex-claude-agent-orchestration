@@ -16,11 +16,13 @@ One serialized operation under the ledger writer lock:
 5. the patched tree is committed with plumbing under a private index, with
    the primary's author identity;
 6. promotion takes Git's own `HEAD.lock`, branch ref lock and `index.lock`,
-   re-verifies the primary under them, records a `promoting` intent, writes
-   the new index into `index.lock` and the patch's raw bytes into the
-   working tree, then renames the index and the ref into place (Git's own
-   commit protocol); any failure before the ref rename restores every
-   touched path and the old index;
+   re-verifies the primary under them, records a `promoting` intent, builds
+   the new index in a private file, writes the patch's raw bytes into the
+   working tree (journaling what it installed), writes the ref lock and the
+   reflogs, renames the private index over `index` while `index.lock` stays
+   held, publishes the ref, and only then removes the locks; any failure
+   before publication rolls back exactly the journaled entries, the
+   reflogs and the old index;
 7. a `write_integration` record is written, for refusals too;
 8. the worktree is removed on every terminal state.
 
@@ -35,6 +37,7 @@ reason codes.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -53,6 +56,7 @@ from typing import Any
 from . import workspace
 from .bridge import BridgeRefused
 from .contracts import ContractError
+from .hosts import HostClientMismatch
 from .learning_contracts import content_digest
 from .workspace import WorkspaceRefused
 
@@ -62,6 +66,8 @@ WORKTREE_PREFIX = "codex-agents-integrate-"
 GIT_TIMEOUT_SECONDS = 60
 _DEFERRED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 _LOCK_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | workspace._O_CLOEXEC
+# Indirected so tests can inject short and failing writes into lock files.
+_os_write = os.write
 _BRANCH_REF = re.compile(r"refs/heads/[^\x00-\x20\x7f~^:?*\[\\]{1,1000}")
 
 
@@ -472,8 +478,24 @@ def _git_directories(root: Path) -> tuple[Path, Path]:
     return Path(os.path.realpath(gitdir)), Path(os.path.realpath(common))
 
 
+def _write_all(descriptor: int, content: bytes) -> None:
+    """Write every byte, looping on short writes; a write of nothing is an error."""
+
+    view = memoryview(content)
+    while view:
+        written = _os_write(descriptor, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "short write")
+        view = view[written:]
+
+
 class _Locks:
-    """Git's own lock files for HEAD, the branch ref and the index, created exclusively."""
+    """Git's own lock files for HEAD, the branch ref and the index, created exclusively.
+
+    Every lock this operation created stays in `held` until it is renamed
+    into place or removed, whatever fails; `None` marks a lock whose
+    descriptor is already closed.
+    """
 
     def __init__(self, gitdir: Path, common: Path, branch: str) -> None:
         if _BRANCH_REF.fullmatch(branch) is None or any(
@@ -485,7 +507,7 @@ class _Locks:
         self.ref_target = common / branch
         self.index = gitdir / "index.lock"
         self.index_target = gitdir / "index"
-        self.held: dict[Path, int] = {}
+        self.held: dict[Path, int | None] = {}
 
     def acquire(self) -> None:
         try:
@@ -493,21 +515,26 @@ class _Locks:
                 if path == self.ref:
                     os.makedirs(path.parent, mode=0o755, exist_ok=True)
                 try:
-                    self.held[path] = os.open(path, _LOCK_FLAGS, 0o644)
+                    descriptor = os.open(path, _LOCK_FLAGS, 0o644)
                 except FileExistsError as exc:
                     raise IntegrationRefused("write_promotion_busy") from exc
+                self.held[path] = descriptor
         except BaseException:
             self.release()
             raise
 
     def write(self, path: Path, content: bytes) -> None:
-        descriptor = self.held.pop(path)
+        """Write a held lock's whole content and fsync it; the lock stays held."""
+
+        descriptor = self.held[path]
+        if descriptor is None:
+            raise OSError(errno.EBADF, "lock is already closed")
         try:
-            os.write(descriptor, content)
+            _write_all(descriptor, content)
             os.fsync(descriptor)
         finally:
+            self.held[path] = None
             os.close(descriptor)
-        self.held[path] = -1
 
     def commit(self, path: Path, target: Path) -> None:
         """Rename a written lock over its target, as Git commits a lock."""
@@ -519,7 +546,7 @@ class _Locks:
         """Close and remove every lock still held; never raises."""
 
         for path, descriptor in list(self.held.items()):
-            if descriptor >= 0:
+            if descriptor is not None:
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
             with contextlib.suppress(OSError):
@@ -558,46 +585,199 @@ def _read_regular(root: Path, path: str) -> tuple[bytes, int] | None:
         os.close(root_fd)
 
 
-def _restore(root: Path, originals: Mapping[str, tuple[bytes, int] | None]) -> None:
-    """Put every touched path back to its recorded original, following no symlinks."""
+def _identity_at(parent: int, name: str) -> tuple[int, int] | None:
+    try:
+        status = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return status.st_dev, status.st_ino
 
+
+def _place(parent: int, name: str, content: bytes, permissions: int, *, replace: bool) -> None:
+    """Write through a random temporary name, then link it in exclusively or replace atomically."""
+
+    temporary = f".cca-{secrets.token_hex(8)}.tmp"
+    descriptor = os.open(temporary, workspace._CREATE_FLAGS, 0o600, dir_fd=parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            os.fchmod(handle.fileno(), permissions)
+            os.fsync(handle.fileno())
+        if replace:
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        else:
+            os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent)
+
+
+def _open_creating(root_fd: int, parts: list[str], journal: list[tuple[str, str, Any]]) -> int:
+    """Open a parent directory, creating missing components and journaling each one created."""
+
+    current = os.dup(root_fd)
+    try:
+        for index, part in enumerate(parts):
+            created = False
+            try:
+                os.mkdir(part, 0o755, dir_fd=current)
+                created = True
+            except FileExistsError:
+                pass
+            try:
+                following = os.open(part, workspace._DIRECTORY_FLAGS, dir_fd=current)
+            except OSError as exc:
+                raise IntegrationRefused("write_promotion_race") from exc
+            os.close(current)
+            current = following
+            if created:
+                status = os.fstat(current)
+                journal.append(("dir", "/".join(parts[: index + 1]), (status.st_dev, status.st_ino)))
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _apply_journaled(
+    root: Path,
+    decoded: list[tuple[dict, bytes | None]],
+    journal: list[tuple[str, str, Any]],
+) -> None:
+    """Apply the patch's raw bytes to the primary, journaling exactly what this operation installed.
+
+    Deletes run first; additions are linked in exclusively, so anything that
+    appeared at an added path refuses (`write_promotion_race`) instead of
+    being overwritten; modifications replace atomically. Each entry is
+    journaled with its `(st_dev, st_ino)` after it was installed.
+    """
+
+    workspace._alias_check((change["path"] for change, _ in decoded), "apply_path_collision")
     root_fd = os.open(root, workspace._DIRECTORY_FLAGS)
     try:
-        for path, original in sorted(originals.items(), reverse=True):
-            parts = path.split("/")
-            if original is None:
-                try:
-                    parent = workspace._open_parents(root_fd, parts[:-1], create=False)
-                except (FileNotFoundError, WorkspaceRefused):
-                    continue
-                try:
-                    with contextlib.suppress(FileNotFoundError):
-                        if stat.S_ISDIR(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False).st_mode):
-                            continue
-                        os.unlink(parts[-1], dir_fd=parent)
-                finally:
-                    os.close(parent)
-                workspace._prune_empty(root_fd, parts[:-1])
-        for path, original in sorted(originals.items()):
-            if original is None:
+        for change, _ in decoded:
+            if change["op"] != "delete":
                 continue
-            content, permissions = original
-            parts = path.split("/")
-            parent = workspace._open_parents(root_fd, parts[:-1], create=True)
+            parts = change["path"].split("/")
+            parent = workspace._open_parents(root_fd, parts[:-1], create=False)
             try:
-                with contextlib.suppress(FileNotFoundError):
-                    if stat.S_ISDIR(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False).st_mode):
-                        shutil.rmtree(os.path.join(root, *parts))
-                temporary = f".cca-{secrets.token_hex(8)}.tmp"
-                descriptor = os.open(temporary, workspace._CREATE_FLAGS, 0o600, dir_fd=parent)
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(content)
-                    os.fchmod(handle.fileno(), permissions)
-                os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+                status = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISREG(status.st_mode):
+                    raise IntegrationRefused("write_promotion_race")
+                os.unlink(parts[-1], dir_fd=parent)
+                journal.append(("deleted", change["path"], None))
+            finally:
+                os.close(parent)
+            workspace._prune_empty(root_fd, parts[:-1])
+        for change, content in decoded:
+            if change["op"] == "delete":
+                continue
+            parts = change["path"].split("/")
+            workspace._check_existing_spelling(root_fd, parts[:-1])
+            parent = _open_creating(root_fd, parts[:-1], journal)
+            try:
+                if change["op"] == "modify":
+                    status = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                    if not stat.S_ISREG(status.st_mode):
+                        raise IntegrationRefused("write_promotion_race")
+                permissions = 0o755 if change["mode"] == workspace.EXECUTABLE_MODE else 0o644
+                try:
+                    _place(parent, parts[-1], content or b"", permissions,
+                           replace=change["op"] == "modify")
+                except FileExistsError as exc:
+                    raise IntegrationRefused("write_promotion_race") from exc
+                journal.append((
+                    "added" if change["op"] == "add" else "replaced",
+                    change["path"], _identity_at(parent, parts[-1]),
+                ))
             finally:
                 os.close(parent)
     finally:
         os.close(root_fd)
+
+
+def _rollback(
+    root: Path,
+    journal: list[tuple[str, str, Any]],
+    originals: Mapping[str, tuple[bytes, int] | None],
+) -> bool:
+    """Undo exactly what the journal says this operation installed; return whether it all held.
+
+    An added file or created directory is removed only while its current
+    identity is the journaled one, so anything another process put there is
+    left alone. A replaced file is restored only while it is still ours; a
+    deleted file is recreated exclusively.
+    """
+
+    restored = True
+    root_fd = os.open(root, workspace._DIRECTORY_FLAGS)
+    try:
+        for kind, path, identity in reversed(journal):
+            parts = path.split("/")
+            create = kind == "deleted"
+            try:
+                parent = workspace._open_parents(root_fd, parts[:-1], create=create)
+            except (FileNotFoundError, WorkspaceRefused):
+                restored = restored and kind in {"added", "dir"}
+                continue
+            try:
+                current = _identity_at(parent, parts[-1])
+                if kind == "added":
+                    if current is not None and current == identity:
+                        os.unlink(parts[-1], dir_fd=parent)
+                elif kind == "dir":
+                    if current is not None and current == identity:
+                        with contextlib.suppress(OSError):
+                            os.rmdir(parts[-1], dir_fd=parent)
+                elif kind == "replaced":
+                    original = originals.get(path)
+                    if original is None or current != identity:
+                        restored = False
+                        continue
+                    _place(parent, parts[-1], original[0], original[1], replace=True)
+                else:
+                    original = originals.get(path)
+                    if original is None:
+                        restored = False
+                        continue
+                    try:
+                        _place(parent, parts[-1], original[0], original[1], replace=False)
+                    except FileExistsError:
+                        restored = False
+            finally:
+                os.close(parent)
+    finally:
+        os.close(root_fd)
+    return restored
+
+
+def _private_index(gitdir: Path, content: bytes) -> Path:
+    """A private temporary index file in the Git directory, holding `content`."""
+
+    path = gitdir / f"index.cca-{secrets.token_hex(8)}"
+    descriptor = os.open(path, _LOCK_FLAGS, 0o644)
+    try:
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    os.close(descriptor)
+    return path
+
+
+def _install_index(locks: _Locks, gitdir: Path, content: bytes) -> None:
+    """Rename a private index holding `content` over `index`, while `index.lock` is still held."""
+
+    temporary = _private_index(gitdir, content)
+    try:
+        os.rename(temporary, locks.index_target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
 
 
 def _write_ref_lock(locks: _Locks, commit: str) -> None:
@@ -608,23 +788,53 @@ def _commit_ref(locks: _Locks) -> None:
     locks.commit(locks.ref, locks.ref_target)
 
 
+def _before_apply() -> None:
+    """Hook point between the locked re-verification and application (tests)."""
+
+
+def _after_index_installed() -> None:
+    """Hook point between installing the index and publishing the ref (tests)."""
+
+
 def _append_reflogs(
     gitdir: Path, common: Path, branch: str, old: str, new: str, identity: tuple[str, str]
-) -> None:
-    """Append Git reflog lines for the branch and HEAD when their logs exist; best effort."""
+) -> list[tuple[Path, int]]:
+    """Append Git reflog lines for the branch and HEAD when their logs exist.
+
+    Called with the new value written into the ref lock and every lock still
+    held, before the ref is renamed, as Git orders it. Returns each log's
+    size before the append so a rollback can truncate it again.
+    """
 
     name, email = identity
     line = (
         f"{old} {new} {name} <{email}> {int(time.time())} {time.strftime('%z')}\t"
         "integrate: fast-forward to a verified write patch\n"
     ).encode("utf-8")
+    marks: list[tuple[Path, int]] = []
     for log in (common / "logs" / branch, gitdir / "logs" / "HEAD"):
-        with contextlib.suppress(OSError):
+        try:
             descriptor = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | workspace._O_CLOEXEC)
-            try:
-                os.write(descriptor, line)
-            finally:
-                os.close(descriptor)
+        except OSError:
+            continue
+        try:
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode):
+                continue
+            marks.append((log, status.st_size))
+            _write_all(descriptor, line)
+        finally:
+            os.close(descriptor)
+    return marks
+
+
+def _truncate_reflogs(marks: list[tuple[Path, int]]) -> None:
+    for log, size in marks:
+        descriptor = os.open(log, os.O_WRONLY | os.O_NOFOLLOW | workspace._O_CLOEXEC)
+        try:
+            os.ftruncate(descriptor, size)
+        finally:
+            os.close(descriptor)
 
 
 def _promote(
@@ -639,14 +849,18 @@ def _promote(
     facts: dict[str, Any],
     identity: tuple[str, str],
 ) -> None:
-    """Fast-forward the primary by hand, under Git's own locks; restore it on any failure.
+    """Fast-forward the primary by hand, under Git's own locks; roll back on any failure.
 
     `write_promotion_busy`: a lock already exists. `write_promotion_race`:
-    the re-verification under the locks fails. Both leave the primary
-    untouched. After the `promoting` intent is recorded, a failure before
-    the ref rename restores the working tree and the old index and is
+    the re-verification under the locks fails, or something appears at an
+    added path during application. After the `promoting` intent is
+    recorded, the new index is built in a private file and renamed over
+    `index` while `index.lock` stays held as a reservation; the ref is
+    published last and every lock is removed only after publication or
+    rollback. A failure before publication rolls back the journaled entries,
+    the reflogs and the old index; it is `write_promotion_race` or
     `write_promotion_failed`, or `write_integration_needs_owner` if the
-    restoration itself failed.
+    rollback could not complete.
     """
 
     source = patch["source_commit"]
@@ -655,9 +869,8 @@ def _promote(
     gitdir, common = _git_directories(root)
     locks = _Locks(gitdir, common, branch)
     locks.acquire()
-    originals: dict[str, tuple[bytes, int] | None] | None = None
-    old_index: bytes | None = None
-    index_renamed = False
+    journal: list[tuple[str, str, Any]] = []
+    index_temporary: Path | None = None
     try:
         try:
             check_primary(root, patch, object_format, branch=branch)
@@ -679,43 +892,49 @@ def _promote(
             project_id, base=target["write_result"], outcome="promoting", reason=None,
             **_record_facts(facts),
         )
+        reflogs: list[tuple[Path, int]] = []
+        index_installed = False
         try:
-            locks.write(locks.index, old_index)
+            index_temporary = _private_index(gitdir, old_index)
             staged = _git(
                 root, "-c", "core.splitIndex=false", "update-index", "-z", "--index-info",
                 stdin=_index_lines(decoded, "0" * len(source), blobs),
-                extra_env={"GIT_INDEX_FILE": str(locks.index)},
+                extra_env={"GIT_INDEX_FILE": str(index_temporary)},
             )
             if staged.returncode != 0:
                 raise IntegrationRefused("write_promotion_failed")
-            workspace.apply_patch_to_tree(patch, root, base_verified_by_caller=True)
+            _before_apply()
+            _apply_journaled(root, decoded, journal)
             _write_ref_lock(locks, commit)
-            locks.commit(locks.index, locks.index_target)
-            index_renamed = True
+            reflogs = _append_reflogs(gitdir, common, branch, source, commit, identity)
+            os.rename(index_temporary, locks.index_target)
+            index_temporary = None
+            index_installed = True
+            _after_index_installed()
             _commit_ref(locks)
         except BaseException as exc:
             restored = True
             try:
-                if index_renamed:
-                    _restore_index(locks, old_index)
-                _restore(root, originals)
+                _truncate_reflogs(reflogs)
+                if index_installed:
+                    _install_index(locks, gitdir, old_index)
+                restored = _rollback(root, journal, originals)
             except BaseException:  # noqa: BLE001 - the primary may be left changed
                 restored = False
             if isinstance(exc, Exception):
-                raise IntegrationRefused(
-                    "write_promotion_failed" if restored else "write_integration_needs_owner"
-                ) from exc
+                if not restored:
+                    reason = "write_integration_needs_owner"
+                elif isinstance(exc, IntegrationRefused) and exc.reason == "write_promotion_race":
+                    reason = "write_promotion_race"
+                else:
+                    reason = "write_promotion_failed"
+                raise IntegrationRefused(reason) from exc
             raise
     finally:
+        if index_temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(index_temporary)
         locks.release()
-    _append_reflogs(gitdir, common, branch, source, commit, identity)
-
-
-def _restore_index(locks: _Locks, old_index: bytes) -> None:
-    descriptor = os.open(locks.index, _LOCK_FLAGS, 0o644)
-    locks.held[locks.index] = descriptor
-    locks.write(locks.index, old_index)
-    locks.commit(locks.index, locks.index_target)
 
 
 def _record_facts(facts: Mapping[str, Any]) -> dict[str, Any]:
@@ -728,42 +947,44 @@ def _record_facts(facts: Mapping[str, Any]) -> dict[str, Any]:
 # --- reconciliation -----------------------------------------------------------------
 
 
-def reconcile_integrations(ledger: Any, project_id: str, root: Path) -> list[dict[str, Any]]:
-    """Finish every `promoting` intent left by an interrupted integration.
+def reconcile_integrations(
+    ledger: Any, project_id: str, root: Path, *, host_client: str
+) -> list[dict[str, Any]]:
+    """Finish every `promoting` intent, of a run this host owns, left by an interruption.
 
     The branch at the candidate commit means the promotion happened
-    (`integrated`). At the source commit with a clean index and tracked
-    files, it did not (`refused`, `write_promotion_failed`). Anything else is
-    `write_integration_needs_owner`, which blocks re-integration of that run.
+    (`integrated`). Anything else, including the branch back at the source
+    commit, is `write_integration_needs_owner`: a crash after publication
+    followed by an owner's reset looks the same as a promotion that never
+    happened. That reason blocks re-integration of the run.
+    `write_promotion_failed` is recorded only on the immediate path, where
+    the code itself completed the rollback. Intents of runs another host
+    owns are left untouched.
     """
 
-    return [
-        _reconcile_intent(ledger, project_id, root, intent)
-        for intent in ledger.unfinished_write_integrations(project_id)
-    ]
+    finished = []
+    for intent in ledger.unfinished_write_integrations(project_id):
+        try:
+            ledger.write_integration_target(
+                project_id, intent["bridge_run_id"], host_client=host_client
+            )
+        except HostClientMismatch:
+            continue
+        finished.append(_reconcile_intent(ledger, project_id, root, intent))
+    return finished
 
 
 def _reconcile_intent(
     ledger: Any, project_id: str, root: Path, intent: Mapping[str, Any]
 ) -> dict[str, Any]:
     with deferred_signals():
-        reason = "write_integration_needs_owner"
+        reason: str | None = "write_integration_needs_owner"
         try:
             resolved = workspace._repository_root(root)
-            object_format = workspace._object_format(resolved)
             head = _git(resolved, "rev-parse", "--verify", "--quiet", f"{intent['branch']}^{{commit}}")
             at = head.stdout.decode("ascii", "replace").strip() if head.returncode == 0 else ""
             if at == intent["new_commit"]:
                 reason = None
-            elif at == intent["source_commit"]:
-                staged = _git(
-                    resolved, "diff-index", "--cached", "--quiet", "--no-renames",
-                    intent["source_commit"], "--",
-                )
-                if staged.returncode == 0 and _tracked_files_clean(
-                    resolved, intent["source_commit"], object_format
-                ):
-                    reason = "write_promotion_failed"
         except (IntegrationRefused, WorkspaceRefused, BridgeRefused, OSError):
             reason = "write_integration_needs_owner"
         return ledger.record_write_integration(
@@ -862,7 +1083,10 @@ def integrate_write(
         "branch": None, "intent": None,
     }
     with ledger.writer_lock():
-        reconcile_integrations(ledger, project_id, Path(project_root))
+        # Authorise the host for the target run before any reconciliation
+        # record is written, then reload the target once intents are finished.
+        ledger.write_integration_target(project_id, bridge_run_id, host_client=host_client)
+        reconcile_integrations(ledger, project_id, Path(project_root), host_client=host_client)
         target = ledger.write_integration_target(
             project_id, bridge_run_id, host_client=host_client
         )

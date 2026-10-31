@@ -394,22 +394,31 @@ Claude to Claude and Codex to Codex.
     `write_promotion_busy`. Under them the branch, cleanliness and collisions are
     verified again (`write_promotion_race`), the original bytes and modes of every
     touched path are kept, and a `promoting` intent (candidate commit, source commit,
-    branch) is recorded. The new index is written into `index.lock`
-    (`update-index --index-info` under that index file), the working-tree files are
-    written from the patch's raw bytes (exclusive create, atomic replace, unlink), the
-    commit is written to the ref lock, and `index.lock` then the ref lock are renamed
-    into place. Any failure before the ref rename restores every touched path and the
-    old index and removes the locks (`write_promotion_failed`), or
-    `write_integration_needs_owner` if the restoration failed. Termination signals are
-    held from before the locks until the record is written, and through cleanup.
+    branch) is recorded. The new index is built in a private file in the Git directory
+    (`update-index --index-info` under that index file); the working-tree files are
+    written from the patch's raw bytes (exclusive create, atomic replace, unlink), each
+    journaled with its device and inode; the commit is written to the ref lock (every
+    byte, then fsync) and the reflog lines are appended; the private index is renamed
+    over `index` while `index.lock` stays held as a reservation; the ref lock is renamed
+    into place; and only then are the locks removed. Any failure before publication
+    removes only the entries the journal shows this operation installed (and only while
+    they are still the same file), restores replaced and deleted files, truncates the
+    reflogs, reinstalls the old index the same way and removes every lock it created
+    (`write_promotion_race` when something appeared at an added path,
+    `write_promotion_failed` otherwise), or `write_integration_needs_owner` if the
+    rollback could not complete. Termination signals are held from before the locks
+    until the record is written, and through cleanup.
   - Every attempt appends ledger-only `write_integration` records (the write run,
     bridge run, patch digest, source and new commit, branch, tested tree digest, check
     report digest, `outcome` `promoting`, `integrated` or `refused`, and the refusal
-    `reason`). A cancelled attempt records `write_integration_interrupted`. An
-    unfinished `promoting` intent is reconciled from the branch: at the candidate
-    commit it is `integrated`; at the source commit with a clean checkout it is
-    `write_promotion_failed`; anything else is `write_integration_needs_owner` and
-    blocks re-integration of that run. The worktree is removed with `git worktree
+    `reason`). A cancelled attempt records `write_integration_interrupted`. The host
+    is authorised for the target run before anything is reconciled. An unfinished
+    `promoting` intent of a run this host owns is reconciled from the branch: at the
+    candidate commit it is `integrated`; anything else, including the branch back at the
+    source commit (a crash after publication followed by a reset looks the same), is
+    `write_integration_needs_owner` and blocks re-integration of that run.
+    `write_promotion_failed` is recorded only when the command itself completed the
+    rollback. The worktree is removed with `git worktree
     remove --force` and `prune` on every terminal state.
   - Every Git call disables hooks and the filesystem monitor, lazy fetch and
     replacement objects, and uses literal pathspecs. A refused integration is not

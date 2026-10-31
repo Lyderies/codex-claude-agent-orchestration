@@ -2,9 +2,11 @@ from __future__ import annotations
 
 # ruff: noqa: I001 -- tests.support bootstraps the native package import path.
 
+import errno
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -439,8 +441,15 @@ class WriteIntegrationTests(WriteVerificationTests):
         self.assertEqual("print('app')\n", (self.project / "src/app.py").read_text())
         self.assertFalse((self.project / "src/new.py").exists())
         self.assertEqual("", git_out(self.project, "status", "--porcelain"))
-        self.assertEqual([], sorted(
-            path.name for path in (self.project / ".git").rglob("*.lock")))
+        self.assert_no_leftover_locks()
+
+    def assert_no_leftover_locks(self) -> None:
+        git_dir = self.project / ".git"
+        self.assertEqual([], sorted(path.name for path in git_dir.rglob("*.lock")))
+        self.assertEqual([], sorted(path.name for path in git_dir.glob("index.cca-*")))
+
+    def reflog(self) -> bytes:
+        return (self.project / ".git/logs" / self.branch_ref()).read_bytes()
 
     def test_an_existing_branch_lock_is_busy(self) -> None:
         binding = self.accepted()
@@ -477,11 +486,112 @@ class WriteIntegrationTests(WriteVerificationTests):
         def fail(locks):
             raise OSError("injected")
 
+        before = self.reflog()
         with mock.patch.object(integration, "_commit_ref", fail):
             outcome = self.integrate(binding)
+        self.assertEqual(before, self.reflog())
         self.assert_refused(outcome, "write_promotion_failed", source)
         self.assert_unchanged(source)
         git_out(self.project, "diff-index", "--cached", "--quiet", "HEAD", "--")
+
+    def test_the_index_stays_reserved_between_install_and_publication(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        attempts = []
+
+        def compete():
+            for arguments in (("reset", "-q", "--hard", source), ("add", "docs/guide.md")):
+                attempts.append(subprocess.run(
+                    ["git", "-C", str(self.project), "-c", "core.hooksPath=/dev/null",
+                     *arguments], capture_output=True, check=False,
+                ).returncode)
+            self.assertTrue((self.project / ".git/index.lock").exists())
+
+        with mock.patch.object(integration, "_after_index_installed", compete):
+            record = self.integrate(binding)["write_integration"]
+        self.assertEqual(2, len(attempts))
+        self.assertTrue(all(code != 0 for code in attempts), attempts)
+        self.assertEqual("integrated", record["outcome"])
+        self.assertEqual(record["new_commit"], self.head())
+        self.assertEqual("", git_out(self.project, "status", "--porcelain"))
+        self.assert_no_leftover_locks()
+
+    def ref_write(self, behaviour):
+        """Route lock-file writes through `behaviour` when they carry a commit ID."""
+
+        original = integration._os_write
+        routed: set[int] = set()
+
+        def write(descriptor, data):
+            if re.fullmatch(rb"[0-9a-f]{40}\n|[0-9a-f]{64}\n", bytes(data)):
+                routed.add(descriptor)
+            if descriptor in routed:
+                return behaviour(descriptor, data, original)
+            return original(descriptor, data)
+        return mock.patch.object(integration, "_os_write", write)
+
+    def test_enospc_on_the_branch_lock_leaves_no_lock_and_no_change(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        before = self.reflog()
+
+        def full(descriptor, data, original):
+            raise OSError(errno.ENOSPC, "no space")
+
+        with self.ref_write(full):
+            outcome = self.integrate(binding)
+        self.assert_refused(outcome, "write_promotion_failed", source)
+        self.assert_unchanged(source)
+        self.assertEqual(before, self.reflog())
+
+    def test_a_short_write_that_stalls_leaves_no_lock_and_no_change(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        calls = []
+
+        def stall(descriptor, data, original):
+            calls.append(len(data))
+            return original(descriptor, bytes(data)[:5]) if len(calls) == 1 else 0
+
+        with self.ref_write(stall):
+            outcome = self.integrate(binding)
+        self.assertEqual(2, len(calls))
+        self.assert_refused(outcome, "write_promotion_failed", source)
+        self.assert_unchanged(source)
+
+    def test_short_writes_are_completed(self) -> None:
+        binding = self.accepted()
+
+        def trickle(descriptor, data, original):
+            return original(descriptor, bytes(data)[:3])
+
+        with self.ref_write(trickle):
+            record = self.integrate(binding)["write_integration"]
+        self.assertEqual("integrated", record["outcome"])
+        branch_file = self.project / ".git" / self.branch_ref()
+        self.assertEqual(f"{record['new_commit']}\n", branch_file.read_text())
+        self.assert_no_leftover_locks()
+        # The reflog entry was appended under the locks, before publication.
+        self.assertIn(f" {record['new_commit']} ".encode(), self.reflog().splitlines()[-1])
+
+    def test_a_file_raced_in_before_application_survives_rollback(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+
+        def ignored_file_appears():
+            (self.project / ".git/info").mkdir(exist_ok=True)
+            (self.project / ".git/info/exclude").write_text("src/new.py\n")
+            (self.project / "src/new.py").write_text("ignored\n")
+
+        with mock.patch.object(integration, "_before_apply", ignored_file_appears):
+            outcome = self.integrate(binding)
+        record = outcome["write_integration"]
+        self.assertEqual(("refused", "write_promotion_race"), (record["outcome"], record["reason"]))
+        self.assertEqual("ignored\n", (self.project / "src/new.py").read_text())
+        self.assertEqual("print('app')\n", (self.project / "src/app.py").read_text())
+        self.assertEqual(source, self.head())
+        self.assert_no_leftover_locks()
+        self.assert_clean_up()
 
     def test_other_git_processes_are_refused_while_promotion_holds_the_locks(self) -> None:
         binding = self.accepted()
@@ -566,16 +676,28 @@ class WriteIntegrationTests(WriteVerificationTests):
             checks_receipt_digest="e" * 64, branch=self.branch_ref(),
         )
 
-    def test_an_intent_with_the_branch_unmoved_and_clean_is_a_failed_promotion(self) -> None:
+    def test_an_intent_with_the_branch_back_at_the_source_needs_the_owner(self) -> None:
+        # A crash after publication followed by an owner's reset looks the same
+        # as a promotion that never happened, so it is never classified as failed.
         binding = self.accepted()
+        source = self.head()
         self.intent(binding, "c" * 40)
         record = self.integrate(binding)["write_integration"]
-        self.assertEqual("integrated", record["outcome"])
+        self.assertEqual(("refused", "write_integration_needs_owner"),
+                         (record["outcome"], record["reason"]))
         self.assertEqual(
-            [("promoting", None), ("refused", "write_promotion_failed"), ("promoting", None),
-             ("integrated", None)],
+            [("promoting", None), ("refused", "write_integration_needs_owner"),
+             ("refused", "write_integration_needs_owner")],
             [(item["outcome"], item["reason"]) for item in self.integrations()],
         )
+        self.assertEqual(source, self.head())
+
+    def test_another_host_with_a_pending_intent_appends_nothing(self) -> None:
+        binding = self.accepted()
+        self.intent(binding, "c" * 40)
+        with self.assertRaises(HostClientMismatch):
+            self.integrate(binding, host="claude-host-v1")
+        self.assertEqual(["promoting"], [item["outcome"] for item in self.integrations()])
 
     def test_an_intent_with_a_changed_primary_needs_the_owner(self) -> None:
         binding = self.accepted()
