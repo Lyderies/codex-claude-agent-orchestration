@@ -2022,81 +2022,50 @@ def load_operational_check_configuration(
     git_executable = shutil.which("git", path=os.defpath)
     if git_executable is None:
         raise ContractError("operational check configuration trust is unavailable")
+    # Every call is hardened: no hooks, no filesystem monitor, no replacement
+    # objects, no lazy fetch and literal pathspecs. Cleanliness is compared
+    # here, on raw bytes, never by an attribute-aware Git diff, so no clean
+    # filter, textconv or monitor configured by the repository runs.
     git_environment = {
         "PATH": os.defpath,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "GIT_LITERAL_PATHSPECS": "1",
     }
+    git_prefix = [git_executable, "--literal-pathspecs", "-C", str(root),
+                  *_hardened_git_options(git_executable, git_environment)]
+
+    def git(*arguments: str, text: bool = True, capture: bool = True):
+        return subprocess.run(
+            [*git_prefix, *arguments],
+            env=git_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=text,
+            timeout=60,
+            check=False,
+        )
+
     try:
-        top = subprocess.run(
-            [git_executable, "-C", str(root), "rev-parse", "--show-toplevel"],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-        head_before = subprocess.run(
-            [
-                git_executable, "-C", str(root), "rev-parse", "--verify",
-                "HEAD^{commit}",
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
+        partial = git("config", "--get", "extensions.partialClone")
+        if partial.returncode == 0 and "--no-lazy-fetch" not in git_prefix:
+            raise ContractError("operational check configuration trust is unavailable")
+        top = git("rev-parse", "--show-toplevel")
+        head_before = git("rev-parse", "--verify", "HEAD^{commit}")
         commit = head_before.stdout.strip()
         config_ref = f"{commit}:.codex/orchestration/operational-checks.json"
-        blob_size = subprocess.run(
-            [git_executable, "-C", str(root), "cat-file", "-s", config_ref],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
+        blob_size = git("cat-file", "-s", config_ref)
         try:
             committed_size = int(blob_size.stdout.strip())
         except ValueError:
             committed_size = -1
-        committed = subprocess.run(
-            [git_executable, "-C", str(root), "cat-file", "blob", config_ref],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE if 0 <= committed_size <= 65_536
-            else subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        committed = git(
+            "cat-file", "blob", config_ref, text=False,
+            capture=0 <= committed_size <= 65_536,
         )
-        clean = subprocess.run(
-            [
-                git_executable, "-C", str(root), "diff", "--quiet", commit, "--",
-                ".codex/orchestration/operational-checks.json",
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        head_after = subprocess.run(
-            [
-                git_executable, "-C", str(root), "rev-parse", "--verify",
-                "HEAD^{commit}",
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
+        head_after = git("rev-parse", "--verify", "HEAD^{commit}")
+    except (OSError, subprocess.SubprocessError) as exc:
         raise ContractError("operational check configuration trust is unavailable") from exc
     try:
         exact_root = Path(top.stdout.strip()).resolve(strict=True) == root
@@ -2111,7 +2080,6 @@ def load_operational_check_configuration(
         or not 0 <= committed_size <= 65_536
         or committed.returncode != 0
         or committed.stdout != raw
-        or clean.returncode != 0
         or head_after.returncode != 0
         or head_after.stdout.strip() != commit
     ):
@@ -2125,31 +2093,91 @@ def load_operational_check_configuration(
         if not executable.startswith("./"):
             continue
         relative = executable.removeprefix("./")
-        tracked_executable = subprocess.run(
-            [
-                git_executable, "-C", str(root), "ls-files", "--error-unmatch",
-                "--", relative,
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        clean_executable = subprocess.run(
-            [
-                git_executable, "-C", str(root), "diff", "--quiet", "HEAD",
-                "--", relative,
-            ],
-            env=git_environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if tracked_executable.returncode != 0 or clean_executable.returncode != 0:
+        try:
+            listed = git("ls-tree", "-z", commit, "--", relative, text=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ContractError("operational check configuration trust is unavailable") from exc
+        if listed.returncode != 0 or not _raw_file_matches_tree_entry(
+            root, relative, listed.stdout, object_format="sha256" if len(commit) == 64 else "sha1"
+        ):
             raise ContractError("operational check executable is not committed and clean")
     return normalized
+
+
+_GIT_LAZY_FETCH_SUPPORTED: bool | None = None
+
+
+def _hardened_git_options(git_executable: str, environment: dict[str, str]) -> list[str]:
+    """The global options that keep repository-side Git machinery from running."""
+
+    global _GIT_LAZY_FETCH_SUPPORTED
+    if _GIT_LAZY_FETCH_SUPPORTED is None:
+        try:
+            probe = subprocess.run(
+                [git_executable, "--no-lazy-fetch", "version"],
+                env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=60, check=False,
+            )
+            _GIT_LAZY_FETCH_SUPPORTED = probe.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _GIT_LAZY_FETCH_SUPPORTED = False
+    return [
+        *(["--no-lazy-fetch"] if _GIT_LAZY_FETCH_SUPPORTED else []),
+        "--no-replace-objects",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false",
+    ]
+
+
+def _raw_file_matches_tree_entry(
+    root: Path, relative: str, listing: bytes, *, object_format: str
+) -> bool:
+    """Whether the file at `relative` holds exactly the one committed blob `listing` names.
+
+    `listing` is `ls-tree -z <commit> -- <relative>` output. The file is opened
+    without following symlinks and hashed here, with its Git mode from the
+    permission bits; no Git filter or attribute is consulted.
+    """
+
+    entries = [item for item in listing.split(b"\x00") if item]
+    if len(entries) != 1:
+        return False
+    header, _, name = entries[0].partition(b"\t")
+    try:
+        mode, kind, sha = header.decode("ascii").split()
+    except ValueError:
+        return False
+    if kind != "blob" or name != relative.encode("utf-8") or mode not in {"100644", "100755"}:
+        return False
+    parts = relative.split("/")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = -1
+    try:
+        directory = os.open(root, flags | os.O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                following = os.open(part, flags | os.O_DIRECTORY, dir_fd=directory)
+                os.close(directory)
+                directory = following
+            descriptor = os.open(parts[-1], flags | os.O_NONBLOCK, dir_fd=directory)
+        finally:
+            os.close(directory)
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size > 64 * 1024 * 1024:
+            return False
+        chunks = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        content = b"".join(chunks)
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    algorithm = "sha256" if object_format == "sha256" else "sha1"
+    blob = hashlib.new(algorithm, b"blob %d\x00" % len(content) + content).hexdigest()
+    git_mode = "100755" if status.st_mode & stat.S_IXUSR else "100644"
+    return blob == sha and git_mode == mode
 
 
 def run_operational_check_suite(project_root: Path) -> dict[str, Any]:

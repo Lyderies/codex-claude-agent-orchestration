@@ -16,7 +16,7 @@ from unittest import mock
 from tests import test_bridge_writes as writes
 from tests.test_write_verification import WriteVerificationTests
 
-from codex_agents import integration
+from codex_agents import bridge, integration
 from codex_agents.hosts import HostClientMismatch
 from codex_agents.learning_contracts import (
     ContractError,
@@ -26,6 +26,10 @@ from codex_agents.learning_contracts import (
 from codex_agents.learning_engine import operational_sandbox_preflight
 from codex_agents.learning_store import LedgerError
 
+SANDBOX = unittest.skipUnless(
+    sys.platform == "darwin" and operational_sandbox_preflight(),
+    "the operational-check sandbox (sandbox-exec) is unavailable",
+)
 HOOKS = (
     "pre-commit", "commit-msg", "post-commit", "post-checkout", "post-merge",
     "reference-transaction", "post-index-change", "pre-merge-commit", "pre-auto-gc",
@@ -34,7 +38,8 @@ HOOKS = (
 
 def git_out(root: Path, *arguments: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null", *arguments],
+        ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+         *arguments],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
@@ -152,7 +157,16 @@ class WriteIntegrationTests(WriteVerificationTests):
              record["new_commit"], record["tested_tree_digest"],
              record["checks_receipt_digest"]),
         )
-        self.assertEqual([record["record_id"]], [item["record_id"] for item in self.integrations()])
+        # A durable `promoting` intent with the same facts preceded the promotion.
+        intent, final = self.integrations()
+        self.assertEqual(record["record_id"], final["record_id"])
+        self.assertEqual(
+            ("promoting", None, record["new_commit"], record["tested_tree_digest"],
+             record["checks_receipt_digest"], branch),
+            (intent["outcome"], intent["reason"], intent["new_commit"],
+             intent["tested_tree_digest"], intent["checks_receipt_digest"], intent["branch"]),
+        )
+        self.assertEqual(branch, record["branch"])
         self.assertEqual(self.last_report, outcome["check_report"])
         # Committed with the primary's identity, naming the task, providers, patch and run.
         self.assertEqual(
@@ -308,12 +322,58 @@ class WriteIntegrationTests(WriteVerificationTests):
         self.assertEqual("dirty\n", (self.project / "src/app.py").read_text())
         self.assert_clean_up()
 
-    @unittest.skipUnless(
-        sys.platform == "darwin" and operational_sandbox_preflight(),
-        "the operational-check sandbox (sandbox-exec) is unavailable",
-    )
-    def test_default_runner_checks_the_patched_worktree(self) -> None:
-        # A committed, approved check that passes only on the patched tree.
+    # --- untrusted repository configuration -----------------------------------
+
+    def markers(self) -> list[str]:
+        return sorted(path.name for path in Path(self.temporary.name).glob("marker-*"))
+
+    def poison(self) -> None:
+        """Repository-configured filters and a filesystem monitor that leave markers.
+
+        Set after the write child and its verifier ran, so only integration
+        could trigger them; `.gitattributes` assigns the filter to every path.
+        """
+
+        base = Path(self.temporary.name)
+        for key, value in (
+            ("filter.evil.smudge", f"sh -c 'touch {base}/marker-smudge; cat'"),
+            ("filter.evil.clean", f"sh -c 'touch {base}/marker-clean; cat'"),
+            ("filter.evil.process", f"sh -c 'touch {base}/marker-process'"),
+            ("core.fsmonitor", f"sh -c 'touch {base}/marker-fsmonitor'"),
+            ("diff.external", f"sh -c 'touch {base}/marker-diff'"),
+        ):
+            git_out(self.project, "config", key, value)
+
+    def commit_attributes(self) -> None:
+        (self.project / ".gitattributes").write_text("* filter=evil\n")
+        git_out(self.project, "add", ".gitattributes")
+        git_out(self.project, "commit", "-qm", "attributes")
+
+    def test_repository_filters_and_monitor_never_run(self) -> None:
+        self.commit_attributes()
+        binding = self.accepted()
+        self.poison()
+        record = self.integrate(binding)["write_integration"]
+        self.assertEqual([], self.markers())
+        self.assertEqual(("integrated", None), (record["outcome"], record["reason"]))
+        self.assertEqual("new\n", (self.project / "src/new.py").read_text())
+        self.assert_clean_up()
+
+    def test_merge_options_cannot_turn_promotion_into_a_squash(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        branch = git_out(self.project, "symbolic-ref", "--short", "HEAD")
+        git_out(self.project, "config", f"branch.{branch}.mergeOptions", "--squash")
+        git_out(self.project, "config", "merge.ff", "false")
+        record = self.integrate(binding)["write_integration"]
+        self.assertEqual("integrated", record["outcome"])
+        self.assertEqual((record["new_commit"], source),
+                         (self.head(), git_out(self.project, "rev-parse", "HEAD^")))
+        self.assertEqual("", git_out(self.project, "status", "--porcelain"))
+
+    def approve_checks(self) -> None:
+        """A committed, approved check that passes only on the patched tree."""
+
         script = self.project / "scripts/qa-patched"
         script.parent.mkdir()
         script.write_text(
@@ -337,12 +397,19 @@ class WriteIntegrationTests(WriteVerificationTests):
         }))
         git_out(self.project, "add", "scripts", ".codex")
         git_out(self.project, "commit", "-qm", "approved checks")
-        binding = self.accepted()
+
+    def integrate_with_default_checks(self, binding: dict) -> dict:
         self.install_hooks()
-        outcome = integration.integrate_write(
+        return integration.integrate_write(
             self.ledger, self.project_id, project_root=self.project,
             bridge_run_id=binding["bridge_run_id"], host_client="codex-host-v1",
         )
+
+    @SANDBOX
+    def test_default_runner_checks_the_patched_worktree(self) -> None:
+        self.approve_checks()
+        binding = self.accepted()
+        outcome = self.integrate_with_default_checks(binding)
         record = outcome["write_integration"]
         self.assertEqual(("integrated", None), (record["outcome"], record["reason"]))
         self.assertEqual(["patched"], [item["check_id"] for item in
@@ -351,20 +418,203 @@ class WriteIntegrationTests(WriteVerificationTests):
         self.assertEqual("new\n", (self.project / "src/new.py").read_text())
         self.assert_clean_up()
 
-    def test_failed_fast_forward_leaves_the_primary_and_says_so(self) -> None:
+    @SANDBOX
+    def test_default_runner_never_runs_repository_filters_or_monitor(self) -> None:
+        self.approve_checks()
+        self.commit_attributes()
+        binding = self.accepted()
+        self.poison()
+        record = self.integrate_with_default_checks(binding)["write_integration"]
+        self.assertEqual([], self.markers())
+        self.assertEqual(("integrated", None), (record["outcome"], record["reason"]))
+        self.assert_clean_up()
+
+    # --- promotion under Git's locks ---------------------------------------------
+
+    def branch_ref(self) -> str:
+        return git_out(self.project, "symbolic-ref", "HEAD")
+
+    def assert_unchanged(self, source: str) -> None:
+        self.assertEqual(source, self.head())
+        self.assertEqual("print('app')\n", (self.project / "src/app.py").read_text())
+        self.assertFalse((self.project / "src/new.py").exists())
+        self.assertEqual("", git_out(self.project, "status", "--porcelain"))
+        self.assertEqual([], sorted(
+            path.name for path in (self.project / ".git").rglob("*.lock")))
+
+    def test_an_existing_branch_lock_is_busy(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        lock = self.project / ".git" / f"{self.branch_ref()}.lock"
+        lock.write_text("")
+        outcome = self.integrate(binding)
+        lock.unlink()
+        self.assert_refused(outcome, "write_promotion_busy", source)
+        self.assert_unchanged(source)
+
+    def test_failure_after_the_files_are_written_restores_everything(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        written = []
+
+        def fail(locks, commit):
+            written.append((self.project / "src/new.py").read_text())
+            raise OSError("injected")
+
+        with mock.patch.object(integration, "_write_ref_lock", fail):
+            outcome = self.integrate(binding)
+        self.assertEqual(["new\n"], written)
+        record = self.assert_refused(outcome, "write_promotion_failed", source)
+        self.assertIsNotNone(record["new_commit"])
+        self.assert_unchanged(source)
+        self.assertEqual(["promoting", "refused"],
+                         [item["outcome"] for item in self.integrations()])
+
+    def test_failure_after_the_index_rename_restores_the_index(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+
+        def fail(locks):
+            raise OSError("injected")
+
+        with mock.patch.object(integration, "_commit_ref", fail):
+            outcome = self.integrate(binding)
+        self.assert_refused(outcome, "write_promotion_failed", source)
+        self.assert_unchanged(source)
+        git_out(self.project, "diff-index", "--cached", "--quiet", "HEAD", "--")
+
+    def test_other_git_processes_are_refused_while_promotion_holds_the_locks(self) -> None:
+        binding = self.accepted()
+        original = integration._Locks.acquire
+        attempts = []
+
+        def acquire_then_compete(locks):
+            original(locks)
+            for arguments in (
+                ("commit", "-q", "--allow-empty", "-m", "competing"),
+                ("switch", "-q", "-c", "competing"),
+                ("update-ref", self.branch_ref(), "HEAD"),
+                ("add", "docs/guide.md"),
+            ):
+                attempts.append(subprocess.run(
+                    ["git", "-C", str(self.project), "-c", "core.hooksPath=/dev/null",
+                     *arguments], capture_output=True, check=False,
+                ).returncode)
+
+        with mock.patch.object(integration._Locks, "acquire", acquire_then_compete):
+            record = self.integrate(binding)["write_integration"]
+        self.assertTrue(all(code != 0 for code in attempts), attempts)
+        self.assertEqual("integrated", record["outcome"])
+        self.assertEqual(record["new_commit"], self.head())
+
+    def test_raced_ignored_file_at_an_added_path_is_kept(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        original = integration._commit_tree
+
+        def then_ignored(*arguments, **keywords):
+            made = original(*arguments, **keywords)
+            (self.project / ".git/info").mkdir(exist_ok=True)
+            (self.project / ".git/info/exclude").write_text("src/new.py\n")
+            (self.project / "src/new.py").write_text("ignored\n")
+            return made
+
+        with mock.patch.object(integration, "_commit_tree", then_ignored):
+            outcome = self.integrate(binding)
+        record = outcome["write_integration"]
+        self.assertEqual(("refused", "write_promotion_race"), (record["outcome"], record["reason"]))
+        self.assertEqual("ignored\n", (self.project / "src/new.py").read_text())
+        self.assertEqual(source, self.head())
+        self.assert_clean_up()
+
+    # --- the durable intent and reconciliation -------------------------------------
+
+    def test_a_lost_integrated_record_is_reconciled_without_double_integration(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        original = type(self.ledger).record_write_integration
+
+        def lose_integrated(ledger, project_id, **keywords):
+            if keywords["outcome"] == "integrated":
+                raise LedgerError("injected append failure")
+            return original(ledger, project_id, **keywords)
+
+        with mock.patch.object(type(self.ledger), "record_write_integration", lose_integrated), \
+                self.assertRaisesRegex(LedgerError, "injected"):
+            self.integrate(binding)
+        promoted = self.head()
+        self.assertNotEqual(source, promoted)
+        self.assertEqual(["promoting"], [item["outcome"] for item in self.integrations()])
+        self.assertEqual(1, len(self.ledger.unfinished_write_integrations(self.project_id)))
+        # The next attempt reconciles the intent first, then refuses a second integration.
+        outcome = self.integrate(binding)
+        self.assertEqual(("refused", "write_already_integrated"),
+                         (outcome["write_integration"]["outcome"],
+                          outcome["write_integration"]["reason"]))
+        self.assertEqual(["promoting", "integrated", "refused"],
+                         [item["outcome"] for item in self.integrations()])
+        self.assertEqual(promoted, self.integrations()[1]["new_commit"])
+        self.assertEqual(promoted, self.head())
+        self.assertEqual([], self.ledger.unfinished_write_integrations(self.project_id))
+
+    def intent(self, binding: dict, new_commit: str) -> dict:
+        [result] = [item for item in self.write_records()
+                    if item["bridge_run_id"] == binding["bridge_run_id"]]
+        return self.ledger.record_write_integration(
+            self.project_id, base=result, outcome="promoting", reason=None,
+            new_commit=new_commit, tested_tree_digest="d" * 40,
+            checks_receipt_digest="e" * 64, branch=self.branch_ref(),
+        )
+
+    def test_an_intent_with_the_branch_unmoved_and_clean_is_a_failed_promotion(self) -> None:
+        binding = self.accepted()
+        self.intent(binding, "c" * 40)
+        record = self.integrate(binding)["write_integration"]
+        self.assertEqual("integrated", record["outcome"])
+        self.assertEqual(
+            [("promoting", None), ("refused", "write_promotion_failed"), ("promoting", None),
+             ("integrated", None)],
+            [(item["outcome"], item["reason"]) for item in self.integrations()],
+        )
+
+    def test_an_intent_with_a_changed_primary_needs_the_owner(self) -> None:
+        binding = self.accepted()
+        source = self.head()
+        self.intent(binding, "c" * 40)
+        (self.project / "src/app.py").write_text("half written\n")
+        record = self.integrate(binding)["write_integration"]
+        self.assertEqual(("refused", "write_integration_needs_owner"),
+                         (record["outcome"], record["reason"]))
+        self.assertEqual(
+            ["promoting", "refused", "refused"],
+            [item["outcome"] for item in self.integrations()],
+        )
+        self.assertEqual(source, self.head())
+        (self.project / "src/app.py").write_text("print('app')\n")
+        again = self.integrate(binding)["write_integration"]
+        self.assertEqual("write_integration_needs_owner", again["reason"])
+
+    # --- signals ---------------------------------------------------------------------
+
+    def test_sigterm_during_cleanup_still_removes_and_records(self) -> None:
         binding = self.accepted()
         source = self.head()
         original = integration._git
 
-        def refusing_merge(root, *arguments, **keywords):
-            if "merge" in arguments:
-                return subprocess.CompletedProcess(arguments, 1, b"", b"")
+        def terminate_during_removal(root, *arguments, **keywords):
+            if arguments[:2] == ("worktree", "remove"):
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
             return original(root, *arguments, **keywords)
 
-        with mock.patch.object(integration, "_git", refusing_merge):
-            outcome = self.integrate(binding)
-        record = self.assert_refused(outcome, "write_promotion_failed", source)
-        self.assertIsNotNone(record["new_commit"])
+        with mock.patch.object(integration, "_git", terminate_during_removal), \
+                bridge.signal_guard(), self.assertRaises(bridge.BridgeInterrupted):
+            self.integrate(binding, checks=self.checks(passed=False))
+        [record] = self.integrations()
+        self.assertEqual(("refused", "write_integration_interrupted"),
+                         (record["outcome"], record["reason"]))
+        self.assertEqual(source, self.head())
+        self.assert_clean_up()
 
     def test_cancellation_removes_the_worktree_and_records_it(self) -> None:
         binding = self.accepted()
@@ -392,6 +642,7 @@ class WriteIntegrationContractTests(unittest.TestCase):
             "bridge_run_id": "brg_" + "1" * 32, "patch_digest": "a" * 64,
             "source_commit": "b" * 40, "new_commit": "c" * 40,
             "tested_tree_digest": "d" * 40, "checks_receipt_digest": "e" * 64,
+            "branch": "refs/heads/main",
             "outcome": "integrated", "reason": None, "observed_at_ms": 1,
         }
         value.update(changes)
@@ -399,12 +650,17 @@ class WriteIntegrationContractTests(unittest.TestCase):
 
     def test_integrated_binds_every_digest_and_refused_carries_a_reason(self) -> None:
         validate_learning_record(self.material())
+        validate_learning_record(self.material(outcome="promoting"))
         validate_learning_record(self.material(
             outcome="refused", reason="write_base_moved", new_commit=None,
-            tested_tree_digest=None, checks_receipt_digest=None,
+            tested_tree_digest=None, checks_receipt_digest=None, branch=None,
         ))
         for changes in (
             {"tested_tree_digest": None},
+            {"branch": None},
+            {"outcome": "promoting", "branch": None},
+            {"branch": "refs/heads/a b"},
+            {"branch": "refs/tags/v1"},
             {"reason": "write_base_moved"},
             {"new_commit": "b" * 40},
             {"outcome": "refused", "reason": None},

@@ -359,40 +359,57 @@ Claude to Claude and Codex to Codex.
 - After an accepted verification the primary runs `learning-integrate-write
   --project-root <root> --bridge-run-id <worker bridge run>`. Never apply a patch by
   hand. The command is one serialized operation under the ledger writer lock:
+  - It first reconciles any `promoting` intent an interrupted attempt left (see below).
   - It refuses unless the write result's ownership passed, `write_verification_state`
     is `accepted` (`write_not_verified`), no `integrated` record exists
-    (`write_already_integrated`) and the calling host owns the run's orchestration
-    (`host_client_mismatch`, which records nothing).
+    (`write_already_integrated`), no reconciliation needed the owner
+    (`write_integration_needs_owner`) and the calling host owns the run's
+    orchestration (`host_client_mismatch`, which records nothing).
   - The primary checkout must be on a named branch at the patch's source commit
     (`write_base_moved`), with no staged or unmerged change and every tracked file
-    equal to that commit, compared by hashing without filters
-    (`write_primary_dirty`), and nothing (untracked or ignored) at a path the patch
-    adds (`write_primary_collision`). Unrelated untracked files are allowed.
-  - A detached disposable worktree at the source commit is created in a private
-    directory under the system temp directory, outside the repository, verified with
-    `verify_tree_at_commit`, and the patch, read only through the verified
-    `write_result_artifact`, is applied there.
+    equal to that commit, compared by hashing raw bytes (`write_primary_dirty`), and
+    nothing (untracked or ignored) at a path the patch adds (`write_primary_collision`).
+    Unrelated untracked files are allowed.
+  - No attribute-aware Git command runs anywhere: no `merge`, `checkout`, `switch` or
+    `worktree add` with a checkout, so no repository filter, attribute, `fsmonitor` or
+    merge option applies. A detached worktree is registered with `--no-checkout` in a
+    private directory under the system temp directory, outside the repository; the
+    source commit's raw blobs are written into it from `cat-file --batch`, with their
+    modes and without following symlinks; it is verified with `verify_tree_at_commit`,
+    and the patch, read only through the verified `write_result_artifact`, is applied.
   - The project's operational checks (`.codex/orchestration/operational-checks.json`)
     run in that worktree through the same sandboxed runner as
-    `learning-run-operational-checks`. Any unavailable or failed check refuses with
+    `learning-run-operational-checks`, whose configuration loader also uses hardened
+    Git and raw-byte comparison. Any unavailable or failed check refuses with
     `write_checks_failed` and nothing is promoted.
-  - The patched tree is committed there from the patch's own bytes (no clean filter
-    runs), with the primary's configured `user.name` and `user.email`
-    (`write_identity_missing` without them); the message names the task's assignment
-    and family, the worker and verifier providers, the patch digest and the bridge run.
-    The worktree must still equal that commit (`write_tested_tree_mismatch`); its tree
-    object ID is the tested tree digest.
-  - Immediately before promotion the base, cleanliness and collision checks run again
-    (`write_promotion_race` otherwise, leaving the primary untouched); then `git merge
-    --ff-only` in the primary, with hooks disabled, moves the branch, index and working
-    tree together. Termination signals are held from that re-check until the record is
-    written. A merge that fails with the primary unchanged is `write_promotion_failed`;
-    one that leaves it anywhere but exactly the new commit is
-    `write_promotion_incomplete`.
-  - Every attempt appends a ledger-only `write_integration` (the write run, bridge run,
-    patch digest, source and new commit, tested tree digest, check report digest,
-    `outcome` `integrated` or `refused`, and the refusal `reason`). A cancelled attempt
-    records `write_integration_interrupted`. The worktree is removed with `git worktree
+  - The commit is built with plumbing under a private `GIT_INDEX_FILE`
+    (`hash-object --no-filters`, `update-index --index-info`, `write-tree`,
+    `commit-tree --no-gpg-sign`) with the primary's configured `user.name` and
+    `user.email` (`write_identity_missing` without them); the message names the task's
+    assignment and family, the worker and verifier providers, the patch digest and the
+    bridge run. The worktree must equal that commit (`write_tested_tree_mismatch`); its
+    tree object ID is the tested tree digest.
+  - Promotion is by hand under Git's own locks. `HEAD.lock`, the branch's ref lock and
+    `index.lock` are created exclusively; any that exists refuses with
+    `write_promotion_busy`. Under them the branch, cleanliness and collisions are
+    verified again (`write_promotion_race`), the original bytes and modes of every
+    touched path are kept, and a `promoting` intent (candidate commit, source commit,
+    branch) is recorded. The new index is written into `index.lock`
+    (`update-index --index-info` under that index file), the working-tree files are
+    written from the patch's raw bytes (exclusive create, atomic replace, unlink), the
+    commit is written to the ref lock, and `index.lock` then the ref lock are renamed
+    into place. Any failure before the ref rename restores every touched path and the
+    old index and removes the locks (`write_promotion_failed`), or
+    `write_integration_needs_owner` if the restoration failed. Termination signals are
+    held from before the locks until the record is written, and through cleanup.
+  - Every attempt appends ledger-only `write_integration` records (the write run,
+    bridge run, patch digest, source and new commit, branch, tested tree digest, check
+    report digest, `outcome` `promoting`, `integrated` or `refused`, and the refusal
+    `reason`). A cancelled attempt records `write_integration_interrupted`. An
+    unfinished `promoting` intent is reconciled from the branch: at the candidate
+    commit it is `integrated`; at the source commit with a clean checkout it is
+    `write_promotion_failed`; anything else is `write_integration_needs_owner` and
+    blocks re-integration of that run. The worktree is removed with `git worktree
     remove --force` and `prune` on every terminal state.
   - Every Git call disables hooks and the filesystem monitor, lazy fetch and
     replacement objects, and uses literal pathspecs. A refused integration is not

@@ -89,13 +89,17 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
      `learning-integrate-write --project-root <root> --bridge-run-id <worker bridge
      run>`. Never apply, copy or commit a patch by hand. The primary checkout must be on
      a named branch at the patch's source commit, with nothing staged, no modified
-     tracked file and nothing at a path the patch adds. The command applies the patch
-     in a disposable worktree, runs the project's operational checks there, commits with
-     the repository's configured identity and fast-forwards the primary only when all of
-     that passed. A refusal (`write_base_moved`, `write_primary_dirty`,
-     `write_primary_collision`, `write_checks_failed`, `write_promotion_race` and the
-     other reason codes) leaves the primary as it was; report it, and re-plan the task
-     with fresh verification rather than retrying or merging by hand.
+     tracked file and nothing at a path the patch adds, and no other Git operation may
+     hold its locks. The command applies the patch in a disposable worktree, runs the
+     project's operational checks there, commits with the repository's configured
+     identity and fast-forwards the primary under Git's own locks only when all of that
+     passed. A refusal (`write_base_moved`, `write_primary_dirty`,
+     `write_primary_collision`, `write_checks_failed`, `write_promotion_busy`,
+     `write_promotion_race`, `write_promotion_failed` and the other reason codes)
+     leaves the primary as it was; report it, and re-plan the task with fresh
+     verification rather than retrying or merging by hand.
+     `write_integration_needs_owner` means an interrupted promotion left the checkout in
+     a state the command could not classify: stop and ask the owner.
 9. **Close.** Report failed, blocked and unverified work plainly, then run
    `learning-close-orchestration` with the real terminal state. Claude Code has no
    native goal counters, so omit `--goal-tokens-used` and `--goal-time-used-seconds`

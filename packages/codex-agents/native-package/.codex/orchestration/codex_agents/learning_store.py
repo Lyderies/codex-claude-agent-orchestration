@@ -4649,7 +4649,8 @@ class LearningLedger:
         The write result must be recorded, and the calling host must own the
         orchestration its run was opened in (`host_client_mismatch`
         otherwise, before anything is recorded). The returned `refusal` is
-        `write_result_not_passed` when ownership did not pass,
+        `write_integration_needs_owner` when a reconciliation left that
+        reason, `write_result_not_passed` when ownership did not pass,
         `write_not_verified` when `write_verification_state` is not
         `accepted`, `write_already_integrated` when an `integrated`
         `write_integration` exists, and otherwise None. The caller holds the
@@ -4698,7 +4699,9 @@ class LearningLedger:
             worker_provider = None
             verifier_providers: list[str] = []
             refusal = None
-            if record["ownership"] != "passed":
+            if self._write_integration_needs_owner_locked(project_id, bridge_run_id):
+                refusal = "write_integration_needs_owner"
+            elif record["ownership"] != "passed":
                 refusal = "write_result_not_passed"
             elif self.write_verification_state(project_id, bridge_run_id) != "accepted":
                 refusal = "write_not_verified"
@@ -4739,43 +4742,71 @@ class LearningLedger:
             "verifier_providers": verifier_providers,
         }
 
+    def _write_integrations_locked(self, project_id: str, bridge_run_id: str | None) -> list:
+        query = (
+            "SELECT content FROM records WHERE project_id=? AND record_type='write_integration' "
+            "AND source='lifecycle'"
+        )
+        arguments: tuple = (project_id,)
+        if bridge_run_id is not None:
+            query += " AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?"
+            arguments += (bridge_run_id,)
+        rows = self._connection.execute(query + " ORDER BY source_sequence", arguments).fetchall()
+        return [validate_learning_record(json.loads(bytes(row["content"]))) for row in rows]
+
     def _write_integrated_locked(self, project_id: str, bridge_run_id: str) -> bool:
-        return self._connection.execute(
-            "SELECT 1 FROM records WHERE project_id=? AND record_type='write_integration' "
-            "AND source='lifecycle' "
-            "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=? "
-            "AND json_extract(CAST(content AS TEXT),'$.outcome')='integrated'",
-            (project_id, bridge_run_id),
-        ).fetchone() is not None
+        return any(
+            record["outcome"] == "integrated"
+            for record in self._write_integrations_locked(project_id, bridge_run_id)
+        )
+
+    def _write_integration_needs_owner_locked(self, project_id: str, bridge_run_id: str) -> bool:
+        return any(
+            record["reason"] == "write_integration_needs_owner"
+            for record in self._write_integrations_locked(project_id, bridge_run_id)
+        )
+
+    def unfinished_write_integrations(self, project_id: str) -> list[dict[str, Any]]:
+        """Every `promoting` intent that no later record of its bridge run finished."""
+
+        with self._lock:
+            latest: dict[str, dict[str, Any]] = {}
+            for record in self._write_integrations_locked(project_id, None):
+                latest[record["bridge_run_id"]] = record
+        return [record for record in latest.values() if record["outcome"] == "promoting"]
 
     def record_write_integration(
         self,
         project_id: str,
         *,
-        write_result: dict[str, Any],
+        base: dict[str, Any],
+        outcome: str,
+        reason: str | None,
         new_commit: str | None,
         tested_tree_digest: str | None,
         checks_receipt_digest: str | None,
-        reason: str | None,
+        branch: str | None,
     ) -> dict[str, Any]:
-        """Append one `write_integration`: `integrated` when `reason` is None, else `refused`.
+        """Append one `write_integration` for the write result (or intent) `base` names.
 
-        Refused attempts may repeat; at most one `integrated` record exists
-        per write result.
+        Refused attempts may repeat. At most one `integrated` record exists
+        per write result, a `promoting` intent needs no unfinished intent and
+        no integration before it, and `integrated` needs no earlier one.
         """
 
         timestamp = self._clock_ms()
         material = {
             "schema_version": 1,
             "record_type": "write_integration",
-            "run_id": write_result["run_id"],
-            "bridge_run_id": write_result["bridge_run_id"],
-            "patch_digest": write_result["patch_digest"],
-            "source_commit": write_result["source_commit"],
+            "run_id": base["run_id"],
+            "bridge_run_id": base["bridge_run_id"],
+            "patch_digest": base["patch_digest"],
+            "source_commit": base["source_commit"],
             "new_commit": new_commit,
             "tested_tree_digest": tested_tree_digest,
             "checks_receipt_digest": checks_receipt_digest,
-            "outcome": "integrated" if reason is None else "refused",
+            "branch": branch,
+            "outcome": outcome,
             "reason": reason,
             "observed_at_ms": timestamp,
         }
@@ -4787,10 +4818,13 @@ class LearningLedger:
             raise LedgerError("write integration record is invalid") from exc
         with self._lock, self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            if reason is None and self._write_integrated_locked(
-                project_id, record["bridge_run_id"]
+            earlier = self._write_integrations_locked(project_id, record["bridge_run_id"])
+            if outcome in {"promoting", "integrated"} and any(
+                item["outcome"] == "integrated" for item in earlier
             ):
                 raise LedgerError("write result is already integrated")
+            if outcome == "promoting" and earlier and earlier[-1]["outcome"] == "promoting":
+                raise LedgerError("write integration has an unfinished promotion")
             self._append_checked_locked(
                 project_id, record, producer="lifecycle", timestamp=timestamp
             )

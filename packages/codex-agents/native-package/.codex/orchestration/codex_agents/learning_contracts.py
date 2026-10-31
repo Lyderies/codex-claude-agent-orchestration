@@ -2253,20 +2253,24 @@ def validate_write_verifier_result(data: Any) -> dict[str, Any]:
 WRITE_INTEGRATION_FIELDS = {
     "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
     "patch_digest", "source_commit", "new_commit", "tested_tree_digest",
-    "checks_receipt_digest", "outcome", "reason", "observed_at_ms",
+    "checks_receipt_digest", "branch", "outcome", "reason", "observed_at_ms",
 }
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_BRANCH_REF = re.compile(r"refs/heads/[^\x00-\x20\x7f~^:?*\[\\]{1,1000}")
 
 
 def validate_write_integration(data: Any) -> dict[str, Any]:
-    """One attempt to integrate a verified write patch into the primary checkout.
+    """One step of integrating a verified write patch into the primary checkout.
 
-    `outcome` is `integrated` or `refused`. An integrated record names the
-    source commit, the new commit the primary branch was fast-forwarded to,
-    the tested tree (that commit's tree object ID, on which the operational
-    checks ran) and the digest of the check report; `reason` is null. A
-    refused record carries the stable `reason` and whatever facts the attempt
-    reached before it stopped. Ledger-only: digests, object IDs and codes.
+    `outcome` is `promoting`, `integrated` or `refused`. A `promoting`
+    record is the durable intent written under Git's locks just before the
+    primary changes; a later `integrated` or `refused` record for the same
+    bridge run finishes it. `promoting` and `integrated` name the source
+    commit, the candidate (new) commit, the branch, the tested tree (the new
+    commit's tree object ID, on which the operational checks ran) and the
+    digest of the check report, with no `reason`. A refused record carries
+    the stable `reason` and whatever facts the attempt reached. Ledger-only:
+    digests, object IDs, the branch ref and codes.
     """
 
     data = _closed(data, WRITE_INTEGRATION_FIELDS, "write_integration")
@@ -2284,17 +2288,24 @@ def validate_write_integration(data: Any) -> dict[str, Any]:
             not isinstance(value, str) or _OBJECT_ID.fullmatch(value) is None
         ):
             raise ContractError(f"write_integration {field} is invalid")
-    _enum(data["outcome"], {"integrated", "refused"}, "outcome")
+    branch = data["branch"]
+    if branch is not None and (
+        not isinstance(branch, str) or _BRANCH_REF.fullmatch(branch) is None
+    ):
+        raise ContractError("write_integration branch is invalid")
+    _enum(data["outcome"], {"promoting", "integrated", "refused"}, "outcome")
     reason = data["reason"]
-    if data["outcome"] == "integrated":
+    if data["outcome"] in {"promoting", "integrated"}:
         if reason is not None or any(
             data[field] is None
             for field in (
                 "patch_digest", "source_commit", "new_commit", "tested_tree_digest",
-                "checks_receipt_digest",
+                "checks_receipt_digest", "branch",
             )
         ):
-            raise ContractError("an integrated write_integration binds every digest and no reason")
+            raise ContractError(
+                "a promoting or integrated write_integration binds every digest and no reason"
+            )
         if data["new_commit"] == data["source_commit"]:
             raise ContractError("write_integration new_commit must differ from its source")
     elif not isinstance(reason, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason) is None:
