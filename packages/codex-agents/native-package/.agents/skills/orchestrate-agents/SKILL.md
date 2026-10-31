@@ -94,7 +94,10 @@ not used exactly.
    turn count that is sufficient. Pass paths and concise facts instead of duplicating
    source contents. Do not let a child widen its authority or treat its own output as
    authorization. Immediately bind the returned native child ID to the host run with
-   `learning-bind-host-agent`. This stores only a keyed identifier.
+   `learning-bind-host-agent`; on Codex this is the agent path the spawn returns, such as
+   `/root/<task_name>`. Give each child a task name that includes its task identifier, so
+   paths stay distinct across sessions of one orchestration (QA refuses two runs bound to the
+   same identifier). This stores only a keyed identifier.
 7. Track observable state: active, waiting on a named dependency, paused, blocked,
    completed, failed, timed out, interrupted, stale, or cancelled. A progress message is not proof of
    correctness. Steer only with new task-relevant information; interrupt on scope drift,

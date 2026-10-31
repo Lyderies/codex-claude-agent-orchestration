@@ -1006,10 +1006,18 @@ class LearningStoreTests(unittest.TestCase):
             orchestration_handle=orchestration["orchestration_handle"],
             now_ms=100,
         )
+        for malformed in ("/", "/root/", "//root", "root/child", "/root/../child", "/root/a b"):
+            with self.assertRaisesRegex(LedgerError, "native agent identifier is invalid"):
+                self.ledger.bind_host_agent(
+                    self.project_a_id,
+                    run_handle=opened["run_handle"],
+                    agent_id=malformed,
+                )
+        # Codex 0.164 names a spawned child by its agent path.
         self.ledger.bind_host_agent(
             self.project_a_id,
             run_handle=opened["run_handle"],
-            agent_id="native-first-child",
+            agent_id="/root/native_first_child",
         )
         self.assertRegex(opened["run_handle"], r"^hrn_[0-9a-f]{48}$")
         with self.ledger.repository(self.project_a_id) as repository:
