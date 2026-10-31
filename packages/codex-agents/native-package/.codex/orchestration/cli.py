@@ -15,8 +15,11 @@ from pathlib import Path
 from typing import Any
 
 ORCHESTRATION_ROOT = Path(__file__).resolve().parent
+# The project this CLI serves. A protected runtime copy (the one the owner's Codex
+# rule runs) replaces it below with the project its binding names.
 BUNDLE_ROOT = ORCHESTRATION_ROOT.parent.parent
-# Present only in an installed project; the installer writes it next to this file.
+# Present only in an installed project or its protected copy; the installer
+# writes it next to this file.
 INSTALL_MANIFEST = ORCHESTRATION_ROOT / "install-manifest.json"
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
@@ -101,10 +104,14 @@ from codex_agents.host_commands import (  # noqa: E402
     HostCommandError,
     OwnRootRefused,
     argv_prefix as codex_argv_prefix,
+    bound_project_root,
+    install_rule as install_codex_rule,
+    remove_rule as remove_codex_rule,
     render_rule as render_codex_rule,
     rule_path as codex_rule_path,
     rule_status as codex_rule_status,
-    write_rule as write_codex_rule,
+    runtime_copy_problem,
+    runtime_copy_root,
 )
 from codex_agents.claude_host import (  # noqa: E402
     ClaudeHostDenied,
@@ -125,6 +132,19 @@ from codex_agents.routing import (  # noqa: E402
     route_task,
 )
 from codex_agents.validation import validate_package  # noqa: E402
+
+# A protected runtime copy serves the project its owner-only binding names, never
+# the place it sits; a binding that does not verify refuses every command.
+_RUNTIME_BINDING_ERROR: str | None = None
+try:
+    _BOUND_PROJECT = bound_project_root(ORCHESTRATION_ROOT)
+except HostCommandError as _binding_error:
+    _BOUND_PROJECT, _RUNTIME_BINDING_ERROR = None, str(_binding_error)
+PROTECTED_RUNTIME = _BOUND_PROJECT is not None or _RUNTIME_BINDING_ERROR is not None
+if _BOUND_PROJECT is not None:
+    BUNDLE_ROOT = _BOUND_PROJECT
+# The copy runs only what the rule allows, plus the collector it starts.
+PROTECTED_RUNTIME_COMMANDS = frozenset(PRIMARY_HOST_COMMANDS) | {"learning-serve"}
 
 
 def _bounded_input(path: str) -> bytes:
@@ -288,6 +308,31 @@ def _with_codex_hint(command: str, report: dict) -> dict:
 
 def _resolved(path: Path) -> Path:
     return Path(os.path.realpath(Path(path).expanduser()))
+
+
+def _require_protected_runtime(args: argparse.Namespace) -> None:
+    """Refuse what a protected runtime copy must not run, before anything else.
+
+    The copy is what the owner's Codex rule runs outside the sandbox. It
+    serves only the primary-host commands (and the collector it starts), and
+    only while the project's installed runtime is still byte-for-byte this
+    copy: a package update, or a change to the project's installed files,
+    stops it until the owner runs setup again.
+    """
+
+    if not PROTECTED_RUNTIME:
+        return
+    if _RUNTIME_BINDING_ERROR is not None:
+        raise HostCommandError(_RUNTIME_BINDING_ERROR)
+    if args.command not in PROTECTED_RUNTIME_COMMANDS:
+        raise HostCommandError("a protected runtime copy runs only the primary-host commands")
+    if args.command == "learning-serve":
+        return
+    if runtime_copy_problem(ORCHESTRATION_ROOT.parent.parent, BUNDLE_ROOT) is not None:
+        raise HostCommandError(
+            "the project's installed runtime differs from its protected copy; ask the "
+            "owner to run ./setup.sh (Codex commands step)"
+        )
 
 
 def _require_own_roots(args: argparse.Namespace) -> None:
@@ -1136,6 +1181,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the rule that would be written, without writing it",
     )
 
+    remove_codex_rule_parser = subparsers.add_parser(
+        "remove-codex-rule",
+        help="owner removal: delete the Codex command rule and runtime copy for one project",
+    )
+    remove_codex_rule_parser.add_argument("--project-root", required=True, type=Path)
+
     for subparser in subparsers.choices.values():
         subparser.add_argument(
             "--host-client",
@@ -1151,6 +1202,7 @@ def main() -> int:
     _EXPLICIT_HOST_CLIENT = args.host_client
     _COLLECTOR_UNREACHED = False
     try:
+        _require_protected_runtime(args)
         _require_own_roots(args)
         if getattr(args, "policy", False) is None:
             args.policy = ORCHESTRATION_ROOT / "config" / (
@@ -2826,11 +2878,19 @@ def main() -> int:
             report = {"ready": True, "record": record}
         elif args.command == "host-command":
             status = codex_rule_status(args.project_root)
+            try:
+                # The rule runs the protected copy, never the project's own CLI.
+                prefix = codex_argv_prefix(args.project_root)
+                runtime_copy = str(runtime_copy_root(args.project_root))
+            except HostCommandError:
+                # No install manifest: nothing to copy, so the rule is stale.
+                prefix = runtime_copy = None
             report = {
                 "ready": status == "installed",
-                "argv_prefix": codex_argv_prefix(args.project_root),
+                "argv_prefix": prefix,
                 "codex_rule": status,
                 "rule_file": str(codex_rule_path(args.project_root)),
+                "runtime_copy": runtime_copy,
             }
         elif args.command == "install-codex-rule":
             rule_file = str(codex_rule_path(args.project_root))
@@ -2839,14 +2899,17 @@ def main() -> int:
                     "ready": True,
                     "rule_file": rule_file,
                     "rule_text": render_codex_rule(args.project_root),
+                    "runtime_copy": str(runtime_copy_root(args.project_root)),
                 }
             else:
-                outcome = write_codex_rule(args.project_root, replace=args.replace)
+                installed = install_codex_rule(args.project_root, replace=args.replace)
                 report = {
-                    "ready": outcome != "differs",
-                    "codex_rule": outcome,
+                    "ready": installed["codex_rule"] != "differs",
+                    **installed,
                     "rule_file": rule_file,
                 }
+        elif args.command == "remove-codex-rule":
+            report = {"ready": True, "removed": remove_codex_rule(args.project_root)}
         else:  # pragma: no cover - argparse restricts commands.
             raise ContractError("unsupported command")
     except OSError:

@@ -24,15 +24,23 @@ from tests.support import BUNDLE_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 import cli
 from codex_agents import host_commands
 from codex_agents.host_commands import (
+    BINDING_RELATIVE,
+    CLI_RELATIVE,
     PRIMARY_HOST_COMMANDS,
     PYTHON_FLAGS,
     HostCommandError,
     argv_prefix,
+    bound_project_root,
+    install_rule,
     interpreter_path,
+    project_digest,
+    remove_rule,
     render_rule,
     rule_file_name,
     rule_path,
     rule_status,
+    runtime_copy_problem,
+    runtime_copy_root,
     write_rule,
 )
 from codex_agents.learning_store import (
@@ -68,6 +76,7 @@ OWNER_COMMANDS = {
     "learning-record-feedback",
     "learning-expire",
     "install-codex-rule",
+    "remove-codex-rule",
 }
 PYTHON = "/opt/example/bin/python3"
 # The interpreter the rule names when tests run: the base one, never a venv's,
@@ -94,6 +103,51 @@ def non_temporary_directory(test: unittest.TestCase) -> Path:
             test.addCleanup(shutil.rmtree, directory, True)
             return directory
     test.skipTest("no directory outside the temporary roots is available")
+
+
+def stand_in_project(project: Path) -> Path:
+    """A project with a stand-in CLI and the manifest that names it."""
+
+    (project / ".codex" / "orchestration").mkdir(parents=True)
+    cli_path = project / CLI_RELATIVE
+    cli_path.write_text("# stand-in\n")
+    manifest = {
+        "format": 1, "version": "0.0.1",
+        "files": {CLI_RELATIVE.as_posix(): hashlib.sha256(cli_path.read_bytes()).hexdigest()},
+    }
+    (project / ".codex" / "orchestration" / "install-manifest.json").write_text(
+        json.dumps(manifest)
+    )
+    return project
+
+
+def install_package(project: Path) -> Path:
+    """Install this package's files into `project` as the installer does, with its manifest."""
+
+    files = {}
+    for path in sorted(BUNDLE_ROOT.rglob("*")):
+        relative = path.relative_to(BUNDLE_ROOT).as_posix()
+        if (
+            not path.is_file() or "__pycache__" in path.parts or path.name == ".DS_Store"
+            or relative in {"VERSION", ".codex/orchestration/install-manifest.json"}
+        ):
+            continue
+        target = project / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(path.read_bytes())
+        files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (project / ".codex" / "orchestration" / "install-manifest.json").write_text(
+        json.dumps({"format": 1, "version": PACKAGE_VERSION, "files": files}, indent=2)
+    )
+    return project
+
+
+def expected_copy(codex_home: Path, project: Path) -> Path:
+    manifest = (project / ".codex" / "orchestration" / "install-manifest.json").read_bytes()
+    return (
+        Path(os.path.realpath(codex_home)) / "agent-orchestration"
+        / project_digest(project.resolve()) / hashlib.sha256(manifest).hexdigest()
+    )
 
 
 def _python_trusted() -> bool:
@@ -148,10 +202,7 @@ class RuleTests(unittest.TestCase):
         self.environ = {"CODEX_HOME": str(self.codex_home)}
 
     def make_project(self, name: str) -> Path:
-        project = self.base / name
-        (project / ".codex" / "orchestration").mkdir(parents=True)
-        (project / ".codex" / "orchestration" / "cli.py").write_text("# stand-in\n")
-        return project
+        return stand_in_project(self.base / name)
 
     @staticmethod
     def pattern(text: str) -> list[str]:
@@ -165,13 +216,22 @@ class RuleTests(unittest.TestCase):
         ]
 
     def test_rule_pins_absolute_paths_and_only_the_allowlist(self) -> None:
-        text = render_rule(self.project, PYTHON)
-        cli_path = str(self.project / ".codex" / "orchestration" / "cli.py")
+        text = render_rule(self.project, PYTHON, self.environ)
+        project_cli_path = str(self.project / ".codex" / "orchestration" / "cli.py")
+        # The rule runs the protected copy in Codex home, never the project's CLI.
+        cli_path = str(expected_copy(self.codex_home, self.project) / CLI_RELATIVE)
         self.assertEqual(("-I", "-B", "-S"), PYTHON_FLAGS)
         self.assertEqual(
             [PYTHON, *PYTHON_FLAGS, cli_path, *PRIMARY_HOST_COMMANDS], self.pattern(text)
         )
-        self.assertEqual([PYTHON, *PYTHON_FLAGS, cli_path], argv_prefix(self.project, PYTHON))
+        self.assertEqual(
+            [PYTHON, *PYTHON_FLAGS, cli_path], argv_prefix(self.project, PYTHON, self.environ)
+        )
+        self.assertNotIn(f'"{project_cli_path}", "learning-status"', text.split("not_match")[0])
+        self.assertIn(
+            f'["{PYTHON}", "-I", "-B", "-S", "{project_cli_path}", "learning-status"',
+            text.split("not_match")[1],
+        )
         self.assertEqual(1, text.count("prefix_rule("))
         self.assertIn('    decision = "allow",\n', text)
         self.assertIn("justification = ", text)
@@ -189,12 +249,12 @@ class RuleTests(unittest.TestCase):
         header = text.split("prefix_rule(", 1)[0]
         self.assertTrue(all(line.startswith("#") for line in header.strip().splitlines()))
         self.assertIn("with the owner's consent", header)
-        self.assertIn("To remove it, delete this file", header)
+        self.assertIn("To remove it, delete this file and the runtime copy", header)
 
     def test_rule_quotes_backslashes_and_double_quotes(self) -> None:
         project = self.make_project('odd "name" \\ dir')
-        text = render_rule(project, PYTHON)
-        cli_path = str(project / ".codex" / "orchestration" / "cli.py")
+        text = render_rule(project, PYTHON, self.environ)
+        cli_path = str(expected_copy(self.codex_home, project) / CLI_RELATIVE)
         self.assertEqual(cli_path, self.pattern(text)[1 + len(PYTHON_FLAGS)])
         self.assertIn('odd \\"name\\" \\\\ dir', text)
 
@@ -263,8 +323,9 @@ class RuleTests(unittest.TestCase):
         path = rule_path(self.project, self.environ)
         self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
         self.assertEqual(0o700, stat.S_IMODE(path.parent.stat().st_mode))
-        self.assertEqual(render_rule(self.project, PYTHON), path.read_text())
-        self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
+        self.assertEqual(render_rule(self.project, PYTHON, self.environ), path.read_text())
+        # The rule names a runtime copy that only install_rule creates.
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
         before = path.stat()
         self.assertEqual("unchanged", write_rule(self.project, self.environ, PYTHON))
         after = path.stat()
@@ -277,13 +338,12 @@ class RuleTests(unittest.TestCase):
         other = "/opt/other/bin/python3"
         self.assertEqual("stale", rule_status(self.project, self.environ, other))
         self.assertEqual("differs", write_rule(self.project, self.environ, other))
-        self.assertEqual(render_rule(self.project, PYTHON), path.read_text())
+        self.assertEqual(render_rule(self.project, PYTHON, self.environ), path.read_text())
         self.assertEqual(
             "replaced", write_rule(self.project, self.environ, other, replace=True)
         )
-        self.assertEqual(render_rule(self.project, other), path.read_text())
+        self.assertEqual(render_rule(self.project, other, self.environ), path.read_text())
         self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
-        self.assertEqual("installed", rule_status(self.project, self.environ, other))
         self.assertEqual([path.name], os.listdir(path.parent))
 
     def test_a_rule_that_appears_after_the_read_is_never_overwritten(self) -> None:
@@ -298,12 +358,12 @@ class RuleTests(unittest.TestCase):
                     name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
                 )
                 with os.fdopen(descriptor, "w") as handle:
-                    handle.write(render_rule(self.project, "/opt/other/bin/python3"))
+                    handle.write(render_rule(self.project, "/opt/other/bin/python3", self.environ))
             return current
 
         with mock.patch.object(host_commands, "_read_rule", side_effect=late_writer):
             self.assertEqual("differs", write_rule(self.project, self.environ, PYTHON))
-        self.assertEqual(render_rule(self.project, "/opt/other/bin/python3"), path.read_text())
+        self.assertEqual(render_rule(self.project, "/opt/other/bin/python3", self.environ), path.read_text())
         self.assertEqual([path.name], os.listdir(path.parent))
 
     def test_concurrent_setups_create_exactly_one_rule(self) -> None:
@@ -337,7 +397,7 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(1, len(created), outcomes)
         self.assertEqual({"created", "differs"}, set(outcomes.values()))
         path = rule_path(self.project, self.environ)
-        self.assertEqual(render_rule(self.project, created[0]), path.read_text())
+        self.assertEqual(render_rule(self.project, created[0], self.environ), path.read_text())
         self.assertEqual([path.name], os.listdir(path.parent))
 
     def test_a_symlinked_rules_directory_is_refused(self) -> None:
@@ -352,14 +412,14 @@ class RuleTests(unittest.TestCase):
 
     def test_a_symlinked_rule_file_is_refused_and_never_followed(self) -> None:
         target = self.base / "target.rules"
-        target.write_text(render_rule(self.project, PYTHON))
+        target.write_text(render_rule(self.project, PYTHON, self.environ))
         rules = self.codex_home / "rules"
         rules.mkdir(parents=True)
         (rules / rule_file_name(self.project)).symlink_to(target)
         for replace in (False, True):
             with self.assertRaisesRegex(HostCommandError, "rule file is a symlink"):
                 write_rule(self.project, self.environ, PYTHON, replace=replace)
-        self.assertEqual(render_rule(self.project, PYTHON), target.read_text())
+        self.assertEqual(render_rule(self.project, PYTHON, self.environ), target.read_text())
         self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
 
     def test_a_non_regular_rule_file_is_refused(self) -> None:
@@ -403,34 +463,233 @@ def _quoted(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+class ProtectedCopyTests(unittest.TestCase):
+    """The rule runs an owner-only copy of the installed runtime, bound to its project."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        # These projects live in the system temp directory; here none counts.
+        patcher = mock.patch.object(host_commands, "temp_roots", lambda: set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.project = install_package(self.base / "project")
+        self.codex_home = self.base / "codex-home"
+        self.environ = {"CODEX_HOME": str(self.codex_home)}
+
+    def install(self, **kwargs) -> dict:
+        return install_rule(self.project, self.environ, PYTHON, **kwargs)
+
+    def test_the_copy_is_private_complete_and_bound(self) -> None:
+        installed = self.install()
+        copy = expected_copy(self.codex_home, self.project)
+        self.assertEqual(
+            {"codex_rule": "created", "runtime_copy": str(copy),
+             "runtime_copy_status": "created"},
+            installed,
+        )
+        manifest = json.loads(
+            (self.project / ".codex" / "orchestration" / "install-manifest.json").read_text()
+        )
+        for relative in manifest["files"]:
+            self.assertEqual(
+                (self.project / relative).read_bytes(), (copy / relative).read_bytes(), relative
+            )
+        for current, directories, files in os.walk(self.codex_home / "agent-orchestration"):
+            for name in directories:
+                self.assertEqual(0o700, stat.S_IMODE(os.lstat(Path(current, name)).st_mode))
+            for name in files:
+                self.assertEqual(0o600, stat.S_IMODE(os.lstat(Path(current, name)).st_mode))
+        binding = json.loads((copy / BINDING_RELATIVE).read_text())
+        self.assertEqual(
+            {"format": 1, "project_root": str(self.project.resolve()),
+             "runtime_digest": copy.name, "version": PACKAGE_VERSION},
+            binding,
+        )
+        # The copy serves its bound project, wherever it sits.
+        self.assertEqual(self.project.resolve(), bound_project_root(copy / ".codex" / "orchestration"))
+        self.assertIsNone(bound_project_root(self.project / ".codex" / "orchestration"))
+        self.assertIsNone(runtime_copy_problem(copy, self.project.resolve()))
+        self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
+        self.assertEqual(
+            str(copy / CLI_RELATIVE), argv_prefix(self.project, PYTHON, self.environ)[-1]
+        )
+        # Running setup again changes nothing.
+        before = (copy / CLI_RELATIVE).stat()
+        self.assertEqual(
+            ("unchanged", "unchanged"),
+            tuple(self.install()[key] for key in ("codex_rule", "runtime_copy_status")),
+        )
+        self.assertEqual(before.st_ino, (copy / CLI_RELATIVE).stat().st_ino)
+
+    def test_status_is_stale_unless_rule_copy_and_project_all_match(self) -> None:
+        self.install()
+        copy = expected_copy(self.codex_home, self.project)
+        installed_cli = self.project / CLI_RELATIVE
+        original = installed_cli.read_bytes()
+        # The project's installed runtime changes (a parent-folder session could).
+        installed_cli.write_bytes(original + b"# changed\n")
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+        self.assertIsNotNone(runtime_copy_problem(copy, self.project.resolve()))
+        installed_cli.write_bytes(original)
+        self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
+        # The copy changes.
+        (copy / ".codex" / "orchestration" / "config" / "routing-policy.json").write_text("{}")
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+        # Setup rebuilds a copy that fails verification.
+        self.assertEqual("replaced", self.install(replace=True)["runtime_copy_status"])
+        self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
+        # The copy disappears.
+        host_commands.remove_tree_at(os.open(copy.parent, os.O_RDONLY), copy.name)
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+        self.install()
+        # A package update names a new copy, so the old rule is stale until setup.
+        manifest = self.project / ".codex" / "orchestration" / "install-manifest.json"
+        data = json.loads(manifest.read_text())
+        manifest.write_text(json.dumps(data))
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+        self.assertEqual("replaced", self.install(replace=True)["codex_rule"])
+        self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
+        # Only the copy the rule names is kept.
+        self.assertEqual(
+            [expected_copy(self.codex_home, self.project).name], os.listdir(copy.parent)
+        )
+
+    def test_a_rule_naming_the_project_cli_is_stale(self) -> None:
+        self.install()
+        path = rule_path(self.project, self.environ)
+        current = path.read_text()
+        copy_cli = str(expected_copy(self.codex_home, self.project) / CLI_RELATIVE)
+        # What earlier setups wrote: the project's own CLI as the rule target.
+        path.write_text(current.replace(copy_cli, str(self.project.resolve() / CLI_RELATIVE)))
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+
+    def test_no_manifest_means_no_copy_and_no_rule(self) -> None:
+        (self.project / ".codex" / "orchestration" / "install-manifest.json").unlink()
+        for attempt in (
+            lambda: install_rule(self.project, self.environ, PYTHON),
+            lambda: render_rule(self.project, PYTHON, self.environ),
+            lambda: argv_prefix(self.project, PYTHON, self.environ),
+            lambda: runtime_copy_root(self.project, self.environ),
+        ):
+            with self.assertRaisesRegex(HostCommandError, "no install manifest"):
+                attempt()
+        self.assertFalse(self.codex_home.exists())
+        self.assertEqual("missing", rule_status(self.project, self.environ, PYTHON))
+        rules = self.codex_home / "rules"
+        rules.mkdir(parents=True)
+        (rules / rule_file_name(self.project)).write_text("# an older rule\n")
+        self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
+
+    def test_a_runtime_that_is_not_this_package_is_refused(self) -> None:
+        manifest = self.project / ".codex" / "orchestration" / "install-manifest.json"
+        data = json.loads(manifest.read_text())
+        module = ".codex/orchestration/codex_agents/routing.py"
+        changed = (self.project / module).read_bytes() + b"# drift\n"
+        (self.project / module).write_bytes(changed)
+        # A consistent manifest is not enough: the runtime digest must be this package's.
+        data["files"][module] = hashlib.sha256(changed).hexdigest()
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(HostCommandError, "recorded runtime"):
+            self.install()
+        self.assertFalse((self.codex_home / "rules").exists())
+        # A manifest whose file digests do not hold is refused too.
+        data["files"][module] = "0" * 64
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(HostCommandError, "differs from its manifest"):
+            self.install()
+
+    def test_copies_in_the_project_or_temporary_directories_are_refused(self) -> None:
+        inside = {"CODEX_HOME": str(self.project / ".codex-home")}
+        with self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
+            install_rule(self.project, inside, PYTHON)
+        with mock.patch.object(host_commands, "temp_roots", lambda: {self.codex_home}):
+            with self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
+                install_rule(self.project, self.environ, PYTHON)
+        self.assertFalse(self.codex_home.exists())
+
+    def test_planted_symlinks_in_the_copy_path_refuse(self) -> None:
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        self.codex_home.mkdir()
+        (self.codex_home / "agent-orchestration").symlink_to(elsewhere)
+        with self.assertRaisesRegex(HostCommandError, "unavailable"):
+            self.install()
+        self.assertEqual([], os.listdir(elsewhere))
+
+    def test_a_misplaced_or_tampered_binding_refuses(self) -> None:
+        self.install()
+        copy = expected_copy(self.codex_home, self.project)
+        moved = self.base / "moved" / copy.name
+        shutil.copytree(copy, moved)
+        with self.assertRaisesRegex(HostCommandError, "not where its binding says"):
+            bound_project_root(moved / ".codex" / "orchestration")
+        binding = copy / BINDING_RELATIVE
+        data = json.loads(binding.read_text())
+        binding.write_text(json.dumps({**data, "extra": 1}))
+        with self.assertRaisesRegex(HostCommandError, "binding is invalid"):
+            bound_project_root(copy / ".codex" / "orchestration")
+        binding.write_text(json.dumps({**data, "runtime_digest": "0" * 64}))
+        with self.assertRaisesRegex(HostCommandError, "not where its binding says"):
+            bound_project_root(copy / ".codex" / "orchestration")
+
+    def test_remove_deletes_the_rule_and_every_copy(self) -> None:
+        self.install()
+        copy = expected_copy(self.codex_home, self.project)
+        stale = copy.parent / ("f" * 64)
+        stale.mkdir(mode=0o700)
+        removed = remove_rule(self.project, self.environ)
+        self.assertEqual(
+            [str(rule_path(self.project, self.environ)), str(copy.parent)], removed
+        )
+        self.assertFalse(rule_path(self.project, self.environ).exists())
+        self.assertFalse(copy.parent.exists())
+        self.assertEqual([], remove_rule(self.project, self.environ))
+        # Removal works after the package files are gone too.
+        self.install()
+        shutil.rmtree(self.project / ".codex")
+        self.assertEqual(2, len(remove_rule(self.project, self.environ)))
+
+
 @NEEDS_TRUSTED_PYTHON
 class HostCommandCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
-        self.project = non_temporary_directory(self) / "project"
-        (self.project / ".codex" / "orchestration").mkdir(parents=True)
-        (self.project / ".codex" / "orchestration" / "cli.py").write_text("# stand-in\n")
-        self.codex_home = self.base / "codex-home"
+        outside = non_temporary_directory(self)
+        self.project = install_package(outside / "project")
+        # The copy may not sit in a temporary directory either.
+        self.codex_home = outside / "codex-home"
+        self.environ = {"CODEX_HOME": str(self.codex_home)}
+        self.home = self.base / "home"
 
-    def run_cli(self, *arguments: str, expected: int = 0) -> dict:
+    def run_cli(
+        self, *arguments: str, expected: int = 0, cli_path: Path | None = None,
+        own_project: bool = True,
+    ) -> dict:
+        project = ["--project-root", str(self.project)] if own_project else []
         completed = subprocess.run(
-            [sys.executable, str(ORCHESTRATION_ROOT / "cli.py"), *arguments,
-             "--project-root", str(self.project)],
+            [sys.executable, "-I", "-B", "-S", str(cli_path or ORCHESTRATION_ROOT / "cli.py"),
+             *arguments, *project],
             capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
-            env={**os.environ, "CODEX_HOME": str(self.codex_home)},
+            env={
+                **os.environ, **self.environ, "HOME": str(self.home),
+                "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+            },
         )
         self.assertEqual(expected, completed.returncode, completed.stderr or completed.stdout)
         return json.loads(completed.stdout)
 
     def test_host_command_reports_the_prefix_and_rule_without_writing(self) -> None:
         report = self.run_cli("host-command", expected=1)
-        cli_path = str(self.project / ".codex" / "orchestration" / "cli.py")
+        copy = expected_copy(self.codex_home, self.project)
         self.assertEqual(
-            {"ready": False, "argv_prefix": [BASE_PYTHON, *PYTHON_FLAGS, cli_path],
+            {"ready": False, "argv_prefix": [BASE_PYTHON, *PYTHON_FLAGS, str(copy / CLI_RELATIVE)],
              "codex_rule": "missing",
-             "rule_file": str(rule_path(self.project, {"CODEX_HOME": str(self.codex_home)}))},
+             "rule_file": str(rule_path(self.project, self.environ)),
+             "runtime_copy": str(copy)},
             report,
         )
         self.assertFalse(self.codex_home.exists())
@@ -438,16 +697,64 @@ class HostCommandCliTests(unittest.TestCase):
     def test_install_then_host_command_reports_installed(self) -> None:
         printed = self.run_cli("install-codex-rule", "--print")
         self.assertFalse(self.codex_home.exists())
-        self.assertEqual(render_rule(self.project), printed["rule_text"])
-        self.assertEqual("created", self.run_cli("install-codex-rule")["codex_rule"])
+        self.assertEqual(render_rule(self.project, environ=self.environ), printed["rule_text"])
+        written = self.run_cli("install-codex-rule")
+        self.assertEqual(
+            ("created", "created", printed["runtime_copy"]),
+            (written["codex_rule"], written["runtime_copy_status"], written["runtime_copy"]),
+        )
         self.assertEqual(printed["rule_text"], Path(printed["rule_file"]).read_text())
         self.assertEqual("unchanged", self.run_cli("install-codex-rule")["codex_rule"])
         report = self.run_cli("host-command")
         self.assertEqual(("installed", True), (report["codex_rule"], report["ready"]))
+        self.assertEqual(str(Path(written["runtime_copy"]) / CLI_RELATIVE), report["argv_prefix"][-1])
+
+    def test_the_copy_serves_only_its_project_and_only_while_it_matches(self) -> None:
+        copy = Path(self.run_cli("install-codex-rule")["runtime_copy"])
+        copy_cli = copy / CLI_RELATIVE
+        # Every allowlisted command parses under the exact prefix.
+        for command in PRIMARY_HOST_COMMANDS:
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    [BASE_PYTHON, *PYTHON_FLAGS, str(copy_cli), command, "--help"],
+                    capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+        # The own-root invariant uses the bound project, not the copy's location.
+        report = self.run_cli("validate", "--root", str(self.project), cli_path=copy_cli,
+                              expected=1, own_project=False)
+        self.assertIn("package_ready", report)
+        other = self.base / "other"
+        other.mkdir()
+        refused = self.run_cli(
+            "learning-status", "--project-root", str(other), cli_path=copy_cli, expected=2,
+            own_project=False,
+        )
+        self.assertTrue(refused["error"].startswith("--project-root is refused"), refused)
+        refused = self.run_cli(
+            "validate", "--root", str(copy), cli_path=copy_cli, expected=2, own_project=False
+        )
+        self.assertTrue(refused["error"].startswith("--root is refused"), refused)
+        # Owner and setup commands never run from the copy.
+        for command in ("host-command", "install-codex-rule", "learning-register"):
+            refused = self.run_cli(command, cli_path=copy_cli, expected=2)
+            self.assertEqual(
+                "a protected runtime copy runs only the primary-host commands", refused["error"]
+            )
+        # A change to the project's installed runtime stops the copy.
+        policy = self.project / ".codex" / "orchestration" / "config" / "routing-policy.json"
+        original = policy.read_bytes()
+        policy.write_bytes(original + b"\n")
+        refused = self.run_cli("validate", "--root", str(self.project), cli_path=copy_cli,
+                               expected=2, own_project=False)
+        self.assertIn("differs from its protected copy", refused["error"])
+        self.assertEqual("stale", self.run_cli("host-command", expected=1)["codex_rule"])
+        policy.write_bytes(original)
+        self.assertEqual("installed", self.run_cli("host-command")["codex_rule"])
+        self.assertEqual([], list(copy.rglob("__pycache__")))
 
     def test_a_differing_rule_needs_replace(self) -> None:
-        environ = {"CODEX_HOME": str(self.codex_home)}
-        write_rule(self.project, environ, "/opt/other/bin/python3")
+        write_rule(self.project, self.environ, "/opt/other/bin/python3")
         self.assertEqual("stale", self.run_cli("host-command", expected=1)["codex_rule"])
         refused = self.run_cli("install-codex-rule", expected=1)
         self.assertEqual(("differs", False), (refused["codex_rule"], refused["ready"]))
@@ -456,12 +763,30 @@ class HostCommandCliTests(unittest.TestCase):
         )
         self.assertEqual("installed", self.run_cli("host-command")["codex_rule"])
 
+    def test_remove_codex_rule_reports_what_it_removed(self) -> None:
+        installed = self.run_cli("install-codex-rule")
+        removed = self.run_cli("remove-codex-rule")
+        self.assertEqual(
+            {"ready": True,
+             "removed": [installed["rule_file"], str(Path(installed["runtime_copy"]).parent)]},
+            removed,
+        )
+        self.assertEqual({"ready": True, "removed": []}, self.run_cli("remove-codex-rule"))
+        self.assertEqual("missing", self.run_cli("host-command", expected=1)["codex_rule"])
+
     def test_refusals_are_fixed_messages_without_paths(self) -> None:
         self.codex_home.mkdir()
         (self.codex_home / "rules").symlink_to(self.base)
         report = self.run_cli("install-codex-rule", expected=2)
         self.assertEqual(
             {"ready": False, "error": "Codex rules directory is a symlink"}, report
+        )
+        (self.project / ".codex" / "orchestration" / "install-manifest.json").unlink()
+        report = self.run_cli("install-codex-rule", expected=2)
+        self.assertEqual(
+            {"ready": False,
+             "error": "the project has no install manifest; install the package first"},
+            report,
         )
 
 
