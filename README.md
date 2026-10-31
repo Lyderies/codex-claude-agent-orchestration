@@ -31,6 +31,34 @@ children are in development. See the [delivery plan](docs/delivery/plan.md) for 
 You need macOS or Linux, Python 3.11 or later, Git, and the Codex and Claude Code clients signed in
 with their subscriptions. API keys are refused.
 
+From the root of this repository, run one command:
+
+```sh
+./setup.sh [/path/to/project]
+```
+
+It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to quit) that:
+
+1. checks your machine and both sign-ins;
+2. lets you choose the project and previews the install;
+3. lets you choose which providers and Claude models children may use;
+4. installs, verifies and, if you agree, commits the files in the project (it never pushes);
+5. registers the learning collector;
+6. hands the terminal to the billing attestation, which only you can sign;
+7. optionally creates the Codex orchestrator profile;
+8. summarises the result and how to use it.
+
+Run it again on an installed project to update, verify or re-attest. It needs an interactive
+terminal and refuses to run piped or scripted. Full command output goes to a private temporary log,
+shown only if something fails. Set `NO_COLOR=1` for plain output. In Claude Code, use the
+`agent-orchestration` skill afterwards. In Codex, start with `codex -p orchestrator`.
+
+### Advanced: manual setup
+
+The wizard runs these commands. The installer also needs the project's
+`.codex/orchestration/project-agent-routing.json` and `operational-checks.json`, passed with
+`--project-agent-routing` and `--operational-checks` on the first install.
+
 1. **Install** into the top of a Git project. Without `--apply` the command only previews:
 
    ```sh
