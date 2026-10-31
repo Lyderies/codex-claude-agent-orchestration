@@ -402,6 +402,13 @@ class GitExecutableTests(unittest.TestCase):
         if sys.platform == "darwin":
             with mock.patch.object(git_plumbing, "git_candidates", lambda: ("/usr/bin/git",)):
                 self.assertIsNone(git_plumbing.git_executable())
+        # A git inside the repository it would inspect is never run.
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (trusted,)), \
+                mock.patch.object(git_plumbing, "temp_roots", lambda: set()):
+            self.assertEqual(trusted, git_plumbing.git_executable())
+            self.assertIsNone(
+                git_plumbing.git_executable(untrusted=[Path(trusted).parent.parent])
+            )
 
     def test_the_developer_directory_comes_from_the_root_owned_link(self) -> None:
         with mock.patch.object(git_plumbing, "sys") as fake_sys, \

@@ -18,11 +18,14 @@ The CLI the rule names is not the project's own ``.codex/orchestration/cli.py``.
 Codex keeps ``.codex`` read-only only at the top of a session's writable root, so
 a session opened on a parent folder could rewrite the project's copy and run it
 through the rule. The owner's setup instead copies the installed runtime into
-``${CODEX_HOME:-~/.codex}/agent-orchestration/<project>/<runtime>/``, next to
+``~/.codex/agent-orchestration/<project>/<runtime>/``, next to
 the rules directory itself: a session that could change that copy could already
-write a rule that allows anything. The copy is verified byte for byte against
-the project's installed files, carries a binding to its project, and is what the
-rule runs.
+write a rule that allows anything. Only the real `~/.codex` qualifies: a
+`CODEX_HOME` elsewhere or a symlinked `~/.codex` may resolve into a folder a
+session can write. The copy holds exactly this package's runtime files
+(`runtime_files.RUNTIME_FILES`, a constant, never the project's manifest), is
+verified byte for byte against the project's installed files, carries a binding
+to its project, and is what the rule runs.
 
 The rule leaves every later argument to the CLI. The copy therefore pins these
 commands to its bound project, the default learning state and its installed
@@ -50,6 +53,13 @@ from .host_paths import (
     temp_roots,
     trusted_location_problem,
     within,
+)
+from .runtime_files import (
+    ORCHESTRATION_PREFIX,
+    PACKAGE_DATA_FILES,
+    PROJECT_FILES,
+    RUNTIME_FILES,
+    runtime_digest,
 )
 
 # The subcommands a primary host runs during an orchestration. Defined once; the
@@ -91,8 +101,6 @@ MAX_RUNTIME_FILE_BYTES = 8 * 1_048_576
 MAX_BINDING_BYTES = 4096
 # The one package path under .claude, as the installer owns it.
 CLAUDE_SKILL_PREFIX = (".claude", "skills", "agent-orchestration")
-# Signed release data; the manifest records it but does not pin its bytes.
-UNPINNED_RUNTIME_FILE = "learning-releases.json"
 _HEX = frozenset("0123456789abcdef")
 # Isolated mode, no bytecode written into `.codex`, and no site-packages (see
 # host_paths): the CLI needs only the standard library and its own package.
@@ -110,6 +118,10 @@ _REFUSED_CATEGORIES = {"Cc", "Cf", "Cs", "Zl", "Zp"}
 
 class HostCommandError(RuntimeError):
     """A rule cannot be built or written safely; messages never carry paths."""
+
+
+class CodexHomeUnsupported(HostCommandError):
+    """The Codex home is not the plain `~/.codex` folder the rule and copy require."""
 
 
 class OwnRootRefused(HostCommandError):
@@ -212,13 +224,73 @@ def interpreter_path(
     return value
 
 
-def codex_home(environ: Mapping[str, str] | None = None) -> Path:
+def _home_folder(environ: Mapping[str, str]) -> Path:
+    value = environ.get("HOME") if "HOME" in environ else str(Path.home())
+    if not value or not os.path.isabs(value):
+        raise CodexHomeUnsupported("the home folder is not an absolute path")
+    return Path(os.path.normpath(value))
+
+
+def configured_codex_home(environ: Mapping[str, str] | None = None) -> Path:
+    """Where Codex keeps its settings in this environment: CODEX_HOME or ~/.codex."""
+
     environ = os.environ if environ is None else environ
     configured = environ.get("CODEX_HOME")
-    home = Path(configured).expanduser() if configured else Path.home() / ".codex"
+    if not configured:
+        return _home_folder(environ) / ".codex"
+    home = Path(configured).expanduser()
     if not home.is_absolute():
-        raise HostCommandError("CODEX_HOME is not an absolute path")
-    return home
+        raise CodexHomeUnsupported("CODEX_HOME is not an absolute path")
+    return Path(os.path.normpath(home))
+
+
+def codex_home(environ: Mapping[str, str] | None = None) -> Path:
+    """The protected Codex home the rule and its copy require: the real `$HOME/.codex`.
+
+    A session opened on the home folder keeps `~/.codex` read-only (it is that
+    workspace's own `.codex`), and a session opened inside a project cannot
+    reach it. A `CODEX_HOME` elsewhere, or a `~/.codex` that is a symlink, may
+    resolve into a folder a home-folder session can write, so neither is
+    supported. The home folder must be canonical, with no symlink and no
+    component another user could change, and `~/.codex`, when present, a real
+    directory of this user's that no one else can write.
+    """
+
+    environ = os.environ if environ is None else environ
+    home = _home_folder(environ)
+    expected = home / ".codex"
+    if configured_codex_home(environ) != expected:
+        raise CodexHomeUnsupported(
+            "CODEX_HOME points somewhere other than ~/.codex; the Codex rule and its "
+            "protected copy work only in ~/.codex"
+        )
+    _checked_text(str(home), "home folder")
+    if Path(os.path.realpath(home)) != home:
+        raise CodexHomeUnsupported(
+            "the home folder's path passes through a symbolic link; the Codex rule "
+            "needs a home folder at its real path"
+        )
+    problem = trusted_location_problem(home, [])
+    if problem is not None:
+        raise CodexHomeUnsupported(f"the home folder cannot be trusted: {problem}")
+    try:
+        info = os.lstat(expected)
+    except FileNotFoundError:
+        return expected
+    except OSError as exc:
+        raise CodexHomeUnsupported("~/.codex is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise CodexHomeUnsupported(
+            "~/.codex is a symbolic link; the Codex rule and its protected copy need a "
+            "real ~/.codex folder"
+        )
+    if not stat.S_ISDIR(info.st_mode):
+        raise CodexHomeUnsupported("~/.codex is not a folder")
+    if info.st_uid != os.geteuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise CodexHomeUnsupported(
+            "~/.codex belongs to another user or others can change it"
+        )
+    return expected
 
 
 def project_digest(root: Path) -> str:
@@ -312,37 +384,90 @@ def _manifest_version(raw: bytes) -> str:
     return json.loads(raw)["version"]
 
 
-def installed_runtime(root: Path) -> tuple[bytes, dict[str, bytes]]:
-    """The project's install manifest and every file it lists, integrity-checked.
-
-    Refused without a manifest: only an installed package has a runtime to copy
-    and a rule to name.
-    """
-
+def _require_manifest(root: Path) -> bytes:
     raw = _read_nofollow(root, MANIFEST_RELATIVE, MAX_MANIFEST_BYTES)
     if raw is None:
         raise HostCommandError("the project has no install manifest; install the package first")
+    _manifest_files(raw)
+    return raw
+
+
+def _runtime_contents(root: Path) -> dict[str, bytes]:
+    """This package's runtime files (RUNTIME_FILES, a constant) as they sit under `root`."""
+
     contents: dict[str, bytes] = {}
-    for relative, digest in sorted(_manifest_files(raw).items()):
-        content = _read_nofollow(root, relative, MAX_RUNTIME_FILE_BYTES)
+    for relative in RUNTIME_FILES:
+        content = _read_nofollow(root, ORCHESTRATION_PREFIX + relative, MAX_RUNTIME_FILE_BYTES)
         if content is None:
             raise HostCommandError("an installed runtime file is missing")
-        if (
-            PurePosixPath(relative).name != UNPINNED_RUNTIME_FILE
-            and hashlib.sha256(content).hexdigest() != digest
-        ):
-            raise HostCommandError("an installed runtime file differs from its manifest")
         contents[relative] = content
-    return raw, contents
+    return contents
 
 
-def _copy_root(root: Path, manifest: bytes, environ: Mapping[str, str] | None) -> Path:
-    home = Path(os.path.realpath(codex_home(environ)))
-    _checked_text(str(home), "Codex home")
-    copy = (
-        home / RUNTIME_CONTAINER / project_digest(root)
-        / hashlib.sha256(manifest).hexdigest()
-    )
+def _unexpected_entries(base: Path, files: set[str], *, ignore_finder: bool = False) -> bool:
+    """Whether `base` holds anything but `files` and the directories that hold them.
+
+    A `__pycache__` directory, a module or package of any kind, an extension
+    module, a symlink or any other extra entry counts.
+    """
+
+    directories = {
+        PurePosixPath(*PurePosixPath(item).parts[:index]).as_posix()
+        for item in files
+        for index in range(1, len(PurePosixPath(item).parts))
+    }
+    for current, subdirectories, names in os.walk(base, followlinks=False):
+        here = Path(current).relative_to(base)
+        for name in subdirectories:
+            if os.path.islink(Path(current, name)) or (here / name).as_posix() not in directories:
+                return True
+        for name in names:
+            path = Path(current, name)
+            if ignore_finder and name == ".DS_Store" and not os.path.islink(path):
+                continue
+            if (here / name).as_posix() not in files or os.path.islink(path):
+                return True
+    return False
+
+
+def _project_holds_extra_files(root: Path) -> bool:
+    """Whether the project's `.codex/orchestration` holds files the package does not.
+
+    Only this package's runtime and data files and the project's own
+    configuration may be there: a planted top-level module (`socket.py`), a
+    package, bytecode or an extension module would be a sign of tampering.
+    Finder's `.DS_Store`, which nothing imports, is ignored.
+    """
+
+    allowed = {*RUNTIME_FILES, *PACKAGE_DATA_FILES, *PROJECT_FILES}
+    return _unexpected_entries(root / ".codex" / "orchestration", allowed, ignore_finder=True)
+
+
+def _copy_manifest(version: str, contents: dict[str, bytes]) -> bytes:
+    """The manifest a copy carries: exactly the runtime files and their digests."""
+
+    manifest = {
+        "format": 1,
+        "version": version,
+        "files": {
+            ORCHESTRATION_PREFIX + relative: hashlib.sha256(contents[relative]).hexdigest()
+            for relative in RUNTIME_FILES
+        },
+    }
+    return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _copy_files() -> set[str]:
+    return {
+        *(ORCHESTRATION_PREFIX + relative for relative in RUNTIME_FILES),
+        MANIFEST_RELATIVE,
+        BINDING_RELATIVE,
+    }
+
+
+def _copy_root(root: Path, digest: str, environ: Mapping[str, str] | None) -> Path:
+    home = codex_home(environ)
+    copy = home / RUNTIME_CONTAINER / project_digest(root) / digest
     if any(within(copy, item) for item in [root, *temp_roots()]):
         raise HostCommandError(
             "the runtime copy would lie in the project or a temporary directory, "
@@ -354,24 +479,22 @@ def _copy_root(root: Path, manifest: bytes, environ: Mapping[str, str] | None) -
 def runtime_copy_root(project_root: Path, environ: Mapping[str, str] | None = None) -> Path:
     """Where the protected copy of the project's current installed runtime lives.
 
-    `<CODEX_HOME>/agent-orchestration/<project digest>/<manifest digest>`: the
-    manifest pins every runtime file's digest and the version, so a package
-    update names a new copy and leaves the rule stale until setup runs again.
+    `~/.codex/agent-orchestration/<project digest>/<runtime digest>`, where
+    the runtime digest covers every file the copy holds (RUNTIME_FILES), so a
+    package update names a new copy and leaves the rule stale until setup
+    runs again. A project without an install manifest has no runtime to copy.
     """
 
     root, _cli = project_cli(project_root)
-    raw = _read_nofollow(root, MANIFEST_RELATIVE, MAX_MANIFEST_BYTES)
-    if raw is None:
-        raise HostCommandError("the project has no install manifest; install the package first")
-    return _copy_root(root, raw, environ)
+    _require_manifest(root)
+    return _copy_root(root, runtime_digest(_runtime_contents(root)), environ)
 
 
-def _binding_bytes(root: Path, manifest: bytes) -> bytes:
-    version = _manifest_version(manifest)
+def _binding_bytes(root: Path, digest: str, version: str) -> bytes:
     binding = {
         "format": BINDING_FORMAT,
         "project_root": str(root),
-        "runtime_digest": hashlib.sha256(manifest).hexdigest(),
+        "runtime_digest": digest,
         "version": version,
     }
     return (json.dumps(binding, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -403,9 +526,10 @@ def bound_project_root(orchestration_root: Path) -> Path | None:
 
     The binding, the manifest and the code all sit in the owner-only copy, so
     the bound root is as trustworthy as the CLI reading it. The copy must sit
-    at exactly the path its binding implies, its manifest must have the bound
-    digest, and the project must still be a canonical directory. A project or
-    source tree has no binding and keeps using its own location.
+    at exactly the path its binding implies, its manifest must carry the bound
+    version, and the project must still be a canonical directory. A project or
+    source tree has no binding and keeps using its own location. The full
+    byte check is `runtime_copy_problem`, which every primary-host command runs.
     """
 
     copy = orchestration_root.parent.parent
@@ -423,11 +547,7 @@ def bound_project_root(orchestration_root: Path) -> Path | None:
     ):
         raise HostCommandError("the protected runtime copy is not where its binding says")
     manifest = _read_nofollow(copy, MANIFEST_RELATIVE, MAX_MANIFEST_BYTES)
-    if (
-        manifest is None
-        or hashlib.sha256(manifest).hexdigest() != binding["runtime_digest"]
-        or _manifest_version(manifest) != binding["version"]
-    ):
+    if manifest is None or _manifest_version(manifest) != binding["version"]:
         raise HostCommandError("the protected runtime copy differs from its binding")
     if Path(os.path.realpath(root)) != root or not root.is_dir():
         raise HostCommandError("the bound project is unavailable")
@@ -437,67 +557,43 @@ def bound_project_root(orchestration_root: Path) -> Path | None:
 def runtime_copy_problem(copy: Path, root: Path) -> str | None:
     """Why `copy` is not the protected copy of `root`'s current runtime, or None.
 
-    The copy's binding must name `root` and the copy's own manifest digest,
-    the copy's manifest must be the project's, every file the manifest lists
-    must be byte-for-byte the project's, and the copy must sit where no
-    workspace or temporary directory reaches. Messages carry no paths.
+    The copy must sit where no workspace or temporary directory reaches and
+    hold exactly the runtime files, its manifest and its binding. Its binding
+    must name `root`, its name and binding the digest of those files, and its
+    manifest exactly those files at the bound version. Every runtime file must
+    be byte-for-byte the project's, and the project's manifest version the
+    bound one. Messages carry no paths.
     """
 
     try:
         problem = trusted_location_problem(copy / CLI_RELATIVE, [root, *temp_roots()])
         if problem is not None:
             return f"the runtime copy cannot be trusted: {problem}"
+        if _unexpected_entries(copy, _copy_files()):
+            return "the runtime copy holds files it should not, such as bytecode"
         raw = _read_nofollow(copy, BINDING_RELATIVE, MAX_BINDING_BYTES)
         if raw is None:
             return "the runtime copy has no binding"
         binding = _parse_binding(raw)
         if binding["project_root"] != str(root) or binding["runtime_digest"] != copy.name:
             return "the runtime copy is bound to another project or runtime"
+        ours = _runtime_contents(copy)
+        if runtime_digest(ours) != copy.name:
+            return "the runtime copy's files differ from its name"
+        if _read_nofollow(copy, MANIFEST_RELATIVE, MAX_MANIFEST_BYTES) != _copy_manifest(
+            binding["version"], ours
+        ):
+            return "the runtime copy's manifest differs from its files"
         project_manifest = _read_nofollow(root, MANIFEST_RELATIVE, MAX_MANIFEST_BYTES)
-        copy_manifest = _read_nofollow(copy, MANIFEST_RELATIVE, MAX_MANIFEST_BYTES)
         if project_manifest is None:
             return "the project has no install manifest"
-        if copy_manifest != project_manifest:
-            return "the runtime copy's manifest differs from the project's"
-        if hashlib.sha256(copy_manifest).hexdigest() != copy.name:
-            return "the runtime copy's manifest differs from its name"
-        if _manifest_version(copy_manifest) != binding["version"]:
-            return "the runtime copy's version differs from its binding"
-        files = _manifest_files(copy_manifest)
-        for relative in sorted(files):
-            ours = _read_nofollow(copy, relative, MAX_RUNTIME_FILE_BYTES)
-            theirs = _read_nofollow(root, relative, MAX_RUNTIME_FILE_BYTES)
-            if ours is None or theirs is None or ours != theirs:
-                return "the runtime copy differs from the project's installed files"
-        if _unexpected_entries(copy, {*files, MANIFEST_RELATIVE, BINDING_RELATIVE}):
-            return "the runtime copy holds files it should not, such as bytecode"
+        if _manifest_version(project_manifest) != binding["version"]:
+            return "the project's installed version differs from the runtime copy's"
+        if _runtime_contents(root) != ours:
+            return "the runtime copy differs from the project's installed files"
     except HostCommandError as exc:
         return str(exc)
     return None
-
-
-def _unexpected_entries(copy: Path, expected: set[str]) -> bool:
-    """Whether the copy holds anything but `expected` files and their directories.
-
-    A `__pycache__` directory, a symlink or any other extra entry counts; the
-    copy is written without bytecode and nothing else may add to it.
-    """
-
-    directories = {
-        PurePosixPath(*PurePosixPath(item).parts[:index]).as_posix()
-        for item in expected
-        for index in range(1, len(PurePosixPath(item).parts))
-    }
-    for current, subdirectories, names in os.walk(copy, followlinks=False):
-        base = Path(current).relative_to(copy)
-        for name in subdirectories:
-            relative = (base / name).as_posix()
-            if os.path.islink(Path(current, name)) or relative not in directories:
-                return True
-        for name in names:
-            if (base / name).as_posix() not in expected or os.path.islink(Path(current, name)):
-                return True
-    return False
 
 
 def argv_prefix(
@@ -650,8 +746,9 @@ def rule_status(
     root, _cli = project_cli(project_root)
     python = interpreter_path(interpreter, project_root=root)
     name = rule_file_name(root)
+    home = codex_home(environ)
     try:
-        directory = _open_rules_directory(codex_home(environ), create=False)
+        directory = _open_rules_directory(home, create=False)
         if directory is None:
             return "missing"
         try:
@@ -805,10 +902,30 @@ def install_runtime_copy(
     created owner-only through no-follow descriptors.
     """
 
+    from .learning_store import COLLECTOR_RUNTIME_DIGEST, PACKAGE_VERSION
+
     root, cli = project_cli(project_root)
-    manifest, files = installed_runtime(root)
+    codex_home(environ)
+    manifest = _require_manifest(root)
     _validate_runtime(cli)
-    copy = _copy_root(root, manifest, environ)
+    if _project_holds_extra_files(root):
+        raise HostCommandError(
+            "the project's .codex/orchestration folder holds files the package does not "
+            "install, such as bytecode or extra modules; remove them, update the install "
+            "and run setup again"
+        )
+    # The copy is exactly this package's runtime file set, read once, and its bytes
+    # must be the runtime this code records for itself; the project's manifest only
+    # supplies the version.
+    files = _runtime_contents(root)
+    digest = runtime_digest(files)
+    version = _manifest_version(manifest)
+    if digest != COLLECTOR_RUNTIME_DIGEST or version != PACKAGE_VERSION:
+        raise HostCommandError(
+            "the installed runtime differs from this package's recorded runtime; "
+            "update the install first"
+        )
+    copy = _copy_root(root, digest, environ)
     home = copy.parent.parent.parent
     try:
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -832,10 +949,10 @@ def install_runtime_copy(
         os.mkdir(staging, 0o700, dir_fd=container)
         staged = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=container)
         try:
-            for relative, content in files.items():
-                _write_new_file(staged, relative, content)
-            _write_new_file(staged, MANIFEST_RELATIVE, manifest)
-            _write_new_file(staged, BINDING_RELATIVE, _binding_bytes(root, manifest))
+            for relative in RUNTIME_FILES:
+                _write_new_file(staged, ORCHESTRATION_PREFIX + relative, files[relative])
+            _write_new_file(staged, MANIFEST_RELATIVE, _copy_manifest(version, files))
+            _write_new_file(staged, BINDING_RELATIVE, _binding_bytes(root, digest, version))
         finally:
             os.close(staged)
         try:
@@ -867,7 +984,7 @@ def prune_runtime_copies(
     """Remove this project's other runtime copies once the rule names `keep`."""
 
     root, _cli = project_cli(project_root)
-    home = Path(os.path.realpath(codex_home(environ)))
+    home = codex_home(environ)
     container = open_private_directories(
         home, (RUNTIME_CONTAINER, project_digest(root)), create=False
     )
@@ -919,15 +1036,31 @@ def remove_rule(
     """Owner removal: delete this project's rule file and every runtime copy for it.
 
     The project need not still hold an installed package (removal may come
-    after the package files are gone), so only its resolved path is used.
-    Symlinks are never followed: a symlinked rule or copy directory refuses.
-    Returns the paths removed, or an empty list when there was nothing.
+    after the package files are gone, or the project may sit in a temporary
+    folder), so only its resolved path is used. It looks in `~/.codex` and,
+    for rules an earlier version wrote, in a different `CODEX_HOME`. Symlinks
+    are never followed: a symlinked rules or copy directory refuses. Returns
+    the paths removed, or an empty list when there was nothing.
     """
 
+    environ = os.environ if environ is None else environ
     root = Path(os.path.realpath(Path(project_root).expanduser()))
     _checked_text(str(root), "project root")
     digest = project_digest(root)
-    home = codex_home(environ)
+    homes = [_home_folder(environ) / ".codex"]
+    try:
+        configured = configured_codex_home(environ)
+    except CodexHomeUnsupported:
+        configured = homes[0]  # an unusable CODEX_HOME never held a rule of ours
+    if os.path.realpath(configured) != os.path.realpath(homes[0]):
+        homes.append(configured)
+    removed: list[str] = []
+    for home in homes:
+        removed.extend(_remove_from(home, digest))
+    return removed
+
+
+def _remove_from(home: Path, digest: str) -> list[str]:
     removed: list[str] = []
     directory = _open_rules_directory(home, create=False)
     if directory is not None:

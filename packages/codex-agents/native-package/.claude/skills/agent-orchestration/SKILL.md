@@ -6,8 +6,10 @@ description: Route and supervise subagents from a Claude Code primary through th
 # Agent orchestration (Claude primary)
 
 Keep the primary agent as the decision owner and final synthesizer. Run each command
-below as `python3 .codex/orchestration/cli.py <command> --project-root <exact-root>`
-from the project root (`validate` takes `--root <exact-root>` instead). The CLI detects the Claude host from Claude Code's own
+below as `python3 -I -B -S -X pycache_prefix=/dev/null .codex/orchestration/cli.py
+<command> --project-root <exact-root>` from the project root (`validate` takes
+`--root <exact-root>` instead); the isolation flags keep Python from writing or reading
+bytecode in `.codex/orchestration`. The CLI detects the Claude host from Claude Code's own
 environment and refuses `host_client_unknown` if it cannot; never set or unset host
 markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--bare`.
 

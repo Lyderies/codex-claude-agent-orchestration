@@ -107,7 +107,7 @@ def _bind_committed_project_bytes(
     *,
     subject: str = "project agent mapping and mapped agents",
 ) -> None:
-    git_executable = find_git()
+    git_executable = find_git(untrusted=[root])
     if git_executable is None:
         raise PolicyError("project agent mapping trust is unavailable")
     if repository_layout_problem(git_executable, root) is not None:
@@ -174,7 +174,7 @@ def _committed_in_head(root: Path, relative: str) -> bool:
     """
 
     unavailable = "project provider routing trust is unavailable"
-    git_executable = find_git()
+    git_executable = find_git(untrusted=[root])
     if git_executable is None:
         raise ContractError(unavailable)
     if repository_layout_problem(git_executable, root) is not None:

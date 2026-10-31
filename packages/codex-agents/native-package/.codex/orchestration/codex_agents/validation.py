@@ -83,8 +83,11 @@ EXPECTED_HOOK_EVENTS = {
     "PreToolUse",
     "PostToolUse",
 }
+# Isolated like every other launch, so a hook neither writes bytecode into
+# `.codex/orchestration` (which the protected runtime copy refuses) nor reads any.
 EXPECTED_HOOK_COMMAND = (
-    'python3 "$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py" '
+    "python3 -I -B -S -X pycache_prefix=/dev/null "
+    '"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py" '
     "--client-version codex-hooks-v1"
 )
 ASYNC_HOOK_EVENTS = {

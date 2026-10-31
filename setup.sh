@@ -2056,7 +2056,7 @@ check_rule() { # check_rule -> RULE_STATUS (installed, missing, stale or empty),
 commands_screen() {
   screen_reset; begin_step 8
   body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it later, use the remove command shown at the end of setup."
-  body "Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). It runs a protected copy of the orchestrator kept in your Codex settings folder, so a session opened on a folder above this project cannot change what it runs. Never start Codex with your home folder's parent or / as its workspace."
+  body "Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). It runs a protected copy of the orchestrator in ~/.codex that sessions opened on a project cannot change. Never open Codex on your home folder, its parent or / while the rule exists."
   if [ "$RULE_STATUS" = stale ]; then
     list_add warn "A rule for this project already exists and differs from this one, for example after a Python upgrade (the rule names the exact Python build) or a package update. It stays unchanged unless you replace it; until then Codex sessions may not reach the orchestrator."
   fi

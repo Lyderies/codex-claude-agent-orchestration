@@ -59,9 +59,11 @@ It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to
 8. when Codex sessions may orchestrate the project, offers the Codex commands rule, which lets
    only this project's everyday orchestrator commands run outside Codex's sandbox (owner
    commands stay blocked). Every Codex session on the machine loads the rule; it runs a
-   protected copy of the orchestrator in the Codex settings folder, so a session opened on a
-   parent folder cannot change what it runs. Never start Codex with your home folder's parent
-   or `/` as its workspace. Delete the rule file, or run the remove command, to undo it;
+   protected copy of the orchestrator in `~/.codex` that sessions opened on a project cannot
+   change. Never open Codex on your home folder, its parent or `/` (or add `~` or `~/.codex`
+   with `--add-dir`) while the rule exists. Only the real `~/.codex` is supported, not a
+   `CODEX_HOME` elsewhere or a symlinked `~/.codex`. Delete the rule file, or run the remove
+   command, to undo it;
 9. summarises the result and how to use it.
 
 Run it again on an installed project to update, verify or re-attest. It needs an interactive
@@ -204,13 +206,18 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    python3 .codex/orchestration/cli.py install-codex-rule --project-root "$PWD"
    ```
 
-   It writes `${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<digest>.rules` and prints
-   its path; `--print` shows the rule without writing it. The rule names the resolved base
-   interpreter of the `python3` that ran it, with the isolation flags `-I -B -S`, so use the
-   one your Codex sessions find first on `PATH`, and run it again after a Python upgrade. It
-   refuses an interpreter inside the project, in a temporary directory or writable by
-   another user, and a project in a temporary folder. Start Codex sessions in the project's
-   root folder, where Codex keeps `.codex` read-only. Delete the file to undo it.
+   It writes `~/.codex/rules/agent-orchestration-<digest>.rules` and a protected copy of the
+   orchestrator's runtime files under `~/.codex/agent-orchestration/`, and prints both;
+   `--print` shows the rule without writing it. The rule runs that copy, never the project's
+   own `cli.py`, with the resolved base interpreter of the `python3` that ran it and the
+   isolation flags `-I -B -S -X pycache_prefix=/dev/null`, so use the one your Codex
+   sessions find first on `PATH`, and run it again after a Python upgrade or a package
+   update. It refuses an interpreter inside the project, in a temporary directory or
+   writable by another user, a project in a temporary folder, a project whose
+   `.codex/orchestration` holds files the package does not install (such as bytecode), and
+   a Codex home other than the real `~/.codex`. Every Codex session loads the rule, so never
+   open Codex on your home folder, its parent or `/` while it exists. Undo it with
+   `python3 .codex/orchestration/cli.py remove-codex-rule --project-root "$PWD"`.
 
 ## Development
 

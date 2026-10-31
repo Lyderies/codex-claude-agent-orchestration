@@ -49,24 +49,16 @@ from .learning_contracts import (
     validate_execution_configuration,
 )
 from .learning_adapters import HOOK_EVENTS, empty_usage, load_client_capabilities, reconcile_run
+from .runtime_files import ORCHESTRATION_PREFIX, RUNTIME_FILES, runtime_digest
 
 
 def _collector_runtime_digest() -> str:
+    """The digest of every runtime file this process runs from (`RUNTIME_FILES`)."""
+
     orchestration_root = Path(__file__).resolve().parent.parent
-    paths = [
-        orchestration_root / "cli.py",
-        orchestration_root / "config" / "learning-clients.json",
-        *sorted((orchestration_root / "codex_agents").glob("*.py")),
-    ]
-    hasher = hashlib.sha256()
-    for path in paths:
-        relative = path.relative_to(orchestration_root).as_posix().encode("utf-8")
-        hasher.update(len(relative).to_bytes(4, "big"))
-        hasher.update(relative)
-        content = path.read_bytes()
-        hasher.update(len(content).to_bytes(8, "big"))
-        hasher.update(content)
-    return hasher.hexdigest()
+    return runtime_digest(
+        {relative: (orchestration_root / relative).read_bytes() for relative in RUNTIME_FILES}
+    )
 
 
 def _package_version() -> str:
@@ -896,36 +888,20 @@ def validate_collector_runtime(cli_path: Path) -> dict[str, str | int]:
                 os.close(descriptor)
         if _version_tuple(version) is None:
             raise ContractError("package VERSION is invalid")
-        prefix = ".codex/orchestration/"
-        cli_relative = f"{prefix}cli.py"
-        clients_relative = f"{prefix}config/learning-clients.json"
-        module_paths = sorted(
-            path
-            for path in paths
-            if path.startswith(f"{prefix}codex_agents/") and path.endswith(".py")
-        )
-        runtime_paths = [cli_relative, clients_relative, *module_paths]
-        if (
-            cli_relative not in contents
-            or clients_relative not in contents
-            or f"{prefix}codex_agents/learning_store.py" not in module_paths
-        ):
+        # The runtime is this package's own file set, never whatever else the
+        # manifest lists: an extra module there is not runtime, and the digest
+        # covers every runtime file, configuration and schemas included.
+        if any(ORCHESTRATION_PREFIX + relative not in contents for relative in RUNTIME_FILES):
             raise ContractError("installed collector runtime is incomplete")
-        hasher = hashlib.sha256()
-        for path in runtime_paths:
-            relative = path.removeprefix(prefix).encode("utf-8")
-            content = contents[path]
-            hasher.update(len(relative).to_bytes(4, "big"))
-            hasher.update(relative)
-            hasher.update(len(content).to_bytes(8, "big"))
-            hasher.update(content)
-        runtime_digest = hasher.hexdigest()
-        if version != PACKAGE_VERSION or runtime_digest != COLLECTOR_RUNTIME_DIGEST:
+        digest = runtime_digest(
+            {relative: contents[ORCHESTRATION_PREFIX + relative] for relative in RUNTIME_FILES}
+        )
+        if version != PACKAGE_VERSION or digest != COLLECTOR_RUNTIME_DIGEST:
             raise ContractError("installed collector identity is inconsistent")
         return {
             "schema_version": COLLECTOR_AUTHORIZATION_SCHEMA_VERSION,
             "runtime_version": version,
-            "runtime_digest": runtime_digest,
+            "runtime_digest": digest,
         }
     except (
         ContractError,

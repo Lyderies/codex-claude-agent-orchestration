@@ -2011,7 +2011,7 @@ def load_operational_check_configuration(
         if descriptor >= 0:
             os.close(descriptor)
 
-    git_executable = find_git()
+    git_executable = find_git(untrusted=[root])
     if git_executable is None:
         raise ContractError("operational check configuration trust is unavailable")
     if repository_layout_problem(git_executable, root) is not None:

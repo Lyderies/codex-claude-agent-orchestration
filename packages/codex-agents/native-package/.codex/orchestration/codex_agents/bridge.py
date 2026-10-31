@@ -282,7 +282,7 @@ def _claude_context_path(relative: str) -> bool:
 
 
 def _git(root: Path, *arguments: str, text: bool = False) -> subprocess.CompletedProcess:
-    executable = find_git()
+    executable = find_git(untrusted=[root])
     if executable is None:
         raise BridgeRefused("git is unavailable")
     try:
@@ -307,7 +307,7 @@ def export_committed_paths(
     """
 
     root = repository_root.resolve()
-    executable = find_git()
+    executable = find_git(untrusted=[root])
     if executable is None or repository_layout_problem(executable, root) is not None:
         raise BridgeRefused("project repository cannot be trusted for export")
     top = _git(root, "rev-parse", "--show-toplevel", text=True)

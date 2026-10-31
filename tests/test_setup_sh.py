@@ -611,9 +611,9 @@ class SetupScriptTests(unittest.TestCase):
     def test_commands_and_commit_screens_say_what_the_rule_and_commit_do(self) -> None:
         text = SETUP.read_text(encoding="utf-8")
         self.assertIn("Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). "
-                      "It runs a protected copy of the orchestrator kept in your Codex settings folder, so a "
-                      "session opened on a folder above this project cannot change what it runs. Never start "
-                      "Codex with your home folder's parent or / as its workspace.", text)
+                      "It runs a protected copy of the orchestrator in ~/.codex that sessions opened on a "
+                      "project cannot change. Never open Codex on your home folder, its parent or / while "
+                      "the rule exists.", text)
         self.assertNotIn("It applies to Codex sessions started in this project's root folder", text)
         self.assertIn("The commit skips the project's Git hooks", text)
         self.assertNotIn("or a commit hook stopped it", text)

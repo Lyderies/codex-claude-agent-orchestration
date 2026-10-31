@@ -28,6 +28,7 @@ from codex_agents.host_commands import (
     CLI_RELATIVE,
     PRIMARY_HOST_COMMANDS,
     PYTHON_FLAGS,
+    CodexHomeUnsupported,
     HostCommandError,
     argv_prefix,
     bound_project_root,
@@ -43,7 +44,9 @@ from codex_agents.host_commands import (
     runtime_copy_root,
     write_rule,
 )
+from codex_agents.runtime_files import ORCHESTRATION_PREFIX, RUNTIME_FILES, runtime_digest
 from codex_agents.learning_store import (
+    COLLECTOR_RUNTIME_DIGEST,
     PACKAGE_VERSION,
     CollectorError,
     LearningLedger,
@@ -106,19 +109,23 @@ def non_temporary_directory(test: unittest.TestCase) -> Path:
 
 
 def stand_in_project(project: Path) -> Path:
-    """A project with a stand-in CLI and the manifest that names it."""
+    """A project with stand-ins for every runtime file and the manifest that names them."""
 
-    (project / ".codex" / "orchestration").mkdir(parents=True)
-    cli_path = project / CLI_RELATIVE
-    cli_path.write_text("# stand-in\n")
-    manifest = {
-        "format": 1, "version": "0.0.1",
-        "files": {CLI_RELATIVE.as_posix(): hashlib.sha256(cli_path.read_bytes()).hexdigest()},
-    }
-    (project / ".codex" / "orchestration" / "install-manifest.json").write_text(
-        json.dumps(manifest)
+    orchestration = project / ".codex" / "orchestration"
+    files = {}
+    for relative in RUNTIME_FILES:
+        path = orchestration / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# stand-in {relative}\n")
+        files[ORCHESTRATION_PREFIX + relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (orchestration / "install-manifest.json").write_text(
+        json.dumps({"format": 1, "version": "0.0.1", "files": files})
     )
     return project
+
+
+def without_codex_home(environ: dict) -> dict:
+    return {key: value for key, value in environ.items() if key != "CODEX_HOME"}
 
 
 def install_package(project: Path) -> Path:
@@ -143,11 +150,11 @@ def install_package(project: Path) -> Path:
 
 
 def expected_copy(codex_home: Path, project: Path) -> Path:
-    manifest = (project / ".codex" / "orchestration" / "install-manifest.json").read_bytes()
-    return (
-        Path(os.path.realpath(codex_home)) / "agent-orchestration"
-        / project_digest(project.resolve()) / hashlib.sha256(manifest).hexdigest()
+    orchestration = project / ".codex" / "orchestration"
+    digest = runtime_digest(
+        {relative: (orchestration / relative).read_bytes() for relative in RUNTIME_FILES}
     )
+    return codex_home / "agent-orchestration" / project_digest(project.resolve()) / digest
 
 
 def _python_trusted() -> bool:
@@ -198,8 +205,11 @@ class RuleTests(unittest.TestCase):
         self.no_temp_roots.start()
         self.addCleanup(self.no_temp_roots.stop)
         self.project = self.make_project("project")
-        self.codex_home = self.base / "codex-home"
-        self.environ = {"CODEX_HOME": str(self.codex_home)}
+        # The rule and its copy live only in the real ~/.codex of this HOME.
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.codex_home = self.home / ".codex"
+        self.environ = {"HOME": str(self.home)}
 
     def make_project(self, name: str) -> Path:
         return stand_in_project(self.base / name)
@@ -319,10 +329,13 @@ class RuleTests(unittest.TestCase):
             self.codex_home / "rules" / f"agent-orchestration-{digest}.rules",
             rule_path(self.project, self.environ),
         )
-        home = Path.home() / ".codex" / "rules" / f"agent-orchestration-{digest}.rules"
-        self.assertEqual(home, rule_path(self.project, {}))
         with self.assertRaisesRegex(HostCommandError, "absolute"):
-            rule_path(self.project, {"CODEX_HOME": "relative/codex"})
+            rule_path(self.project, {**self.environ, "CODEX_HOME": "relative/codex"})
+        # CODEX_HOME may name ~/.codex itself, never another folder.
+        self.assertEqual(
+            rule_path(self.project, self.environ),
+            rule_path(self.project, {**self.environ, "CODEX_HOME": str(self.codex_home)}),
+        )
 
     def test_write_is_private_atomic_and_idempotent(self) -> None:
         self.assertEqual("missing", rule_status(self.project, self.environ, PYTHON))
@@ -447,7 +460,7 @@ class RuleTests(unittest.TestCase):
             completed = subprocess.run(
                 ["codex", "execpolicy", "check", "--rules", str(rules), *argv],
                 capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
-                env={**os.environ, "CODEX_HOME": str(self.codex_home)},
+                env={**without_codex_home(os.environ), "HOME": str(self.home)},
             )
             self.assertEqual(0, completed.returncode, completed.stderr)
             return json.loads(completed.stdout)
@@ -483,8 +496,11 @@ class ProtectedCopyTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.project = install_package(self.base / "project")
-        self.codex_home = self.base / "codex-home"
-        self.environ = {"CODEX_HOME": str(self.codex_home)}
+        # The rule and its copy live only in the real ~/.codex of this HOME.
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.codex_home = self.home / ".codex"
+        self.environ = {"HOME": str(self.home)}
 
     def install(self, **kwargs) -> dict:
         return install_rule(self.project, self.environ, PYTHON, **kwargs)
@@ -497,13 +513,32 @@ class ProtectedCopyTests(unittest.TestCase):
              "runtime_copy_status": "created"},
             installed,
         )
-        manifest = json.loads(
-            (self.project / ".codex" / "orchestration" / "install-manifest.json").read_text()
+        # Exactly this package's runtime files, byte for byte: no skills, hook,
+        # release data or anything else the project's manifest lists.
+        copied = sorted(
+            path.relative_to(copy).as_posix() for path in copy.rglob("*") if path.is_file()
         )
-        for relative in manifest["files"]:
+        self.assertEqual(
+            sorted([
+                *(ORCHESTRATION_PREFIX + relative for relative in RUNTIME_FILES),
+                ".codex/orchestration/install-manifest.json", BINDING_RELATIVE,
+            ]),
+            copied,
+        )
+        for relative in RUNTIME_FILES:
             self.assertEqual(
-                (self.project / relative).read_bytes(), (copy / relative).read_bytes(), relative
+                (self.project / ORCHESTRATION_PREFIX / relative).read_bytes(),
+                (copy / ORCHESTRATION_PREFIX / relative).read_bytes(), relative,
             )
+        copy_manifest = json.loads(
+            (copy / ".codex" / "orchestration" / "install-manifest.json").read_text()
+        )
+        self.assertEqual(
+            {ORCHESTRATION_PREFIX + relative for relative in RUNTIME_FILES},
+            set(copy_manifest["files"]),
+        )
+        # The copy's name is the digest of every file it runs.
+        self.assertEqual(COLLECTOR_RUNTIME_DIGEST, copy.name)
         for current, directories, files in os.walk(self.codex_home / "agent-orchestration"):
             for name in directories:
                 self.assertEqual(0o700, stat.S_IMODE(os.lstat(Path(current, name)).st_mode))
@@ -569,17 +604,17 @@ class ProtectedCopyTests(unittest.TestCase):
         host_commands.remove_tree_at(os.open(copy.parent, os.O_RDONLY), copy.name)
         self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
         self.install()
-        # A package update names a new copy, so the old rule is stale until setup.
+        # Another installed version leaves the rule stale until setup runs again.
         manifest = self.project / ".codex" / "orchestration" / "install-manifest.json"
         data = json.loads(manifest.read_text())
-        manifest.write_text(json.dumps(data))
+        manifest.write_text(json.dumps({**data, "version": "0.0.1"}))
         self.assertEqual("stale", rule_status(self.project, self.environ, PYTHON))
-        self.assertEqual("replaced", self.install(replace=True)["codex_rule"])
+        manifest.write_text(json.dumps(data))
         self.assertEqual("installed", rule_status(self.project, self.environ, PYTHON))
-        # Only the copy the rule names is kept.
-        self.assertEqual(
-            [expected_copy(self.codex_home, self.project).name], os.listdir(copy.parent)
-        )
+        # Setup keeps only the copy the rule names.
+        (copy.parent / ("f" * 64)).mkdir(mode=0o700)
+        self.assertEqual("unchanged", self.install()["codex_rule"])
+        self.assertEqual([copy.name], os.listdir(copy.parent))
 
     def test_a_rule_naming_the_project_cli_is_stale(self) -> None:
         self.install()
@@ -622,13 +657,82 @@ class ProtectedCopyTests(unittest.TestCase):
         # A manifest whose file digests do not hold is refused too.
         data["files"][module] = "0" * 64
         manifest.write_text(json.dumps(data))
-        with self.assertRaisesRegex(HostCommandError, "differs from its manifest"):
+        with self.assertRaisesRegex(HostCommandError, "recorded runtime"):
             self.install()
 
+    def test_extra_files_in_the_project_runtime_refuse_the_copy(self) -> None:
+        orchestration = self.project / ".codex" / "orchestration"
+        manifest = orchestration / "install-manifest.json"
+        original = manifest.read_text()
+        # A parent-folder session plants a top-level module and lists it, with its
+        # digest, in the project's manifest: the copy never takes the manifest's word.
+        planted = orchestration / "socket.py"
+        planted.write_text("raise SystemExit('planted module ran')\n")
+        data = json.loads(original)
+        data["files"][".codex/orchestration/socket.py"] = hashlib.sha256(
+            planted.read_bytes()
+        ).hexdigest()
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(HostCommandError, "files the package does not install"):
+            self.install()
+        self.assertFalse(self.codex_home.exists())
+        planted.unlink()
+        manifest.write_text(original)
+        for extra in (
+            orchestration / "codex_agents" / "__pycache__" / "routing.cpython-312.pyc",
+            orchestration / "codex_agents" / "native.so",
+            orchestration / "extra_package" / "__init__.py",
+        ):
+            with self.subTest(extra=extra.name):
+                extra.parent.mkdir(exist_ok=True)
+                extra.write_bytes(b"")
+                with self.assertRaisesRegex(HostCommandError, "does not install"):
+                    self.install()
+                extra.unlink()
+                if extra.parent.name in {"__pycache__", "extra_package"}:
+                    extra.parent.rmdir()
+        # Finder's metadata is not importable and is ignored; project files are allowed.
+        (orchestration / ".DS_Store").write_bytes(b"")
+        (orchestration / "provider-routing.json").write_text("{}")
+        self.assertEqual("created", self.install()["codex_rule"])
+
+    def test_only_the_real_home_codex_folder_is_supported(self) -> None:
+        elsewhere = self.base / "codex-config"
+        for environ in (
+            {**self.environ, "CODEX_HOME": str(elsewhere)},
+            {**self.environ, "CODEX_HOME": str(self.home / "codex")},
+        ):
+            with self.subTest(codex_home=environ["CODEX_HOME"]):
+                with self.assertRaisesRegex(CodexHomeUnsupported, "only in ~/.codex"):
+                    install_rule(self.project, environ, PYTHON)
+                with self.assertRaisesRegex(CodexHomeUnsupported, "only in ~/.codex"):
+                    rule_status(self.project, environ, PYTHON)
+        # A symlinked ~/.codex may resolve into a folder a home session can write.
+        elsewhere.mkdir(mode=0o700)
+        self.codex_home.symlink_to(elsewhere)
+        with self.assertRaisesRegex(CodexHomeUnsupported, "symbolic link"):
+            install_rule(self.project, self.environ, PYTHON)
+        self.assertEqual([], os.listdir(elsewhere))
+        self.codex_home.unlink()
+        # A home folder reached through a symlink is refused too.
+        linked_home = self.base / "linked-home"
+        linked_home.symlink_to(self.home)
+        with self.assertRaisesRegex(CodexHomeUnsupported, "symbolic link"):
+            install_rule(self.project, {"HOME": str(linked_home)}, PYTHON)
+        # ~/.codex that others can change is refused.
+        self.codex_home.mkdir(mode=0o700)
+        self.codex_home.chmod(0o777)
+        with self.assertRaisesRegex(CodexHomeUnsupported, "others can change"):
+            install_rule(self.project, self.environ, PYTHON)
+        self.codex_home.chmod(0o700)
+        self.assertEqual("created", self.install()["codex_rule"])
+
     def test_copies_in_the_project_or_temporary_directories_are_refused(self) -> None:
-        inside = {"CODEX_HOME": str(self.project / ".codex-home")}
+        # A home folder inside the project would put ~/.codex there too.
+        inside = self.project / "home"
+        inside.mkdir()
         with self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
-            install_rule(self.project, inside, PYTHON)
+            install_rule(self.project, {"HOME": str(inside)}, PYTHON)
         with mock.patch.object(host_commands, "temp_roots", lambda: {self.codex_home}):
             with self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
                 install_rule(self.project, self.environ, PYTHON)
@@ -702,13 +806,15 @@ class HostCommandCliTests(unittest.TestCase):
         outside = non_temporary_directory(self)
         self.project = install_package(outside / "project")
         # The copy may not sit in a temporary directory either.
-        self.codex_home = outside / "codex-home"
-        self.environ = {"CODEX_HOME": str(self.codex_home)}
-        self.home = self.base / "home"
+        # The copy may not sit in a temporary directory either.
+        self.home = outside / "home"
+        self.home.mkdir()
+        self.codex_home = self.home / ".codex"
+        self.environ = {"HOME": str(self.home)}
 
     def run_cli(
         self, *arguments: str, expected: int = 0, cli_path: Path | None = None,
-        own_project: bool = True,
+        own_project: bool = True, env: dict | None = None,
     ) -> dict:
         project = ["--project-root", str(self.project)] if own_project else []
         completed = subprocess.run(
@@ -716,7 +822,7 @@ class HostCommandCliTests(unittest.TestCase):
              *arguments, *project],
             capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
             env={
-                **os.environ, **self.environ, "HOME": str(self.home),
+                **without_codex_home(os.environ), **self.environ, **(env or {}),
                 "XDG_STATE_HOME": str(self.home / ".local" / "state"),
             },
         )
@@ -824,6 +930,39 @@ class HostCommandCliTests(unittest.TestCase):
                 own_project=False,
             ),
         )
+
+    def test_a_module_planted_in_the_copy_never_imports(self) -> None:
+        copy = Path(self.run_cli("install-codex-rule")["runtime_copy"])
+        marker = self.base / "planted-ran"
+        planted = copy / ".codex" / "orchestration" / "socket.py"
+        planted.write_text(f"open({str(marker)!r}, 'w').close()\n")
+        refused = self.run_cli(
+            "validate", "--root", str(self.project), cli_path=copy / CLI_RELATIVE,
+            expected=2, own_project=False,
+        )
+        self.assertIn("holds files it should not", refused["error"])
+        self.assertFalse(marker.exists())
+        self.assertEqual("stale", self.run_cli("host-command", expected=1)["codex_rule"])
+
+    def test_host_command_reports_an_unsupported_codex_home(self) -> None:
+        elsewhere = self.base / "codex-config"
+        report = self.run_cli(
+            "host-command", expected=1, env={"CODEX_HOME": str(elsewhere)}
+        )
+        self.assertEqual(("unsupported", False, None), (
+            report["codex_rule"], report["ready"], report["argv_prefix"]
+        ))
+        self.assertIn("only in ~/.codex", report["reason"])
+        refused = self.run_cli(
+            "install-codex-rule", expected=2, env={"CODEX_HOME": str(elsewhere)}
+        )
+        self.assertIn("only in ~/.codex", refused["error"])
+        self.assertFalse(elsewhere.exists())
+        elsewhere.mkdir(mode=0o700)
+        self.codex_home.symlink_to(elsewhere)
+        report = self.run_cli("host-command", expected=1)
+        self.assertEqual("unsupported", report["codex_rule"])
+        self.assertIn("symbolic link", report["reason"])
 
     def test_refusals_are_fixed_messages_without_paths(self) -> None:
         self.codex_home.mkdir()
