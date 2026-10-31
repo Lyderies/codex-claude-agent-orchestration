@@ -98,8 +98,8 @@ Each slice is a feature branch with tests and a cross-provider review.
   - Never `--bare`.
   - The run fails closed unless the init frame reports `apiKeySource: none` and the requested model.
 - **Codex child:** `codex exec`.
-  - Flags: `-s read-only`, `--ephemeral`, `--ignore-user-config`, the routed model and effort,
-    `--json`, and the result schema as `--output-schema`.
+  - Flags: `-s read-only`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules` (see S4c),
+    the routed model and effort, `--json`, and the result schema as `--output-schema`.
   - A `model/rerouted` event marks the result unreviewed.
 - **Observations:**
   - Each run's usage and its headroom and billing observations are written as ledger records.
@@ -184,6 +184,45 @@ The allowlist only detects emitted, typed events. Pre-dispatch denial comes from
 and ephemeral mode, which were shown live only on codex-cli 0.164.0, so the reviewed Codex range
 is pinned to that build. Widening it requires the live containment check to pass on the new
 build.
+
+### S4c: bridged child containment
+
+- **No execpolicy rules.** `--ignore-user-config` skips only `config.toml`. Codex still loaded
+  `${CODEX_HOME:-~/.codex}/rules/*.rules`, and a trusted project's `.codex/rules`, for a bridged
+  child, and the S5b rule lets the primary-host commands (including `dispatch`) run outside the
+  sandbox, matched by their arguments alone. A read-only bridged child could therefore have run
+  them unsandboxed. The bridge now passes `--ignore-rules`. Before the durable intent it reads
+  `codex exec --help` from the re-checked client (no model call) and refuses with
+  `codex_exec_options_unavailable` unless `--ignore-user-config` and `--ignore-rules` are listed.
+- **Rest of the user layer.** Inspected on codex-cli 0.164.0 with a scratch `CODEX_HOME` and
+  `codex debug prompt-input` and `codex features list`, which make no model call. The user's
+  `AGENTS.md` and skills (`$CODEX_HOME/skills`, `~/.agents/skills`) still reach a child's prompt,
+  as do the export's own `AGENTS.md` and skills; they are instructions, not authority. No MCP
+  server or plugin tool appears, an exported `.codex/config.toml` is not loaded, and hooks stay
+  disabled. `skill_mcp_dependency_install`, on by default, can install and start an MCP server
+  that a mentioned skill declares, and MCP servers run outside the sandbox, so the bridge
+  disables it too.
+- **Whole process tree.** The child runs in its own session, but Codex starts helpers such as
+  `codex-code-mode-host` in their own process groups, and TTY commands may get their own
+  session, so killing the child's group could leave them running. While the child runs,
+  `run_child` takes a snapshot every 0.25 s with a fixed-path `ps` (`/bin/ps`, else
+  `/usr/bin/ps`; `-U <uid> -o pid=,ppid=,pgid=,lstart=`) and adopts every process whose parent or
+  process group belongs to a tracked process. A group never spans sessions, so its members are
+  descendants too. On exit, abort or a termination signal it stops every tracked process with
+  SIGSTOP, rescans to adopt anything they started, then sends SIGKILL to each process and its
+  group. A process is signalled only when a fresh snapshot shows the same pid with the same
+  start time, and the child's own group is signalled by id only while the child is unreaped.
+  The deadline watchdog runs the same standard-library module as a script and tracks the tree
+  itself every 0.5 s, so after a bridge crash it still kills the whole tree at the deadline, or
+  whatever is left once the child is gone. Without a readable process table the child is not
+  launched (`process_tracking_unavailable`).
+- **Residual risks.**
+  - A descendant that leaves the child's group, and whose parent exits before any snapshot has
+    seen it (within 0.25 s), is not tracked. A command the model started stays inside the
+    child's read-only sandbox, but it can keep running.
+  - Managed Codex configuration (`/etc/codex/`, MDM preferences) is not skipped by
+    `--ignore-user-config` and is not checked; none was present on the reviewed machine.
+  - A pid reused in the milliseconds between a snapshot and its signal is not excluded.
 
 ### S4: security review, pilot install and exit
 
@@ -330,6 +369,11 @@ build.
     attestation and the rule itself come from the owner's terminal. An owner who runs
     `scripts/attest.py --state-root` against an installed project is refused at
     `provider-observe`, because only the default state is accepted.
+  - Native Codex children that a Codex primary spawns share its session, so the rule applies
+    to them too: a native child could run the primary-host commands outside its own sandbox.
+    It is still held to this project's root and the owner's state by the own-root invariant,
+    and every run it could open or dispatch still needs ledger admission. The Codex skill
+    says never to ask a child to run them. Bridged Codex children load no rules (S4c).
   - The Claude primary's permission rules are a separate follow-up.
 
 ## Deferred to G4

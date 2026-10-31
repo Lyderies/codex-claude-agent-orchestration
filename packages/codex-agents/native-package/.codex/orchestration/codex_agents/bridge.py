@@ -43,9 +43,11 @@ from .host_paths import (
     temp_roots,
 )
 from .learning_contracts import SUPPORTED_MODELS
+from .process_tree import TRACK_INTERVAL_SECONDS, ProcessTree, process_table
 from .providers import (
     api_keys_present,
     client_environment,
+    codex_exec_options,
     observation_failure_reason,
     resolve_client,
 )
@@ -72,12 +74,21 @@ CODEX_REROUTE_EVENTS = {"model/rerouted", "model_rerouted", "model.rerouted"}
 # any sub-agent run because no rollout exists, and no item event is emitted for the
 # attempt. The reviewed Codex range in config/routing-policy.json is therefore
 # pinned to that build; widening it requires a live containment check on the new build.
+# `skill_mcp_dependency_install` lets a skill the prompt mentions install and start
+# its declared MCP server, which would run outside the sandbox; skills from the user's
+# directories and from the export itself are listed to every child.
 CODEX_DISABLED_FEATURES = (
     "apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2",
     "image_generation", "goals", "browser_use", "browser_use_external",
-    "computer_use", "in_app_browser", "hooks",
+    "computer_use", "in_app_browser", "hooks", "skill_mcp_dependency_install",
 )
 CODEX_WEB_SEARCH_SETTING = 'web_search="disabled"'
+# `--ignore-user-config` skips only config.toml. Without `--ignore-rules` Codex still
+# loads the owner's execpolicy rules, and an `allow` rule (setup writes one for the
+# primary's lifecycle commands) runs a matching command outside the sandbox. A client
+# whose `codex exec --help` does not list both options is refused before launch with
+# `codex_exec_options_unavailable`.
+CODEX_REQUIRED_EXEC_OPTIONS = ("--ignore-user-config", "--ignore-rules")
 # Collaboration tools cannot be switched off by configuration. This allowlist only
 # detects emitted, typed events: anything outside it stops the child, but it does not
 # prevent a call and cannot see one that emits no event.
@@ -316,33 +327,20 @@ def export_committed_paths(
     return len(entries)
 
 
-_ACTIVE_GROUPS: set[int] = set()
+# Each running child's process and its tracked tree, for the signal guard.
+_ACTIVE_CHILDREN: dict[int, tuple[Any, ProcessTree]] = {}
 # A detached watchdog enforces the deadline even if the bridge is SIGKILLed: it
-# polls the child's process group, kills it at the deadline, and exits as soon
-# as the group is gone.
-WATCHDOG_SOURCE = """
-import os, signal, sys, time
-group, deadline = int(sys.argv[1]), float(sys.argv[2])
-while True:
-    try:
-        os.killpg(group, 0)
-    except OSError:
-        sys.exit(0)
-    if time.time() >= deadline:
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except OSError:
-            pass
-        sys.exit(0)
-    time.sleep(0.2)
-"""
+# tracks the child's whole tree itself, kills it at the deadline, and once the
+# child is gone kills whatever it left and exits. It runs the standard-library
+# process_tree module as a script, from the same installed directory as this one.
+WATCHDOG_SCRIPT = Path(__file__).resolve().with_name("process_tree.py")
 
 
 def _start_watchdog(group: int, deadline_epoch: float) -> None:
     try:
         subprocess.Popen(
             [
-                sys.executable, *PYTHON_ISOLATION_FLAGS, "-c", WATCHDOG_SOURCE,
+                sys.executable, *PYTHON_ISOLATION_FLAGS, str(WATCHDOG_SCRIPT),
                 str(group), repr(deadline_epoch),
             ],
             stdin=subprocess.DEVNULL,
@@ -364,17 +362,14 @@ class BridgeInterrupted(SystemExit):
 
 @contextlib.contextmanager
 def signal_guard():
-    """Kill every running child group on SIGTERM, SIGINT or SIGHUP, then exit.
+    """Kill every running child's tree on SIGTERM, SIGINT or SIGHUP, then exit.
 
     Raising out of the wait lets each dispatch's own cleanup remove its export.
     """
 
     def handler(signum: int, _frame: Any) -> None:
-        for group in list(_ACTIVE_GROUPS):
-            try:
-                os.killpg(group, signal.SIGKILL)
-            except OSError:
-                pass
+        for process, tree in list(_ACTIVE_CHILDREN.values()):
+            _kill_child(process, tree)
         raise BridgeInterrupted(128 + signum)
 
     signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
@@ -386,11 +381,23 @@ def signal_guard():
             signal.signal(signum, value)
 
 
-def _stop_group(process: Any) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+def _kill_child(process: Any, tree: ProcessTree) -> None:
+    """Kill the child's tracked tree, and its own group while the child is unreaped.
+
+    Until the child is reaped its pid, and so its group's id, cannot belong to
+    anything else, so the group is signalled by id only then.
+    """
+
+    tree.terminate()
+    if process.returncode is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _stop_child(process: Any, tree: ProcessTree) -> None:
+    _kill_child(process, tree)
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -408,11 +415,15 @@ def run_child(
 ) -> dict[str, Any]:
     """Run one child in its own session, feeding each JSON line to `on_frame`.
 
-    The whole process group is killed on timeout, overflow, an unparseable line
-    or an aborting frame, and always once the child has exited.
+    The child's whole tree, including descendants that left its process group or
+    session, is killed on timeout, overflow, an unparseable line or an aborting
+    frame, and always once the child has exited. Descendants are tracked while it
+    runs, so the child is never launched when the process table cannot be read.
     """
 
     outcome: dict[str, Any] = {"returncode": None, "abort": None}
+    if process_table() is None:
+        return {"returncode": None, "abort": "process_tracking_unavailable"}
     try:
         process = popen(
             arguments,
@@ -425,20 +436,30 @@ def run_child(
         )
     except OSError:
         return {"returncode": None, "abort": "launch_failed"}
-    _ACTIVE_GROUPS.add(process.pid)
+    tree = ProcessTree(process.pid)
+    _ACTIVE_CHILDREN[process.pid] = (process, tree)
     deadline = time.monotonic() + deadline_seconds
     buffer = b""
     received = 0
     try:
+        if not tree.identify(process_table()):
+            raise _Abort("process_tracking_unavailable")
         _start_watchdog(
             process.pid, time.time() + deadline_seconds + WATCHDOG_GRACE_SECONDS
         )
+        next_track = time.monotonic() + TRACK_INTERVAL_SECONDS
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
+                if remaining <= 0:
                     raise _Abort("timed_out")
+                ready = selector.select(min(remaining, TRACK_INTERVAL_SECONDS))
+                if time.monotonic() >= next_track:
+                    tree.refresh()
+                    next_track = time.monotonic() + TRACK_INTERVAL_SECONDS
+                if not ready:
+                    continue
                 chunk = os.read(process.stdout.fileno(), 65_536)
                 if not chunk:
                     break
@@ -459,6 +480,9 @@ def run_child(
                 raise _Abort("stream_too_large")
             if buffer.strip():
                 _deliver(buffer, on_frame)
+        # One more snapshot while the child is still unreaped, so anything it started
+        # since the last one is tracked before the wait reaps it.
+        tree.refresh()
         try:
             outcome["returncode"] = process.wait(
                 timeout=max(deadline - time.monotonic(), 0.1)
@@ -468,8 +492,8 @@ def run_child(
     except _Abort as abort:
         outcome["abort"] = abort.reason
     finally:
-        _stop_group(process)
-        _ACTIVE_GROUPS.discard(process.pid)
+        _stop_child(process, tree)
+        _ACTIVE_CHILDREN.pop(process.pid, None)
         process.stdout.close()
     return outcome
 
@@ -908,6 +932,7 @@ def run_codex(
         "-s", "read-only",
         "--ephemeral",
         "--ignore-user-config",
+        "--ignore-rules",
         *(
             part
             for feature in CODEX_DISABLED_FEATURES
@@ -1269,6 +1294,12 @@ def dispatch(
         executable, digest = resolve_client(provider)
         if (executable, digest) != (identity["client_path"], identity["client_sha256"]):
             raise BridgeRefused("provider client changed during the launch re-check")
+        if provider == "codex":
+            # A Codex child must load no execpolicy rules: a client that cannot be
+            # told so is refused, never launched without the option.
+            options = codex_exec_options(executable, environ=environ, tmpdir=workspace / "tmp")
+            if not set(CODEX_REQUIRED_EXEC_OPTIONS) <= options:
+                raise BridgeRefused("codex_exec_options_unavailable")
         # Billing, headroom and plan are re-read too, account-wide and including
         # the fresh reading above; the run cap is not counted again.
         denied = ledger.launch_recheck(project_id, run_handle=run_handle, identity=identity)

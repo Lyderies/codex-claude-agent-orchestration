@@ -2,6 +2,18 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **Bridged child containment (0.8.8).**
+  - Bridged Codex children run with `--ignore-rules`: `--ignore-user-config` skips only
+    `config.toml`, so a child still loaded the owner's execpolicy rules, and the setup-written
+    rule would have let it run the primary-host commands, `dispatch` among them, outside its
+    sandbox. A client whose `codex exec --help` lacks the option is refused before launch, and
+    `skill_mcp_dependency_install` is disabled as well.
+  - A child's whole process tree is killed, not just its process group: descendants are
+    tracked with a fixed-path `ps` while it runs, then stopped and killed together at the end,
+    on abort or on a termination signal, and the deadline watchdog tracks the tree too.
+    Only a process seen as a descendant with the same start time is ever signalled.
+  - Native Codex children share the primary's session and its command rule; the design's
+    residual risks and the Codex skill now say so.
 - **Route-first model guidance.** The Codex skill and its routing reference no longer summarize
   per-family models, which had drifted from policy v5's provider candidates; they defer to the
   route's provider, model and effort.

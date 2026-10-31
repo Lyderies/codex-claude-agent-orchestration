@@ -18,7 +18,10 @@ call, with no shell compounds (`&&`, `;`,
 pipes, redirections or substitutions) and no environment-variable prefixes. Any other form
 stays sandboxed and fails. Below, every command, named alone or as `cli.py <command>`,
 runs with that prefix. A failure whose `hint` names the Codex sandbox means the prefix was
-not used exactly.
+not used exactly. The rule applies to the whole Codex session, so native Codex children
+you spawn can match it too: a child could run these commands outside its own sandbox,
+still limited to this project and its ledger. Never ask a child to run them; lifecycle
+commands belong to the primary. Bridged Codex children load no rules.
 
 1. Read the applicable project instructions and accepted decisions. Do not fill a
    material open choice with an assumption.

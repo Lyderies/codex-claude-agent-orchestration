@@ -337,6 +337,37 @@ def read_client_version(
     return parse_client_version(provider, output)
 
 
+# An option line in clap's help: indented, an optional short form, then `--name`.
+HELP_OPTION_PATTERN = re.compile(rb"^[ \t]+(?:-[A-Za-z0-9], )?(--[a-z0-9][a-z0-9-]*)", re.MULTILINE)
+
+
+def codex_exec_options(
+    executable: str,
+    *,
+    environ: Mapping[str, str],
+    tmpdir: Path,
+    popen: Callable[..., Any] = subprocess.Popen,
+    timeout: float = OBSERVATION_TIMEOUT_SECONDS,
+) -> frozenset[str]:
+    """The long options the resolved client's `codex exec --help` lists; empty on failure.
+
+    Help makes no model call and loads no configuration.
+    """
+
+    try:
+        output = _bounded_output(
+            [executable, "exec", "--help"],
+            environment=client_environment(environ, tmpdir),
+            timeout=timeout,
+            popen=popen,
+        )
+    except ContractError:
+        return frozenset()
+    return frozenset(
+        match.decode("ascii") for match in HELP_OPTION_PATTERN.findall(output)
+    )
+
+
 def observe_claude(
     *,
     digest_key: bytes,
