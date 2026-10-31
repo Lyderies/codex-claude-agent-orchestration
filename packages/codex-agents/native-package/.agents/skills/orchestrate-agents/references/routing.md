@@ -245,9 +245,10 @@ provider API key, and a run handle that was already dispatched.
   `--max-turns`. On timeout, on a contract violation, on an over-long line and after it
   exits, its process group and every descendant tracked while it ran are killed before
   the child is reaped, so an exit first seen after the deadline counts as a timeout.
-  Descendants in other groups or sessions are tracked by ancestry with `ps` every
-  0.25 s, and a process is signalled only after its kernel birth time is checked again,
-  so an unrelated process is never killed; one that detaches and loses its parent
+  Descendants in other groups or sessions are tracked by ancestry every 0.25 s: `ps`
+  lists candidates, and adoption and every signal rest on the process's own kernel
+  record (parent, group and birth time read together), so an unrelated process is never
+  killed; one that detaches and loses its parent
   between two snapshots is left running inside the child's sandbox. Without a readable
   process table the child is not launched (`process_tracking_unavailable`). `dispatch`
   kills the tree on SIGTERM, SIGINT or SIGHUP. A detached watchdog verifies the child's

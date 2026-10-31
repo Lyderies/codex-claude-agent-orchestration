@@ -216,18 +216,23 @@ build.
   `codex-code-mode-host` in their own process groups, and TTY commands may get their own
   session. The rule is that killing an unrelated process is worse than leaving a sandboxed
   orphan, so tracking is conservative:
-  - A process is tracked only when a snapshot shows its parent is a tracked process. Snapshots
-    come from a fixed-path `ps` (`/bin/ps`, else `/usr/bin/ps`; `-U <uid> -o
-    pid=,ppid=,pgid=,stat=`) every 0.25 s while the child runs, and the first one, taken while
-    the child is unreaped, already adopts what is visible. A shared process group never adopts.
-  - Each process is identified by pid and the kernel's birth time: `p_starttime` from
-    `sysctl(KERN_PROC_PID)` in microseconds on macOS, field 22 of `/proc/<pid>/stat` in clock
-    ticks on Linux. The birth time is read again immediately before every signal.
-  - The child is never reaped before cleanup: its exit is seen as a zombie in a snapshot. Then
-    every live tracked process is killed with SIGKILL in up to five rounds, each re-verified and
-    rescanned. A group is killed only through a verified leader: the child's own group (its pid
-    cannot change hands while it is unreaped), or a tracked process that leads its group.
-    Nothing is stopped. Only then is the child reaped and its exit status kept.
+  - A fixed-path `ps` (`/bin/ps`, else `/usr/bin/ps`; `-U <uid> -o pid=,ppid=`) only lists
+    candidate pids, every 0.25 s while the child runs. Every decision rests on one kernel record
+    per process that gives its parent, process group, birth time and exit state together:
+    `kinfo_proc` from `sysctl(KERN_PROC_PID)` on macOS (birth in microseconds; the record must
+    name the pid asked for, and this process's own record must give its own parent and group),
+    and `/proc/<pid>/stat` on Linux (birth in clock ticks).
+  - A candidate is adopted only when its own record names a tracked parent and that parent's
+    record, read afterwards, still has the tracked birth time; the candidate's birth time comes
+    from the same record as its parent. A pid rejected earlier is readopted only the same way.
+    The first snapshot, taken while the child is unreaped, already adopts what is visible. A
+    shared process group never adopts.
+  - The child is never reaped before cleanup: its exit is seen in its record. Then every live
+    tracked process is killed with SIGKILL in up to five rounds, each rescanned, with a fresh
+    record read before every signal. A group is killed only through a leader whose fresh record
+    shows the tracked birth time and that it leads the group: the child itself (its pid cannot
+    change hands while it is unreaped) or another tracked process. Nothing is stopped. Only then
+    is the child reaped and its exit status kept.
   - An exit first seen after the deadline, for example because a snapshot blocked, is a timeout.
   - The deadline watchdog runs the same standard-library module as a script, with the child's
     pid and birth time. It verifies that identity, retrying for up to five seconds, then
@@ -235,7 +240,7 @@ build.
     could not verify. Without the acknowledgement the run is aborted (`watchdog_unavailable`).
     It then tracks the tree itself every 0.5 s and kills it at the deadline or once the child
     has exited, so a bridge crash still ends the tree.
-  - Without a readable process table or birth times the child is not launched
+  - Without a readable process table or kernel records the child is not launched
     (`process_tracking_unavailable`).
 - **Residual risks.**
   - Deliberate lifetime escape: polling cannot contain a process that double-forks into a new
@@ -245,8 +250,8 @@ build.
     Linux cgroup) would be needed to end it. The same applies to an orphan that a process
     starts in the instant before its own kill, outside the child's group.
   - Identity window: the birth time is microseconds on macOS and 10 ms clock ticks on Linux, and
-    a pid could change hands between that check and the signal. Both require the pid space to
-    wrap around in that interval.
+    a pid could change hands between the last record read and the signal. Both require the pid
+    space to wrap around in that interval.
   - Native Codex children share the primary's command rule (see S5b).
 
 ### S4: security review, pilot install and exit

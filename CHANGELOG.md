@@ -10,9 +10,11 @@
     `approval_policy="never"` is pinned and `skill_mcp_dependency_install` is disabled.
   - Codex system or managed configuration (`/etc/codex`, `~/.codex/managed_config.toml`, macOS
     managed preferences) refuses a Codex dispatch (`codex_managed_config_present`).
-  - Cleanup reaches descendants outside the child's process group, conservatively: they are
-    tracked by ancestry with a fixed-path `ps`, identified by kernel birth time and re-verified
-    before each SIGKILL; the child's own group is killed before the child is reaped. The
+  - Cleanup reaches descendants outside the child's process group, conservatively: a
+    fixed-path `ps` lists candidates, and a process is adopted only when its own kernel record
+    (parent, group and birth time read together) names a tracked parent whose record still
+    matches; every SIGKILL is preceded by a fresh record read, and the child's own group is
+    killed before the child is reaped. The
     deadline watchdog verifies the child's identity before the run continues and tracks the
     tree too. A process that detaches between snapshots is left running in the sandbox rather
     than risk killing an unrelated one.

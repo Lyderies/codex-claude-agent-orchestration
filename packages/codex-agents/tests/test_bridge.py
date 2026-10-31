@@ -9,6 +9,7 @@ import os
 import pwd
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1332,8 +1333,17 @@ class DescendantTerminationTests(unittest.TestCase):
     def test_descendants_die_after_the_deadline(self) -> None:
         outcome, frames = self.run_tree(linger=120, deadline=2)
         self.assertEqual("timed_out", outcome["abort"])
-        self.assertEqual([{"tree": "started"}], frames)
-        self.assert_only_the_tree_died(self.tree_pids())
+        # A slow watchdog acknowledgement can use up the deadline before any frame
+        # is read; then only the part of the tree that had started is checked.
+        self.assertIn(frames, ([], [{"tree": "started"}]))
+        if frames:
+            pids = self.tree_pids()
+        else:
+            pids = {
+                name: int((self.directory / name).read_text())
+                for name in TREE_NAMES if (self.directory / name).exists()
+            }
+        self.assert_only_the_tree_died(pids)
 
     def test_an_exit_first_seen_after_the_deadline_is_a_timeout(self) -> None:
         calls = []
@@ -1403,39 +1413,54 @@ def sequence(*values):
     return next_value
 
 
-class ProcessTreeTests(unittest.TestCase):
-    """Adoption and signalling decisions on recorded process tables."""
+def readings(*values):
+    """A record that changes between reads: each value in turn, then the last one."""
 
-    # pid -> (parent, group, state). 100 is the child; 101 its child; 102 its
-    # grandchild, leading a group of its own; 103 an orphan left in 102's group;
-    # 200 and 201 are unrelated.
-    TABLE = {
-        100: (50, 100, "Ss"), 101: (100, 100, "S"), 102: (101, 102, "Ss"),
-        103: (1, 102, "S"), 200: (1, 200, "Ss"), 201: (200, 200, "S"),
-    }
+    return sequence(*values)
+
+
+class ProcessTreeTests(unittest.TestCase):
+    """Adoption and signalling decisions on recorded kernel records."""
 
     def setUp(self) -> None:
-        self.births: dict[int, object] = {pid: f"birth-{pid}" for pid in self.TABLE}
-        patcher = mock.patch.object(process_tree, "birth_time", self.birth)
+        # pid -> (parent, group, birth, exited). 100 is the child; 101 its child; 102
+        # its grandchild, leading a group of its own; 103 an orphan left in 102's
+        # group; 200 and 201 are unrelated.
+        self.records: dict[int, object] = {
+            100: (50, 100, "b100", False), 101: (100, 100, "b101", False),
+            102: (101, 102, "b102", False), 103: (1, 102, "b103", False),
+            200: (1, 200, "b200", False), 201: (200, 200, "b201", False),
+        }
+        patcher = mock.patch.object(process_tree, "process_record", self.record)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.signals: list[tuple[str, int, int]] = []
 
-    def birth(self, pid: int):
-        value = self.births.get(pid)
+    def record(self, pid: int):
+        value = self.records.get(pid)
         return value() if callable(value) else value
+
+    def listing(self) -> dict[int, int]:
+        """What `ps` would list now: each pid with its current parent."""
+
+        return {pid: self.record(pid)[0] for pid in self.records if self.record(pid)}
 
     def tree(self) -> process_tree.ProcessTree:
         tree = process_tree.ProcessTree(100)
-        self.assertTrue(tree.identify(self.TABLE))
+        self.assertTrue(tree.identify(self.listing()))
         return tree
+
+    def kill(self, pid: int, signum: int) -> None:
+        self.signals.append(("pid", pid, signum))
+        current = self.record(pid)
+        if current is not None:
+            self.records[pid] = (*current[:3], True)
 
     @contextlib.contextmanager
     def recorded(self, *tables):
         with mock.patch.object(process_tree, "process_table", sequence(*tables)), \
                 mock.patch.object(process_tree.time, "sleep"), \
-                mock.patch.object(process_tree.os, "kill",
-                                  lambda pid, signum: self.signals.append(("pid", pid, signum))), \
+                mock.patch.object(process_tree.os, "kill", self.kill), \
                 mock.patch.object(process_tree.os, "killpg",
                                   lambda group, signum: self.signals.append(
                                       ("group", group, signum))):
@@ -1444,30 +1469,54 @@ class ProcessTreeTests(unittest.TestCase):
     def test_identification_adopts_visible_descendants_by_ancestry_only(self) -> None:
         tree = self.tree()
         # 103 shares 102's group but its parent is gone, so it is not adopted.
-        self.assertEqual({100: "birth-100", 101: "birth-101", 102: "birth-102"}, tree.tracked)
+        self.assertEqual({100: "b100", 101: "b101", 102: "b102"}, tree.tracked)
         other = process_tree.ProcessTree(100)
-        self.assertFalse(other.identify(self.TABLE, "birth-of-another-process"))
+        self.assertFalse(other.identify(self.listing(), "birth-of-another-process"))
         self.assertFalse(other.identify(None))
-        self.assertFalse(other.identify({200: (1, 200, "S")}))
         self.assertEqual({}, other.tracked)
-        with self.recorded(self.TABLE):
+        with self.recorded(self.listing()):
             other.terminate()
         self.assertEqual([], self.signals)
 
-    def test_a_reused_pid_and_its_children_are_dropped(self) -> None:
+    def test_a_replacement_between_listing_and_record_is_not_adopted(self) -> None:
+        # The listing was taken while 104 and 105 were children of the tree; by the
+        # time their records are read, both pids belong to children of 200.
+        stale = {**self.listing(), 104: 101, 105: 100}
+        self.records[104] = (200, 200, "b104-unrelated", False)
+        self.records[105] = (200, 200, "b105-unrelated", False)
+        tree = process_tree.ProcessTree(100)
+        self.assertTrue(tree.identify(stale))
+        self.assertEqual({100, 101, 102}, set(tree.tracked))
+        self.assertEqual({100, 101, 102}, tree.update(stale))
+
+    def test_a_rejected_pid_is_readopted_only_through_its_own_record(self) -> None:
         tree = self.tree()
-        # 101 exits and an unrelated process, child of 200, gets its pid and a child.
-        self.births[101] = "birth-of-a-reused-pid"
-        later = {**self.TABLE, 101: (200, 200, "S"), 104: (101, 200, "S")}
-        self.births[104] = "birth-104"
-        self.assertEqual({100, 102}, tree.update(later))
-        self.assertEqual({100, 102}, set(tree.tracked))
+        # 101 exits and an unrelated child of 200 gets its pid, and a child of its own;
+        # the listing still shows the old ancestry.
+        stale = {**self.listing(), 104: 101}
+        self.records[101] = (200, 200, "b101-unrelated", False)
+        self.records[104] = (101, 200, "b104", False)
+        self.assertEqual({100, 102}, tree.update(stale))
+        self.assertNotIn(101, tree.tracked)
+        # A real new child of the root that gets pid 101 later is adopted afresh.
+        self.records[101] = (100, 100, "b101-new", False)
+        self.assertEqual({100, 101, 102, 104}, tree.update(self.listing()))
+        self.assertEqual("b101-new", tree.tracked[101])
+
+    def test_a_candidate_whose_parent_changed_identity_is_not_adopted(self) -> None:
+        tree = self.tree()
+        # 104's record names 102, which is still itself when the update starts but
+        # belongs to another process when its record is read again for the adoption.
+        self.records[104] = (102, 102, "b104", False)
+        listing = self.listing()
+        self.records[102] = readings((101, 102, "b102", False), (1, 102, "b102-new", False))
+        self.assertEqual({100, 101, 102}, tree.update(listing))
+        self.assertNotIn(104, tree.tracked)
+        self.assertEqual({100, 101}, tree.update(listing))
 
     def test_terminate_kills_verified_processes_and_verified_leaders_groups(self) -> None:
         tree = self.tree()
-        dead = {pid: (parent, group, "Z") for pid, (parent, group, _) in self.TABLE.items()
-                if pid in {100, 101, 102}}
-        with self.recorded(self.TABLE, {**self.TABLE, **dead}):
+        with self.recorded(self.listing()):
             tree.terminate()
         kill = signal.SIGKILL
         self.assertEqual([
@@ -1476,38 +1525,46 @@ class ProcessTreeTests(unittest.TestCase):
         ], self.signals)
 
     def test_a_pid_that_changes_hands_before_its_signal_is_not_signalled(self) -> None:
-        # 102 is verified while the snapshot is read, then belongs to another process.
-        readings = iter(["birth-102", "birth-102"])
-        self.births[102] = lambda: next(readings, "birth-of-a-reused-pid")
+        # 102 is read three times as itself (adoption, then two checks in the kill
+        # round) and belongs to another process at its signal-time reads.
+        listing = self.listing()
+        original, replaced = (101, 102, "b102", False), (1, 102, "b102-new", False)
+        reads: list[int] = []
+        values = readings(original, original, original, replaced)
+        self.records[102] = lambda: reads.append(1) or values()
         tree = process_tree.ProcessTree(100)
-        self.assertTrue(tree.identify(self.TABLE))
-        with self.recorded(self.TABLE, {**self.TABLE, 102: (200, 200, "S")}):
+        self.assertTrue(tree.identify(listing))
+        with self.recorded(listing):
             tree.terminate()
-        targets = {target for _, target, _ in self.signals}
-        self.assertNotIn(102, targets)
-        self.assertEqual({100, 101}, targets)
-        self.assertFalse({103, 200, 201} & targets)
+        kill = signal.SIGKILL
+        self.assertEqual([("group", 100, kill), ("pid", 100, kill), ("pid", 101, kill)],
+                         self.signals)
+        # Adoption, the round's two checks, then the leader and the pid signal checks.
+        self.assertGreaterEqual(len(reads), 5)
 
-    def test_without_a_snapshot_only_verified_pids_and_the_childs_group_are_signalled(
-        self,
-    ) -> None:
+    def test_without_a_snapshot_only_verified_records_are_signalled_once(self) -> None:
         tree = self.tree()
         with self.recorded(None):
             tree.terminate()
         kill = signal.SIGKILL
         self.assertEqual([
-            ("group", 100, kill), ("pid", 100, kill), ("pid", 101, kill), ("pid", 102, kill),
+            ("group", 100, kill), ("group", 102, kill),
+            ("pid", 100, kill), ("pid", 101, kill), ("pid", 102, kill),
         ], self.signals)
 
     def test_root_exit_is_seen_without_reaping(self) -> None:
         tree = self.tree()
-        self.assertFalse(tree.root_exited(self.TABLE))
-        self.assertTrue(tree.root_exited({**self.TABLE, 100: (50, 100, "Z")}))
-        self.assertTrue(tree.root_exited({200: (1, 200, "S")}))
+        self.assertFalse(tree.root_exited())
+        self.records[100] = (50, 100, "b100", True)
+        self.assertTrue(tree.root_exited())
+        self.records[100] = (1, 100, "b100-new", False)
+        self.assertTrue(tree.root_exited())
+        del self.records[100]
+        self.assertTrue(tree.root_exited())
 
     def test_the_watchdog_does_nothing_unless_it_verifies_the_child(self) -> None:
         announced = mock.Mock()
-        with self.recorded(self.TABLE), \
+        with self.recorded(self.listing()), \
                 mock.patch.object(process_tree, "WATCHDOG_IDENTIFY_SECONDS", 0):
             process_tree.watch(100, "birth-of-another-process", 0.0, announced)
         announced.assert_not_called()
@@ -1515,9 +1572,8 @@ class ProcessTreeTests(unittest.TestCase):
 
     def test_the_watchdog_retries_identification_then_enforces_the_deadline(self) -> None:
         announced = mock.Mock()
-        dead = {**self.TABLE, 100: (50, 100, "Z"), 101: (100, 100, "Z"), 102: (101, 102, "Z")}
-        with self.recorded(None, None, self.TABLE, self.TABLE, self.TABLE, dead):
-            process_tree.watch(100, "birth-100", 0.0, announced)
+        with self.recorded(None, None, self.listing()):
+            process_tree.watch(100, "b100", 0.0, announced)
         announced.assert_called_once_with()
         kill = signal.SIGKILL
         self.assertEqual([
@@ -1526,30 +1582,55 @@ class ProcessTreeTests(unittest.TestCase):
         ], self.signals)
 
 
-class KernelIdentityTests(unittest.TestCase):
-    def test_the_process_table_and_birth_times_come_from_the_system(self) -> None:
+class KernelRecordTests(unittest.TestCase):
+    def test_linux_stat_lines_parse_after_the_last_parenthesis(self) -> None:
+        tail = " ".join(["0"] * 15) + " 98765 rest"
+        for name in (b"sh", b"a (b) c", b"x) S 1 1 (y"):
+            with self.subTest(name=name):
+                line = b"123 (" + name + b") S 45 67 0 " + tail.encode()
+                self.assertEqual((45, 67, "98765", False), process_tree.parse_proc_stat(line))
+        zombie = b"123 (z) Z 45 67 0 " + tail.encode()
+        self.assertTrue(process_tree.parse_proc_stat(zombie)[3])
+        for broken in (b"no parenthesis", b"123 (short) S 45", b"123 (x) S a 67 0 " + tail.encode()):
+            self.assertIsNone(process_tree.parse_proc_stat(broken))
+
+    def test_macos_records_must_name_the_pid_asked_for(self) -> None:
+        raw = bytearray(process_tree.DARWIN_KINFO_PROC_SIZE)
+        struct.pack_into("=qi", raw, 0, 1_700_000_000, 42)
+        struct.pack_into("=i", raw, process_tree.DARWIN_PID_OFFSET, 123)
+        struct.pack_into("=i", raw, process_tree.DARWIN_PPID_OFFSET, 45)
+        struct.pack_into("=i", raw, process_tree.DARWIN_PGID_OFFSET, 67)
+        raw[process_tree.DARWIN_STAT_OFFSET] = process_tree.DARWIN_ZOMBIE
+        self.assertEqual((45, 67, "1700000000.000042", True),
+                         process_tree.parse_kinfo_proc(bytes(raw), 123))
+        self.assertIsNone(process_tree.parse_kinfo_proc(bytes(raw), 124))
+        self.assertIsNone(process_tree.parse_kinfo_proc(bytes(raw[:-1]), 123))
+
+    def test_the_process_table_and_records_come_from_the_system(self) -> None:
         self.assertTrue(all(path.startswith("/") for path in process_tree.PS_PATHS))
         table = process_tree.process_table()
         self.assertIsNotNone(table)
-        parent, group, state = table[os.getpid()]
-        self.assertEqual((os.getppid(), os.getpgrp()), (parent, group))
-        self.assertTrue(state)
+        self.assertEqual(os.getppid(), table[os.getpid()])
         self.assertTrue(process_tree.tracking_available())
-        own = process_tree.birth_time(os.getpid())
-        self.assertIsNotNone(own)
-        self.assertEqual(own, process_tree.birth_time(os.getpid()))
-        child = subprocess.Popen(["/bin/sleep", "0"])
-        for _ in range(100):
+        own = process_tree.process_record(os.getpid())
+        self.assertEqual((os.getppid(), os.getpgrp(), False), (own[0], own[1], own[3]))
+        self.assertEqual(own, process_tree.process_record(os.getpid()))
+        child = subprocess.Popen(["/bin/sleep", "0.5"], start_new_session=True)
+        running = process_tree.process_record(child.pid)
+        self.assertEqual((os.getpid(), child.pid, False),
+                         (running[0], running[1], running[3]))
+        self.assertNotEqual(own[2], running[2])
+        for _ in range(200):
             if process_state(child.pid).startswith("Z"):
                 break
             time.sleep(0.02)
-        # An exited, unreaped child keeps its identity; once reaped it has none.
-        birth = process_tree.birth_time(child.pid)
-        self.assertIsNotNone(birth)
-        self.assertNotEqual(own, birth)
+        # An exited, unreaped child keeps its identity and shows as exited; once
+        # reaped it has no record.
+        exited = process_tree.process_record(child.pid)
+        self.assertEqual((running[2], True), (exited[2], exited[3]))
         child.wait()
-        self.assertIsNone(process_tree.birth_time(child.pid))
-        self.assertIsNone(process_tree.birth_time(0))
+        self.assertIsNone(process_tree.process_record(child.pid))
+        self.assertIsNone(process_tree.process_record(0))
 
 
 class CodexBridgeTests(BridgeTestCase):

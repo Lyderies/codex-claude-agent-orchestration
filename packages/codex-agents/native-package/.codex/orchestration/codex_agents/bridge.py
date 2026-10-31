@@ -533,10 +533,10 @@ def run_child(
         # The output is closed. Wait for the child to exit without reaping it; an
         # exit first seen after the deadline (a snapshot can block) is a timeout.
         while True:
-            table = _track(tree)
+            _track(tree)
             if time.monotonic() >= deadline:
                 raise _Abort("timed_out")
-            if table is not None and tree.root_exited(table):
+            if tree.root_exited():
                 break
             time.sleep(min(TRACK_INTERVAL_SECONDS, max(deadline - time.monotonic(), 0.0)))
     except _Abort as abort:

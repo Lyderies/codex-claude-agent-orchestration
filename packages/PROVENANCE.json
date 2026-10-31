@@ -164,7 +164,7 @@
         "native-package/.codex/orchestration/codex_agents/git_plumbing.py": "new: plumbing-only git with repository helpers off and a repository layout check (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap)",
         "tests/test_git_plumbing.py": "new: hostile own-repository, layout and plumbing-only tests (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap)",
         "tests/test_host_paths.py": "new: private scratch, trusted interpreter and host scratch tests (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap); G2 bridged child containment",
-        "native-package/.codex/orchestration/codex_agents/process_tree.py": "new: conservative descendant tracking by ancestry and kernel birth time, verified kill rounds and the identity-verified deadline watchdog (G2 bridged child containment)"
+        "native-package/.codex/orchestration/codex_agents/process_tree.py": "new: conservative descendant tracking by ancestry from single kernel process records (parent, group and birth time together), verified kill rounds and the identity-verified deadline watchdog (G2 bridged child containment)"
       }
     },
     "claude-agents": {

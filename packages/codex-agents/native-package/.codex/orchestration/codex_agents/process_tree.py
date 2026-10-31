@@ -1,12 +1,14 @@
 """Track and kill the descendants of one bridged child, and never anything else.
 
-A process is tracked only once a snapshot shows its parent is a tracked process:
-ancestry, never a shared process group. Each process is known by its pid and
-the kernel's record of when it started (microseconds on macOS, clock ticks on
-Linux), and that birth time is read again immediately before every signal, so
-a pid that now belongs to another process is not signalled. Groups are
-signalled only when their leader is a verified tracked process, which includes
-the child itself while it is unreaped.
+`ps` only lists candidate pids. Every decision rests on one kernel record per
+process, read in a single call, that gives its parent, process group and birth
+time together (kinfo_proc on macOS, /proc/<pid>/stat on Linux). A process is
+adopted only when its own record names a tracked parent and that parent's
+record, read afterwards, still has the tracked birth time; its own birth time
+comes from the same record as its parent. A process group never adopts. Every
+signal is preceded by a fresh record read, so a pid that now belongs to another
+process is not signalled, and a group is signalled only through a verified
+tracked leader, which includes the child itself while it is unreaped.
 
 Tracking is by polling, so it is conservative rather than complete: a
 descendant whose parent exits before any snapshot has seen it is lost, and it
@@ -28,7 +30,7 @@ import time
 
 # Fixed paths, never a search path: macOS has /bin/ps, Linux distributions one or both.
 PS_PATHS = ("/bin/ps", "/usr/bin/ps")
-PS_COLUMNS = "pid=,ppid=,pgid=,stat="
+PS_COLUMNS = "pid=,ppid="
 PS_ENVIRONMENT = {"PATH": os.defpath, "LC_ALL": "C"}
 SNAPSHOT_TIMEOUT_SECONDS = 5
 TRACK_INTERVAL_SECONDS = 0.25
@@ -44,18 +46,26 @@ MAX_KILL_ROUNDS = 5
 KILL_ROUND_PAUSE_SECONDS = 0.05
 
 # macOS: sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid) fills one 648-byte
-# struct kinfo_proc; its first field is p_starttime (struct timeval) and p_pid
-# sits at offset 40, which is checked so a layout change fails closed.
+# struct kinfo_proc. kp_proc starts with p_starttime (struct timeval); p_stat is
+# at 36 and p_pid at 40; kp_eproc starts at 296 with e_ppid at 560 and e_pgid at
+# 564. Every record must name the pid asked for, and this process's own record
+# must give its own parent and group, so a layout change fails closed.
 DARWIN_LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
 DARWIN_KINFO_PROC_SIZE = 648
+DARWIN_STAT_OFFSET = 36
 DARWIN_PID_OFFSET = 40
+DARWIN_PPID_OFFSET = 560
+DARWIN_PGID_OFFSET = 564
+DARWIN_ZOMBIE = 5
 
-# pid -> (parent pid, process group, ps state letters)
-Table = dict[int, tuple[int, int, str]]
+# pid -> parent pid, as `ps` listed it: a hint for which records to read, never trusted.
+Table = dict[int, int]
+# One kernel record: (parent pid, process group, birth time, exited)
+Record = tuple[int, int, str, bool]
 
 
 def process_table() -> Table | None:
-    """This user's processes from a fixed-path `ps`; None when it is unavailable."""
+    """This user's pids and their listed parents from a fixed-path `ps`; None when unavailable."""
 
     path = next((candidate for candidate in PS_PATHS if os.path.isfile(candidate)), None)
     if path is None:
@@ -81,16 +91,16 @@ def process_table() -> Table | None:
         if not fields:
             continue
         # A line that does not parse makes the whole snapshot unusable.
-        if len(fields) != 4 or not all(field.isdigit() for field in fields[:3]):
+        if len(fields) != 2 or not all(field.isdigit() for field in fields):
             return None
-        table[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[3])
+        table[int(fields[0])] = int(fields[1])
     return table or None
 
 
 _SYSCTL: list = []
 
 
-def _darwin_birth(pid: int) -> str | None:
+def _darwin_raw(pid: int) -> bytes | None:
     import ctypes
 
     if not _SYSCTL:
@@ -107,50 +117,85 @@ def _darwin_birth(pid: int) -> str | None:
     size = ctypes.c_size_t(DARWIN_KINFO_PROC_SIZE)
     if _SYSCTL[0](name, 4, buffer, ctypes.byref(size), None, 0) != 0:
         return None
-    if size.value != DARWIN_KINFO_PROC_SIZE:
+    return buffer.raw if size.value == DARWIN_KINFO_PROC_SIZE else None
+
+
+def parse_kinfo_proc(raw: bytes, pid: int) -> Record | None:
+    """A macOS kinfo_proc as a record; None unless it is the record for `pid`."""
+
+    if len(raw) != DARWIN_KINFO_PROC_SIZE:
         return None
-    raw = buffer.raw
-    seconds, microseconds = struct.unpack_from("=qi", raw, 0)
     if struct.unpack_from("=i", raw, DARWIN_PID_OFFSET)[0] != pid:
         return None
-    return f"{seconds}.{microseconds:06d}"
+    seconds, microseconds = struct.unpack_from("=qi", raw, 0)
+    parent = struct.unpack_from("=i", raw, DARWIN_PPID_OFFSET)[0]
+    group = struct.unpack_from("=i", raw, DARWIN_PGID_OFFSET)[0]
+    exited = raw[DARWIN_STAT_OFFSET] == DARWIN_ZOMBIE
+    return parent, group, f"{seconds}.{microseconds:06d}", exited
 
 
-def _linux_birth(pid: int) -> str | None:
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as handle:
-            content = handle.read()
-    except OSError:
+_DARWIN_LAYOUT: list[bool] = []
+
+
+def _darwin_record(pid: int) -> Record | None:
+    if not _DARWIN_LAYOUT:
+        own_pid = os.getpid()
+        raw = _darwin_raw(own_pid)
+        own = parse_kinfo_proc(raw, own_pid) if raw is not None else None
+        _DARWIN_LAYOUT.append(
+            own is not None and own[:2] == (os.getppid(), os.getpgrp()) and not own[3]
+        )
+    if not _DARWIN_LAYOUT[0]:
         return None
+    raw = _darwin_raw(pid)
+    return parse_kinfo_proc(raw, pid) if raw is not None else None
+
+
+def parse_proc_stat(content: bytes) -> Record | None:
+    """A Linux /proc/<pid>/stat line as a record: state, ppid, pgrp and starttime."""
+
     # The command name may hold spaces and parentheses; the fields follow the last ")".
     end = content.rfind(b")")
     if end < 0:
         return None
     fields = content[end + 2:].split()
-    if len(fields) < 20 or not fields[19].isdigit():
+    if len(fields) < 20 or not all(fields[index].isdigit() for index in (1, 2, 19)):
         return None
-    return fields[19].decode("ascii")
+    return int(fields[1]), int(fields[2]), fields[19].decode("ascii"), fields[0] == b"Z"
 
 
-def birth_time(pid: int) -> str | None:
-    """When the kernel says a process started; None when it is gone or unreadable."""
+def _linux_record(pid: int) -> Record | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            content = handle.read()
+    except OSError:
+        return None
+    return parse_proc_stat(content)
+
+
+def process_record(pid: int) -> Record | None:
+    """One process's parent, group, birth time and exit state, from one kernel read.
+
+    None when the process is gone (reaped), unreadable, or the platform is not
+    macOS or Linux.
+    """
 
     if pid <= 0:
         return None
     try:
         if sys.platform == "darwin":
-            return _darwin_birth(pid)
+            return _darwin_record(pid)
         if sys.platform.startswith("linux"):
-            return _linux_birth(pid)
-    except (OSError, ValueError, AttributeError, struct.error):
+            return _linux_record(pid)
+    except (OSError, ValueError, AttributeError, IndexError, struct.error):
         return None
     return None
 
 
 def tracking_available() -> bool:
-    """Whether both the process table and birth times can be read here."""
+    """Whether both the process table and kernel records can be read here."""
 
-    return process_table() is not None and birth_time(os.getpid()) is not None
+    return process_table() is not None and process_record(os.getpid()) is not None
 
 
 def _excluded_pid(pid: int) -> bool:
@@ -177,55 +222,65 @@ class ProcessTree:
         With `birth` the root must still be that same process.
         """
 
-        if table is None or self.root not in table:
+        if table is None:
             return False
-        observed = birth_time(self.root)
-        if observed is None or (birth is not None and observed != birth):
+        record = process_record(self.root)
+        if record is None or (birth is not None and record[2] != birth):
             return False
-        self.root_birth = observed
-        self.tracked = {self.root: observed}
+        self.root_birth = record[2]
+        self.tracked = {self.root: record[2]}
         self.identified = True
         self.update(table)
         return True
 
-    def _verified(self, pid: int) -> bool:
+    def _record(self, pid: int) -> Record | None:
+        """The pid's current record, only while it is still the tracked process."""
+
         birth = self.tracked.get(pid)
-        return birth is not None and not _excluded_pid(pid) and birth_time(pid) == birth
+        if birth is None or _excluded_pid(pid):
+            return None
+        record = process_record(pid)
+        return record if record is not None and record[2] == birth else None
 
     def update(self, table: Table) -> set[int]:
-        """Adopt the children of tracked processes; return the tracked pids still present."""
+        """Adopt the children of tracked processes; return the tracked pids still present.
 
-        live = {pid for pid in self.tracked if pid in table and self._verified(pid)}
-        children: dict[int, list[int]] = {}
-        for pid, (parent, _, _) in table.items():
-            children.setdefault(parent, []).append(pid)
-        pending = sorted(live)
-        while pending:
-            for child in children.get(pending.pop(), ()):
-                if child in live or _excluded_pid(child):
+        The listed parent only chooses which records to read. A candidate, even a
+        pid tracked before as another process, is adopted only when its own record
+        names a tracked parent whose record, read afterwards, is still that process.
+        """
+
+        live = {pid for pid in self.tracked if self._record(pid) is not None}
+        grew = True
+        while grew:
+            grew = False
+            for pid, listed_parent in table.items():
+                if pid in live or listed_parent not in live or _excluded_pid(pid):
                     continue
-                birth = birth_time(child)
-                if birth is None:
+                record = process_record(pid)
+                if record is None or record[0] not in live:
                     continue
-                self.tracked[child] = birth
-                live.add(child)
-                pending.append(child)
+                if self._record(record[0]) is None:
+                    continue
+                self.tracked[pid] = record[2]
+                live.add(pid)
+                grew = True
         # Exited processes are forgotten; their pids may belong to anything later.
         self.tracked = {pid: self.tracked[pid] for pid in live}
         return live
 
-    def root_exited(self, table: Table) -> bool:
-        """Whether the unreaped root has exited: a zombie, or absent from the snapshot."""
+    def root_exited(self) -> bool:
+        """Whether the unreaped root has exited: a zombie, or no longer the tracked root."""
 
-        entry = table.get(self.root)
-        return entry is None or entry[2].startswith("Z")
+        record = self._record(self.root)
+        return record is None or record[3]
 
     def terminate(self) -> None:
         """Kill every tracked process in rounds, each verified just before its signal.
 
-        A group is killed only through a verified leader: the root, whose group is
-        its own for life, or a tracked process that leads its group in the
-        snapshot. Nothing is stopped, so nothing is ever left stopped.
+        A group is killed only through a verified leader whose record shows it
+        leads that group: the root, whose group is its own for life, or another
+        tracked process. Nothing is stopped, so nothing is ever left stopped.
         """
 
         if not self.identified:
@@ -236,25 +291,22 @@ class ProcessTree:
             table = process_table()
             if table is not None:
                 self.update(table)
-            running = [
-                pid for pid in sorted(self.tracked)
-                if table is None or (pid in table and not table[pid][2].startswith("Z"))
-            ]
+            records = {pid: self._record(pid) for pid in sorted(self.tracked)}
+            running = [pid for pid, record in records.items() if record and not record[3]]
             if round_number and not running:
                 return
-            leaders = {self.root} | {
-                pid for pid in self.tracked
-                if table is not None and pid in table and table[pid][1] == pid
-            }
-            for group in sorted(leaders):
-                if not _excluded_group(group) and self._verified(group):
+            for group, record in records.items():
+                if record is None or record[1] != group or _excluded_group(group):
+                    continue
+                leader = self._record(group)
+                if leader is not None and leader[1] == group:
                     with contextlib.suppress(OSError):
                         os.killpg(group, signal.SIGKILL)
             for pid in running:
-                if self._verified(pid):
+                if self._record(pid) is not None:
                     with contextlib.suppress(OSError):
                         os.kill(pid, signal.SIGKILL)
-            # Without a snapshot nothing new can be adopted or seen to have died.
+            # Without a snapshot nothing new can be adopted.
             if table is None:
                 return
 
@@ -296,10 +348,10 @@ def watch(root: int, birth: str, deadline: float, announce) -> None:
     while True:
         table = process_table()
         if table is not None:
-            live = tree.update(table)
-            if root not in live or tree.root_exited(table):
-                tree.terminate()
-                return
+            tree.update(table)
+        if tree.root_exited():
+            tree.terminate()
+            return
         if time.time() >= deadline:
             tree.terminate()
             return
