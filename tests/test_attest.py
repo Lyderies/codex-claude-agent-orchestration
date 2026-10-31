@@ -5,6 +5,8 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -18,9 +20,17 @@ _SPEC = importlib.util.spec_from_file_location("umbrella_attest", _SCRIPT)
 attest = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = attest
 _SPEC.loader.exec_module(attest)
+_REAL_CHECK = attest.check_ssh_keygen
 
 FINGERPRINT = "ab" * 32
 SECRET_BITS = ("owner@example.invalid", "acct-12345", FINGERPRINT)
+PRIVATE_HEAD = "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETBODY\n"
+COMMENT = "someone@example.invalid"
+
+
+def write_key(path: Path) -> None:
+    path.write_text(PRIVATE_HEAD)
+    path.chmod(0o600)
 
 
 class FakeWorld:
@@ -28,6 +38,9 @@ class FakeWorld:
 
     def __init__(self, root: Path, *, sign_ok: bool = True, logged_in: bool = True) -> None:
         self.root = root
+        self.encrypted = True
+        self.derived = f"ssh-ed25519 AAAAkey {COMMENT}\n"
+        self.envs: list[dict] = []
         self.sign_ok = sign_ok
         self.logged_in = logged_in
         self.calls: list[list[str]] = []
@@ -70,15 +83,23 @@ class FakeWorld:
         self.calls.append([str(part) for part in command])
         if command[0] == sys.executable:
             return self._cli([str(part) for part in command])
-        assert command[0] == "ssh-keygen"
+        assert command[0] == "/usr/bin/ssh-keygen", command[0]
+        self.envs.append(kwargs["env"])
         if command[1] == "-t":
             key = Path(command[command.index("-f") + 1])
-            key.write_text("PRIVATE")
-            Path(str(key) + ".pub").write_text("ssh-ed25519 AAAAkey codex-agents-owner\n")
+            write_key(key)
+            Path(str(key) + ".pub").write_text(f"ssh-ed25519 AAAAkey {COMMENT}\n")
+            if not self.encrypted:  # user left the passphrase empty
+                self.unencrypted_new = True
             return subprocess.CompletedProcess(command, 0)
+        if command[1] == "-y":
+            if "-P" in command:
+                return subprocess.CompletedProcess(command, 1 if self.encrypted else 0, "", "")
+            return subprocess.CompletedProcess(command, 0, self.derived, "")
         if command[1] == "-l":
-            return subprocess.CompletedProcess(
-                command, 0, "256 SHA256:publicprint codex-agents-owner (ED25519)\n", "")
+            content = Path(command[-1]).read_text()
+            assert COMMENT not in content  # only type and blob are ever written for display
+            return subprocess.CompletedProcess(command, 0, "256 SHA256:publicprint (ED25519)\n", "")
         assert command[1:3] == ["-Y", "sign"]
         self.signed_names.append(command[command.index("-n") + 1])
         if self.sign_ok:
@@ -92,22 +113,29 @@ class AttestTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="attest-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.root, True)
         self.home = self.root / "home"
-        self.home.mkdir()
         self.state = self.root / "state"
-        self.state.mkdir()
         self.target = self.root / "project"
+        for directory in (self.home, self.state):
+            directory.mkdir()
+            directory.chmod(0o755)
         (self.target / ".codex/orchestration").mkdir(parents=True)
         (self.target / ".codex/orchestration/cli.py").write_text("")
         self.world = FakeWorld(self.root)
+        attest._CLEANUP_FAILURES.clear()
+        attest._TEMP_DIRS.clear()
+        patcher = mock.patch.object(attest, "check_ssh_keygen")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def set_providers(self, **enabled: bool) -> None:
         config = {"version": 1, "providers": {n: {"enabled": v} for n, v in enabled.items()}}
         (self.target / ".codex/orchestration/provider-routing.json").write_text(json.dumps(config))
 
     def configure_key(self) -> Path:
-        key = self.home / ".ssh" / "codex-agents-owner"
-        key.parent.mkdir()
-        key.write_text("PRIVATE")
+        ssh_dir = self.home / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        key = ssh_dir / "codex-agents-owner"
+        write_key(key)
         (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
         return key
 
@@ -129,6 +157,8 @@ class AttestTests(unittest.TestCase):
         self.prompts = prompts
         return code
 
+    # terminal
+
     def test_refuses_without_terminal(self) -> None:
         self.assertEqual(self.run_main([], terminal=False), 2)
         self.assertIn("human step", self.output)
@@ -140,11 +170,32 @@ class AttestTests(unittest.TestCase):
                 sin.isatty.return_value, sout.isatty.return_value = stdin, stdout
                 self.assertIs(attest._is_terminal(), expected)
 
+    def test_wording_does_not_claim_terminal_keeps_agents_out(self) -> None:
+        source = _SCRIPT.read_text().lower()
+        self.assertNotIn("keeps agents out", source)
+        self.assertIn("passphrase is what proves", attest.KEY_ADVICE)
+
+    # signer binary
+
+    def test_every_ssh_keygen_call_uses_fixed_path_despite_path_plant(self) -> None:
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "ssh-keygen").write_text("#!/bin/sh\nexit 0\n")
+        self.set_providers(codex=True)
+        self.configure_key()
+        with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
+            self.run_main(["", "y", "y", "y", "y"])
+        keygen = [c for c in self.world.calls if "ssh-keygen" in c[0]]
+        self.assertTrue(keygen)
+        self.assertTrue(all(c[0] == "/usr/bin/ssh-keygen" for c in keygen))
+
+    # key creation, reuse, enrolment
+
     def test_creates_key_when_none_configured(self) -> None:
         self.set_providers(codex=True)
-        code = self.run_main(["y", "y"])  # create key, credits off
+        code = self.run_main(["y", "y", "n", "y"])  # create key; buy off; spend balance not off; sign
         self.assertEqual(code, 0)
-        keygen = [c for c in self.world.calls if c[:2] == ["ssh-keygen", "-t"]]
+        keygen = [c for c in self.world.calls if c[:2] == ["/usr/bin/ssh-keygen", "-t"]]
         self.assertEqual(len(keygen), 1)
         self.assertEqual(keygen[0][2:], ["ed25519", "-f", str(self.home / ".ssh/codex-agents-owner"),
                                          "-C", "codex-agents-owner"])
@@ -152,46 +203,156 @@ class AttestTests(unittest.TestCase):
         self.assertIn("passphrase", self.output)
         self.assertEqual(self.world.recorded, ["codex"])
         self.assertEqual(self.world.signed_names, ["codex-agents-owner-v1"])
+        self.assertEqual((self.home / ".ssh").stat().st_mode & 0o777, 0o700)
 
-    def test_existing_private_key_path_is_configured(self) -> None:
+    def test_new_key_with_empty_passphrase_is_refused(self) -> None:
+        self.set_providers(codex=True)
+        self.world.encrypted = False
+        self.assertEqual(self.run_main(["y"]), 1)
+        self.assertIn("ssh-keygen -p -f", self.output)
+        self.assertEqual(self.world.recorded, [])
+
+    def test_existing_private_key_path_is_enrolled_from_derived_key(self) -> None:
         self.set_providers(codex=True)
         other = self.root / "mykey"
-        other.write_text("PRIVATE")
-        Path(str(other) + ".pub").write_text("ssh-ed25519 AAAAother c\n")
-        self.assertEqual(self.run_main(["n", str(other), "y"]), 0)
-        self.assertFalse(any(c[:2] == ["ssh-keygen", "-t"] for c in self.world.calls))
+        write_key(other)
+        Path(str(other) + ".pub").write_text(f"ssh-ed25519 AAAAkey {COMMENT}\n")
+        self.assertEqual(self.run_main(["n", str(other), "y", "y", "y"]), 0)
+        self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
+        self.assertTrue(any("-y" in c and "-P" not in c for c in self.world.calls))
         self.assertIn(str(other), next(c for c in self.world.calls if "-Y" in c))
+
+    def test_pub_mismatch_is_refused(self) -> None:
+        self.set_providers(codex=True)
+        other = self.root / "mykey"
+        write_key(other)
+        Path(str(other) + ".pub").write_text("ssh-ed25519 AAAAdifferent c\n")
+        self.assertEqual(self.run_main(["n", str(other)]), 1)
+        self.assertIn("does not match", self.output)
+        self.assertFalse(any("learning-configure-owner-key" in c for c in self.world.calls))
+
+    def test_public_key_file_cannot_be_the_signing_key(self) -> None:
+        self.set_providers(codex=True)
+        public = self.root / "mykey.pub"
+        public.write_text("ssh-ed25519 AAAAkey c\n")
+        public.chmod(0o600)
+        self.assertEqual(self.run_main(["n", str(public)]), 1)
+        self.assertIn("not a private key", self.output)
+
+    def test_unencrypted_existing_key_is_refused(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_key()
+        self.world.encrypted = False
+        self.assertEqual(self.run_main([""]), 1)
+        self.assertIn("ssh-keygen -p -f", self.output)
+        self.assertFalse(any("-Y" in c for c in self.world.calls))
 
     def test_reuses_configured_key(self) -> None:
         key = self.configure_key()
         self.set_providers(codex=True)
-        self.assertEqual(self.run_main(["", "y"]), 0)  # blank path = default
-        self.assertFalse(any(c[:2] == ["ssh-keygen", "-t"] for c in self.world.calls))
+        self.assertEqual(self.run_main(["", "y", "y", "y"]), 0)  # blank path = default
+        self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
         self.assertFalse(any("learning-configure-owner-key" in c for c in self.world.calls))
         self.assertIn(str(key), next(c for c in self.world.calls if "-Y" in c))
 
-    def test_yes_and_no_per_provider(self) -> None:
+    def test_configured_key_mismatch_is_refused(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        self.world.derived = "ssh-ed25519 AAAAother\n"
+        self.assertEqual(self.run_main([""]), 1)
+        self.assertIn("does not match", self.output)
+
+    # agent, paths
+
+    def test_signing_runs_without_agent_socket(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "/agent.sock"}):
+            self.run_main(["", "y", "y", "y"])
+        self.assertTrue(self.world.envs)
+        self.assertTrue(all("SSH_AUTH_SOCK" not in env for env in self.world.envs))
+
+    def test_symlinked_ssh_dir_is_refused(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        write_key(elsewhere / "codex-agents-owner")
+        (self.home / ".ssh").symlink_to(elsewhere)
+        (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
+        self.set_providers(codex=True)
+        self.assertEqual(self.run_main([""]), 1)
+        self.assertIn("symbolic links", self.output)
+
+    def test_group_writable_directory_and_loose_key_are_refused(self) -> None:
+        key = self.configure_key()
+        key.parent.chmod(0o775)
+        with self.assertRaises(attest.AttestError):
+            attest.validate_private_key(key)
+        key.parent.chmod(0o700)
+        key.chmod(0o640)
+        with self.assertRaises(attest.AttestError):
+            attest.validate_private_key(key)
+
+    def test_existing_or_dangling_output_files_block_creation(self) -> None:
+        self.set_providers(codex=True)
+        ssh_dir = self.home / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "codex-agents-owner.pub").symlink_to(self.root / "nowhere")  # dangling
+        self.assertEqual(self.run_main(["y"]), 1)
+        self.assertIn("already exists", self.output)
+        self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
+
+    def test_ssh_keygen_binary_checks(self) -> None:
+        planted = self.root / "ssh-keygen"
+        planted.write_text("#!/bin/sh\n")  # owned by this user, not root
+        real = _REAL_CHECK
+        with mock.patch.object(attest, "SSH_KEYGEN", str(planted)):
+            with self.assertRaises(attest.AttestError):
+                real()
+        with mock.patch.object(attest, "SSH_KEYGEN", str(self.root / "missing")):
+            with self.assertRaises(attest.AttestError):
+                real()
+
+    def test_main_stops_when_ssh_keygen_untrusted(self) -> None:
+        with mock.patch.object(attest, "check_ssh_keygen", side_effect=attest.AttestError("bad")):
+            self.assertEqual(self.run_main([]), 1)
+        self.assertEqual(self.world.calls, [])
+
+    # providers
+
+    def test_claude_yes_and_no(self) -> None:
         self.configure_key()
         self.set_providers(codex=True, claude=True)
-        self.assertEqual(self.run_main(["", "y", "n"]), 0)
+        # codex: buy off yes, spend yes, sign yes; claude: No
+        self.assertEqual(self.run_main(["", "y", "y", "y", "n"]), 0)
         self.assertEqual(self.world.recorded, ["codex"])
-        self.assertIn(attest.QUESTIONS["codex"], self.prompts[-2])
         self.assertIn(attest.QUESTIONS["claude"], self.prompts[-1])
         self.assertIn("Attested: codex", self.output)
-        self.assertIn("Still blocked: claude", self.output)
-        self.assertIn("run this command again", self.output.lower())
+        self.assertIn("Not attested: claude", self.output)
+        self.assertIn("Any earlier attestation for this provider stays in effect", self.output)
+        self.assertIn("provider-routing.json", self.output)
+        self.assertNotIn("revoke", self.output.lower())
+        self.assertNotIn("stay blocked", self.output)
 
     def test_default_answer_is_no(self) -> None:
         self.configure_key()
         self.set_providers(claude=True, codex=False)
         self.assertEqual(self.run_main(["", ""]), 1)
         self.assertEqual(self.world.recorded, [])
-        self.assertIn("children stay blocked", self.output)
 
-    def test_codex_field_only_for_codex(self) -> None:
+    def test_codex_buy_not_off_refuses_attestation(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        self.assertEqual(self.run_main(["", "n"]), 1)
+        self.assertEqual(self.world.grants, {})
+        self.assertIn("not attested while credits can still be bought", self.output)
+
+    def test_codex_two_questions_and_field_only_when_spend_disabled(self) -> None:
         self.configure_key()
         self.set_providers(codex=True, claude=True)
-        self.run_main(["", "y", "y"])
+        self.run_main(["", "y", "y", "y", "y", "y"])
+        self.assertIn(attest.QUESTIONS["codex_buy"], self.prompts[1])
+        self.assertIn(attest.QUESTIONS["codex_spend"], self.prompts[2])
+        self.assertIn("credit spending disabled", self.output)
         self.assertIs(self.world.grants["codex"]["codex_credits_spending_disabled"], True)
         self.assertNotIn("codex_credits_spending_disabled", self.world.grants["claude"])
         for grant in self.world.grants.values():
@@ -200,28 +361,25 @@ class AttestTests(unittest.TestCase):
             self.assertIs(grant["no_usage_credits"], True)
             self.assertIsInstance(grant["issued_at"], int)
 
+    def test_codex_spend_not_off_omits_field(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        self.assertEqual(self.run_main(["", "y", "n", "y"]), 0)
+        self.assertNotIn("codex_credits_spending_disabled", self.world.grants["codex"])
+        self.assertNotIn("credit spending disabled", self.output)
+        self.assertIn("no paid overage, no usage credits.", self.output)
+
+    def test_final_confirmation_declined_does_not_sign(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        self.assertEqual(self.run_main(["", "y", "y", "n"]), 1)
+        self.assertEqual(self.world.grants, {})
+        self.assertFalse(any("-Y" in c for c in self.world.calls))
+
     def test_codex_only_without_routing_file(self) -> None:
         self.configure_key()
-        self.run_main(["", "y"])
+        self.run_main(["", "y", "y", "y"])
         self.assertEqual(list(self.world.grants), ["codex"])
-
-    def test_temp_dir_removed_on_success(self) -> None:
-        self.configure_key()
-        self.set_providers(codex=True)
-        self.run_main(["", "y"])
-        self.assertEqual(len(self.world.work_dirs), 2)  # payload request and recording
-        for directory in self.world.work_dirs:
-            self.assertFalse(directory.exists())
-
-    def test_temp_dir_removed_on_failure(self) -> None:
-        self.configure_key()
-        self.set_providers(codex=True)
-        self.world.sign_ok = False
-        self.assertEqual(self.run_main(["", "y"]), 1)
-        self.assertIn("signing did not finish", self.output)
-        self.assertEqual(self.world.recorded, [])
-        for directory in self.world.work_dirs:
-            self.assertFalse(directory.exists())
 
     def test_not_logged_in_is_skipped(self) -> None:
         self.configure_key()
@@ -230,15 +388,87 @@ class AttestTests(unittest.TestCase):
         self.assertEqual(self.run_main([""]), 1)
         self.assertEqual(self.world.grants, {})
 
+    # temporary directories
+
+    def test_temp_dir_removed_on_success_and_private(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        modes: list[int] = []
+        original = attest.make_temp
+
+        def spy(prefix: str) -> Path:
+            path = original(prefix)
+            modes.append(path.stat().st_mode & 0o777)
+            return path
+
+        with mock.patch.object(attest, "make_temp", spy):
+            self.run_main(["", "y", "y", "y"])
+        self.assertEqual(len(self.world.work_dirs), 2)
+        for directory in self.world.work_dirs:
+            self.assertFalse(directory.exists())
+        self.assertTrue(modes and all(mode == 0o700 for mode in modes))
+        self.assertEqual(attest._TEMP_DIRS, set())
+
+    def test_temp_dir_removed_on_failure(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        self.world.sign_ok = False
+        self.assertEqual(self.run_main(["", "y", "y", "y"]), 1)
+        self.assertIn("signing did not finish", self.output)
+        self.assertEqual(self.world.recorded, [])
+        for directory in self.world.work_dirs:
+            self.assertFalse(directory.exists())
+
+    def test_cleanup_failure_is_reported_and_fails_exit(self) -> None:
+        self.configure_key()
+        self.set_providers(codex=True)
+        real_rmtree = shutil.rmtree
+
+        def stubborn(path, ignore_errors=False):
+            if Path(path).name.startswith("attest-") and "attest-pub-" not in str(path):
+                return None
+            return real_rmtree(path, ignore_errors=ignore_errors)
+
+        with mock.patch.object(attest.shutil, "rmtree", stubborn):
+            code = self.run_main(["", "y", "y", "y"])
+        self.assertEqual(code, 1)
+        self.assertIn("could not be removed", self.output)
+        for leftover in attest._CLEANUP_FAILURES:
+            real_rmtree(leftover, ignore_errors=True)
+
+    def test_signal_handler_removes_temp_dirs(self) -> None:
+        scratch = attest.make_temp("attest-")
+        with self.assertRaises(SystemExit) as raised:
+            attest._on_signal(signal.SIGTERM, None)
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertFalse(scratch.exists())
+
+    def test_handlers_installed_and_restored(self) -> None:
+        before = signal.getsignal(signal.SIGTERM)
+        previous = attest._install_handlers()
+        self.assertIs(signal.getsignal(signal.SIGTERM), attest._on_signal)
+        if hasattr(signal, "SIGHUP"):
+            self.assertIs(signal.getsignal(signal.SIGHUP), attest._on_signal)
+        attest._restore_handlers(previous)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    # privacy
+
     def test_nothing_identifying_in_output(self) -> None:
         self.configure_key()
         self.set_providers(codex=True, claude=True)
-        self.run_main(["", "y", "y"])
-        for fragment in SECRET_BITS + ("AAAAkey", "PRIVATE"):
+        self.run_main(["", "y", "y", "y", "y", "y"])
+        for fragment in SECRET_BITS + ("AAAAkey", "SECRETBODY", COMMENT):
             self.assertNotIn(fragment, self.output)
         self.assertIn("Plan: max", self.output)
         self.assertIn("Plan: pro", self.output)
-        self.assertIn("SHA256:publicprint", self.output)
+        self.assertIn("ssh-ed25519 SHA256:publicprint", self.output)
+
+    def test_key_comment_never_printed_when_enrolling(self) -> None:
+        self.set_providers(codex=True)
+        self.run_main(["y", "y", "y", "y"])
+        self.assertNotIn(COMMENT, self.output)
+        self.assertNotIn("codex-agents-owner (", self.output)
 
 
 if __name__ == "__main__":
