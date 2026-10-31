@@ -4,8 +4,8 @@ Let a Codex or Claude coding session delegate bounded sub-tasks to the best-suit
 Claude child agent. The choice is deterministic: verified quality first, then usage cost, then
 subscription quota headroom. Metered billing is never used.
 
-**Status:** pre-alpha. Nothing here is ready to install yet. See the
-[delivery plan](docs/delivery/plan.md) for the objective and goals.
+**Status:** pre-alpha. Read-only cross-provider routing works and is being piloted; write-capable
+children are in development. See the [delivery plan](docs/delivery/plan.md) for the objective and goals.
 
 ## What it will do
 
@@ -25,6 +25,56 @@ subscription quota headroom. Metered billing is never used.
 - Only existing subscription logins are used. API keys, usage credits and paid fallback are never
   used.
 - Run records stay on your machine and are never committed.
+
+## Setup
+
+You need macOS or Linux, Python 3.11 or later, Git, and the Codex and Claude Code clients signed in
+with their subscriptions. API keys are refused.
+
+1. **Install** into the top of a Git project. Without `--apply` the command only previews:
+
+   ```sh
+   python3 scripts/install.py install --target /path/to/project --apply
+   python3 scripts/install.py verify --target /path/to/project
+   ```
+
+   Commit the installed files in the project.
+2. **Enable providers.** Commit `.codex/orchestration/provider-routing.json` in the project. It
+   says which providers and models children may use. Without it, only Codex children are
+   allowed.
+3. **Register the learning collector** once, from the project:
+
+   ```sh
+   python3 .codex/orchestration/cli.py learning-register --project-root "$PWD"
+   ```
+
+4. **Attest billing.** This is a one-time human step:
+
+   ```sh
+   python3 scripts/attest.py --target /path/to/project
+   ```
+
+   No child runs until you confirm that each account cannot be charged beyond its subscription.
+   The command explains each question in plain language:
+   - It creates an owner key if you don't have one. Give it a passphrase, so no program,
+     including an AI agent, can sign in your name.
+   - It asks whether pay-as-you-go extra usage and Codex credit spending are turned off.
+   - It has you sign each answer.
+
+   Run it again whenever your billing settings change.
+5. **Optional: let a Codex session orchestrate Claude children.** Codex runs commands without
+   network by default, so a Codex primary cannot reach Claude. Create
+   `~/.codex/orchestrator.config.toml`:
+
+   ```toml
+   sandbox_mode = "workspace-write"
+
+   [sandbox_workspace_write]
+   network_access = true
+   ```
+
+   Then start orchestrating sessions with `codex -p orchestrator`. Ordinary sessions keep network
+   off.
 
 ## Development
 
