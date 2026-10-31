@@ -325,6 +325,8 @@ read_key() {
       case "$rest" in
         '[A'|'OA') KEY=UP;;
         '[B'|'OB') KEY=DOWN;;
+        '[5') IFS= read -rsn1 -t 1 rest; KEY=PGUP;;
+        '[6') IFS= read -rsn1 -t 1 rest; KEY=PGDN;;
         *) KEY=ESC;;
       esac;;
     '') KEY=ENTER;;
@@ -474,12 +476,6 @@ run_cmd() {
   ACTIVE_PID=""
   printf '\r\033[K'
   show_cursor
-  if [ "$RUN_QUIET" -ne 1 ]; then
-    {
-      printf '== %s (exit %s)\n' "$label" "$LAST_RC"
-      cat "$LAST_OUT" "$LAST_ERR"
-    } >>"$LOGDIR/setup.log" 2>/dev/null
-  fi
   return $LAST_RC
 }
 
@@ -488,33 +484,67 @@ run_identity() {
   "$@" 2>/dev/null </dev/null
 }
 
-# failure_detail LABEL [HINT] : never prints raw command output, only the exit code and a
-# fixed hint. A redacted log can be saved from the final screen.
-failure_detail() {
+# Only step names, command labels, exit codes and fixed hints ever reach the screen or the
+# saved summary. Raw command output is never shown, logged or exported.
+FAIL_SUMMARY=""
+FAIL_HINT_DEFAULT="Run the same command yourself to see details."
+record_failure() { # record_failure LABEL HINT
   FAILED_ANY=1
+  FAIL_SUMMARY="${FAIL_SUMMARY}step ${STEP} (${STEP_NAMES[$((STEP-1))]}): $1 | exit code $LAST_RC | $2
+"
+}
+
+failure_detail() { # failure_detail LABEL [HINT]
+  local hint=${2:-$FAIL_HINT_DEFAULT}
+  record_failure "$1" "$hint"
   list_add fail "$1 (exit $LAST_RC)"
-  list_sub "${2:-Run the same command yourself for details, or save a redacted log on the last screen.}"
+  list_sub "$hint"
 }
 
-# Mask emails, long hex or base64-like tokens and home directories.
-redact_log() {
-  sed -E -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/[email]/g' \
-         -e 's/[0-9A-Fa-f]{32,}/[hex]/g' \
-         -e 's#[A-Za-z0-9+/=_-]{40,}#[token]#g' \
-         -e 's#/(Users|home)/[^/ ]+#/~#g'
+# explain_installer LABEL MANUAL_COMMAND : map known installer refusals to fixed messages.
+# The installer's own text is only matched, never echoed.
+explain_installer() {
+  local label=$1 manual=$2 raw msg
+  raw=$(pj raw "$LAST_OUT")
+  case "$raw" in
+    *"merge"*"progress"*|*"rebase"*"progress"*|*"cherry-pick"*"progress"*|*"revert"*"progress"*|*"bisect"*"progress"*|*unmerged*)
+      msg="A Git operation (merge, rebase, cherry-pick or similar) is unfinished in the project. Finish or abort it first.";;
+    *"managed paths"*|*"uncommitted"*)
+      msg="Managed paths (.codex, .agents, .claude) have uncommitted changes. Commit or discard them first.";;
+    *"top of its working tree"*|*"not a usable git"*)
+      msg="The path is not the top folder of a Git working tree. Choose the project root.";;
+    *symlink*|*unsafe_or_unavailable_path*|*"not a regular file"*)
+      msg="A managed path is a symlink or cannot be used safely. Replace it with a real file or folder.";;
+    *"differs"*|*conflict*|*collision*|*"modified obsolete"*|*"already exists"*)
+      msg="A file in the project collides with a managed file (it differs from what would be installed). Move or commit it, then retry.";;
+    *"configuration is missing"*|*"required"*"configuration"*)
+      msg="Project configuration is missing (project-agent-routing.json or operational-checks.json).";;
+    *"not committed"*|*"verification"*)
+      msg="Verification failed: the project configuration and installed files must be committed and clean.";;
+    *)
+      msg="The installer refused: run it manually to see why:"
+      record_failure "$label" "installer refusal not recognised; run: $manual"
+      list_add fail "$label"
+      list_sub "$msg"
+      list_cmd "$manual"
+      return 0;;
+  esac
+  record_failure "$label" "$msg"
+  list_add fail "$label"
+  list_sub "$msg"
 }
 
-save_redacted_log() {
+save_summary() {
   local dest
-  ask_text "Save redacted log to (new file)" "$PWD/agent-orchestration-setup.log"
+  ask_text "Save the summary to (new file)" "$PWD/agent-orchestration-setup-summary.txt"
   dest=$ANSWER
   screen_reset; begin_step 8
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     list_add fail "$dest already exists; nothing written"
-  elif [ -f "$LOGDIR/setup.log" ] && ( umask 077; set -C; redact_log <"$LOGDIR/setup.log" >"$dest" ) 2>/dev/null; then
-    list_add ok "Saved a redacted log (emails, tokens and home paths masked)"
+  elif ( umask 077; set -C; printf 'Agent orchestration setup: what failed\n%s' "$FAIL_SUMMARY" >"$dest" ) 2>/dev/null; then
+    list_add ok "Saved a summary of what failed (step names, labels, exit codes and fixed hints only)"
   else
-    list_add fail "Could not write the log"
+    list_add fail "Could not write the summary"
   fi
   menu 0 "Continue"
 }
@@ -600,20 +630,21 @@ elif op == "plan":
         print(("UPDATE %s" if os.path.lexists(os.path.join(target, rel)) else "ADD %s") % rel)
     for rel, action in sorted((codex.get("project_configuration") or {}).items()):
         print("CONFIG %s -> %s" % (rel, action))
-elif op == "problems":
+elif op == "raw":
     data = load(sys.argv[2]) or {}
-    seen = []
+    parts = []
+    for key in ("refused", "error"):
+        if isinstance(data.get(key), str):
+            parts.append(data[key])
     for source in (data.get("codex") or {}, data.get("claude") or {}):
         for key in ("errors", "project_errors", "package_errors"):
             for item in source.get(key) or []:
-                if isinstance(item, str) and item not in seen:
-                    seen.append(item)
+                if isinstance(item, str):
+                    parts.append(item)
         for key in ("error", "required_action"):
-            item = source.get(key)
-            if isinstance(item, str) and item not in seen:
-                seen.append(item)
-    for item in seen[:6]:
-        print(re.sub(r"\s+", " ", item)[:200])
+            if isinstance(source.get(key), str):
+                parts.append(source[key])
+    print(" ".join(parts).lower().replace("\n", " "))
 PY
 pj() { python3 -I -c "$PY_HELPER" "$@"; }
 
@@ -833,14 +864,7 @@ step_project() {
     cp "$LAST_OUT" "$PREVIEW_FILE"
     screen_reset; begin_step 2
     if [ "$rc" -ne 0 ]; then
-      out=$(pj get "$PREVIEW_FILE" refused)
-      if [ -n "$out" ]; then
-        list_add fail "The installer refused this project"
-        list_sub "$out"
-      else
-        failure_detail "The install preview failed"
-        while IFS= read -r out; do list_sub "$out"; done < <(pj problems "$PREVIEW_FILE")
-      fi
+      explain_installer "The install preview was refused" "$(manual_installer install "$dir")"
       menu 0 "Choose another path" "Quit"
       [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 1; }
       default=$dir
@@ -971,6 +995,46 @@ show_plan() {
   done < <(printf '%s\n' "$PLAN_TEXT" | grep '^CONFIG ')
 }
 
+# manual_installer OPERATION PROJECT [--apply] : the exact, shell-quoted command to run by hand.
+manual_installer() {
+  printf 'python3 %q %s --target %q%s' "$ROOT_DIR/scripts/install.py" "$1" "$2" "${3:+ $3}"
+}
+
+# view_plan : every add, update and remove path in a scrollable view.
+view_plan() {
+  local text off=0 page n i end k
+  local lines=()
+  text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE) ')
+  hide_cursor
+  while :; do
+    term_size
+    lines=()
+    while IFS= read -r k; do lines+=("$k"); done < <(printf '%s\n' "$text" | fold -s -w $((COLS - 6)))
+    n=${#lines[@]}
+    page=$((LINES_N - 9)); [ $page -lt 3 ] && page=3
+    [ $off -gt $((n - page)) ] && off=$((n - page))
+    [ $off -lt 0 ] && off=0
+    printf '\033[H\033[2J'
+    draw_header
+    printf '\n  %sFull plan: lines %d-%d of %d%s\n\n' "$C_BOLD" $((off + 1)) $((off + page > n ? n : off + page)) "$n" "$C_RESET"
+    i=$off; end=$((off + page))
+    while [ $i -lt $end ] && [ $i -lt "$n" ]; do
+      printf '    %s\n' "${lines[$i]}"
+      i=$((i + 1))
+    done
+    printf '\n  %sUp/Down scroll   PageUp/PageDown page   q back%s\n' "$C_DIM" "$C_RESET"
+    read_key
+    case "$KEY" in
+      UP|k) off=$((off - 1));;
+      DOWN|j) off=$((off + 1));;
+      PGUP) off=$((off - page));;
+      PGDN|SPACE) off=$((off + page));;
+      q|Q|ENTER|ESC) show_cursor; return 0;;
+      EOF) show_cursor; return 0;;
+    esac
+  done
+}
+
 verify_install() { # verify_install -> sets LAST_* and records problems in LIST
   run_cmd "Verifying the install" python3 "$ROOT_DIR/scripts/install.py" verify --target "$PROJECT"
   local rc=$? line
@@ -978,8 +1042,7 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
     list_add ok "Verification passed: the install is ready"
     return 0
   fi
-  list_add warn "Verification is not ready yet"
-  while IFS= read -r line; do list_sub "$line"; done < <(pj problems "$LAST_OUT")
+  explain_installer "Verification is not ready yet" "$(manual_installer verify "$PROJECT")"
   return 1
 }
 
@@ -990,17 +1053,20 @@ step_install() {
   body "Install into: $PROJECT"
   show_plan
   body "This adds or updates files under .codex, .agents and .claude, then writes .codex/orchestration/provider-routing.json. Nothing outside the project is touched."
-  menu 0 "Install now" "Skip the install" "Quit"
+  while :; do
+    menu 0 "Install now" "Show the full list of files" "Skip the install" "Quit"
+    [ "$MENU_IDX" -eq 1 ] && { view_plan; continue; }
+    break
+  done
   case $MENU_IDX in
-    1) mark_step 4 skip "install skipped"; return 0;;
-    2) echo "Stopped."; exit 0;;
+    2) mark_step 4 skip "install skipped"; return 0;;
+    3) echo "Stopped."; exit 0;;
   esac
   screen_reset; begin_step 4
   render
   if ! run_cmd "Installing" python3 "$ROOT_DIR/scripts/install.py" install --target "$PROJECT" "${INSTALL_OPTS[@]}" --apply; then
     screen_reset; begin_step 4
-    failure_detail "The install failed"
-    while IFS= read -r line; do list_sub "$line"; done < <(pj problems "$LAST_OUT")
+    explain_installer "The install failed" "$(manual_installer "install" "$PROJECT" --apply)"
     list_sub "The installer rolls back a partial install where it can."
     mark_step 4 fail "install failed"
     FAIL_REASON="install failed"
@@ -1014,8 +1080,8 @@ step_install() {
       list_add ok "Wrote .codex/orchestration/provider-routing.json"
     else
       list_add fail "Could not write provider-routing.json"
-      list_sub "$(head -n 1 "$LOGDIR/routing.err")"
-      FAILED_ANY=1
+      list_sub "The destination is a symlink, or its folders are not real folders inside the project."
+      record_failure "provider-routing.json not written" "destination refused or not writable"
       mark_step 4 fail "provider routing not written"
       FAIL_REASON="provider routing not written"
       menu 0 "Continue to the summary"
@@ -1232,9 +1298,9 @@ step_done() {
  - In Codex, start a session with: $codex_cmd
  - To remove everything, run:"
   list_cmd "python3 $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
-  if [ "$FAILED_ANY" -eq 1 ] && [ -f "$LOGDIR/setup.log" ]; then
-    menu 0 "Exit" "Save a redacted log to a file"
-    [ "$MENU_IDX" -eq 1 ] && save_redacted_log
+  if [ "$FAILED_ANY" -eq 1 ] && [ -n "$FAIL_SUMMARY" ]; then
+    menu 0 "Exit" "Save a summary of what failed"
+    [ "$MENU_IDX" -eq 1 ] && save_summary
     show_cursor
     return 0
   fi
@@ -1243,18 +1309,6 @@ step_done() {
   printf '  %sPress Enter to exit.%s ' "$C_DIM" "$C_RESET"
   IFS= read -r _ || true
   printf '\n'
-}
-
-# Some nested Python processes started by the installed CLI scrub their environment and still
-# write bytecode. Remove untracked __pycache__ directories from managed paths so setup never
-# leaves the project dirty.
-clean_bytecode() {
-  local d
-  [ -n "$PROJECT" ] || return 0
-  while IFS= read -r d; do
-    [ -n "$(git -C "$PROJECT" ls-files -- "$d" 2>/dev/null)" ] || rm -rf -- "$PROJECT/$d"
-  done < <(cd "$PROJECT" 2>/dev/null && find .codex .agents .claude -type d -name __pycache__ -prune -print 2>/dev/null)
-  return 0
 }
 
 skip_rest() { # skip_rest REASON : mark collector, billing and profile as skipped
@@ -1278,18 +1332,14 @@ main() {
         skip_rest "$FAIL_REASON"
       else
         step_collector
-        clean_bytecode
         step_billing
-        clean_bytecode
         step_profile
       fi;;
     verify)
       step_verify_only;;
     attest)
-      step_billing
-      clean_bytecode;;
+      step_billing;;
   esac
-  clean_bytecode
   step_done
 }
 

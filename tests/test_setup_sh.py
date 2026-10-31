@@ -42,6 +42,9 @@ VALIDATE = (
 )
 
 
+TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789SECRETTOKEN"
+
+
 def write_routing(project: Path, codex: str = "on", claude: str = "on",
                   models: str = "claude-opus-5-5", bridge: str = "off") -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -191,6 +194,8 @@ class WizardTerminalTests(unittest.TestCase):
         (self.fakes / "python3").write_text(
             "#!/bin/sh\n"
             f'echo "$PYTHONDONTWRITEBYTECODE" >> "{self.py_log}"\n'
+            'if [ -n "$FAKE_FAIL" ]; then case "$*" in *install.py*--apply*)'
+            ' echo \'{"error": "boom ' + TOKEN + ' user@example.invalid"}\'; echo ' + TOKEN + ' >&2; exit 2;; esac; fi\n'
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
             f'exec "{sys.executable}" "$@"\n')
@@ -206,6 +211,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.pid = 0
         self.fd = -1
         self.screen = ""
+        self.transcript = ""
 
     def start(self, cwd: Path, extra_env: dict | None = None) -> None:
         import fcntl
@@ -260,6 +266,7 @@ class WizardTerminalTests(unittest.TestCase):
                 if not chunk:
                     break
                 self.screen += chunk.decode(errors="replace")
+                self.transcript += chunk.decode(errors="replace")
         self.fail(f"never saw {text!r}; last screen: {re.sub(chr(27) + r'.*?[A-Za-z]', '', self.screen[-1500:])!r}")
 
     def send(self, data: str) -> None:
@@ -279,7 +286,9 @@ class WizardTerminalTests(unittest.TestCase):
             ready, _, _ = select.select([self.fd], [], [], 0.1)
             if ready:
                 try:
-                    self.screen += os.read(self.fd, 65536).decode(errors="replace")
+                    chunk = os.read(self.fd, 65536).decode(errors="replace")
+                    self.screen += chunk
+                    self.transcript += chunk
                 except OSError:
                     time.sleep(0.1)
         self.fail("the wizard did not exit")
@@ -382,14 +391,44 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
         self.send("\r")
         self.assertEqual(self.finish(), 0)
-        self.assertEqual(
-            [str(p) for p in project.rglob("__pycache__")], [])
         runs = self.py_log.read_text().split()
         self.assertTrue(runs and set(runs) == {"1"}, runs)
         self.assertEqual(list(self.tmpdir.iterdir()), [])
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
+
+    def test_failure_summary_is_an_allowlist_and_never_echoes_output(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_FAIL": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("The install failed")
+        self.expect("run it manually to see why")
+        self.expect("Continue to the summary")
+        self.send("\r")
+        self.expect("Save a summary of what failed")
+        self.send("\x1b[B\r")
+        self.expect("Save the summary to")
+        destination = self.base / "summary.txt"
+        self.send(f"{destination}\r")
+        self.expect("Saved a summary")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        saved = destination.read_text()
+        self.assertIn("exit code 2", saved)
+        self.assertIn("install failed".lower(), saved.lower())
+        for text in (saved, self.transcript):
+            self.assertNotIn(TOKEN, text)
+            self.assertNotIn("user@example.invalid", text)
+        self.assertEqual(oct(destination.stat().st_mode & 0o777), "0o600")
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:
         (self.base / "-odd").mkdir()

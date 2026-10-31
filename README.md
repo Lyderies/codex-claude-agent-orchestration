@@ -66,13 +66,15 @@ The wizard runs these commands. The installer also needs the project's
 `--project-agent-routing` and `--operational-checks` on the first install.
 
 **Operational checks recipe.** In the project, write two small wrapper scripts (one runs your
-tests, one runs a security or secret scan), commit them, then compute the hashes. The wrapper
-must be committed, because the installer checks that the file matches a clean commit:
+tests, one runs a secret scanner), commit them, then compute the hashes. The wrapper
+must be committed, because the installer checks that the file matches a clean commit. The security
+example uses `gitleaks`, which must be installed (`brew install gitleaks`, or download it from the
+project's release page); any equivalent secret scanner works the same way.
 
 ```sh
 cd /path/to/project
 printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["python3", "-m", "unittest", "discover"]))\n' > qa-check
-printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["git", "diff", "--check"]))\n' > qa-security
+printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["gitleaks", "detect", "--no-banner", "--redact"]))\n' > qa-security
 chmod 700 qa-check qa-security
 git add qa-check qa-security && git commit -m "Add QA check wrappers"
 INTERP=$(shasum -a 256 /usr/bin/python3 | cut -d' ' -f1)   # sha256sum on Linux
