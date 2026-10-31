@@ -194,6 +194,39 @@ class SetupScriptTests(unittest.TestCase):
                 env=dict(os.environ, CODEX_HOME=str(base / "outer" / "inner")))
             self.assertEqual(result.stdout.splitlines()[0], "codex")
 
+    def test_codex_hint_does_not_hang_on_a_fifo_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(os.path.realpath(directory))
+            os.mkfifo(base / "orchestrator.config.toml")
+            started = time.time()
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-codex-hint", "1", "0"], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, env=dict(os.environ, CODEX_HOME=str(base)), timeout=20)
+            self.assertLess(time.time() - started, 15)
+        self.assertEqual(result.stdout.splitlines()[0], "codex")
+
+    def test_uncommitted_summary_keeps_rename_source_names_whole(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            (project / ".codex").mkdir()
+            old = project / ".codex" / "old name .txt"
+            old.write_text("same content for rename detection\n" * 5)
+            git = ["git", "-C", str(project)]
+            subprocess.run(git + ["add", "-A"], check=True, env=env)
+            subprocess.run(git + ["commit", "-qm", "i"], check=True, env=env)
+            subprocess.run(git + ["mv", ".codex/old name .txt", ".codex/new name.txt"], check=True, env=env)
+            (project / ".codex" / "extra").write_text("x")
+            result = subprocess.run(["bash", str(SETUP), "--print-uncommitted", str(project)],
+                                    capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertIn(".codex/new name.txt (from .codex/old name .txt)", lines)
+        self.assertIn(".codex/extra", lines)
+        self.assertEqual(len(lines), 2, lines)
+
     def helper(self, *args: str, stdin: bytes = b"", env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(SETUP), "--helper", *args], input=stdin, capture_output=True,
                               env=dict(os.environ, **(env or {})))

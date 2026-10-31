@@ -268,29 +268,51 @@ elif op in ("plan", "planpaths", "paths"):
 elif op == "netprofile":
     def read_profile(path):
         uid = os.geteuid()
-        parts = [part for part in os.path.abspath(path).split("/") if part]
-        cur = "/"
-        for index, part in enumerate(parts):
-            nxt = os.path.join(cur, part)
-            info = os.lstat(nxt)
-            last = index == len(parts) - 1
-            if stat.S_ISLNK(info.st_mode):
-                # Only root-owned system links (such as /var on macOS) are followed.
-                if last or info.st_uid != 0:
-                    return None
-                cur = os.path.realpath(nxt)
-                continue
-            if info.st_uid != (uid if last else info.st_uid) or info.st_uid not in (0, uid):
-                return None
-            cur = nxt
-        fd = os.open(cur, os.O_RDONLY | os.O_NOFOLLOW)
+        full = os.path.abspath(path)
+        # Pre-pass: only root-owned system links (such as /var on macOS) may be resolved, and
+        # only here. Any other symlink is refused; the walk below never follows one.
+        for _ in range(40):
+            parts = [part for part in full.split("/") if part]
+            cur = "/"
+            for index, part in enumerate(parts):
+                cur = os.path.join(cur, part)
+                if stat.S_ISLNK(os.lstat(cur).st_mode):
+                    if index == len(parts) - 1 or os.lstat(cur).st_uid != 0:
+                        return None
+                    full = os.path.join(os.path.realpath(cur), *parts[index + 1:])
+                    break
+            else:
+                break
+        else:
+            return None
+        parts = [part for part in full.split("/") if part]
+        if not parts:
+            return None
+        # Walk by directory descriptors: each component is opened relative to its verified
+        # parent with O_NOFOLLOW, so a swapped parent cannot redirect the read.
+        dirfd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
         try:
-            info = os.fstat(fd)
+            for part in parts[:-1]:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd)
+                os.close(dirfd)
+                dirfd = nxt
+                if os.fstat(dirfd).st_uid not in (0, uid):
+                    return None
+            leaf = parts[-1]
+            # Check the leaf type before opening so a FIFO or device is never opened.
+            info = os.stat(leaf, dir_fd=dirfd, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
                 return None
-            return os.read(fd, 65536)
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+                    return None
+                return os.read(fd, 65536)
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
+            os.close(dirfd)
 
     result = "no"
     try:
@@ -326,6 +348,27 @@ elif op == "raw":
     print(" ".join(parts).lower().replace("\n", " "))
 PY
 pj() { python3 -I -c "$PY_HELPER" "$@"; }
+
+# uncommitted_managed PROJECT : the paths still uncommitted in the managed folders, one per
+# line, for display. `git status -z` records are `XY path` and, for a rename or copy (R or C),
+# `XY new` followed by a bare `old` field; both names are kept whole. Only control characters
+# are removed, so a name cannot drive the terminal.
+uncommitted_managed() {
+  local rec st name src out=""
+  while IFS= read -r -d '' rec; do
+    st=${rec:0:2}; name=${rec:3}
+    name=${name//[[:cntrl:]]/}
+    case "$st" in
+      *R*|*C*)
+        IFS= read -r -d '' src
+        src=${src//[[:cntrl:]]/}
+        name="$name (from $src)";;
+    esac
+    if [ -z "$out" ]; then out=$name; else out="$out
+$name"; fi
+  done < <(git -C "$1" status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null)
+  printf '%s' "$out"
+}
 
 # codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
 # [sandbox_workspace_write]. The Python helper walks every path component with lstat (no
@@ -381,6 +424,9 @@ case "${1:-}" in
   --print-codex-hint)
     if [ "$#" -ne 3 ]; then echo "usage: setup.sh --print-codex-hint WANTED READY" >&2; exit 2; fi
     codex_hint "$2" "$3"; printf '%s\n%s\n' "$CODEX_CMD" "$CODEX_WHY"; exit 0;;
+  --print-uncommitted)
+    if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-uncommitted PROJECT" >&2; exit 2; fi
+    uncommitted_managed "$2"; printf '\n'; exit 0;;
   --helper)
     shift; pj "$@"; exit "$?";;
   -h|--help) usage; exit 0;;
@@ -1373,7 +1419,7 @@ step_install() {
     fi
   fi
   # Whatever is still uncommitted in the managed paths is listed in the final summary.
-  UNCOMMITTED=$(git -C "$PROJECT" status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null | tr '\0' '\n' | cut -c4- | tr -d '\001-\011\013-\037\177')
+  UNCOMMITTED=$(uncommitted_managed "$PROJECT")
   if [ "$COMMIT_STATE" = committed ] && [ -n "$UNCOMMITTED" ]; then
     COMMIT_STATE=failed
     commit_done=0
