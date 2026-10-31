@@ -98,8 +98,9 @@ Each slice is a feature branch with tests and a cross-provider review.
   - Never `--bare`.
   - The run fails closed unless the init frame reports `apiKeySource: none` and the requested model.
 - **Codex child:** `codex exec`.
-  - Flags: `-s read-only`, `--ephemeral`, `--ignore-user-config`, the routed model and effort,
-    `--json`, and the result schema as `--output-schema`.
+  - Flags: `-s read-only`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules` and
+    `approval_policy="never"` (see S4c), the routed model and effort, `--json`, and the result
+    schema as `--output-schema`.
   - A `model/rerouted` event marks the result unreviewed.
 - **Observations:**
   - Each run's usage and its headroom and billing observations are written as ledger records.
@@ -184,6 +185,74 @@ The allowlist only detects emitted, typed events. Pre-dispatch denial comes from
 and ephemeral mode, which were shown live only on codex-cli 0.164.0, so the reviewed Codex range
 is pinned to that build. Widening it requires the live containment check to pass on the new
 build.
+
+### S4c: bridged child containment
+
+- **No execpolicy rules.** `--ignore-user-config` skips only `config.toml`. Codex still loaded
+  `${CODEX_HOME:-~/.codex}/rules/*.rules`, and a trusted project's `.codex/rules`, for a bridged
+  child, and the S5b rule lets the primary-host commands (including `dispatch`) run outside the
+  sandbox, matched by their arguments alone. A read-only bridged child could therefore have run
+  them unsandboxed. The bridge now passes `--ignore-rules`. Before the durable intent it reads
+  `codex exec --help` from the re-checked client (no model call) and refuses with
+  `codex_exec_options_unavailable` unless `--ignore-user-config` and `--ignore-rules` are listed.
+  It also pins `-c approval_policy="never"`, so no escalation request can be granted; codex-cli
+  0.164.0 validates the value and the rendered prompt then says commands needing approval are
+  rejected.
+- **Rest of the user layer.** Inspected on codex-cli 0.164.0 with a scratch `CODEX_HOME` and
+  `codex debug prompt-input` and `codex features list`, which make no model call. The user's
+  `AGENTS.md` and skills (`$CODEX_HOME/skills`, `~/.agents/skills`) still reach a child's prompt,
+  as do the export's own `AGENTS.md` and skills; they are instructions, not authority. No MCP
+  server or plugin tool appears, an exported `.codex/config.toml` is not loaded, and hooks stay
+  disabled. `skill_mcp_dependency_install`, on by default, can install and start an MCP server
+  that a mentioned skill declares, and MCP servers run outside the sandbox, so the bridge
+  disables it too.
+- **Managed configuration.** System and managed Codex configuration applies despite
+  `--ignore-user-config` and can add MCP servers or hooks. A Codex dispatch is refused with
+  `codex_managed_config_present` when `/etc/codex` holds any TOML file (or cannot be read), when
+  `~/.codex/managed_config.toml` exists, or, on macOS, when a `com.openai.codex` plist exists
+  under `/Library/Managed Preferences/` (machine-wide or for the account), as Claude launches
+  are refused on managed settings.
+- **Process tree.** The child runs in its own session, but Codex starts helpers such as
+  `codex-code-mode-host` in their own process groups, and TTY commands may get their own
+  session. The rule is that killing an unrelated process is worse than leaving a sandboxed
+  orphan, so tracking is conservative:
+  - A fixed-path `ps` (`/bin/ps`, else `/usr/bin/ps`; `-U <uid> -o pid=,ppid=`) only lists
+    candidate pids, every 0.25 s while the child runs. Every decision rests on one kernel record
+    per process that gives its parent, process group, birth time and exit state together:
+    `kinfo_proc` from `sysctl(KERN_PROC_PID)` on macOS (birth in microseconds; the record must
+    name the pid asked for, and this process's own record must give its own parent and group),
+    and `/proc/<pid>/stat` on Linux (birth in clock ticks).
+  - A candidate is adopted only when its own record names a tracked parent and that parent's
+    record, read afterwards, still has the tracked birth time; the candidate's birth time comes
+    from the same record as its parent. A pid rejected earlier is readopted only the same way.
+    The first snapshot, taken while the child is unreaped, already adopts what is visible. A
+    shared process group never adopts.
+  - The child is never reaped before cleanup: its exit is seen in its record. Then every live
+    tracked process is killed with SIGKILL in up to five rounds, each rescanned, with a fresh
+    record read before every signal. A group is killed only through a leader whose fresh record
+    shows the tracked birth time and that it leads the group: the child itself (its pid cannot
+    change hands while it is unreaped) or another tracked process. Nothing is stopped. Only then
+    is the child reaped and its exit status kept.
+  - An exit first seen after the deadline, for example because a snapshot blocked, is a timeout.
+  - The deadline watchdog runs the same standard-library module as a script, with the child's
+    pid and birth time. It verifies that identity, retrying for up to five seconds, then
+    acknowledges while the bridge still holds the child unreaped; it never signals anything it
+    could not verify. Without the acknowledgement the run is aborted (`watchdog_unavailable`).
+    It then tracks the tree itself every 0.5 s and kills it at the deadline or once the child
+    has exited, so a bridge crash still ends the tree.
+  - Without a readable process table or kernel records the child is not launched
+    (`process_tracking_unavailable`).
+- **Residual risks.**
+  - Deliberate lifetime escape: polling cannot contain a process that double-forks into a new
+    session and loses its parent between two snapshots (within 0.25 s, or 0.5 s for the watchdog
+    after a bridge crash). It is left running rather than risk an unrelated kill. It stays inside
+    the child's read-only, network-disabled Codex sandbox; kernel-enforced membership (such as a
+    Linux cgroup) would be needed to end it. The same applies to an orphan that a process
+    starts in the instant before its own kill, outside the child's group.
+  - Identity window: the birth time is microseconds on macOS and 10 ms clock ticks on Linux, and
+    a pid could change hands between the last record read and the signal. Both require the pid
+    space to wrap around in that interval.
+  - Native Codex children share the primary's command rule (see S5b).
 
 ### S4: security review, pilot install and exit
 
@@ -330,6 +399,11 @@ build.
     attestation and the rule itself come from the owner's terminal. An owner who runs
     `scripts/attest.py --state-root` against an installed project is refused at
     `provider-observe`, because only the default state is accepted.
+  - Native Codex children that a Codex primary spawns share its session, so the rule applies
+    to them too: a native child could run the primary-host commands outside its own sandbox.
+    It is still held to this project's root and the owner's state by the own-root invariant,
+    and every run it could open or dispatch still needs ledger admission. The Codex skill
+    says never to ask a child to run them. Bridged Codex children load no rules (S4c).
   - The Claude primary's permission rules are a separate follow-up.
 
 ## Deferred to G4

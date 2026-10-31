@@ -2,6 +2,24 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **Bridged child containment (0.8.8).**
+  - Bridged Codex children run with `--ignore-rules`: `--ignore-user-config` skips only
+    `config.toml`, so a child still loaded the owner's execpolicy rules, and the setup-written
+    rule would have let it run the primary-host commands, `dispatch` among them, outside its
+    sandbox. A client whose `codex exec --help` lacks the option is refused before launch.
+    `approval_policy="never"` is pinned and `skill_mcp_dependency_install` is disabled.
+  - Codex system or managed configuration (`/etc/codex`, `~/.codex/managed_config.toml`, macOS
+    managed preferences) refuses a Codex dispatch (`codex_managed_config_present`).
+  - Cleanup reaches descendants outside the child's process group, conservatively: a
+    fixed-path `ps` lists candidates, and a process is adopted only when its own kernel record
+    (parent, group and birth time read together) names a tracked parent whose record still
+    matches; every SIGKILL is preceded by a fresh record read, and the child's own group is
+    killed before the child is reaped. The
+    deadline watchdog verifies the child's identity before the run continues and tracks the
+    tree too. A process that detaches between snapshots is left running in the sandbox rather
+    than risk killing an unrelated one.
+  - Native Codex children share the primary's session and its command rule; the design's
+    residual risks and the Codex skill now say so.
 - **Setup wizard retry.** A wrong owner-key passphrase no longer stops `scripts/attest.py`: it says
   "That passphrase did not unlock the key." and offers Try again or Exit, for the key check, the
   signing and the passphrase change (other failures still stop). In `setup.sh`, no failed step

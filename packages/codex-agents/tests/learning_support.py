@@ -545,6 +545,14 @@ if arguments == ["--version"]:
     sys.stdout.write(open(version).read() if os.path.exists(version) else default + "\\n")
 elif name == "claude" and arguments[:2] == ["auth", "status"]:
     sys.stdout.write(open(os.path.join(directory, "claude-status.json")).read())
+elif name == "codex" and arguments == ["exec", "--help"]:
+    # Answers from codex-exec-help.txt, or the options the reviewed client lists.
+    help_text = os.path.join(directory, "codex-exec-help.txt")
+    default = (
+        "Options:\\n  -m, --model <MODEL>\\n      --ephemeral\\n"
+        "      --ignore-user-config\\n      --ignore-rules\\n      --json\\n"
+    )
+    sys.stdout.write(open(help_text).read() if os.path.exists(help_text) else default)
 elif name == "codex" and arguments[:1] == ["app-server"]:
     log = open(os.path.join(directory, "methods.log"), "a")
     for line in sys.stdin:

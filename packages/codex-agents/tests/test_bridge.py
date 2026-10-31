@@ -9,6 +9,7 @@ import os
 import pwd
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,7 @@ from unittest import mock
 from tests.support import FIXTURES_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 import cli
-from codex_agents import bridge, claude_host, learning_store
+from codex_agents import bridge, claude_host, learning_store, process_tree
 from codex_agents.bridge import (
     BridgeRefused,
     dispatch,
@@ -150,6 +151,11 @@ class BridgeTestCase(unittest.TestCase):
                 "darwin": (str(base / "managed-preferences" / "{user}" / "claude.plist"),),
                 "linux": (str(base / "managed-preferences" / "{user}" / "claude.plist"),),
             }),
+            ("CODEX_MANAGED_PATHS", {
+                "darwin": (str(base / "codex-managed" / "{user}" / "managed_config.toml"),),
+                "linux": (str(base / "codex-managed" / "{user}" / "managed_config.toml"),),
+            }),
+            ("CODEX_SYSTEM_DIRECTORY", str(base / "etc-codex")),
         ):
             patcher = mock.patch.object(bridge, name, value)
             patcher.start()
@@ -1098,10 +1104,17 @@ from codex_agents import bridge
 marker, deadline = sys.argv[2], float(sys.argv[3])
 child = [sys.executable, "-c",
          "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpgid(0)));"
-         " time.sleep(120)", marker]
+         " print('{}', flush=True); time.sleep(120)", marker]
+
+
+def on_frame(frame):
+    # The bridge reads frames only once its watchdog has acknowledged.
+    open(marker + "-reading", "w").close()
+
+
 with bridge.signal_guard():
     bridge.run_child(child, environment={"PATH": os.defpath}, cwd=Path(marker).parent,
-                     deadline_seconds=deadline, on_frame=lambda frame: None)
+                     deadline_seconds=deadline, on_frame=on_frame)
 """
 
 
@@ -1113,8 +1126,9 @@ class ChildTerminationTests(unittest.TestCase):
              str(deadline)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        for _ in range(200):
-            if marker.exists() and marker.read_text():
+        reading = directory / "child-group-reading"
+        for _ in range(400):
+            if marker.exists() and marker.read_text() and reading.exists():
                 return driver, int(marker.read_text())
             time.sleep(0.05)
         driver.kill()
@@ -1142,7 +1156,7 @@ class ChildTerminationTests(unittest.TestCase):
 
     def test_watchdog_kills_the_child_after_the_bridge_is_sigkilled(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
-            driver, group = self.start(Path(directory), 1)
+            driver, group = self.start(Path(directory), 3)
             driver.kill()
             driver.wait(timeout=10)
             os.killpg(group, 0)  # Still running: only the watchdog can end it now.
@@ -1151,6 +1165,472 @@ class ChildTerminationTests(unittest.TestCase):
             finally:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(group, signal.SIGKILL)
+
+
+# A child that leaves descendants outside its own process group, as Codex helpers and
+# TTY commands do, and reports a started frame. In `tree` mode the grandchild moves to
+# a new session and the great-grandchild takes a group of its own; in `orphan` mode an
+# intermediate leaves an orphan in the child's own group and exits at once, so only
+# the child's group can still reach it. The child then lingers and exits.
+TREE_CHILD = """
+import os, sys, time
+directory, linger, mode = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+
+
+def record(name):
+    path = os.path.join(directory, name)
+    with open(path + ".tmp", "w") as handle:
+        handle.write(str(os.getpid()))
+    os.replace(path + ".tmp", path)
+
+
+def detach_output():
+    null = os.open(os.devnull, os.O_RDWR)
+    for descriptor in (0, 1, 2):
+        os.dup2(null, descriptor)
+
+
+def wait_for(*names):
+    for _ in range(400):
+        if all(os.path.exists(os.path.join(directory, name)) for name in names):
+            return
+        time.sleep(0.025)
+
+
+if os.fork() == 0:
+    detach_output()
+    if mode == "tree":
+        os.setsid()
+    if os.fork() == 0:
+        if mode == "tree":
+            os.setpgid(0, 0)
+        record("great-grandchild" if mode == "tree" else "orphan")
+        time.sleep(120)
+        os._exit(0)
+    if mode == "tree":
+        record("grandchild")
+        time.sleep(120)
+    os._exit(0)
+wait_for(*(("grandchild", "great-grandchild") if mode == "tree" else ("orphan",)))
+record("child")
+print('{"tree": "started"}', flush=True)
+time.sleep(linger)
+print("{}", flush=True)
+"""
+
+TREE_DRIVER = """
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from codex_agents import bridge
+directory, deadline, source = sys.argv[2], float(sys.argv[3]), sys.argv[4]
+
+
+def on_frame(frame):
+    # The bridge reads frames only once its watchdog has acknowledged.
+    open(os.path.join(directory, "bridge-reading"), "w").close()
+
+
+with bridge.signal_guard():
+    bridge.run_child([sys.executable, "-c", source, directory, "120", "tree"],
+                     environment={"PATH": os.defpath}, cwd=Path(directory),
+                     deadline_seconds=deadline, on_frame=on_frame)
+"""
+
+TREE_NAMES = ("child", "grandchild", "great-grandchild")
+
+
+def process_state(pid: int) -> str:
+    """The `ps` state letters of a process; empty once it no longer exists."""
+
+    ps = next(path for path in process_tree.PS_PATHS if os.path.isfile(path))
+    return subprocess.run(
+        [ps, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True
+    ).stdout.strip()
+
+
+def process_gone(pid: int) -> bool:
+    # A killed process may stay a zombie until whoever adopted it reaps it.
+    state = process_state(pid)
+    return not state or state.startswith("Z")
+
+
+class DescendantTerminationTests(unittest.TestCase):
+    """Descendants outside the child's group or session die with it; nothing else does."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        # An unrelated process in a session of its own, started before the child.
+        self.bystander = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        self.addCleanup(self.bystander.wait)
+        self.addCleanup(self.bystander.kill)
+        self.addCleanup(self.kill_leftovers)
+
+    def kill_leftovers(self) -> None:
+        for name in (*TREE_NAMES, "orphan"):
+            path = self.directory / name
+            if path.exists():
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(int(path.read_text()), signal.SIGKILL)
+
+    def wait_for(self, *names: str) -> None:
+        for _ in range(800):
+            if all((self.directory / name).exists() for name in names):
+                return
+            time.sleep(0.025)
+        self.fail(f"{names} did not appear")
+
+    def tree_pids(self, names: tuple[str, ...] = TREE_NAMES) -> dict[str, int]:
+        self.wait_for(*names)
+        return {name: int((self.directory / name).read_text()) for name in names}
+
+    def assert_only_the_tree_died(self, pids: dict[str, int], seconds: float = 10) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not all(map(process_gone, pids.values())):
+            time.sleep(0.1)
+        for name, pid in pids.items():
+            self.assertTrue(process_gone(pid), f"{name} survived")
+        # The bystander is neither killed nor stopped.
+        self.assertIsNone(self.bystander.poll())
+        self.assertFalse(process_state(self.bystander.pid).startswith(("T", "Z")))
+
+    def run_tree(self, linger: float, deadline: float, mode: str = "tree") -> tuple[dict, list]:
+        frames: list[dict] = []
+        outcome = bridge.run_child(
+            [sys.executable, "-c", TREE_CHILD, str(self.directory), str(linger), mode],
+            environment={"PATH": os.defpath}, cwd=self.directory,
+            deadline_seconds=deadline, on_frame=frames.append,
+        )
+        return outcome, frames
+
+    def driver(self, deadline: float) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, "-c", TREE_DRIVER, str(ORCHESTRATION_ROOT),
+             str(self.directory), str(deadline), TREE_CHILD],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def test_descendants_die_after_normal_completion(self) -> None:
+        outcome, frames = self.run_tree(linger=1, deadline=60)
+        self.assertEqual({"returncode": 0, "abort": None}, outcome)
+        self.assertEqual([{"tree": "started"}, {}], frames)
+        self.assert_only_the_tree_died(self.tree_pids())
+
+    def test_an_orphan_left_in_the_childs_group_just_before_exit_dies(self) -> None:
+        # Its parent exits at once and the child right after, so no snapshot links it
+        # to the tree; the child's own group, killed before the child is reaped, does.
+        outcome, frames = self.run_tree(linger=0, deadline=60, mode="orphan")
+        self.assertEqual({"returncode": 0, "abort": None}, outcome)
+        self.assertEqual([{"tree": "started"}, {}], frames)
+        self.assert_only_the_tree_died(self.tree_pids(("child", "orphan")))
+
+    def test_descendants_die_after_the_deadline(self) -> None:
+        outcome, frames = self.run_tree(linger=120, deadline=2)
+        self.assertEqual("timed_out", outcome["abort"])
+        # A slow watchdog acknowledgement can use up the deadline before any frame
+        # is read; then only the part of the tree that had started is checked.
+        self.assertIn(frames, ([], [{"tree": "started"}]))
+        if frames:
+            pids = self.tree_pids()
+        else:
+            pids = {
+                name: int((self.directory / name).read_text())
+                for name in TREE_NAMES if (self.directory / name).exists()
+            }
+        self.assert_only_the_tree_died(pids)
+
+    def test_an_exit_first_seen_after_the_deadline_is_a_timeout(self) -> None:
+        calls = []
+        real = bridge.process_table
+
+        def slow_after_identification():
+            calls.append(1)
+            if len(calls) > 1:
+                time.sleep(1.5)
+            return real()
+
+        with mock.patch.object(bridge, "process_table", slow_after_identification):
+            outcome = bridge.run_child(
+                [sys.executable, "-c", "print('{}')"], environment={"PATH": os.defpath},
+                cwd=self.directory, deadline_seconds=1, on_frame=lambda frame: None,
+            )
+        self.assertEqual({"returncode": None, "abort": "timed_out"}, outcome)
+
+    def test_descendants_die_after_sigterm_to_the_bridge(self) -> None:
+        driver = self.driver(60)
+        self.wait_for("bridge-reading")
+        pids = self.tree_pids()
+        time.sleep(4 * process_tree.TRACK_INTERVAL_SECONDS)
+        driver.send_signal(signal.SIGTERM)
+        self.assertEqual(128 + signal.SIGTERM, driver.wait(timeout=20))
+        self.assert_only_the_tree_died(pids)
+
+    def test_the_watchdog_kills_the_tree_after_the_bridge_is_sigkilled(self) -> None:
+        driver = self.driver(4)
+        # Reading starts only after the watchdog verified the child.
+        self.wait_for("bridge-reading")
+        pids = self.tree_pids()
+        driver.kill()
+        driver.wait(timeout=10)
+        # Still running: only the watchdog, at its deadline, can end the tree now.
+        self.assertFalse(any(map(process_gone, pids.values())))
+        self.assert_only_the_tree_died(pids, seconds=30)
+
+    def test_the_child_is_not_launched_without_tracking(self) -> None:
+        launched: list[list[str]] = []
+        with mock.patch.object(bridge, "tracking_available", return_value=False):
+            outcome = bridge.run_child(
+                ["/usr/bin/true"], environment={"PATH": os.defpath}, cwd=self.directory,
+                deadline_seconds=5, on_frame=lambda frame: None,
+                popen=lambda arguments, **_: launched.append(arguments),
+            )
+        self.assertEqual({"returncode": None, "abort": "process_tracking_unavailable"}, outcome)
+        self.assertEqual([], launched)
+
+    def test_a_watchdog_that_does_not_acknowledge_aborts_the_run(self) -> None:
+        silent = self.directory / "silent_watchdog.py"
+        silent.write_text("import sys\n")
+        with mock.patch.object(bridge, "WATCHDOG_SCRIPT", silent):
+            outcome, frames = self.run_tree(linger=120, deadline=60)
+        self.assertEqual({"returncode": None, "abort": "watchdog_unavailable"}, outcome)
+        self.assertEqual([], frames)
+
+
+def sequence(*values):
+    """A stand-in returning each value in turn, then the last one forever."""
+
+    remaining = list(values)
+
+    def next_value(*_arguments):
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return next_value
+
+
+def readings(*values):
+    """A record that changes between reads: each value in turn, then the last one."""
+
+    return sequence(*values)
+
+
+class ProcessTreeTests(unittest.TestCase):
+    """Adoption and signalling decisions on recorded kernel records."""
+
+    def setUp(self) -> None:
+        # pid -> (parent, group, birth, exited). 100 is the child; 101 its child; 102
+        # its grandchild, leading a group of its own; 103 an orphan left in 102's
+        # group; 200 and 201 are unrelated.
+        self.records: dict[int, object] = {
+            100: (50, 100, "b100", False), 101: (100, 100, "b101", False),
+            102: (101, 102, "b102", False), 103: (1, 102, "b103", False),
+            200: (1, 200, "b200", False), 201: (200, 200, "b201", False),
+        }
+        patcher = mock.patch.object(process_tree, "process_record", self.record)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.signals: list[tuple[str, int, int]] = []
+
+    def record(self, pid: int):
+        value = self.records.get(pid)
+        return value() if callable(value) else value
+
+    def listing(self) -> dict[int, int]:
+        """What `ps` would list now: each pid with its current parent."""
+
+        return {pid: self.record(pid)[0] for pid in self.records if self.record(pid)}
+
+    def tree(self) -> process_tree.ProcessTree:
+        tree = process_tree.ProcessTree(100)
+        self.assertTrue(tree.identify(self.listing()))
+        return tree
+
+    def kill(self, pid: int, signum: int) -> None:
+        self.signals.append(("pid", pid, signum))
+        current = self.record(pid)
+        if current is not None:
+            self.records[pid] = (*current[:3], True)
+
+    @contextlib.contextmanager
+    def recorded(self, *tables):
+        with mock.patch.object(process_tree, "process_table", sequence(*tables)), \
+                mock.patch.object(process_tree.time, "sleep"), \
+                mock.patch.object(process_tree.os, "kill", self.kill), \
+                mock.patch.object(process_tree.os, "killpg",
+                                  lambda group, signum: self.signals.append(
+                                      ("group", group, signum))):
+            yield
+
+    def test_identification_adopts_visible_descendants_by_ancestry_only(self) -> None:
+        tree = self.tree()
+        # 103 shares 102's group but its parent is gone, so it is not adopted.
+        self.assertEqual({100: "b100", 101: "b101", 102: "b102"}, tree.tracked)
+        other = process_tree.ProcessTree(100)
+        self.assertFalse(other.identify(self.listing(), "birth-of-another-process"))
+        self.assertFalse(other.identify(None))
+        self.assertEqual({}, other.tracked)
+        with self.recorded(self.listing()):
+            other.terminate()
+        self.assertEqual([], self.signals)
+
+    def test_a_replacement_between_listing_and_record_is_not_adopted(self) -> None:
+        # The listing was taken while 104 and 105 were children of the tree; by the
+        # time their records are read, both pids belong to children of 200.
+        stale = {**self.listing(), 104: 101, 105: 100}
+        self.records[104] = (200, 200, "b104-unrelated", False)
+        self.records[105] = (200, 200, "b105-unrelated", False)
+        tree = process_tree.ProcessTree(100)
+        self.assertTrue(tree.identify(stale))
+        self.assertEqual({100, 101, 102}, set(tree.tracked))
+        self.assertEqual({100, 101, 102}, tree.update(stale))
+
+    def test_a_rejected_pid_is_readopted_only_through_its_own_record(self) -> None:
+        tree = self.tree()
+        # 101 exits and an unrelated child of 200 gets its pid, and a child of its own;
+        # the listing still shows the old ancestry.
+        stale = {**self.listing(), 104: 101}
+        self.records[101] = (200, 200, "b101-unrelated", False)
+        self.records[104] = (101, 200, "b104", False)
+        self.assertEqual({100, 102}, tree.update(stale))
+        self.assertNotIn(101, tree.tracked)
+        # A real new child of the root that gets pid 101 later is adopted afresh.
+        self.records[101] = (100, 100, "b101-new", False)
+        self.assertEqual({100, 101, 102, 104}, tree.update(self.listing()))
+        self.assertEqual("b101-new", tree.tracked[101])
+
+    def test_a_candidate_whose_parent_changed_identity_is_not_adopted(self) -> None:
+        tree = self.tree()
+        # 104's record names 102, which is still itself when the update starts but
+        # belongs to another process when its record is read again for the adoption.
+        self.records[104] = (102, 102, "b104", False)
+        listing = self.listing()
+        self.records[102] = readings((101, 102, "b102", False), (1, 102, "b102-new", False))
+        self.assertEqual({100, 101, 102}, tree.update(listing))
+        self.assertNotIn(104, tree.tracked)
+        self.assertEqual({100, 101}, tree.update(listing))
+
+    def test_terminate_kills_verified_processes_and_verified_leaders_groups(self) -> None:
+        tree = self.tree()
+        with self.recorded(self.listing()):
+            tree.terminate()
+        kill = signal.SIGKILL
+        self.assertEqual([
+            ("group", 100, kill), ("group", 102, kill),
+            ("pid", 100, kill), ("pid", 101, kill), ("pid", 102, kill),
+        ], self.signals)
+
+    def test_a_pid_that_changes_hands_before_its_signal_is_not_signalled(self) -> None:
+        # 102 is read three times as itself (adoption, then two checks in the kill
+        # round) and belongs to another process at its signal-time reads.
+        listing = self.listing()
+        original, replaced = (101, 102, "b102", False), (1, 102, "b102-new", False)
+        reads: list[int] = []
+        values = readings(original, original, original, replaced)
+        self.records[102] = lambda: reads.append(1) or values()
+        tree = process_tree.ProcessTree(100)
+        self.assertTrue(tree.identify(listing))
+        with self.recorded(listing):
+            tree.terminate()
+        kill = signal.SIGKILL
+        self.assertEqual([("group", 100, kill), ("pid", 100, kill), ("pid", 101, kill)],
+                         self.signals)
+        # Adoption, the round's two checks, then the leader and the pid signal checks.
+        self.assertGreaterEqual(len(reads), 5)
+
+    def test_without_a_snapshot_only_verified_records_are_signalled_once(self) -> None:
+        tree = self.tree()
+        with self.recorded(None):
+            tree.terminate()
+        kill = signal.SIGKILL
+        self.assertEqual([
+            ("group", 100, kill), ("group", 102, kill),
+            ("pid", 100, kill), ("pid", 101, kill), ("pid", 102, kill),
+        ], self.signals)
+
+    def test_root_exit_is_seen_without_reaping(self) -> None:
+        tree = self.tree()
+        self.assertFalse(tree.root_exited())
+        self.records[100] = (50, 100, "b100", True)
+        self.assertTrue(tree.root_exited())
+        self.records[100] = (1, 100, "b100-new", False)
+        self.assertTrue(tree.root_exited())
+        del self.records[100]
+        self.assertTrue(tree.root_exited())
+
+    def test_the_watchdog_does_nothing_unless_it_verifies_the_child(self) -> None:
+        announced = mock.Mock()
+        with self.recorded(self.listing()), \
+                mock.patch.object(process_tree, "WATCHDOG_IDENTIFY_SECONDS", 0):
+            process_tree.watch(100, "birth-of-another-process", 0.0, announced)
+        announced.assert_not_called()
+        self.assertEqual([], self.signals)
+
+    def test_the_watchdog_retries_identification_then_enforces_the_deadline(self) -> None:
+        announced = mock.Mock()
+        with self.recorded(None, None, self.listing()):
+            process_tree.watch(100, "b100", 0.0, announced)
+        announced.assert_called_once_with()
+        kill = signal.SIGKILL
+        self.assertEqual([
+            ("group", 100, kill), ("group", 102, kill),
+            ("pid", 100, kill), ("pid", 101, kill), ("pid", 102, kill),
+        ], self.signals)
+
+
+class KernelRecordTests(unittest.TestCase):
+    def test_linux_stat_lines_parse_after_the_last_parenthesis(self) -> None:
+        tail = " ".join(["0"] * 15) + " 98765 rest"
+        for name in (b"sh", b"a (b) c", b"x) S 1 1 (y"):
+            with self.subTest(name=name):
+                line = b"123 (" + name + b") S 45 67 0 " + tail.encode()
+                self.assertEqual((45, 67, "98765", False), process_tree.parse_proc_stat(line))
+        zombie = b"123 (z) Z 45 67 0 " + tail.encode()
+        self.assertTrue(process_tree.parse_proc_stat(zombie)[3])
+        for broken in (b"no parenthesis", b"123 (short) S 45", b"123 (x) S a 67 0 " + tail.encode()):
+            self.assertIsNone(process_tree.parse_proc_stat(broken))
+
+    def test_macos_records_must_name_the_pid_asked_for(self) -> None:
+        raw = bytearray(process_tree.DARWIN_KINFO_PROC_SIZE)
+        struct.pack_into("=qi", raw, 0, 1_700_000_000, 42)
+        struct.pack_into("=i", raw, process_tree.DARWIN_PID_OFFSET, 123)
+        struct.pack_into("=i", raw, process_tree.DARWIN_PPID_OFFSET, 45)
+        struct.pack_into("=i", raw, process_tree.DARWIN_PGID_OFFSET, 67)
+        raw[process_tree.DARWIN_STAT_OFFSET] = process_tree.DARWIN_ZOMBIE
+        self.assertEqual((45, 67, "1700000000.000042", True),
+                         process_tree.parse_kinfo_proc(bytes(raw), 123))
+        self.assertIsNone(process_tree.parse_kinfo_proc(bytes(raw), 124))
+        self.assertIsNone(process_tree.parse_kinfo_proc(bytes(raw[:-1]), 123))
+
+    def test_the_process_table_and_records_come_from_the_system(self) -> None:
+        self.assertTrue(all(path.startswith("/") for path in process_tree.PS_PATHS))
+        table = process_tree.process_table()
+        self.assertIsNotNone(table)
+        self.assertEqual(os.getppid(), table[os.getpid()])
+        self.assertTrue(process_tree.tracking_available())
+        own = process_tree.process_record(os.getpid())
+        self.assertEqual((os.getppid(), os.getpgrp(), False), (own[0], own[1], own[3]))
+        self.assertEqual(own, process_tree.process_record(os.getpid()))
+        child = subprocess.Popen(["/bin/sleep", "0.5"], start_new_session=True)
+        running = process_tree.process_record(child.pid)
+        self.assertEqual((os.getpid(), child.pid, False),
+                         (running[0], running[1], running[3]))
+        self.assertNotEqual(own[2], running[2])
+        for _ in range(200):
+            if process_state(child.pid).startswith("Z"):
+                break
+            time.sleep(0.02)
+        # An exited, unreaped child keeps its identity and shows as exited; once
+        # reaped it has no record.
+        exited = process_tree.process_record(child.pid)
+        self.assertEqual((running[2], True), (exited[2], exited[3]))
+        child.wait()
+        self.assertIsNone(process_tree.process_record(child.pid))
+        self.assertIsNone(process_tree.process_record(0))
 
 
 class CodexBridgeTests(BridgeTestCase):
@@ -1193,8 +1673,8 @@ class CodexBridgeTests(BridgeTestCase):
         argv = invocation["argv"]
         self.assertEqual("read-only", argv[argv.index("-s") + 1])
         self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
-        for flag in ("--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
-                     "--json"):
+        for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules",
+                     "--skip-git-repo-check", "--json"):
             self.assertIn(flag, argv)
         self.assertEqual(invocation["cwd"], argv[argv.index("-C") + 1])
         self.assertEqual(["source.txt"], invocation["files"])
@@ -1216,11 +1696,71 @@ class CodexBridgeTests(BridgeTestCase):
         for feature in ("apps", "plugins", "remote_plugin", "multi_agent",
                         "multi_agent_v2", "image_generation", "goals", "browser_use",
                         "browser_use_external", "computer_use", "in_app_browser",
-                        "hooks"):
+                        "hooks", "skill_mcp_dependency_install"):
             self.assertIn(feature, disabled)
         self.assertNotIn("code_mode_host", disabled)
         self.assertNotIn("code_mode_host", " ".join(argv))
         self.assertIn('web_search="disabled"', argv)
+        # No escalation request can be granted, whatever the client's default.
+        self.assertEqual('approval_policy="never"', argv[argv.index('approval_policy="never"')])
+        self.assertEqual("-c", argv[argv.index('approval_policy="never"') - 1])
+
+    def test_managed_codex_configuration_refuses_a_codex_launch(self) -> None:
+        system = Path(self.temporary.name) / "etc-codex"
+        managed = Path(self.temporary.name) / "codex-managed" / "{user}"
+        user = pwd.getpwuid(os.getuid()).pw_name
+        placements = (
+            system / "config.toml", system / "requirements.toml", system / "anything.toml",
+            Path(str(managed).format(user=user)) / "managed_config.toml",
+        )
+        for path in placements:
+            with self.subTest(path=path.name):
+                route, assigned, handle = self.codex_run()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('[mcp_servers.server]\ncommand = "/usr/bin/true"\n')
+                try:
+                    with self.assertRaisesRegex(BridgeRefused, "codex_managed_config_present"):
+                        self.dispatch(route, assigned, handle)
+                finally:
+                    path.unlink()
+                self.assertFalse([i for i in self.invocations("codex") if "exec" in i["argv"]])
+                with self.ledger.repository(self.project_id) as repository:
+                    self.assertEqual([], repository.records("dispatch_intent"))
+        # An unreadable system directory refuses too; an empty one does not.
+        system.mkdir(exist_ok=True)
+        self.assertFalse(bridge.codex_managed_configuration_present())
+        if os.geteuid() != 0:
+            system.chmod(0)
+            try:
+                self.assertTrue(bridge.codex_managed_configuration_present())
+            finally:
+                system.chmod(0o700)
+
+    def test_children_load_no_execpolicy_rules(self) -> None:
+        route, assigned, handle = self.codex_run()
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 1}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(result()))
+        )
+        self.dispatch(route, assigned, handle)
+        argv = [i for i in self.invocations("codex") if "exec" in i["argv"]][0]["argv"]
+        # An owner `allow` rule would otherwise run a matching command unsandboxed.
+        self.assertIn("--ignore-rules", argv)
+        self.assertIn("--ignore-user-config", argv)
+        self.assertEqual(("--ignore-user-config", "--ignore-rules"),
+                         bridge.CODEX_REQUIRED_EXEC_OPTIONS)
+        # A client whose help does not list the option is refused before launch.
+        launches = len(self.invocations("codex"))
+        for help_text in ("Options:\n      --ignore-user-config\n      --json\n", ""):
+            with self.subTest(help_text=help_text):
+                route, assigned, handle = self.codex_run()
+                (self.tools / "codex-exec-help.txt").write_text(help_text)
+                with self.assertRaisesRegex(BridgeRefused, "codex_exec_options_unavailable"):
+                    self.dispatch(route, assigned, handle)
+                self.assertEqual(launches, len(self.invocations("codex")))
+                self.assertEqual([], self.workspace_entries())
+                with self.ledger.repository(self.project_id) as repository:
+                    self.assertEqual(1, len(repository.records("dispatch_intent")))
 
     def test_disallowed_codex_events_abort_the_child(self) -> None:
         cases = {

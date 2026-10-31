@@ -122,7 +122,11 @@ partial clone; the collector and watchdog start with `-I -B -S`; bridge exports,
 files and child temporary directories live in an owner-only directory under the per-user
 cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere); operational-check snapshots and
 provider clients' temporary directories live under the learning state. A Claude primary
-does not use the rule.
+does not use the rule. Native Codex children share the primary's Codex session, so the
+rule matches their commands too: a native child could run the primary-host commands
+outside its own sandbox, still held to this project and the owner's state by the same
+refusals and to ledger admission. Bridged Codex children start with `--ignore-rules` and
+load no rule.
 
 ## Provider admission
 
@@ -238,11 +242,20 @@ provider API key, and a run handle that was already dispatched.
   agent ID, and its result cannot be committed without that `dispatch_intent`.
 - The child runs in its own session. The tighter of the route's and the assignment's
   `timeout_seconds` is a hard deadline, and the tighter `max_tool_calls` sets Claude's
-  `--max-turns`. Its process group is killed on timeout, on a contract violation, on
-  an over-long line and after it exits. `dispatch` kills it on SIGTERM, SIGINT or
-  SIGHUP, and a detached watchdog kills it at the deadline even if the bridge itself
-  is killed. Any outcome the bridge cannot prove (timeout, crash, a broken stream or no
-  parseable result) returns a failed or timed-out result, never success.
+  `--max-turns`. On timeout, on a contract violation, on an over-long line and after it
+  exits, its process group and every descendant tracked while it ran are killed before
+  the child is reaped, so an exit first seen after the deadline counts as a timeout.
+  Descendants in other groups or sessions are tracked by ancestry every 0.25 s: `ps`
+  lists candidates, and adoption and every signal rest on the process's own kernel
+  record (parent, group and birth time read together), so an unrelated process is never
+  killed; one that detaches and loses its parent
+  between two snapshots is left running inside the child's sandbox. Without a readable
+  process table the child is not launched (`process_tracking_unavailable`). `dispatch`
+  kills the tree on SIGTERM, SIGINT or SIGHUP. A detached watchdog verifies the child's
+  identity before the run continues (`watchdog_unavailable` otherwise) and kills the
+  tree at the deadline even if the bridge itself is killed. Any outcome the bridge
+  cannot prove (timeout, crash, a broken stream or no parseable result) returns a failed
+  or timed-out result, never success.
 - Claude children run with only Read, Glob and Grep, `dontAsk` permissions, generated
   settings with hooks and built-in plugins off and the model pinned, no MCP servers and
   no session persistence. The run fails closed unless the init frame reports no API
@@ -253,8 +266,16 @@ provider API key, and a run handle that was already dispatched.
   in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
   unreviewed with an unknown verdict. `read_containment` is `enforced`.
 - Codex children run `codex exec` read-only and ephemeral, between non-spending
-  observations taken before and after. The launch disables account connectors,
-  plugins, multi-agent, image generation, goals, browser and computer use and hooks
+  observations taken before and after. They load no user configuration and no
+  execpolicy rules (`--ignore-user-config --ignore-rules`), so the owner's command rule
+  never lets a child run a command outside its sandbox; a client whose `codex exec
+  --help` lacks either option is refused before launch (`codex_exec_options_unavailable`).
+  `approval_policy="never"` is pinned, so no escalation can be granted. Codex system or
+  managed configuration (a TOML file in `/etc/codex`, `~/.codex/managed_config.toml`, or
+  a `com.openai.codex` managed-preferences plist on macOS) refuses a Codex dispatch
+  (`codex_managed_config_present`), since it applies despite `--ignore-user-config`.
+  The launch disables account connectors, plugins, multi-agent, image generation,
+  goals, browser and computer use, hooks and skill MCP dependency installs
   (`--disable <feature>`, never `code_mode_host`) and web search
   (`web_search="disabled"`). The feature disables plus `--ephemeral` are the pre-dispatch denial (on
   codex-cli 0.164.0, `spawn_agent` fails before any sub-agent run because no rollout

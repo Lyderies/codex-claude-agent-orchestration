@@ -42,6 +42,7 @@ from codex_agents.providers import (
     AppServerSession,
     billing_attestation_record,
     claude_rate_limit_records,
+    codex_exec_options,
     evaluate_admission,
     evaluate_launch,
     observe_claude,
@@ -262,6 +263,37 @@ class ProviderObservationTests(unittest.TestCase):
                             environ={**environ, name: "set"}, popen=popen,
                         )
             self.assertEqual(2, len(calls))
+
+    def test_codex_exec_options_are_read_from_the_clients_help(self) -> None:
+        sample = (
+            "Options:\n  -c, --config <key=value>\n          Examples: - `-c model=\"o3\"`\n"
+            "      --ignore-user-config\n          Do not load `$CODEX_HOME/config.toml`\n"
+            "      --ignore-rules\n          Do not load user or project execpolicy files\n"
+        )
+        calls = []
+
+        def popen(arguments, **options):
+            calls.append((arguments, options))
+            return subprocess.Popen(
+                [sys.executable, "-c", f"import sys; sys.stdout.write({sample!r})"], **options
+            )
+
+        def failing(arguments, **options):
+            return subprocess.Popen(["/usr/bin/false"], **options)
+
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            options = codex_exec_options(
+                "/fake/codex", environ={"CODEX_HOME": "/elsewhere"},
+                tmpdir=Path(directory), popen=popen,
+            )
+            self.assertEqual({"--config", "--ignore-user-config", "--ignore-rules"}, options)
+            self.assertEqual(["/fake/codex", "exec", "--help"], calls[0][0])
+            self.assertNotIn("CODEX_HOME", calls[0][1]["env"])
+            self.assertTrue(calls[0][1]["start_new_session"])
+            # A failed help run lists nothing, so the bridge refuses the launch.
+            self.assertEqual(frozenset(), codex_exec_options(
+                "/fake/codex", environ={}, tmpdir=Path(directory), popen=failing,
+            ))
 
     def test_clients_resolve_only_from_the_trusted_path(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
