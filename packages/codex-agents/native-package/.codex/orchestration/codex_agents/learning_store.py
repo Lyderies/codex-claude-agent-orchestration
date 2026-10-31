@@ -95,6 +95,11 @@ COLLECTOR_PROTOCOL_VERSION = 1
 COLLECTOR_RUNTIME_DIGEST = _collector_runtime_digest()
 PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
+# The one line `install_owner_public_key` writes; the allowed-signers file holds nothing else.
+OWNER_SIGNER_LINE = re.compile(
+    rb"codex-agents-owner (?:ssh-ed25519|sk-ssh-ed25519@openssh\.com|ssh-rsa|"
+    rb"ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+\n"
+)
 DEFAULT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
 # A worker result kept for its verifier is raw child text, so it lives only while
 # its orchestration is open, and never longer than this; only digests stay.
@@ -837,12 +842,21 @@ class LearningState:
         return self.allowed_signers_path
 
     def owner_allowed_signers(self) -> Path:
+        """The allowed-signers file, only while it names exactly one owner key.
+
+        It must be exactly the single canonical line `install_owner_public_key` writes:
+        `ssh-keygen -Y verify` accepts a signature from any key the file lists, so a second
+        line, options or a comment would let another key sign as the owner.
+        """
+
         if self.allowed_signers_path.is_symlink():
             raise StateError("owner allowed-signers path is unsafe")
         _check_owner_mode(self.allowed_signers_path, directory=False)
-        content = self.allowed_signers_path.read_text(encoding="ascii")
-        if not content.startswith("codex-agents-owner ") or len(content) > 16_384:
+        content = self.allowed_signers_path.read_bytes()
+        if not content:
             raise StateError("owner public key is not configured")
+        if OWNER_SIGNER_LINE.fullmatch(content) is None:
+            raise StateError("owner allowed-signers must name exactly one owner key")
         return self.allowed_signers_path
 
     def harden_database_files(self) -> None:

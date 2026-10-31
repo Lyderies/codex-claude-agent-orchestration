@@ -81,25 +81,41 @@ when a path with a lost `~` does not exist.
 ### How setup keeps your authority away from the agents
 
 The AI agents this sets up run as your user, so the setup tools assume an agent may have
-changed anything it can write: the project's working tree and the temporary folders.
+changed anything it can write: the temporary folders, and any folder a Codex session was
+opened on, which may be a project or a folder above it (a nested project's tree, `.git` and
+`.claude` included). Sessions are never opened on your home folder, its parent or `/`.
+**Keep this repository's folder outside every folder you open in Codex**, so no session can
+change the code that runs with your authority.
 
-- **Trusted Python, isolated.** Every Python the wizard starts is the real file behind the
-  `python3` on your `PATH`, never a symlink, a virtual environment's copy, or one in a temporary
-  folder or the project, and it runs with `-I -B -S` so nothing in the working folder, the
-  environment or site-packages loads. Use a system Python such as Homebrew's or python.org's.
-- **Private working files.** Logs, the install plan, the key being enrolled and the statement
-  being signed live in a fresh owner-only folder in your per-user cache folder (macOS) or
-  `$XDG_RUNTIME_DIR` (Linux; setup refuses without it), never in `/tmp` or `$TMPDIR`.
-- **Only this release's orchestrator runs.** Before running the project's orchestration CLI,
-  setup and `attest.py` check its runtime files against this repository's copy byte for byte
-  (same version, identical files, no extra modules) and refuse otherwise; it then runs isolated
-  and never reads cached bytecode from the project.
-- **You sign only what you approved.** `attest.py` sends the statement on standard input,
-  rebuilds the exact bytes to sign from your answers, refuses to sign anything else, checks the
-  signature covers those bytes, and after enrolling a key checks that the configured key is the
-  one it showed you.
-- **No repository hooks.** Git commands on the project run with
-  `-c core.hooksPath=/dev/null -c core.fsmonitor=false`.
+- **Trusted Python, decided before it runs.** Every Python the wizard starts is the real file
+  behind the `python3` on your `PATH`, checked before it ever runs: never a symlink, a virtual
+  environment's copy, macOS's `/usr/bin/python3` shim, one in a temporary folder or the
+  project, or one in a folder under your home folder other than an interpreter manager's
+  (`~/.pyenv`, `~/.local`, `~/.asdf`, conda and the like). It runs with
+  `-I -B -S -X pycache_prefix=/dev/null`, so nothing in the working folder, the environment,
+  site-packages or a bytecode cache loads. Use a system Python such as Homebrew's or
+  python.org's.
+- **Private working files.** Logs, the install plan and a snapshot of the operational-checks
+  file you chose (the preview and the install both read that snapshot) live in a fresh
+  owner-only folder in your per-user cache folder (macOS) or `$XDG_RUNTIME_DIR` (Linux; setup
+  refuses without it, or when it is under your home folder), never in `/tmp` or `$TMPDIR`.
+- **Owner commands run this repository's code.** Registration, the collector status, the
+  billing attestation and the Codex rule commands run this repository's own orchestrator CLI
+  with `--project-root`, never the project's installed copy. The steps that depend on the
+  install first check that it is this release, byte for byte, with nothing extra (no module,
+  package, bytecode or link of any name) in `.codex/orchestration`.
+- **You sign only what you approved.** `attest.py` rebuilds the exact bytes to sign from your
+  answers and refuses anything else. The statement goes to `ssh-keygen` on standard input, the
+  signature comes back on standard output and is checked against those bytes, and the key being
+  enrolled and the signature reach the orchestrator through pipes: nothing touches disk. After
+  enrolling, the owner key record must hold exactly one key, the one it showed you.
+- **Git without project programs.** Git is a real binary at a fixed location (never macOS's
+  `/usr/bin/git` shim, never one on a search path an agent could change), run with
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgSign=false
+  -c tag.gpgSign=false -c gc.auto=0 -c maintenance.auto=false`. Before any status, staging or
+  commit, setup reads the project's own Git settings and stops if they name a program Git would
+  start (a filter, diff or merge driver, pager, editor, SSH, signing or credential helper, or an
+  include); commit by hand in that case.
 - **Claude primaries cannot run owner commands.** The installer merges Claude Code permission
   deny rules into the project's `.claude/settings.json` (and records what it added in
   `.claude/agent-orchestration-permissions.json`): two `Bash` rules for each owner-only CLI
@@ -147,29 +163,30 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
 1. **Install** into the top of a Git project. Without `--apply` the command only previews:
 
    ```sh
-   python3 -I -B -S scripts/install.py install --target /path/to/project --apply
-   python3 -I -B -S scripts/install.py verify --target /path/to/project
+   python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py install --target /path/to/project --apply
+   python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py verify --target /path/to/project
    ```
 
    Commit the installed files in the project, including `.claude/settings.json` and
    `.claude/agent-orchestration-permissions.json`. To uninstall, run
-   `python3 -I -B -S scripts/install.py remove --target /path/to/project --apply`: it first removes
-   the Codex commands rule through the project's `remove-codex-rule` command (an older installed
-   version without that command makes it stop and name the rule file to delete), then the
-   permission entries it added, then both packages.
+   `python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py remove --target /path/to/project --apply`:
+   it first removes the Codex commands rule and its protected copy with this repository's own
+   `remove-codex-rule` (whatever version the project has installed), then the permission
+   entries it added, then both packages.
 2. **Enable providers.** Commit `.codex/orchestration/provider-routing.json` in the project. It
    says which providers and models children may use. Without it, only Codex children are
    allowed.
-3. **Register the learning collector** once, from the project:
+3. **Register the learning collector** once, from the root of this repository, with this
+   repository's own orchestrator (owner commands never run the project's copy):
 
    ```sh
-   python3 -I -B -S .codex/orchestration/cli.py learning-register --project-root "$PWD"
+   python3 -I -B -S -X pycache_prefix=/dev/null packages/codex-agents/native-package/.codex/orchestration/cli.py learning-register --project-root /path/to/project
    ```
 
 4. **Attest billing.** This is a one-time human step:
 
    ```sh
-   python3 -I -B -S scripts/attest.py --target /path/to/project
+   python3 -I -B -S -X pycache_prefix=/dev/null scripts/attest.py --target /path/to/project
    ```
 
    No child runs until you confirm that each account cannot be charged beyond its subscription.
@@ -182,7 +199,7 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    If the owner key is already configured, it finds the key file at `~/.ssh/codex-agents-owner`
    by itself and only asks for a file location when it cannot (never for the passphrase there).
    To change the key's passphrase, choose "Change the owner key passphrase" in `./setup.sh`, or run
-   `python3 -I -B -S scripts/attest.py --change-passphrase`.
+   `python3 -I -B -S -X pycache_prefix=/dev/null scripts/attest.py --change-passphrase`.
 
    Run it again whenever your billing settings change.
 5. **Optional: let a Codex session orchestrate Claude children.** Codex runs commands without
@@ -200,10 +217,10 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    off. Without this profile, start plain `codex`.
 6. **Let a Codex session reach the orchestrator.** Codex's sandbox blocks the learning
    collector, so a Codex primary needs a Codex command rule that lets only this project's
-   everyday orchestrator commands run outside the sandbox. From the project:
+   everyday orchestrator commands run outside the sandbox. From the root of this repository:
 
    ```sh
-   python3 .codex/orchestration/cli.py install-codex-rule --project-root "$PWD"
+   python3 -I -B -S -X pycache_prefix=/dev/null packages/codex-agents/native-package/.codex/orchestration/cli.py install-codex-rule --project-root /path/to/project
    ```
 
    It writes `~/.codex/rules/agent-orchestration-<digest>.rules` and a protected copy of the
@@ -216,8 +233,8 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    writable by another user, a project in a temporary folder, a project whose
    `.codex/orchestration` holds files the package does not install (such as bytecode), and
    a Codex home other than the real `~/.codex`. Every Codex session loads the rule, so never
-   open Codex on your home folder, its parent or `/` while it exists. Undo it with
-   `python3 .codex/orchestration/cli.py remove-codex-rule --project-root "$PWD"`.
+   open Codex on your home folder, its parent or `/` while it exists. Undo it with the same
+   command and `remove-codex-rule --project-root /path/to/project`.
 
 ## Development
 

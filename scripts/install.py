@@ -13,8 +13,11 @@ unless both previews succeed.
 Install also merges Claude Code permission deny rules into the project's
 .claude/settings.json, so a Claude primary cannot run the orchestrator's owner-only commands
 or edit the orchestration, Claude settings or Git folders. Remove takes out only the
-entries install added, and first removes the Codex commands rule through the project's own
-owner command. Run it isolated: ``python3 -I -B -S scripts/install.py``.
+entries install added, and first removes the Codex commands rule with this repository's own
+``remove-codex-rule``. Owner commands always run this repository's orchestrator, never the
+project's copy; Git runs from a trusted real binary with hooks, signing and maintenance off,
+and porcelain commands only while the repository's settings name no helper program. Run it
+isolated: ``python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py``.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,9 +41,22 @@ MANAGED_PATHS = (".codex", ".agents", ".claude")
 CODEX_MANIFEST = Path(".codex") / "orchestration" / "install-manifest.json"
 CLAUDE_SETTINGS = ".claude/settings.json"
 PERMISSIONS_RECORD = ".claude/agent-orchestration-permissions.json"
-# Git on the project never runs repository hooks or a configured file-system monitor, so a
-# hook or monitor script an AI agent planted in the working tree cannot run as the owner.
-GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+# Git on the project never runs repository hooks, a file-system monitor, a signing program
+# or automatic maintenance. A Codex session opened on a parent folder can write the
+# project's .git, so porcelain commands also run only while the repository's own settings
+# name no program for Git to start (repository_helpers).
+GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
+            "-c", "gc.auto=0", "-c", "maintenance.auto=false")
+# Repository settings that name a program Git may start (setup.sh uses the same pattern):
+# filters, diff and merge drivers, transports, pagers, editors, signing and credential
+# helpers, trailer commands, and includes, whose files cannot be vetted here.
+GIT_HELPER_KEYS = (
+    r"^(filter\..+\.(clean|smudge|process)|diff\.external|diff\..+\.(command|textconv)"
+    r"|merge\..+\.driver|core\.(sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)"
+    r"|gpg\.(.+\.)?program|gpg\.ssh\.defaultkeycommand|credential\.(.+\.)?helper|pager\..+"
+    r"|sequence\.editor|include\.path|includeif\..+\.path|trailer\..+\.(command|cmd))$"
+)
 IN_PROGRESS = {
     "MERGE_HEAD": "a merge",
     "CHERRY_PICK_HEAD": "a cherry-pick",
@@ -59,22 +76,91 @@ PROTECTED_EDITS = ("/.codex/**", "/.agents/**", "/.claude/settings*.json",
                    "/" + PERMISSIONS_RECORD, "/.git/**")
 CLI_PATTERN = "*.codex/orchestration/cli.py"
 MAX_SETTINGS_BYTES = 1024 * 1024
+# Every owner-only command an earlier release's installer denied (0.8.8 and 0.8.9). A recorded
+# entry counts as the installer's own only when it is in the current or an earlier generated
+# set, so a planted record can never make the installer delete a user's own rule.
+HISTORICAL_OWNER_ONLY = (
+    "learning-route-canary", "evaluate", "learning-validate", "learning-register", "learning-serve",
+    "learning-backup-project", "learning-verify-backup", "learning-delete-project",
+    "learning-normalize-app", "learning-ingest-app", "learning-compare",
+    "learning-record-billing-attestation", "learning-prepare-upgrade-reconciliation",
+    "learning-commit-upgrade-reconciliation", "learning-record-verified-outcome", "learning-expire",
+    "learning-run-cycle", "learning-create-evaluation-assignment", "learning-record-trial",
+    "learning-record-evidence-review", "learning-record-comparison", "learning-mine-case",
+    "learning-review-case", "learning-analyze", "learning-generate-candidate",
+    "learning-calibrate-grader", "learning-record-feedback", "learning-evaluate-candidate",
+    "learning-start-canary", "learning-complete-canary", "learning-promote", "learning-record-drift",
+    "learning-rollback", "learning-configure-owner-key", "learning-create-grant-request",
+    "learning-attach-grant-signature", "host-command", "install-codex-rule", "remove-codex-rule",
+)
+HISTORICAL_PROTECTED_EDITS = PROTECTED_EDITS
 
 _ATTEST_SPEC = importlib.util.spec_from_file_location("agent_orchestration_attest",
                                                       ROOT / "scripts" / "attest.py")
 attest = importlib.util.module_from_spec(_ATTEST_SPEC)
 _ATTEST_SPEC.loader.exec_module(attest)
+# This repository's own runtime decides which git binary is real and trusted.
+sys.path.insert(0, str(ORCHESTRATION))
+from codex_agents.git_plumbing import git_executable  # noqa: E402 - this checkout's package
 
 
 class InstallRefused(RuntimeError):
     """The target is not in a state where packages may be changed."""
 
 
+def _git_binary(target: Path) -> str:
+    """The real git binary at a fixed, trusted location (never macOS's xcrun shim), outside
+    the project and every temporary folder."""
+
+    found = git_executable([Path(os.path.realpath(target))])
+    if found is None:
+        raise InstallRefused("no trusted Git was found (macOS: the Command Line Tools or Homebrew's "
+                             "git; Linux: /usr/bin/git)")
+    return found
+
+
+def _git_run(target: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([_git_binary(target), "-C", str(target), *GIT_SAFE, *args], capture_output=True,
+                          text=True, stdin=subprocess.DEVNULL, env={**os.environ, "xcrun_nocache": "1"})
+
+
 def _git(target: Path, *args: str) -> str:
-    result = subprocess.run(["git", "-C", str(target), *GIT_SAFE, *args], capture_output=True, text=True)
+    result = _git_run(target, *args)
     if result.returncode != 0:
         raise InstallRefused(f"target is not a usable Git working tree: {target}")
     return result.stdout.strip()
+
+
+def repository_helpers(target: Path) -> list[str]:
+    """The repository's own settings that name a program Git could start, read with plumbing.
+
+    Only the repository's configuration (and its worktree configuration, when enabled) is
+    read, without following includes: an include is itself reported. The owner's own global
+    and system settings are trusted.
+    """
+
+    scopes = ["--local"]
+    enabled = _git_run(target, "config", "--local", "--no-includes", "--bool", "--get",
+                       "extensions.worktreeConfig")
+    if enabled.returncode == 0 and enabled.stdout.strip() == "true":
+        scopes.append("--worktree")
+    found: set[str] = set()
+    for scope in scopes:
+        result = _git_run(target, "config", scope, "--no-includes", "--name-only", "--get-regexp",
+                          GIT_HELPER_KEYS)
+        if result.returncode == 1:
+            continue
+        if result.returncode != 0:
+            raise InstallRefused("the project's Git settings cannot be read, so setup will not run Git on it")
+        found.update(re.sub(r"[\x00-\x1f\x7f]", "", line) for line in result.stdout.splitlines() if line)
+    return sorted(found)
+
+
+def helpers_refusal(helpers: list[str]) -> str:
+    shown = ", ".join(helpers[:4]) + (" and more" if len(helpers) > 4 else "")
+    return (f"the project's Git settings name programs Git would run ({shown}); setup does not run Git "
+            "commands that could start them as you. Remove them from .git/config, or install and "
+            "commit by hand")
 
 
 def check_target(target: Path, *, mutating: bool) -> None:
@@ -89,8 +175,13 @@ def check_target(target: Path, *, mutating: bool) -> None:
             raise InstallRefused(f"{operation} is in progress in the target; finish or abort it first")
     if _git(target, "ls-files", "--unmerged"):
         raise InstallRefused("the target has unmerged paths; resolve them first")
-    if mutating and _git(target, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all",
-                         "--", *MANAGED_PATHS):
+    if not mutating:
+        return
+    helpers = repository_helpers(target)
+    if helpers:
+        raise InstallRefused(helpers_refusal(helpers))
+    if _git(target, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all",
+            "--", *MANAGED_PATHS):
         raise InstallRefused("managed paths (.codex, .agents, .claude) have uncommitted changes")
 
 
@@ -175,11 +266,21 @@ def deny_rules(orchestration: Path = ORCHESTRATION) -> list[str]:
     starts the CLI itself, is not matched.
     """
 
+    return _rules_for(owner_only_commands(orchestration), PROTECTED_EDITS)
+
+
+def _rules_for(commands, edits) -> list[str]:
     rules: list[str] = []
-    for name in owner_only_commands(orchestration):
+    for name in commands:
         rules += [f"Bash({CLI_PATTERN} {name})", f"Bash({CLI_PATTERN} {name} *)"]
-    rules += [f"Edit({path})" for path in PROTECTED_EDITS]
+    rules += [f"Edit({path})" for path in edits]
     return rules
+
+
+def generated_rules(orchestration: Path = ORCHESTRATION) -> set[str]:
+    """Every rule this installer or an earlier release's ever adds."""
+
+    return {*deny_rules(orchestration), *_rules_for(HISTORICAL_OWNER_ONLY, HISTORICAL_PROTECTED_EDITS)}
 
 
 # --- .claude/settings.json ---------------------------------------------------------------
@@ -295,8 +396,13 @@ def _load_settings(project: _Project) -> tuple[dict | None, bytes | None]:
     return data, raw
 
 
-def _load_record(project: _Project) -> dict | None:
-    raw = project.read(PERMISSIONS_RECORD)
+def _load_record(project: _Project, raw: bytes | None, generated: set[str]) -> dict | None:
+    """The installer's record of the entries it added, keeping only generated rules.
+
+    An entry outside every set this installer generates is never treated as the installer's,
+    so a planted record cannot make an update or a removal delete a user's own rule.
+    """
+
     if raw is None:
         return None
     try:
@@ -309,7 +415,7 @@ def _load_record(project: _Project) -> dict | None:
             or not isinstance(record.get("deny"), list)
             or not all(isinstance(item, str) for item in record["deny"])):
         raise InstallRefused(f"{PERMISSIONS_RECORD} is unreadable; restore it from Git before continuing")
-    return record
+    return {**record, "deny": [entry for entry in record["deny"] if entry in generated]}
 
 
 def _record_bytes(record: dict) -> bytes:
@@ -328,13 +434,17 @@ def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHEST
     project = _Project(target)
     try:
         data, raw = _load_settings(project)
-        record = _load_record(project)
+        record_raw = project.read(PERMISSIONS_RECORD)
+        record = _load_record(project, record_raw, generated_rules(orchestration))
     finally:
         project.close()
+    # The bytes this plan was made from: apply_settings writes nothing if either changed.
+    original = {CLAUDE_SETTINGS: raw, PERMISSIONS_RECORD: record_raw}
     writes: dict[str, bytes | None] = {}
     if operation == "remove":
         if record is None:
-            return {"action": "none", "changed_paths": [], "writes": writes, "removed": []}
+            return {"action": "none", "changed_paths": [], "writes": writes, "removed": [],
+                    "original": original, "order": []}
         ours = set(record["deny"])
         removed: list[str] = []
         if data is not None:
@@ -357,7 +467,11 @@ def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHEST
             elif updated != data:
                 writes[CLAUDE_SETTINGS] = _dump(updated)
         writes[PERMISSIONS_RECORD] = None
-        return {"action": "remove", "changed_paths": sorted(writes), "writes": writes, "removed": removed}
+        # Settings first, then the record: a failure in between leaves a record naming entries
+        # already gone, which the next install or removal handles.
+        order = [path for path in (CLAUDE_SETTINGS, PERMISSIONS_RECORD) if path in writes]
+        return {"action": "remove", "changed_paths": sorted(writes), "writes": writes, "removed": removed,
+                "original": original, "order": order}
     desired = deny_rules(orchestration)
     previous = set(record["deny"]) if record else set()
     updated = json.loads(json.dumps(data)) if data is not None else {}
@@ -383,13 +497,24 @@ def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHEST
     if record is None or _record_bytes(new_record) != _record_bytes(record):
         writes[PERMISSIONS_RECORD] = _record_bytes(new_record)
     action = "unchanged" if not writes else ("create" if data is None else "merge")
-    return {"action": action, "changed_paths": sorted(writes), "writes": writes, "added": added}
+    # The record first, then the settings: a failure in between leaves a record that claims
+    # entries not yet in the settings, which the next install adds and owns and a removal skips.
+    order = [path for path in (PERMISSIONS_RECORD, CLAUDE_SETTINGS) if path in writes]
+    return {"action": action, "changed_paths": sorted(writes), "writes": writes, "added": added,
+            "original": original, "order": order}
 
 
 def apply_settings(target: Path, plan: dict) -> None:
+    """Write a plan made moments before; refuse if either file changed since it was read."""
+
     project = _Project(target)
     try:
-        for relative, content in sorted(plan["writes"].items()):
+        for relative, before in plan["original"].items():
+            if project.read(relative) != before:
+                raise InstallRefused(f"{relative} changed while setup ran, so it was not overwritten; "
+                                     "run setup again")
+        for relative in plan["order"]:
+            content = plan["writes"][relative]
             if content is None:
                 project.remove(relative)
             else:
@@ -418,7 +543,7 @@ def verify_settings(target: Path, *, orchestration: Path = ORCHESTRATION) -> dic
 
 
 def _settings_report(plan: dict) -> dict:
-    return {key: value for key, value in plan.items() if key != "writes"}
+    return {key: value for key, value in plan.items() if key not in ("writes", "original", "order")}
 
 
 # --- the Codex commands rule -------------------------------------------------------------
@@ -426,11 +551,16 @@ def _settings_report(plan: dict) -> dict:
 RULE_COMMAND = "remove-codex-rule"
 
 
-def _project_cli(target: Path, args: list[str]) -> dict:
-    """Run the project's installed CLI isolated, after checking it is this checkout's copy."""
+def _owner_cli(target: Path, args: list[str], *, needs_install: bool = True) -> dict:
+    """Run this repository's own CLI for the project, isolated; never the project's copy.
+
+    Commands that depend on the installed files first require the installed orchestrator to
+    be this release, byte for byte (attest.check_project_runtime).
+    """
 
     try:
-        attest.check_project_runtime(target)
+        if needs_install:
+            attest.check_project_runtime(target)
         command = attest.cli_command(target, args)
     except attest.AttestError as exc:
         raise InstallRefused(str(exc)) from None
@@ -442,45 +572,19 @@ def _project_cli(target: Path, args: list[str]) -> dict:
     return report if isinstance(report, dict) else {"ready": False}
 
 
-def _in_temporary_folder(target: Path) -> bool:
-    real = Path(os.path.realpath(target))
-    return any(attest.within(real, root) for root in attest.temp_roots())
-
-
 def plan_codex_rule(target: Path) -> dict:
-    """How remove takes out the Codex commands rule and its protected runtime copy.
+    """Remove takes out the Codex commands rule and its protected copy first.
 
-    The project's own owner command does it. A project with no Codex install, or one in a
-    temporary folder (which never gets a rule), has nothing to remove. An installed CLI too
-    old to have the command is asked, read-only, whether a rule exists; if one does, remove
-    fails closed and names the file to delete.
+    This repository's own ``remove-codex-rule --project-root <root>`` does it. It needs only
+    the project's resolved path, so it works whatever version the project has installed, for
+    a project in a temporary folder, and when no rule exists (it then removes nothing).
     """
 
-    if not (target / CODEX_MANIFEST).is_file():
-        return {"action": "none", "reason": "the Codex package is not installed"}
-    if _in_temporary_folder(target):
-        return {"action": "none", "reason": "a project in a temporary folder never gets a rule"}
-    try:
-        attest.check_project_runtime(target)
-    except attest.AttestError as exc:
-        return {"error": f"the Codex commands rule cannot be removed: {exc}"}
-    if RULE_COMMAND in _parser_commands(ORCHESTRATION / "cli.py"):
-        return {"action": RULE_COMMAND}
-    status = _project_cli(target, ["host-command", "--project-root", str(target)])
-    if status.get("codex_rule") == "missing":
-        return {"action": "none", "reason": "no Codex commands rule exists for this project"}
-    rule_file = status.get("rule_file")
-    shown = re.sub(r"[\x00-\x1f\x7f]", "", rule_file) if isinstance(rule_file, str) else None
-    where = f"delete {shown}" if shown else (
-        "delete the agent-orchestration-*.rules file for this project in your Codex rules folder")
-    return {"error": f"this installed orchestrator cannot remove its Codex commands rule; {where} "
-                     "yourself, then run remove again"}
+    return {"action": RULE_COMMAND}
 
 
 def apply_codex_rule(target: Path, plan: dict) -> dict:
-    if plan.get("action") != RULE_COMMAND:
-        return dict(plan)
-    report = _project_cli(target, [RULE_COMMAND, "--project-root", str(target)])
+    report = _owner_cli(target, [RULE_COMMAND, "--project-root", str(target)], needs_install=False)
     removed = report.get("removed")
     if report.get("ready") is not True or not isinstance(removed, list):
         return {"action": RULE_COMMAND, "error": "the Codex commands rule could not be removed",
@@ -544,10 +648,8 @@ def operate(operation: str, target: Path, *, apply: bool = False, codex_options:
     previews = {name: _run(installer, op, target, False, extra) for installer, name, op, extra in order}
     summary.update(previews)
     try:
-        settings_plan = plan_settings(target, operation)
-        summary["claude_settings"] = _settings_report(settings_plan)
+        summary["claude_settings"] = _settings_report(plan_settings(target, operation))
     except (InstallRefused, OSError) as exc:
-        settings_plan = None
         summary["claude_settings"] = {"error": str(exc)}
     rule_plan = None
     if operation == "remove":
@@ -565,7 +667,8 @@ def operate(operation: str, target: Path, *, apply: bool = False, codex_options:
 
     def settings_step() -> bool:
         try:
-            apply_settings(target, settings_plan)
+            # Re-read both files now, so edits made while the packages were applied are kept.
+            apply_settings(target, plan_settings(target, operation))
         except (InstallRefused, OSError) as exc:
             summary["claude_settings"] = {**summary["claude_settings"], "error": str(exc)}
             return False
@@ -577,7 +680,7 @@ def operate(operation: str, target: Path, *, apply: bool = False, codex_options:
         if _failed(summary["codex_rule"]):
             summary["ok"] = False
             return summary
-        if summary["codex_rule"].get("action") == RULE_COMMAND:
+        if summary["codex_rule"].get("removed"):
             applied.append(("codex_rule", None))
         if not settings_step():
             summary["ok"] = False

@@ -157,6 +157,10 @@ def write_key(path: Path) -> None:
     path.chmod(0o600)
 
 
+def fake_signature(data: bytes) -> bytes:
+    return attest.SIGNATURE_HEAD + b"\n" + hashlib.sha256(data).hexdigest().encode() + b"\n"
+
+
 class FakeWorld:
     """Stands in for ssh-keygen and the orchestration CLI; records what was asked.
 
@@ -173,7 +177,7 @@ class FakeWorld:
         self.logged_in = logged_in
         self.calls: list[list[str]] = []
         self.grants: dict[str, dict] = {}
-        self.work_dirs: list[Path] = []
+        self.handed_over: list[str] = []  # the paths the CLI was given for key and signature
         self.recorded: list[str] = []
         self.signed_names: list[str] = []
         self.passphrase_changes: list[list[str]] = []
@@ -183,15 +187,17 @@ class FakeWorld:
         self.enrol_as: str | None = None  # a different key the state ends up holding
         self.sign_other_bytes = False
         self.cli_commands: list[list[str]] = []
+        self.signed_inputs: list[bytes] = []
 
     def _cli(self, command: list[str], stdin: str | None) -> subprocess.CompletedProcess:
         self.cli_commands.append(command)
+        assert command[1 + len(attest.PYTHON_FLAGS)] == str(attest.clone_cli()), "never the project's CLI"
         args = command[2 + len(attest.PYTHON_FLAGS):]
         name = args[0]
         option = lambda flag: args[args.index(flag) + 1]  # noqa: E731
         if name == "learning-configure-owner-key":
             public_path = Path(option("--public-key"))
-            self.work_dirs.append(public_path.parent)
+            self.handed_over.append(str(public_path))
             pub = public_path.read_text().split()
             state = Path(option("--state-root"))
             enrolled = self.enrol_as or f"{pub[0]} {pub[1]}"
@@ -215,8 +221,8 @@ class FakeWorld:
             record, payload = _runtime_payload(PROJECT_ID, grant)
             if "--signature" in args:
                 signature = Path(option("--signature"))
-                self.work_dirs.append(signature.parent)
-                assert signature.read_bytes() == b"SIG" + hashlib.sha256(payload).digest()
+                self.handed_over.append(str(signature))
+                assert signature.read_bytes() == fake_signature(payload)
                 self.recorded.append(grant["provider"])
                 report = {"ready": True}
             else:
@@ -250,20 +256,23 @@ class FakeWorld:
                 return subprocess.CompletedProcess(command, 1 if self.encrypted else 0, "", "")
             return subprocess.CompletedProcess(command, 0, self.derived, "")
         if command[1] == "-l":
-            content = Path(command[-1]).read_text()
-            assert COMMENT not in content  # only type and blob are ever written for display
+            assert command[2:] == ["-f", "-"], "the public key goes on stdin, never a file"
+            assert COMMENT not in kwargs["input"]  # only type and blob are ever shown
             return subprocess.CompletedProcess(command, 0, "256 SHA256:publicprint (ED25519)\n", "")
         if command[1:3] == ["-Y", "check-novalidate"]:
-            signature = Path(command[command.index("-s") + 1]).read_bytes()
-            good = signature == b"SIG" + hashlib.sha256(kwargs["input"]).digest()
+            source = command[command.index("-s") + 1]
+            assert source.startswith("/dev/fd/"), "the signature goes through a pipe, never a file"
+            good = Path(source).read_bytes() == fake_signature(kwargs["input"])
             return subprocess.CompletedProcess(command, 0 if good else 255, b"", b"")
         assert command[1:3] == ["-Y", "sign"]
+        assert command[3:] == ["-f", command[4], "-n", attest.NAMESPACE], "no file to sign"
         self.signed_names.append(command[command.index("-n") + 1])
+        self.signed_inputs.append(kwargs["input"])
         if self.sign_ok:
-            signed = Path(command[-1]).read_bytes() + (b"other" if self.sign_other_bytes else b"")
-            Path(command[-1] + ".sig").write_bytes(b"SIG" + hashlib.sha256(signed).digest())
-            return subprocess.CompletedProcess(command, 0)
-        return subprocess.CompletedProcess(command, 1)
+            signed = kwargs["input"] + (b"other" if self.sign_other_bytes else b"")
+            return subprocess.CompletedProcess(command, 0, fake_signature(signed),
+                                               b"Signing data on standard input\n")
+        return subprocess.CompletedProcess(command, 1, b"", b"")
 
 
 class AttestHarness(unittest.TestCase):
@@ -888,56 +897,25 @@ class AttestTests(AttestHarness):
 
     # temporary directories
 
-    def test_temp_dir_removed_on_success_and_private(self) -> None:
+    def test_nothing_the_owner_approves_touches_disk(self) -> None:
         self.set_providers(codex=True)
-        modes: list[int] = []
-        created: list[Path] = []
-        original = attest.make_scratch
-
-        def spy(prefix: str, project: Path | None = None) -> Path:
-            path = original(prefix, project)
-            modes.append(path.stat().st_mode & 0o777)
-            created.append(path)
-            return path
-
-        with mock.patch.object(attest, "make_scratch", spy):
+        with mock.patch.object(attest, "make_scratch", side_effect=AssertionError("no scratch")):
             self.assertEqual(self.run_main(["y", "y", "y", "y"]), 0)  # enrol a new key, then sign
-        self.assertEqual(len(self.world.work_dirs), 2)  # the enrolment key and the signature
-        container = Path(os.path.realpath(self.scratch_base)) / attest.SCRATCH_CONTAINER
-        for directory in created:
-            self.assertFalse(directory.exists())
-            self.assertEqual(directory.parent, container)
-            self.assertFalse(any(attest.within(directory, root) for root in attest.temp_roots()))
-        self.assertEqual(set(self.world.work_dirs) - set(created), set())
-        self.assertTrue(modes and all(mode == 0o700 for mode in modes))
-        self.assertEqual(oct(container.stat().st_mode & 0o777), "0o700")
-        self.assertEqual(attest._TEMP_DIRS, set())
+        # The enrolled key and the signature reached the CLI through pipes.
+        self.assertEqual(len(self.world.handed_over), 2)
+        self.assertTrue(all(path.startswith("/dev/fd/") for path in self.world.handed_over))
+        # ssh-keygen signed exactly the approved bytes, given on stdin.
+        grant = self.world.grants["codex"]
+        self.assertEqual(self.world.signed_inputs, [_runtime_payload(PROJECT_ID, grant)[1]])
+        self.assertEqual(self.world.recorded, ["codex"])
 
-    def test_temp_dir_removed_on_failure(self) -> None:
+    def test_a_failed_signature_records_nothing(self) -> None:
         self.configure_key()
         self.set_providers(codex=True)
         self.world.sign_ok = False
         self.assertEqual(self.run_main(["y", "y", "y"]), 1)
         self.assertIn("signing did not finish", self.output)
         self.assertEqual(self.world.recorded, [])
-        self.assertEqual(list((self.scratch_base / attest.SCRATCH_CONTAINER).iterdir()), [])
-
-    def test_cleanup_failure_is_reported_and_fails_exit(self) -> None:
-        self.configure_key()
-        self.set_providers(codex=True)
-        real_rmtree = shutil.rmtree
-
-        def stubborn(path, ignore_errors=False):
-            if Path(path).name.startswith("sign-"):
-                return None
-            return real_rmtree(path, ignore_errors=ignore_errors)
-
-        with mock.patch.object(attest.shutil, "rmtree", stubborn):
-            code = self.run_main(["y", "y", "y"])
-        self.assertEqual(code, 1)
-        self.assertIn("could not be removed", self.output)
-        for leftover in attest._CLEANUP_FAILURES:
-            real_rmtree(leftover, ignore_errors=True)
 
     def test_signal_handler_removes_temp_dirs(self) -> None:
         scratch = attest.make_scratch("attest-")
@@ -1062,15 +1040,51 @@ class SignOnlyWhatWasApprovedTests(AttestHarness):
         self.assertEqual(self.world.cli_commands, [])
         self.assertFalse(any("ssh-keygen" in c[0] for c in self.world.calls))
 
-    def test_the_cli_runs_isolated_in_the_real_interpreter(self) -> None:
+    def test_this_repositorys_cli_runs_isolated_never_the_projects(self) -> None:
         self.configure_key()
         self.set_providers(codex=True)
         self.run_main(["y", "y", "y"])
         self.assertTrue(self.world.cli_commands)
+        clone = attest.NATIVE_PACKAGE / ".codex" / "orchestration" / "cli.py"
         for command in self.world.cli_commands:
             self.assertEqual(command[0], os.path.realpath(sys.executable))
             self.assertEqual(command[1:6], ["-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"])
-            self.assertEqual(command[6], str(self.target / ".codex/orchestration/cli.py"))
+            self.assertEqual(command[6], str(clone))
+            self.assertNotIn(str(self.target / ".codex"), " ".join(command[6:7]))
+            if command[7] != "learning-configure-owner-key":
+                self.assertEqual(command[command.index("--project-root") + 1], str(self.target))
+
+    def test_a_second_signer_in_the_owner_key_record_is_refused(self) -> None:
+        key = self.configure_key()
+        self.set_providers(codex=True)
+        signers = self.state / "owner-allowed-signers"
+        line = signers.read_text()
+        for content in (line + "codex-agents-owner ssh-ed25519 AAAAattacker\n",
+                        line.rstrip("\n") + " comment\n", 'namespaces="x" ' + line, line + "\n"):
+            with self.subTest(content=content[:30]):
+                signers.write_text(content)
+                self.assertEqual(self.run_main([]), 1)
+                self.assertIn("does not hold exactly one owner key", self.output)
+                self.assertFalse(any(c[1:3] == ["-Y", "sign"] for c in self.world.calls))
+        signers.write_text("")
+        self.assertIsNone(attest.configured_public_key(self.state))
+        self.assertTrue(key.exists())
+
+    def test_enrolment_is_refused_when_state_gains_a_second_signer(self) -> None:
+        self.set_providers(codex=True)
+        real = self.world._cli
+
+        def append_attacker(command, stdin):
+            result = real(command, stdin)
+            if "learning-configure-owner-key" in command:
+                with (self.state / "owner-allowed-signers").open("a") as handle:
+                    handle.write("codex-agents-owner ssh-ed25519 AAAAattacker\n")
+            return result
+
+        self.world._cli = append_attacker
+        self.assertEqual(self.run_main(["y", "y", "y", "y"]), 1)
+        self.assertIn("does not hold exactly one owner key", self.output)
+        self.assertEqual(self.world.grants, {})
 
 
 class OwnerScratchTests(unittest.TestCase):
@@ -1079,6 +1093,17 @@ class OwnerScratchTests(unittest.TestCase):
     def setUp(self) -> None:
         attest._TEMP_DIRS.clear()
         self.base = private_base(self)
+        # The test base may sit under the real home folder (a CI checkout); the home rule is
+        # tested on its own below.
+        patcher = mock.patch.object(attest.Path, "home", return_value=Path("/nonexistent-home-for-tests"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_base_under_the_home_folder_is_refused(self) -> None:
+        with mock.patch.object(attest.Path, "home", return_value=self.base.parent), \
+                mock.patch.object(attest, "SCRATCH_BASE", str(self.base)):
+            with self.assertRaisesRegex(attest.AttestError, "no private working folder"):
+                attest.make_scratch("test-")
 
     def scratch(self, base: str | None) -> Path:
         with mock.patch.object(attest, "SCRATCH_BASE", base):
@@ -1185,7 +1210,7 @@ class OwnerScratchTests(unittest.TestCase):
 
 
 class ProjectRuntimeTests(unittest.TestCase):
-    """The project's CLI runs only when its runtime is byte for byte this repository's copy."""
+    """Steps that depend on the install need it to be this release, byte for byte, and nothing else."""
 
     FILES = {
         ".codex/orchestration/cli.py": "print('cli')\n",
@@ -1216,15 +1241,26 @@ class ProjectRuntimeTests(unittest.TestCase):
             _REAL_RUNTIME_CHECK(self.project)
         self.assertIn("not an exact copy", str(raised.exception))
         self.assertIn(text, str(raised.exception))
-        self.assertIn("so it was not run", str(raised.exception))
+        self.assertIn("so setup stops here", str(raised.exception))
 
-    def test_an_exact_copy_passes_with_project_files_and_bytecode_caches(self) -> None:
+    def test_an_exact_copy_passes_with_the_projects_own_files(self) -> None:
         orchestration = self.project / ".codex/orchestration"
-        (orchestration / "provider-routing.json").write_text("{}")
-        (orchestration / "__pycache__").mkdir()
-        (orchestration / "codex_agents" / "__pycache__").mkdir()
-        (orchestration / "codex_agents" / "__pycache__" / "host_paths.cpython-312.pyc").write_bytes(b"x")
+        for name in attest.PROJECT_FILES:
+            if not (orchestration / name).exists():
+                (orchestration / name).write_text("{}")
+        (orchestration / ".DS_Store").write_bytes(b"finder")
         _REAL_RUNTIME_CHECK(self.project)
+
+    def test_the_project_file_list_matches_the_runtime(self) -> None:
+        sys.path.insert(0, str(_ORCHESTRATION))
+        try:
+            from codex_agents.runtime_files import PACKAGE_DATA_FILES, PROJECT_FILES, RUNTIME_FILES
+        finally:
+            sys.path.remove(str(_ORCHESTRATION))
+        self.assertEqual(set(attest.PROJECT_FILES), set(PROJECT_FILES))
+        with mock.patch.object(attest, "NATIVE_PACKAGE", _ORCHESTRATION.parents[1]):
+            bundle = {name.removeprefix(".codex/orchestration/") for name in attest._runtime_bundle()}
+        self.assertEqual(bundle, {*RUNTIME_FILES, *PACKAGE_DATA_FILES})
 
     def test_a_modified_file_is_refused(self) -> None:
         (self.project / ".codex/orchestration/codex_agents/host_paths.py").write_text("X = 2\n")
@@ -1248,16 +1284,33 @@ class ProjectRuntimeTests(unittest.TestCase):
         (self.project / ".codex/orchestration/install-manifest.json").unlink()
         self.refused("install record is missing")
 
-    def test_an_extra_module_package_or_extension_is_refused(self) -> None:
-        cases = {".codex/orchestration/json.py": "file", ".codex/orchestration/sqlite3": "dir",
-                 ".codex/orchestration/codex_agents/routing.cpython-312-darwin.so": "file",
-                 ".codex/orchestration/secrets.pyc": "file"}
-        for relative, kind in cases.items():
-            with self.subTest(path=relative):
-                path = self.project / relative
-                path.mkdir() if kind == "dir" else path.write_text("")
-                self.refused("an extra Python module or folder")
-                shutil.rmtree(path) if kind == "dir" else path.unlink()
+    def test_any_unexpected_entry_is_refused(self) -> None:
+        package = self.root / "attacker-package"
+        package.mkdir()
+        (package / "__init__.py").write_text("raise SystemExit('planted')\n")
+        orchestration = self.project / ".codex/orchestration"
+        cases = {
+            "an extensionless symlink to a package": ("hashlib", lambda path: path.symlink_to(package)),
+            "a symlink to a module": ("json.py", lambda path: path.symlink_to(package / "__init__.py")),
+            "a dangling symlink": ("socket", lambda path: path.symlink_to(self.root / "nowhere")),
+            "a package": ("sqlite3", lambda path: (path.mkdir(), (path / "__init__.py").write_text(""))),
+            "an empty folder": ("empty", lambda path: path.mkdir()),
+            "a bytecode cache": ("__pycache__", lambda path: (path.mkdir(),
+                                 (path / "cli.cpython-312.pyc").write_bytes(b"x"))),
+            "an extension module": ("codex_agents/routing.cpython-312-darwin.so",
+                                    lambda path: path.write_bytes(b"")),
+            "an extra file": ("notes", lambda path: path.write_text("")),
+            "a symlinked config folder": ("schemas", lambda path: path.symlink_to(self.root)),
+        }
+        for label, (relative, make) in cases.items():
+            with self.subTest(case=label):
+                path = orchestration / relative
+                make(path)
+                self.refused("holds a file, folder or link the package does not install")
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+                else:
+                    shutil.rmtree(path)
         _REAL_RUNTIME_CHECK(self.project)
 
 
@@ -1296,8 +1349,48 @@ class IsolationTests(unittest.TestCase):
         (project / "bin" / "python3").write_text("")
         with mock.patch.object(attest.sys, "executable", str(project / "bin" / "python3")):
             self.assertEqual(attest.trusted_python(), str(project / "bin" / "python3"))
-            with self.assertRaisesRegex(attest.AttestError, "in the project"):
+            with self.assertRaisesRegex(attest.AttestError, "inside the project"):
                 attest.trusted_python(project)
+
+    def test_interpreters_under_home_are_trusted_only_in_a_tool_folder(self) -> None:
+        home = private_base(self) / "home"
+        for relative, expected in ((".pyenv/versions/3.12.4/bin/python3.12", None),
+                                   (".local/share/uv/python/cpython-3.12/bin/python3.12", None),
+                                   ("miniforge3/bin/python3", None),
+                                   ("Code/tools/bin/python3", "under your home folder"),
+                                   ("projects/app/.venv-copies/bin/python3", "under your home folder")):
+            with self.subTest(path=relative):
+                executable = home / relative
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("")
+                problem = attest.python_location_problem(executable, home=home)
+                if expected is None:
+                    self.assertIsNone(problem)
+                else:
+                    self.assertIn(expected, problem)
+
+    @unittest.skipUnless(sys.platform == "darwin", "the xcrun shim is macOS's")
+    def test_the_macos_xcrun_shim_is_refused(self) -> None:
+        self.assertIn("shim", attest.python_location_problem(Path("/usr/bin/python3")))
+
+    def test_an_owner_chosen_input_is_snapshot_safely(self) -> None:
+        base = private_base(self)
+        source = base / "checks.json"
+        source.write_text('{"version": 1}')
+        copy = base / "copy.json"
+        attest.copy_input(source, copy)
+        self.assertEqual(copy.read_text(), '{"version": 1}')
+        self.assertEqual(oct(copy.stat().st_mode & 0o777), "0o600")
+        with self.assertRaises(attest.AttestError):  # never overwrites
+            attest.copy_input(source, copy)
+        fifo = base / "fifo"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(attest.AttestError, "not a regular file"):
+            attest.copy_input(fifo, base / "from-fifo.json")  # returns at once, never blocks
+        big = base / "big.json"
+        big.write_bytes(b"x" * (1024 * 1024 + 1))
+        with self.assertRaisesRegex(attest.AttestError, "too large"):
+            attest.copy_input(big, base / "from-big.json")
 
     def test_a_symlinked_interpreter_is_launched_as_its_real_file(self) -> None:
         outside = private_base(self)
@@ -1490,6 +1583,52 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         self.assertNotIn("is not logged in", transcript)
         self.assertEqual(code, 1)
         self.no_passphrase_in(transcript)
+
+    SIGNING_CLI = (
+        "import json, subprocess, sys, tempfile\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, {orchestration!r})\n"
+        "from codex_agents.learning_engine import OwnerGrantAuthority\n"
+        "from codex_agents.providers import billing_attestation_record\n"
+        "args = sys.argv[1:]\n"
+        "option = lambda flag: args[args.index(flag) + 1]\n"
+        "if args[0] == 'provider-observe':\n"
+        "    print(json.dumps({{'ready': True, 'records': [{{'record_type': 'provider_identity',\n"
+        "        'logged_in': True, 'account_fingerprint': 'ab' * 32, 'auth_method': 'chatgpt',\n"
+        "        'plan_type': 'pro'}}]}}))\n"
+        "    raise SystemExit(0)\n"
+        "assert option('--grant') == '-'\n"
+        "record = billing_attestation_record(json.loads(sys.stdin.read()))\n"
+        "payload = OwnerGrantAuthority.owner_record_payload('prj_' + '0' * 32, record)\n"
+        "if '--signature' not in args:\n"
+        "    import base64\n"
+        "    print(json.dumps({{'ready': True, 'record': record,\n"
+        "        'signing_payload_b64': base64.b64encode(payload).decode()}}))\n"
+        "    raise SystemExit(0)\n"
+        "source = option('--signature')\n"
+        "assert source.startswith('/dev/fd/'), source\n"
+        "with tempfile.TemporaryDirectory() as directory:\n"
+        "    signature = Path(directory) / 'signature'\n"
+        "    signature.write_bytes(Path(source).read_bytes())\n"
+        "    checked = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'verify', '-f',\n"
+        "        str(Path(option('--state-root')) / 'owner-allowed-signers'), '-I', 'codex-agents-owner',\n"
+        "        '-n', 'codex-agents-owner-v1', '-s', str(signature)], input=payload, capture_output=True)\n"
+        "print(json.dumps({{'ready': checked.returncode == 0, 'error': 'bad signature'}}))\n"
+    )
+
+    def test_the_real_signer_signs_the_approved_bytes_from_memory(self) -> None:
+        (self.project / ".codex/orchestration/cli.py").write_text(
+            self.SIGNING_CLI.format(orchestration=str(_ORCHESTRATION)))
+        (self.bundle / ".codex/orchestration/cli.py").write_text(
+            self.SIGNING_CLI.format(orchestration=str(_ORCHESTRATION)))
+        transcript, code = self.drive([
+            ("Enter passphrase", self.RIGHT), ("credits turned off", "y"),
+            ("existing Codex credit", "y"), ("Sign this statement?", "y"),
+            ("Enter passphrase", self.RIGHT)])
+        self.assertIn("Codex attested.", transcript)
+        self.assertEqual(code, 0)
+        self.no_passphrase_in(transcript)
+        self.assertEqual([path.name for path in self.root.rglob("*.sig")], [])
 
     def test_a_key_that_is_not_the_owner_key_stops_without_the_retry_menu(self) -> None:
         other = self.root / "other-key"

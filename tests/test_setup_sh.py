@@ -62,6 +62,13 @@ TRUSTED_PYTHON = interpreter_trusted()
 SCRATCH_CONTAINER = "agent-orchestration-owner"
 
 
+def trusted_git() -> str:
+    """The git binary setup.sh trusts (never the PATH one)."""
+
+    return subprocess.run(["bash", str(SETUP), "--print-git"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
 def outside_temporary_folders() -> Path | None:
     """An existing folder outside every temporary root: the wizard's private working folder
     and its trusted Python may not live in one."""
@@ -366,7 +373,7 @@ class SetupScriptTests(unittest.TestCase):
             plan = Path(directory) / "plan.nul"
             # `.codex/local*` is only a wildcard to Git, never a file here: it must not match local-other.
             plan.write_bytes(b".codex/local*\0.codex/ok\0")
-            result = self.helper("paths", str(apply), str(project), str(plan))
+            result = self.helper("paths", str(apply), str(project), str(plan), trusted_git())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b".codex/ok\0")
             # Invalid UTF-8 in the plan fails closed with no output (core.quotePath=false).
@@ -375,34 +382,89 @@ class SetupScriptTests(unittest.TestCase):
             except OSError:
                 pass
             plan.write_bytes(b".codex/ok\0.codex/bad\xff\0")
-            result = self.helper("paths", str(apply), str(project), str(plan))
+            result = self.helper("paths", str(apply), str(project), str(plan), trusted_git())
             self.assertEqual(result.returncode, 3)
             self.assertEqual(result.stdout, b"")
             # A missing plan file fails closed too.
-            result = self.helper("paths", str(apply), str(project), str(Path(directory) / "missing"))
+            result = self.helper("paths", str(apply), str(project), str(Path(directory) / "missing"), trusted_git())
             self.assertEqual(result.returncode, 3)
             self.assertEqual(result.stdout, b"")
             # A tracked file with an invalid-UTF-8 name does not break a valid list.
             subprocess.run(git + ["add", "-A"], check=True, env=env)
             plan.write_bytes(b".codex/ok\0")
-            result = self.helper("paths", str(apply), str(project), str(plan))
+            result = self.helper("paths", str(apply), str(project), str(plan), trusted_git())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b".codex/ok\0")
 
-    def test_every_git_call_on_the_project_skips_hooks_and_the_monitor(self) -> None:
-        lines = [line for line in SETUP.read_text(encoding="utf-8").splitlines()
-                 if re.search(r'\bgit -C "', line) and not line.lstrip().startswith("#")]
-        self.assertGreaterEqual(len(lines), 8)
-        for line in lines:
-            with self.subTest(line=line.strip()):
-                self.assertIn('git -C "$', line)
-                self.assertIn('"${GIT_SAFE[@]}"', line)
-                if " status " in line:
-                    self.assertIn("--no-optional-locks", line.split(" status ")[0])
-        self.assertIn("GIT_SAFE=(-c core.hooksPath=/dev/null -c core.fsmonitor=false)",
-                      SETUP.read_text(encoding="utf-8"))
-        self.assertIn('"core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"',
-                      SETUP.read_text(encoding="utf-8"))  # the helper's own git call
+    def test_every_git_call_uses_the_trusted_binary_with_helpers_off(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        # No git is ever run by name from PATH: only "$GIT", through g() for the project.
+        for line in code:
+            stripped = line.strip()
+            if re.search(r'(^|[;&|]\s*|run_cmd "[^"]*" |\$\()git\s', stripped):
+                self.fail(f"git run from PATH: {stripped}")
+        self.assertIn('xcrun_nocache=1 "$GIT" -C "$project" "${GIT_SAFE[@]}" "$@"', text)
+        uses = [line for line in code if re.search(r'\bg "\$', line)]
+        self.assertGreaterEqual(len(uses), 8)
+        for line in uses:
+            if " status " in line:
+                self.assertIn("--no-optional-locks", line.split(" status ")[0], line)
+        safe = re.search(r"^GIT_SAFE=\((.*)\)$", text, re.M).group(1).split()
+        self.assertEqual(safe, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                                "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
+                                "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        # The helper's own git call is the trusted binary too.
+        self.assertIn('[git, "-C", project, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",', text)
+
+    def test_the_helper_pattern_matches_the_installer(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("install_for_pattern", ROOT / "scripts" / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        pattern = re.search(r"^GIT_HELPER_KEYS='(.*)'$", SETUP.read_text(encoding="utf-8"), re.M).group(1)
+        self.assertEqual(pattern, module.GIT_HELPER_KEYS)
+
+    def test_the_trusted_git_is_never_the_path_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stubs = Path(directory)
+            (stubs / "git").write_text("#!/bin/sh\necho planted\n")
+            (stubs / "git").chmod(0o755)
+            found = subprocess.run(["bash", str(SETUP), "--print-git"], capture_output=True, text=True,
+                                   env=dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")).stdout.strip()
+        self.assertNotEqual(found, str(stubs / "git"))
+        if found != "none":
+            self.assertTrue(os.path.isabs(found))
+            if sys.platform == "darwin":
+                self.assertNotEqual(os.path.dirname(found), "/usr/bin")  # the xcrun shim
+
+    def test_helper_programs_in_the_repository_stop_porcelain_git(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            marker = Path(directory) / "filter-ran"
+            script = Path(directory) / "filter.sh"
+            script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+            script.chmod(0o755)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            run = lambda *args: subprocess.run(["bash", str(SETUP), *args], capture_output=True, env=env)  # noqa: E731
+            self.assertEqual(run("--print-git-helpers", str(project)).stdout.strip(), b"none")
+            subprocess.run(["git", "-C", str(project), "config", "filter.planted.clean", str(script)],
+                           check=True, env=env)
+            (project / ".git" / "info").mkdir(exist_ok=True)
+            (project / ".git" / "info" / "attributes").write_text("* filter=planted\n")
+            (project / ".codex").mkdir()
+            (project / ".codex" / "a").write_text("x")
+            self.assertIn(b"filter.planted.clean", run("--print-git-helpers", str(project)).stdout)
+            # Status is never run: every candidate counts as changed, the ignored query fails.
+            self.assertEqual(run("--print-changed-paths", str(project), ".codex/a").stdout, b".codex/a\0")
+            self.assertEqual(run("--print-ignored-paths", str(project), ".codex/a").stdout, b"!\0")
+            self.assertIn(b"not checked", run("--print-uncommitted", str(project)).stdout)
+            self.assertFalse(marker.exists())
+            subprocess.run(["git", "-C", str(project), "config", "--unset", "filter.planted.clean"],
+                           check=True, env=env)
+            subprocess.run(["git", "-C", str(project), "config", "include.path", "../elsewhere"],
+                           check=True, env=env)
+            self.assertIn(b"include.path", run("--print-git-helpers", str(project)).stdout)
 
     def test_status_helpers_never_run_a_planted_fsmonitor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -427,7 +489,8 @@ class SetupScriptTests(unittest.TestCase):
         text = SETUP.read_text(encoding="utf-8")
         code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
         # Every use of "$PY" either launches it isolated or only inspects the path.
-        inspecting = ("inside_temp ", "inside_dir ", "dirname -- ", "[ -n ", "printf '%s\\n' ")
+        inspecting = ("inside_temp ", "inside_dir ", "dirname -- ", "[ -n ", "printf '%s\\n' ",
+                      "python_location_problem ")
         launches = 0
         for line in code:
             for match in re.finditer(r'"\$PY"', line):
@@ -436,20 +499,68 @@ class SetupScriptTests(unittest.TestCase):
                     continue
                 launches += 1
                 with self.subTest(line=line.strip()):
-                    self.assertTrue(after.startswith(" -I -B -S "), line.strip())
-        self.assertGreaterEqual(launches, 10)
+                    self.assertTrue(after.startswith(' "${PYF[@]}" '), line.strip())
+        self.assertGreaterEqual(launches, 12)
+        self.assertIn("PYF=(-I -B -S -X pycache_prefix=/dev/null)", text)
+        # The commands shown to the owner carry the same flags.
+        for line in code:
+            if "python3 -I" in line:
+                self.assertIn("python3 -I -B -S -X pycache_prefix=/dev/null", line)
         # No bare python3 is ever run: only the resolved, checked "$PY".
         for line in code:
             stripped = line.strip()
             if re.match(r'^(run_cmd "[^"]*" )?python3\b', stripped) or re.search(r'\$\(python3\b', stripped):
                 self.fail(f"bare python3 launch: {stripped}")
-        self.assertIn('run_cmd "$label" "$PY" -I -B -S -X pycache_prefix=/dev/null "$PROJECT/.codex/orchestration/cli.py"',
-                      text)
+        # Owner commands run this repository's CLI, never the project's copy.
+        self.assertIn('run_cmd "$label" "$PY" "${PYF[@]}" "$CLONE_CLI" "$@"', text)
+        self.assertIn('CLONE_CLI="$ORCH_DIR/cli.py"', text)
+        self.assertNotIn('"$PROJECT/.codex/orchestration/cli.py" "$@"', text)
 
-    def python_for(self, path_entry: Path) -> str:
+    def python_for(self, path_entry: Path, home: str = "/nonexistent-home-for-tests",
+                   cwd: Path | None = None) -> str:
         result = subprocess.run(["bash", str(SETUP), "--print-python"], capture_output=True, text=True,
-                                env=dict(os.environ, PATH=f"{path_entry}:/usr/bin:/bin"))
+                                env=dict(os.environ, PATH=f"{path_entry}:/usr/bin:/bin", HOME=home),
+                                cwd=cwd)
         return result.stdout.strip()
+
+    def test_python_under_home_must_be_in_an_interpreter_managers_folder(self) -> None:
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        home = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
+        self.addCleanup(shutil.rmtree, home, True)
+        for relative, expected in ((".pyenv/versions/3.12/bin", None), (".local/bin", None),
+                                   ("Code/tools/bin", "refused: home"), ("bin", "refused: home")):
+            with self.subTest(folder=relative):
+                folder = home / relative
+                folder.mkdir(parents=True)
+                (folder / "python3").write_text("#!/bin/sh\nexit 99\n")  # never run
+                (folder / "python3").chmod(0o755)
+                found = self.python_for(folder, home=str(home))
+                self.assertEqual(found, expected or str(folder.resolve() / "python3"))
+
+    def test_python_inside_the_starting_project_is_refused_before_it_runs(self) -> None:
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        base = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
+        self.addCleanup(shutil.rmtree, base, True)
+        project = base / "project"
+        (project / "tools" / "bin").mkdir(parents=True)
+        (project / ".git").mkdir()
+        ran = base / "ran"
+        (project / "tools" / "bin" / "python3").write_text(f"#!/bin/sh\ntouch '{ran}'\n")
+        (project / "tools" / "bin" / "python3").chmod(0o755)
+        (project / "src").mkdir()
+        self.assertEqual(self.python_for(project / "tools" / "bin", cwd=project / "src"), "refused: project")
+        self.assertFalse(ran.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the xcrun shim is macOS's")
+    def test_the_macos_python_shim_is_refused(self) -> None:
+        if not Path("/usr/bin/python3").exists():
+            self.skipTest("no /usr/bin/python3")
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.python_for(Path(directory)), "refused: shim")
 
     def test_python_is_the_real_file_and_never_temporary_or_a_virtual_environment(self) -> None:
         outside = outside_temporary_folders()
@@ -476,6 +587,34 @@ class SetupScriptTests(unittest.TestCase):
             (linked / "python3").unlink()
             (linked / "python3").symlink_to(temporary / "python3")
             self.assertEqual(self.python_for(linked), "refused: temporary")
+
+    def test_only_the_macos_only_check_failure_is_quiet_on_linux(self) -> None:
+        import json
+        sandbox = ("operational check sandbox preflight failed; validate from an owner shell or "
+                   "approved unsandboxed command boundary")
+        limited = {"ready": False, "codex": {"package_ready": True, "project_errors": [sandbox]},
+                   "claude": {"result": "verified"}, "claude_settings": {"ready": True}}
+        cases = {
+            "ready": {**limited, "ready": True},
+            "linux-limited": limited,
+            "failed": None,
+        }
+        failures = [
+            {**limited, "claude_settings": {"ready": False, "missing": ["Edit(/.git/**)"]}},
+            {**limited, "codex": {"package_ready": True, "project_errors": [sandbox, "not committed and clean"]}},
+            {**limited, "codex": {"package_ready": False, "project_errors": [sandbox]}},
+            {**limited, "claude": {"error": "managed_file_modified"}},
+            {"refused": "the project's Git settings name programs Git would run"},
+            {},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "verify.json"
+            for expected, data in cases.items():
+                for sample in ([data] if data is not None else failures):
+                    with self.subTest(expected=expected, sample=str(sample)[:60]):
+                        report.write_text(json.dumps(sample))
+                        result = self.helper("verifyclass", str(report))
+                        self.assertEqual(result.stdout.decode().strip(), expected)
 
     def test_every_git_call_with_paths_is_literal(self) -> None:
         text = SETUP.read_text(encoding="utf-8")
@@ -587,18 +726,11 @@ class SetupScriptTests(unittest.TestCase):
 
     def test_a_failed_ignored_file_query_is_reported_not_read_as_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = self.git_project(directory)
-            stubs = Path(directory) / "bin"
-            stubs.mkdir()
-            real_git = shutil.which("git")
-            (stubs / "git").write_text(
-                f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
-            (stubs / "git").chmod(0o755)
-            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
-                       PATH=f"{stubs}:{os.environ['PATH']}")
+            # Not a repository: the trusted git cannot answer.
             result = subprocess.run(
-                ["bash", str(SETUP), "--print-ignored-paths", str(project), ".codex/a"],
-                capture_output=True, env=env)
+                ["bash", str(SETUP), "--print-ignored-paths", directory, ".codex/a"],
+                capture_output=True, env=dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null",
+                                              GIT_CEILING_DIRECTORIES=str(Path(directory).parent)))
         self.assertEqual(result.stdout, b"!\0")
 
     def test_profile_larger_than_the_read_limit_is_unreadable(self) -> None:
@@ -615,8 +747,12 @@ class SetupScriptTests(unittest.TestCase):
                       "project cannot change. Never open Codex on your home folder, its parent or / while "
                       "the rule exists.", text)
         self.assertNotIn("It applies to Codex sessions started in this project's root folder", text)
-        self.assertIn("The commit skips the project's Git hooks", text)
+        self.assertIn("Git runs with the project's hooks, file-system monitor, commit signing and "
+                      "background maintenance turned off, and only after setup has checked that the "
+                      "project's own Git settings name no program (such as a filter) for Git to start.", text)
+        self.assertNotIn("no script in the project runs as you", text)
         self.assertNotIn("or a commit hook stopped it", text)
+        self.assertIn("Keep this setup folder outside every folder you open in Codex", text)
         self.assertIn("including the Codex commands rule", text)
 
     def test_wizard_messages_for_the_polished_screens(self) -> None:
@@ -743,11 +879,16 @@ class WizardTerminalTests(unittest.TestCase):
             '#!/bin/sh\necho \'{"loggedIn": true, "subscriptionType": "max", "authMethod": "x"}\'\n')
         self.py_log = self.base / "python.log"
         self.py_args = self.base / "python-args.log"
+        self.py_full = self.base / "python-full.log"
         self.slow_pid = self.base / "slow.pid"
         (self.fakes / "python3").write_text(
             "#!/bin/sh\n"
             f'echo "$PYTHONDONTWRITEBYTECODE" >> "{self.py_log}"\n'
-            f'echo "$1 $2 $3" >> "{self.py_args}"\n'
+            f'echo "$1 $2 $3 $4 $5" >> "{self.py_args}"\n'
+            f'printf "%s\\n" "$*" >> "{self.py_full}"\n'
+            'if [ -n "$FAKE_PLANT" ]; then case "$*" in *install.py*--apply*)'
+            ' "$0.real" "$@"; rc=$?; git -C "$FAKE_PLANT" config filter.planted.clean "$FAKE_PLANT_SCRIPT";'
+            ' exit $rc;; esac; fi\n'
             'if [ -n "$FAKE_FAIL" ]; then case "$*" in *install.py*--apply*)'
             ' echo \'{"error": "boom ' + TOKEN + ' user@example.invalid"}\'; echo ' + TOKEN + ' >&2; exit 2;; esac; fi\n'
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
@@ -760,8 +901,10 @@ class WizardTerminalTests(unittest.TestCase):
             ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
             ' exit 2;; esac; fi\n'
             f'exec "{sys.executable}" "$@"\n')
+        (self.fakes / "python3.real").symlink_to(os.path.realpath(sys.executable))
         for fake in self.fakes.iterdir():
-            fake.chmod(0o755)
+            if not fake.is_symlink():
+                fake.chmod(0o755)
         # CODEX_HOME is dropped so the commands step can only write under the test's HOME.
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR",
@@ -801,7 +944,7 @@ class WizardTerminalTests(unittest.TestCase):
         lines = self.py_args.read_text().splitlines()
         self.assertTrue(lines)
         for line in lines:
-            self.assertTrue(line.startswith("-I -B -S"), line)
+            self.assertEqual(line, "-I -B -S -X pycache_prefix=/dev/null", line)
 
     def start(self, cwd: Path, extra_env: dict | None = None) -> None:
         import fcntl
@@ -1064,6 +1207,13 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertTrue(runs and set(runs) == {"1"}, runs)
         self.assert_python_isolated()
         self.assert_no_working_files_left()
+        # Owner commands ran this checkout's CLI with --project-root, never the project's copy.
+        launched = self.py_full.read_text().splitlines()
+        clone = str(ORCHESTRATION / "cli.py")
+        owner = [line for line in launched if clone in line]
+        self.assertTrue(any("host-command" in line for line in owner), launched)
+        self.assertTrue(any("install-codex-rule" in line for line in owner), launched)
+        self.assertFalse(any(str(cli) in line for line in launched), launched)
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
@@ -1103,6 +1253,12 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertEqual(oct(destination.stat().st_mode & 0o777), "0o600")
         self.assert_python_isolated()
         self.assert_no_working_files_left()
+        # Preview and install read one private snapshot of the chosen checks file, never the file.
+        installs = [line for line in self.py_full.read_text().splitlines() if "install.py install" in line]
+        self.assertEqual(len(installs), 2)
+        for line in installs:
+            self.assertNotIn(str(checks), line)
+            self.assertRegex(line, SCRATCH_CONTAINER + r"/setup-[0-9a-f]+/inputs/operational-checks\.json")
 
     def commit_count(self, project: Path) -> int:
         return int(subprocess.run(["git", "-C", str(project), "rev-list", "--count", "HEAD"],
@@ -1134,32 +1290,41 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertNotIn("The commit", final)
         self.assertEqual(self.commit_count(project), before)
 
-    def test_a_failed_ignored_file_query_never_says_nothing_to_commit(self) -> None:
+    def test_a_helper_planted_during_the_run_stops_git_and_the_commit(self) -> None:
         project, checks = self.make_project()
-        self.drive_to_commit_menu(project, checks)
-        self.send("\r")
-        self.finish_after_install()
-        real_git = shutil.which("git", path=os.environ["PATH"])
-        (self.fakes / "git").write_text(
-            f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
-        (self.fakes / "git").chmod(0o755)
+        marker = self.base / "filter-ran"
+        script = self.base / "filter.sh"
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+        script.chmod(0o755)
+        (project / ".git" / "info").mkdir(exist_ok=True)
+        (project / ".git" / "info" / "attributes").write_text("* filter=planted\n")
         before = self.commit_count(project)
-        self.start(project)
-        self.expect("Everything looks good")
-        self.send("\r")
-        self.expect("Project path")
-        self.send("\r")
-        self.expect("Update the install")
-        self.send("\r")
-        for wait in ("install can be updated", "Keep the existing configuration", "Install now"):
-            self.expect(wait)
-            self.send("\r")
-        self.expect("could not check whether installed files are ignored")
+        # The filter appears in .git/config right after the install, as a session opened on a
+        # parent folder could do it.
+        self.drive_to_commit_menu(project, checks, {"FAKE_PLANT": str(project), "FAKE_PLANT_SCRIPT": str(script)})
+        self.assertIn("could not check whether installed files are ignored", self.screen)
         self.assertNotIn("Nothing to commit", self.screen)
+        self.send("\r")  # Commit now
+        self.expect("Not committed")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        self.assertIn("filter.planted.clean", plain)
         final = self.finish_after_install()
         self.assertNotIn("nothing to commit", final)
-        self.assertIn("could not be checked", final)
         self.assertEqual(self.commit_count(project), before)
+        self.assertFalse(marker.exists(), "the planted filter ran")
+
+    def test_helpers_in_the_project_settings_stop_setup_before_any_git_porcelain(self) -> None:
+        project, checks = self.make_project()
+        subprocess.run(["git", "-C", str(project), "config", "core.pager", "./pager.sh"],
+                       check=True, env=self.env)
+        self.to_project_prompt(project)
+        self.send("\r")
+        self.expect("Choose another path")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B|\r|\n", " ", self.screen)
+        self.assertIn("core.pager", plain)
+        self.assertIn("will not run Git commands that could start them", re.sub(r"\s+", " ", plain))
+        self.send("\x1b[B\r")
+        self.assertEqual(self.finish(), 1)
 
     def test_only_paths_with_changes_are_committed(self) -> None:
         import json
@@ -1642,7 +1807,8 @@ class WizardTerminalTests(unittest.TestCase):
                        check=True, env=self.env)
         self.drive_to_commit_menu(project, checks)
         plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
-        self.assertIn("skips the project's Git hooks", re.sub(r"\s+", " ", plain))
+        self.assertIn("Git runs with the project's hooks, file-system monitor, commit signing and background "
+                      "maintenance turned off", re.sub(r"\s+", " ", plain))
         self.send("\r")
         final = self.finish_after_install()
         self.assertIn("; committed", final)
@@ -1650,11 +1816,11 @@ class WizardTerminalTests(unittest.TestCase):
 
     def test_summary_says_commit_failed_when_git_refuses(self) -> None:
         project, checks = self.make_project()
-        for key, value in (("commit.gpgSign", "true"), ("gpg.program", "/usr/bin/false")):
-            subprocess.run(["git", "-C", str(project), "config", key, value], check=True, env=self.env)
-        self.drive_to_commit_menu(project, checks)
+        # Signing is switched off for the commit, so a signing setting never stops it.
+        subprocess.run(["git", "-C", str(project), "config", "commit.gpgSign", "true"], check=True, env=self.env)
+        self.drive_to_commit_menu(project, checks, {"GIT_AUTHOR_NAME": "", "GIT_COMMITTER_NAME": ""})
         self.send("\r")
-        self.expect("commit signing failed")
+        self.expect("Git identity")
         final = self.finish_after_install()
         self.assertIn("commit failed", final)
         self.assertNotIn("not committed", final)
@@ -1678,7 +1844,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
         self.expect("Start the attestation")
         self.send("\r")
-        self.expect("orchestrator was not run")
+        self.expect("does not match this setup")
         plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
         self.assertIn(".codex/orchestration/cli.py differs", plain.replace("\r\n", " "))
         self.assertFalse((self.base / "attest.count").exists(), "attest.py ran")
@@ -1778,6 +1944,38 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertIn("Codex sessions cannot reach the orchestrator", final)
         self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
+
+    def test_an_unsupported_codex_home_is_explained_with_its_fix(self) -> None:
+        import json
+        project, checks = self.make_project(base=self.non_temporary_base())
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
+        elsewhere = self.base / "codex-elsewhere"
+        elsewhere.mkdir()
+        self.start(project, {"CODEX_HOME": str(elsewhere)})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("cannot be used with this Codex setup")
+        self.expect("Continue")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("CODEX_HOME points somewhere other than ~/.codex", plain)
+        self.assertIn("unset CODEX_HOME", plain)
+        self.assertNotIn("may be older", plain)
+        self.send("\r")
+        self.expect("Back to the main menu")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertEqual(list(elsewhere.iterdir()), [])
 
     def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
         project, checks = self.make_project(base=self.non_temporary_base())

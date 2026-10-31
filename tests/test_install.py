@@ -98,10 +98,21 @@ def make_target(base: Path) -> tuple[Path, list[str]]:
     return target, ["--project-agent-routing", str(routing), "--operational-checks", str(checks)]
 
 
+def isolate_home(test: unittest.TestCase, home: Path) -> None:
+    """Point HOME at a test folder (remove runs remove-codex-rule, which reads ~/.codex)."""
+
+    home.mkdir(mode=0o700, exist_ok=True)
+    environment = {key: value for key, value in os.environ.items() if key != "CODEX_HOME"}
+    patcher = mock.patch.dict(os.environ, {**environment, "HOME": str(home)}, clear=True)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class UmbrellaInstallTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(tempfile.mkdtemp(dir=os.path.realpath(tempfile.gettempdir())))
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        isolate_home(self, self.base / "home")
         self.target, self.codex_options = make_target(self.base)
 
     def install(self, target: Path | None = None, apply: bool = False) -> dict:
@@ -258,9 +269,47 @@ class UmbrellaInstallTests(unittest.TestCase):
         for command in pythons:
             self.assertEqual(command[0], os.path.realpath(sys.executable))
             self.assertEqual(command[1:6], ["-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"])
-        for command in seen:
-            if command[0] == "git":
-                self.assertEqual(command[3:7], list(installer.GIT_SAFE), command)
+        trusted = installer.git_executable([self.target])
+        gits = [command for command in seen if os.path.basename(command[0]) == "git"]
+        self.assertTrue(gits)
+        for command in gits:
+            self.assertEqual(command[0], trusted, command)  # never a PATH lookup
+            self.assertEqual(command[3:3 + len(installer.GIT_SAFE)], list(installer.GIT_SAFE), command)
+        for option in ("core.hooksPath=/dev/null", "core.fsmonitor=false", "commit.gpgSign=false",
+                       "tag.gpgSign=false", "gc.auto=0", "maintenance.auto=false"):
+            self.assertIn(option, installer.GIT_SAFE)
+
+    def test_repository_helper_programs_refuse_before_any_write(self) -> None:
+        before = inventory(self.target)
+        for key, value in (("filter.planted.clean", "./planted.sh"), ("filter.planted.process", "./p.sh"),
+                           ("diff.planted.textconv", "./p.sh"), ("merge.planted.driver", "./p.sh"),
+                           ("core.sshCommand", "./p.sh"), ("gpg.program", "./p.sh"),
+                           ("gpg.ssh.program", "./p.sh"), ("credential.helper", "./p.sh"),
+                           ("core.pager", "./p.sh"), ("sequence.editor", "./p.sh"), ("core.editor", "./p.sh"),
+                           ("include.path", "../planted.config"), ("includeIf.gitdir:/.path", "x")):
+            with self.subTest(key=key):
+                git(self.target, "config", key, value)
+                with self.assertRaisesRegex(installer.InstallRefused, "name programs Git would run"):
+                    self.install(apply=True)
+                self.assertIn(key.lower().split(".")[0], " ".join(installer.repository_helpers(self.target)).lower())
+                git(self.target, "config", "--unset", key)
+        self.assertEqual(installer.repository_helpers(self.target), [])
+        self.assertEqual(inventory(self.target), before)
+        # The owner's own hooks path and the settings Git is told to ignore stay allowed.
+        git(self.target, "config", "core.hooksPath", ".githooks")
+        self.assertEqual(installer.repository_helpers(self.target), [])
+
+    def test_a_planted_clean_filter_never_runs(self) -> None:
+        marker = self.base / "filter-ran"
+        script = self.base / "filter.sh"
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+        script.chmod(0o755)
+        git(self.target, "config", "filter.planted.clean", str(script))
+        (self.target / ".git" / "info").mkdir(exist_ok=True)
+        (self.target / ".git" / "info" / "attributes").write_text("* filter=planted\n")
+        with self.assertRaises(installer.InstallRefused):
+            self.install(apply=True)
+        self.assertFalse(marker.exists())
 
     def test_git_never_runs_a_planted_fsmonitor(self) -> None:
         marker = self.base / "fsmonitor-ran"
@@ -365,8 +414,76 @@ class UmbrellaInstallTests(unittest.TestCase):
         (self.target / ".claude" / "settings.json").write_text(json.dumps(data))
         git(self.target, "add", ".")
         git(self.target, "commit", "-qm", "install packages")
-        self.assertTrue(self.install(apply=True)["ok"])
+        # An earlier release generated the retired rule; this one no longer wants it.
+        with mock.patch.object(installer, "HISTORICAL_OWNER_ONLY",
+                               (*installer.HISTORICAL_OWNER_ONLY, "retired-command")):
+            self.assertTrue(self.install(apply=True)["ok"])
         self.assertEqual(self.settings()["permissions"]["deny"], installer.deny_rules())
+
+    def test_a_forged_record_never_deletes_a_users_rule(self) -> None:
+        settings = self.target / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"permissions": {"deny": ["Bash(curl *)"]}}), encoding="utf-8")
+        record = self.target / installer.PERMISSIONS_RECORD
+        record.write_text(json.dumps({"format": 1, "created_settings_file": False, "created_permissions": False,
+                                      "created_deny": False, "deny": ["Bash(curl *)", "Edit(/src/**)"]}))
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "planted record")
+        self.assertTrue(self.install(apply=True)["ok"])
+        deny = self.settings()["permissions"]["deny"]
+        self.assertEqual(deny[0], "Bash(curl *)")
+        owned = json.loads(record.read_text())["deny"]
+        self.assertNotIn("Bash(curl *)", owned)
+        self.assertNotIn("Edit(/src/**)", owned)
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "install packages")
+        self.assertTrue(installer.operate("remove", self.target, apply=True)["ok"])
+        self.assertEqual(json.loads(settings.read_text(encoding="utf-8")),
+                         {"permissions": {"deny": ["Bash(curl *)"]}})
+
+    def test_historical_generated_rules_count_as_the_installers(self) -> None:
+        generated = installer.generated_rules()
+        self.assertTrue(set(installer.deny_rules()) <= generated)
+        for name in installer.HISTORICAL_OWNER_ONLY:
+            self.assertIn(f"Bash(*.codex/orchestration/cli.py {name} *)", generated)
+        self.assertNotIn("Bash(curl *)", generated)
+
+    def test_settings_changed_after_planning_are_never_overwritten(self) -> None:
+        plan = installer.plan_settings(self.target, "install")
+        settings = self.target / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"permissions": {"deny": ["Bash(rm *)"]}}), encoding="utf-8")
+        with self.assertRaisesRegex(installer.InstallRefused, "changed while setup ran"):
+            installer.apply_settings(self.target, plan)
+        self.assertEqual(json.loads(settings.read_text()), {"permissions": {"deny": ["Bash(rm *)"]}})
+        self.assertFalse((self.target / installer.PERMISSIONS_RECORD).exists())
+        # Applying replans from the current files, so the edit is kept.
+        installer.apply_settings(self.target, installer.plan_settings(self.target, "install"))
+        self.assertEqual(self.settings()["permissions"]["deny"][0], "Bash(rm *)")
+
+    def test_an_interrupted_paired_write_recovers(self) -> None:
+        plan = installer.plan_settings(self.target, "install")
+        self.assertEqual(plan["order"], [installer.PERMISSIONS_RECORD, installer.CLAUDE_SETTINGS])
+        real_write = installer._Project.write
+
+        def fail_on_settings(project, relative, content):
+            if relative == installer.CLAUDE_SETTINGS:
+                raise OSError("simulated failure")
+            return real_write(project, relative, content)
+
+        with mock.patch.object(installer._Project, "write", fail_on_settings):
+            with self.assertRaises(OSError):
+                installer.apply_settings(self.target, plan)
+        # The record already claims the entries; the next install adds and owns them.
+        self.assertTrue((self.target / installer.PERMISSIONS_RECORD).exists())
+        self.assertFalse((self.target / ".claude" / "settings.json").exists())
+        installer.apply_settings(self.target, installer.plan_settings(self.target, "install"))
+        self.assertEqual(self.settings()["permissions"]["deny"], installer.deny_rules())
+        removal = installer.plan_settings(self.target, "remove")
+        self.assertEqual(removal["order"], [installer.CLAUDE_SETTINGS, installer.PERMISSIONS_RECORD])
+        installer.apply_settings(self.target, removal)
+        self.assertFalse((self.target / ".claude" / "settings.json").exists())
+        self.assertFalse((self.target / installer.PERMISSIONS_RECORD).exists())
 
     def test_unmergeable_settings_refuse_before_any_write(self) -> None:
         settings = self.target / ".claude" / "settings.json"
@@ -408,7 +525,7 @@ class UmbrellaInstallTests(unittest.TestCase):
 
 
 class CodexRuleRemovalTests(unittest.TestCase):
-    """Uninstall takes out the Codex commands rule through the project's own owner command."""
+    """Uninstall takes out the Codex commands rule with this repository's own remove-codex-rule."""
 
     def setUp(self) -> None:
         outside = outside_temporary_folders()
@@ -416,80 +533,159 @@ class CodexRuleRemovalTests(unittest.TestCase):
             self.skipTest("no folder outside the temporary roots is available")
         self.base = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        isolate_home(self, self.base / "home")
         self.target, codex_options = make_target(self.base)
         installed = installer.operate("install", self.target, apply=True, codex_options=codex_options)
         self.assertTrue(installed["ok"], installed)
         git(self.target, "add", "-A")
         git(self.target, "commit", "-qm", "install packages")
-        self.calls: list[list[str]] = []
+        self.ran: list[list[str]] = []
+        real_run = subprocess.run
 
-    def cli(self, reports: dict):
-        def fake(target, args):
-            self.calls.append(list(args))
-            return reports[args[0]]
-        return mock.patch.object(installer, "_project_cli", fake)
+        def spy(command, *args, **kwargs):
+            self.ran.append([str(part) for part in command])
+            return real_run(command, *args, **kwargs)
 
-    def commands(self, *, with_rule_command: bool):
-        real = installer._parser_commands
+        patcher = mock.patch.object(installer.subprocess, "run", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-        def parsed(cli):
-            names = [name for name in real(cli) if name != installer.RULE_COMMAND]
-            return names + [installer.RULE_COMMAND] if with_rule_command else names
-        return mock.patch.object(installer, "_parser_commands", parsed)
+    def owner_runs(self) -> list[list[str]]:
+        return [command for command in self.ran if command[6:7] == [str(installer.attest.clone_cli())]]
 
-    def test_remove_calls_the_owner_command_before_removing_files(self) -> None:
-        reports = {installer.RULE_COMMAND: {"ready": True, "removed": ["/rules/agent-orchestration-x.rules"]}}
-        with self.cli(reports), self.commands(with_rule_command=True):
-            preview = installer.operate("remove", self.target)
-            self.assertEqual(preview["codex_rule"], {"action": installer.RULE_COMMAND})
-            self.assertEqual(self.calls, [])  # a preview never runs it
-            removed = installer.operate("remove", self.target, apply=True)
+    def test_remove_runs_this_checkouts_remove_codex_rule_first(self) -> None:
+        rules = self.base / "home" / ".codex" / "rules"
+        rules.mkdir(parents=True, mode=0o700)
+        digest = hashlib.sha256(str(self.target.resolve()).encode()).hexdigest()[:12]
+        rule = rules / f"agent-orchestration-{digest}.rules"
+        rule.write_text("# a rule for this project\n")
+        rule.chmod(0o600)
+        preview = installer.operate("remove", self.target)
+        self.assertEqual(preview["codex_rule"], {"action": installer.RULE_COMMAND})
+        self.assertTrue(rule.exists())  # a preview never runs it
+        self.assertEqual(self.owner_runs(), [])
+        removed = installer.operate("remove", self.target, apply=True)
         self.assertTrue(removed["ok"], removed)
-        self.assertEqual(self.calls, [[installer.RULE_COMMAND, "--project-root", str(self.target.absolute())]])
-        self.assertEqual(removed["codex_rule"]["removed"], ["/rules/agent-orchestration-x.rules"])
+        self.assertEqual(removed["codex_rule"]["removed"], [str(rule)])
+        self.assertFalse(rule.exists())
+        runs = self.owner_runs()
+        self.assertEqual([command[7:] for command in runs],
+                         [[installer.RULE_COMMAND, "--project-root", str(self.target.absolute())]])
+        self.assertEqual(runs[0][1:6], ["-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"])
         self.assertFalse((self.target / installer.CODEX_MANIFEST).exists())
+        project_cli = str(self.target / ".codex" / "orchestration" / "cli.py")
+        self.assertFalse(any(project_cli in command for command in self.ran))
 
     def test_a_failed_rule_removal_changes_nothing_else(self) -> None:
         before = inventory(self.target)
-        with self.cli({installer.RULE_COMMAND: {"ready": False}}), self.commands(with_rule_command=True):
+        with mock.patch.object(installer, "_owner_cli", return_value={"ready": False}):
             removed = installer.operate("remove", self.target, apply=True)
         self.assertFalse(removed["ok"])
         self.assertIn("error", removed["codex_rule"])
         self.assertEqual(inventory(self.target), before)
 
-    def test_an_old_cli_fails_closed_and_names_the_rule_file(self) -> None:
-        before = inventory(self.target)
-        status = {"ready": True, "codex_rule": "installed", "rule_file": "/h/.codex/rules/agent-orchestration-a.rules"}
-        with self.cli({"host-command": status}), self.commands(with_rule_command=False):
-            removed = installer.operate("remove", self.target, apply=True)
-        self.assertFalse(removed["ok"])
-        self.assertIn("delete /h/.codex/rules/agent-orchestration-a.rules yourself", removed["codex_rule"]["error"])
-        self.assertEqual(self.calls, [["host-command", "--project-root", str(self.target.absolute())]])
-        self.assertEqual(inventory(self.target), before)
-
-    def test_an_old_cli_with_no_rule_lets_remove_continue(self) -> None:
-        with self.cli({"host-command": {"ready": True, "codex_rule": "missing"}}), \
-                self.commands(with_rule_command=False):
-            removed = installer.operate("remove", self.target, apply=True)
+    def test_an_older_or_modified_install_is_still_removed_without_running_its_code(self) -> None:
+        manifest = self.target / installer.CODEX_MANIFEST
+        data = json.loads(manifest.read_text())
+        data["version"] = "0.0.1"
+        manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        git(self.target, "commit", "-qam", "an older install")
+        removed = installer.operate("remove", self.target, apply=True)
         self.assertTrue(removed["ok"], removed)
-        self.assertEqual(removed["codex_rule"]["action"], "none")
+        project_cli = str(self.target / ".codex" / "orchestration" / "cli.py")
+        self.assertFalse(any(project_cli in command for command in self.ran))
+        self.assertEqual(len(self.owner_runs()), 1)
 
-    def test_a_modified_cli_is_never_run(self) -> None:
+    def test_owner_commands_that_need_the_install_refuse_a_modified_one(self) -> None:
         cli = self.target / ".codex" / "orchestration" / "cli.py"
         cli.write_text(cli.read_text() + "\n# changed\n")
-        git(self.target, "commit", "-qam", "change the cli")
-        ran: list[list[str]] = []
-        real_run = subprocess.run
+        with self.assertRaisesRegex(installer.InstallRefused, "not an exact copy"):
+            installer._owner_cli(self.target, ["host-command", "--project-root", str(self.target)])
+        self.assertEqual(self.owner_runs(), [])
 
-        def spy(command, *args, **kwargs):
-            ran.append([str(part) for part in command])
-            return real_run(command, *args, **kwargs)
 
-        with self.commands(with_rule_command=True), mock.patch.object(installer.subprocess, "run", spy):
-            removed = installer.operate("remove", self.target, apply=True)
-        self.assertFalse(removed["ok"])
-        self.assertIn("not an exact copy", removed["codex_rule"]["error"])
-        self.assertFalse(any(str(cli) in command for command in ran))
+def interpreter_trusted() -> bool:
+    """Whether the Codex rule may name this Python (CI toolcaches can be world-writable)."""
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-S", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from codex_agents.host_commands import interpreter_path; interpreter_path()",
+         str(installer.ORCHESTRATION)],
+        capture_output=True, stdin=subprocess.DEVNULL, check=False,
+    )
+    return completed.returncode == 0
+
+
+@unittest.skipUnless(interpreter_trusted(), "this machine's Python cannot be named by the Codex rule")
+class OwnerCommandsFromThisCheckoutTests(unittest.TestCase):
+    """Owner commands run from this checkout's package with --project-root behave as the
+    project's own copy would, and install-codex-rule copies exactly this checkout's runtime."""
+
+    def setUp(self) -> None:
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        self.base = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        self.home = self.base / "home"
+        isolate_home(self, self.home)
+        self.target, codex_options = make_target(self.base)
+        installed = installer.operate("install", self.target, apply=True, codex_options=codex_options)
+        self.assertTrue(installed["ok"], installed)
+        git(self.target, "add", "-A")
+        git(self.target, "commit", "-qm", "install packages")
+        self.installed_cli = self.target / ".codex" / "orchestration" / "cli.py"
+
+    def run_cli(self, cli: Path, *args: str) -> dict:
+        completed = subprocess.run([os.path.realpath(sys.executable), "-I", "-B", "-S", "-X",
+                                    "pycache_prefix=/dev/null", str(cli), *args],
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return json.loads(completed.stdout)
+
+    def test_host_command_and_the_rule_lifecycle_match_and_copy_this_checkout(self) -> None:
+        clone = installer.attest.clone_cli()
+        root = ["--project-root", str(self.target)]
+        before = self.run_cli(clone, "host-command", *root)
+        self.assertEqual(before, self.run_cli(self.installed_cli, "host-command", *root))
+        self.assertEqual(before["codex_rule"], "missing")
+        printed = self.run_cli(clone, "install-codex-rule", *root, "--print")
+        self.assertEqual(printed, self.run_cli(self.installed_cli, "install-codex-rule", *root, "--print"))
+        written = self.run_cli(clone, "install-codex-rule", *root)
+        self.assertEqual(written["codex_rule"], "created", written)
+        copy = Path(written["runtime_copy"])
+        self.assertTrue(str(copy).startswith(str(self.home / ".codex" / "agent-orchestration")))
+        sys.path.insert(0, str(installer.ORCHESTRATION))
+        try:
+            from codex_agents.runtime_files import RUNTIME_FILES
+        finally:
+            sys.path.remove(str(installer.ORCHESTRATION))
+        for relative in RUNTIME_FILES:
+            self.assertEqual((copy / ".codex/orchestration" / relative).read_bytes(),
+                             (installer.ORCHESTRATION / relative).read_bytes(), relative)
+        after = self.run_cli(clone, "host-command", *root)
+        self.assertEqual(after, self.run_cli(self.installed_cli, "host-command", *root))
+        self.assertEqual(after["codex_rule"], "installed")
+        self.assertEqual(after["argv_prefix"][-1], str(copy / ".codex" / "orchestration" / "cli.py"))
+        removed = self.run_cli(clone, "remove-codex-rule", *root)
+        self.assertTrue(removed["ready"])
+        self.assertIn(written["rule_file"], removed["removed"])
+        self.assertFalse(copy.exists())
+        self.assertEqual(self.run_cli(clone, "host-command", *root)["codex_rule"], "missing")
+
+    def test_configure_owner_key_writes_the_same_record_from_either_copy(self) -> None:
+        key = self.base / "throwaway"
+        subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                       check=True, capture_output=True)
+        records = []
+        for name, cli in (("clone", installer.attest.clone_cli()), ("installed", self.installed_cli)):
+            state = self.base / f"state-{name}"
+            report = self.run_cli(cli, "learning-configure-owner-key", "--public-key", f"{key}.pub",
+                                  "--state-root", str(state))
+            self.assertTrue(report["ready"], report)
+            records.append((state / "owner-allowed-signers").read_bytes())
+        self.assertEqual(records[0], records[1])
+        self.assertRegex(records[0].decode(), r"^codex-agents-owner ssh-ed25519 [A-Za-z0-9+/=]+\n$")
 
 
 if __name__ == "__main__":

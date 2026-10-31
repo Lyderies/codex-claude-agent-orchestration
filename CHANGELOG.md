@@ -55,6 +55,45 @@
     a bridged Codex child receives its routed role's developer instructions (as
     `-c developer_instructions=...`), refused unless they match the run's recorded
     execution configuration.
+- **Owner-side review fixes (0.8.9).** Two further reviews of setup, attestation and the
+  installer, under the narrowed threat model (sessions may be opened on a project's parent
+  folder, never on the home folder, its parent or `/`; this repository must sit outside every
+  folder opened in Codex, as the wizard's first screen and the README now say).
+  - Owner commands (registration, status, attestation, `host-command`, `install-codex-rule`,
+    `remove-codex-rule`) run this repository's own orchestrator CLI with `--project-root`,
+    never the project's `.codex/orchestration` code. Steps that depend on the install first
+    require it to be this release byte for byte, and the check now refuses any extra entry in
+    `.codex/orchestration`: a symlink of any name (an extensionless `hashlib` link to a
+    package passed before), a package, bytecode or another file. `install-codex-rule` from this
+    repository copies bytes equal to this repository's runtime; uninstall runs this
+    repository's `remove-codex-rule` whatever version the project has.
+  - `attest.py` signs in memory: the approved bytes go to `ssh-keygen -Y sign` on stdin and the
+    signature comes back on stdout; the enrolled key and the signature reach the CLI through
+    pipes (`/dev/fd`), and `check-novalidate` verifies the in-memory bytes. No key, statement or
+    signature file exists.
+  - Exactly one owner signer: `attest.py` and the runtime's `owner_allowed_signers()` refuse
+    an allowed-signers file that is not exactly one canonical `codex-agents-owner <type> <key>`
+    line (0.8.9's recorded runtime digest updated).
+  - Git runs from a trusted real binary (the runtime's `git_executable` rules: never macOS's
+    `/usr/bin` shim or a PATH lookup) with hooks, the file-system monitor, commit and tag
+    signing and automatic maintenance off. Before any status, staging or commit, setup and the
+    installer read the repository's own settings with `git config --get-regexp` plumbing and
+    refuse when they name a helper program (filters, diff and merge drivers, `core.sshCommand`,
+    `gpg.program`, credential helpers, pagers, editors, trailer commands or any include).
+  - The interpreter is trusted before it first runs: refused in a temporary folder, the project
+    (the starting folder's project, then the chosen one), a virtual environment, macOS's
+    `/usr/bin/python3` shim, or a folder under home other than an interpreter manager's. Every
+    owner Python launch and every command shown to the owner adds `-X pycache_prefix=/dev/null`.
+  - The chosen operational-checks file is snapshot into private scratch at once, and the preview
+    and the install read that snapshot. A scratch base under the home folder is refused.
+  - The permissions record counts an entry as the installer's only when the current or an
+    earlier release generated it, so a planted record cannot delete a user's rule. Settings are
+    replanned just before writing and refused if either file changed since it was read; the
+    record is written before the settings on install and removed after them on uninstall, so an
+    interruption leaves a state the next run repairs.
+  - On Linux only the operational-check sandbox failure is reported as the known limitation;
+    every other verify failure is shown. The Commands step explains `codex_rule: unsupported`
+    with its reason and the fix (the real `~/.codex`, no `CODEX_HOME` elsewhere, no symlink).
 - **Owner-side hardening (v1 security review).**
   - `setup.sh` and `scripts/attest.py` keep every working file in a fresh owner-only folder in
     the per-user cache folder (macOS) or `$XDG_RUNTIME_DIR` (Linux, refused when unset), created
