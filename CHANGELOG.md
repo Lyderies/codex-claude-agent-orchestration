@@ -52,6 +52,14 @@
   `PYTHONDONTWRITEBYTECODE`, so it wrote `__pycache__` into the project's managed `.codex/` paths.
   It now starts with `-B`. The package is 0.8.2.
 - **CI.** The checkout and Python setup actions move to releases that run on Node 24.
+- **Verifier handoff and lifecycle fixes (0.8.3).** A verification task may set
+  `verification_for_outcome` to the worker's `host_outcome_digest`; the router checks it is
+  this orchestration's outcome from the named provider. A bridged verifier gets the worker's
+  ledger-recorded result read-only at `.orchestration-input/worker-result.json`; a native
+  verifier gets it from `learning-open-host-run`. `learning-record-host-result` prints the
+  `host_outcome_digest` that operational QA takes, a bridged run's outcome carries the
+  bridge's recorded usage, `provider-observe` shows `paid_usage_waived_by_attestation`, and
+  both skills give the exact QA commands with every argument.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the

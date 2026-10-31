@@ -1373,6 +1373,41 @@ class ProviderRoutingTests(unittest.TestCase):
             ):
                 route_task(self.verification_task(value), self.policy)
 
+    def test_verification_for_outcome_is_a_bound_verification_digest(self) -> None:
+        digest = "d" * 64
+        bound = {**self.verification_task("codex"), "verification_for_outcome": digest}
+        # The binding names the worker outcome; it never changes the route.
+        self.assertEqual(
+            route_task(self.verification_task("codex"), self.policy)["model"],
+            route_task(bound, self.policy)["model"],
+        )
+        cases = {
+            "record identifier": (
+                {**bound, "verification_for_outcome": "out:" + digest},
+                "must be a host_outcome_digest",
+            ),
+            "prefixed": (
+                {**bound, "verification_for_outcome": "outcome:" + digest},
+                "must be a host_outcome_digest",
+            ),
+            "upper case": (
+                {**bound, "verification_for_outcome": digest.upper()},
+                "must be a host_outcome_digest",
+            ),
+            "worker task": (
+                self.task(verification_for_outcome=digest),
+                "valid only for verification tasks",
+            ),
+            "no provider": (
+                {key: value for key, value in bound.items()
+                 if key != "verification_for_provider"},
+                "requires verification_for_family and verification_for_provider",
+            ),
+        }
+        for name, (task, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ContractError, message):
+                route_task(task, self.policy)
+
     def test_provider_trust_classifies_git_outcomes(self) -> None:
         arguments = (
             ORCHESTRATION_ROOT / "config/routing-policy.json",

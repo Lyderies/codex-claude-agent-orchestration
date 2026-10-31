@@ -64,6 +64,9 @@ FAILURE_REASONS = {
     "authority",
 }
 FAILURE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+# A recorded host outcome is named by the SHA-256 of its canonical content, as
+# learning-record-host-result prints it in `host_outcome_digest`.
+HOST_OUTCOME_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 VERIFIED_FAILURE_REFERENCE = re.compile(r"^verification:[0-9a-f]{64}$")
 RESULT_VALIDATION_REASON_CODES = {
     "assignment_mismatch",
@@ -174,6 +177,7 @@ def validate_task(data: Any) -> dict[str, Any]:
         "prohibited_actions",
         "verification_for_family",
         "verification_for_provider",
+        "verification_for_outcome",
     }
     _required(data, required, "task")
     unknown = sorted(data.keys() - allowed)
@@ -204,6 +208,25 @@ def validate_task(data: Any) -> dict[str, Any]:
             verification_for_provider not in {"codex", "claude"}
         ):
             raise ContractError("verification_for_provider is unsupported")
+    verification_for_outcome = data.get("verification_for_outcome")
+    if verification_for_outcome is not None:
+        # The worker's host outcome digest, exactly as learning-record-host-result
+        # prints it; the ledger resolves it, so the task only names it.
+        if data["family"] != "verification":
+            raise ContractError(
+                "verification_for_outcome is valid only for verification tasks"
+            )
+        if not isinstance(verification_for_outcome, str) or not HOST_OUTCOME_DIGEST.fullmatch(
+            verification_for_outcome
+        ):
+            raise ContractError(
+                "verification_for_outcome must be a host_outcome_digest"
+            )
+        if verification_for_family is None or verification_for_provider is None:
+            raise ContractError(
+                "verification_for_outcome requires verification_for_family "
+                "and verification_for_provider"
+            )
     if not isinstance(data["complexity"], str) or data["complexity"] not in COMPLEXITIES:
         raise ContractError(f"unsupported complexity: {data['complexity']}")
     if not isinstance(data["risk"], str) or data["risk"] not in RISKS:

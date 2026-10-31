@@ -259,6 +259,14 @@ def _validated_assignment(args: argparse.Namespace) -> dict:
     fallback_receipt = args.fallback_receipt
     if fallback_receipt is not None and project_root is None:
         raise ContractError("fallback receipt requires a registered project")
+    if isinstance(task, dict) and task.get("verification_for_outcome") is not None:
+        if project_root is None:
+            raise LedgerError("verification_for_outcome requires --project-root")
+        ledger, project_id = _learning_ledger(args)
+        try:
+            ledger.verification_worker_result(project_id, task, with_result=False)
+        finally:
+            _close_ledger(ledger)
     if fallback_receipt is not None:
         ledger, project_id = _learning_ledger(args)
         try:
@@ -408,6 +416,10 @@ def _trusted_host_route(
         ORCHESTRATION_ROOT / "config" / "discovery-policy.json",
     )
     trusted = ledger.trusted_routing_evidence_refs(project_id, task)
+    # A verifier bound to a worker outcome is routed only when that outcome is
+    # this project's, from the named provider and family, in an active boundary.
+    # Open and dispatch read the result itself; recording needs only the binding.
+    ledger.verification_worker_result(project_id, task, with_result=False)
     primary_route = route_task(
         task,
         policy,
@@ -1059,6 +1071,7 @@ def main() -> int:
             ledger, project_id = _learning_ledger(args)
             try:
                 trusted = ledger.trusted_routing_evidence_refs(project_id, task)
+                ledger.verification_worker_result(project_id, task)
                 base_route = route_task(
                     task,
                     policy,
@@ -1458,6 +1471,9 @@ def main() -> int:
                     route=route,
                     parent_grant=_json_input(args.parent_grant),
                 )
+                verification_input = ledger.verification_worker_result(
+                    project_id, task, orchestration_handle=args.orchestration_handle
+                )
                 host_profile, spawn = _claude_host_open_checks(
                     ledger, project_id, host, route, args.project_root.resolve()
                 )
@@ -1477,6 +1493,18 @@ def main() -> int:
                         host_profile=host_profile,
                     ),
                     **({"native_spawn": spawn} if spawn is not None else {}),
+                    # A native verifier cannot be handed a file by the bridge, so
+                    # the primary puts this ledger-read result in its prompt. A
+                    # bridged verifier gets it from `dispatch` instead.
+                    **(
+                        {"verification_input": {
+                            "host_outcome_digest": verification_input["host_outcome_digest"],
+                            "worker_result": verification_input["worker_result"],
+                        }}
+                        if verification_input is not None
+                        and route.get("dispatch") != "bridge"
+                        else {}
+                    ),
                     # Native children of either provider run with the parent
                     # session's permissions, so only a bridged Claude child's
                     # reads are contained.
@@ -1544,7 +1572,23 @@ def main() -> int:
                 report = {
                     "ready": True,
                     "records": [
-                        {key: value for key, value in record.items() if key != "client_path"}
+                        {
+                            **{
+                                key: value for key, value in record.items()
+                                if key != "client_path"
+                            },
+                            # Display only: admission makes its own decision,
+                            # by the same rule, from the ledger.
+                            **(
+                                {"paid_usage_waived_by_attestation": (
+                                    ledger.billing_waived_by_attestation(
+                                        project_id, record
+                                    )
+                                )}
+                                if record.get("record_type") == "provider_billing"
+                                else {}
+                            ),
+                        }
                         for record in records
                     ],
                     **({"probe": probe} if probe is not None else {}),

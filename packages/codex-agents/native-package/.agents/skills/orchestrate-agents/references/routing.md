@@ -244,6 +244,29 @@ provider API key, and a run handle that was already dispatched.
   from the reply before the result is validated. A reroute or a different
   model marks the result unreviewed with an unknown verdict. Codex reads are not contained by the
   sandbox, so `read_containment` is `advisory`.
+- A verification task may set `verification_for_outcome` to a worker's
+  `host_outcome_digest` (the SHA-256 of the recorded outcome, as
+  `learning-record-host-result` prints it; operational QA takes the same value, and
+  routing evidence wraps it as `outcome:<digest>`). It needs `verification_for_family`
+  and `verification_for_provider`. `learning-route`, `learning-open-host-run` and
+  `dispatch` refuse it unless the outcome is a host outcome of this project from a
+  non-verification run of that family, admitted for that provider, in an active
+  orchestration, and, at open and dispatch, the verifier's own orchestration. The
+  worker result is read from the ledger and checked against the keyed result digest
+  the outcome cites; a primary never supplies it. For a bridged verifier, the
+  assignment's `context` names the digest (that entry is not exported as a path),
+  and the bridge writes the result read-only to `.orchestration-input/worker-result.json`
+  after the export and tells the child to review it. `.orchestration-input` is
+  reserved: an assignment `context`, `owned_paths` or filesystem permission whose
+  first component folds to it, in any letter case, refuses, and the directory must
+  not already exist in the export. A native verifier gets the result as
+  `verification_input` from `learning-open-host-run`.
 - Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
-  typed codes, never prompts or file contents.
+  typed codes, never prompts or file contents. A host result whose route requires
+  verification is kept, as its validated JSON, in an owner-only file under the
+  learning state's `artifacts/` directory (at most 1 MiB), registered under the keyed
+  result digest; it expires and is deleted with its outcome and with the project. A
+  bridged run's recorded `provider_usage` becomes its outcome usage
+  (`client_observed`): Claude cache reads and writes are added to the input total,
+  and counts the client did not report stay unknown.
 
