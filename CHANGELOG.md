@@ -48,6 +48,10 @@
   change needs a version bump. `packages/codex-agents/runtime-releases.json` records the runtime digest
   for each version, and a test fails when the code changes without a new version and entry. The
   package is now 0.8.1.
+- **Collector bytecode.** The detached learning collector runs in isolated mode, which ignores
+  `PYTHONDONTWRITEBYTECODE`, so it wrote `__pycache__` into the project's managed `.codex/` paths.
+  It now starts with `-B`. The package is 0.8.2.
+- **CI.** The checkout and Python setup actions move to releases that run on Node 24.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the

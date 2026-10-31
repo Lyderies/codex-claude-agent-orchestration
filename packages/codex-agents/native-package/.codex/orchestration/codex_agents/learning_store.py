@@ -8699,6 +8699,7 @@ def _start_collector_locked(
         [
             sys.executable,
             "-I",
+            "-B",  # isolated mode ignores PYTHONDONTWRITEBYTECODE; keep managed paths clean
             str(cli_path.resolve(strict=True)),
             "learning-serve",
             "--state-root",

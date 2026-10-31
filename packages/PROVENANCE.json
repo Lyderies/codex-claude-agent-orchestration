@@ -143,7 +143,7 @@
         "native-package/.codex/orchestration/codex_agents/contracts.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "native-package/.codex/orchestration/schemas/task.schema.json": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
         "tests/test_validation.py": "G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates)",
-        "native-package/.codex/orchestration/codex_agents/learning_store.py": "G2 S2a provider admission and observations; G2 S2b dispatch bridge; G2 S3 Claude host client and orchestration skills; G2 S3b eligibility and observation gaps; G2 S4 security review fixes; G2 Codex credits attestation",
+        "native-package/.codex/orchestration/codex_agents/learning_store.py": "G2 S2a provider admission and observations; G2 S2b dispatch bridge; G2 S3 Claude host client and orchestration skills; G2 S3b eligibility and observation gaps; G2 S4 security review fixes; G2 Codex credits attestation; detached collector launched with -B",
         "native-package/.codex/orchestration/config/learning-clients.json": "G2 S2a provider admission and observations; G2 S3 Claude host client and orchestration skills",
         "native-package/.codex/orchestration/config/learning-producers.json": "G2 S2a provider admission and observations",
         "native-package/.codex/orchestration/codex_agents/providers.py": "G2 provider admission and observations; G2 S2a provider admission and observations; G2 S3 Claude host client and orchestration skills; G2 S3b eligibility and observation gaps; G2 S4 security review fixes; G2 Codex credits attestation",
@@ -153,7 +153,7 @@
         "native-package/.claude/skills/agent-orchestration/SKILL.md": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
         "native-package/.codex/orchestration/codex_agents/hosts.py": "G2 S3 Claude host client and orchestration skills",
         "native-package/.codex/orchestration/codex_agents/claude_host.py": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
-        "native-package/VERSION": "package version 0.8.0, so existing 0.7.2 collectors upgrade instead of refusing the changed build; 0.8.1 for the attested Codex credits waiver",
+        "native-package/VERSION": "package version 0.8.0, so existing 0.7.2 collectors upgrade instead of refusing the changed build; 0.8.1 for the attested Codex credits waiver; 0.8.2 for the collector bytecode fix",
         "tests/test_runtime_release.py": "new: fails when the collector runtime changes without a version bump",
         "runtime-releases.json": "new: collector runtime digest recorded per package version"
       }
