@@ -425,16 +425,18 @@ changed_paths() {
 
 # ignored_paths PROJECT PATH... : prints, NUL-delimited, the PATHs that exist untracked but
 # are ignored by the project's .gitignore, which `git status` never lists and `git add`
-# would refuse. Silent when Git cannot answer (status already covers that case).
+# would refuse. If Git cannot answer it prints a single `!` record instead, so a failed query
+# is never read as "nothing is ignored".
 ignored_paths() {
   local project=$1 rec cand
   shift
   [ "$#" -gt 0 ] || return 0
   while IFS= read -r -d '' rec; do
+    if [ "$rec" = '!' ]; then printf '!\0'; continue; fi
     for cand in "$@"; do
       if [ "$cand" = "$rec" ]; then printf '%s\0' "$rec"; break; fi
     done
-  done < <(git -C "$project" --literal-pathspecs ls-files -z --others --ignored --exclude-standard -- "$@" 2>/dev/null)
+  done < <(git -C "$project" --literal-pathspecs ls-files -z --others --ignored --exclude-standard -- "$@" 2>/dev/null || printf '!\0')
 }
 
 # codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
@@ -1437,7 +1439,7 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 
 step_install() {
   local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
-  local commit_note paths_ok paths_rc nothing_to_commit candidates ignored_n=0
+  local commit_note paths_ok paths_rc nothing_to_commit candidates ignored_n=0 ignored_fail=0
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
   body "Install into: $PROJECT"
@@ -1507,12 +1509,16 @@ step_install() {
     done < <(changed_paths "$PROJECT" "${candidates[@]}")
     n_paths=${#COMMIT_PATHS[@]}
     IGNORED=()
+    ignored_fail=0
     while IFS= read -r -d '' path; do
-      IGNORED+=("$path")
+      if [ "$path" = '!' ]; then ignored_fail=1; else IGNORED+=("$path"); fi
     done < <(ignored_paths "$PROJECT" "${candidates[@]}")
-    ignored_n=${#IGNORED[@]}
+    ignored_n=$((${#IGNORED[@]} + ignored_fail))
     if [ "$n_paths" -eq 0 ] && [ "$ignored_n" -eq 0 ]; then nothing_to_commit=1; fi
-    if [ "$ignored_n" -gt 0 ]; then
+    if [ "$ignored_fail" -eq 1 ]; then
+      list_add warn "Git could not check whether installed files are ignored, so setup cannot tell whether anything needs committing."
+    fi
+    if [ "${#IGNORED[@]}" -gt 0 ]; then
       list_add warn "Some installed files are ignored by the project's .gitignore, so Git will not commit them:"
       shown=0
       for path in "${IGNORED[@]}"; do
@@ -1520,15 +1526,15 @@ step_install() {
         list_sub "${path//[[:cntrl:]]/}"
         shown=$((shown + 1))
       done
-      [ "$ignored_n" -gt "$shown" ] && list_sub "... and $((ignored_n - shown)) more"
+      [ "${#IGNORED[@]}" -gt "$shown" ] && list_sub "... and $((${#IGNORED[@]} - shown)) more"
     fi
   fi
   if [ "$paths_ok" -eq 1 ] && [ "$n_paths" -eq 0 ] && [ "$ignored_n" -gt 0 ]; then
     COMMIT_STATE=failed
     commit_done=0
     LAST_RC=1
-    record_failure "installed files are ignored by .gitignore" "remove them from .gitignore or add them with git add -f yourself, then choose Verify"
-    list_sub "Nothing was committed. Remove them from .gitignore or add them yourself with git add -f, then run ./setup.sh again and choose Verify."
+    record_failure "installed files are ignored by .gitignore or could not be checked" "check .gitignore and git status yourself, add the files with git add -f if needed, then choose Verify"
+    list_sub "Nothing was committed. Check .gitignore and git status yourself (git add -f adds an ignored file), then run ./setup.sh again and choose Verify."
   elif [ "$nothing_to_commit" -eq 1 ]; then
     list_add ok "Nothing to commit: the project already has these files committed"
     COMMIT_STATE=nothing
@@ -1590,15 +1596,15 @@ step_install() {
     COMMIT_STATE=failed
     commit_done=0
     LAST_RC=1
-    record_failure "installed files are ignored by .gitignore" "remove them from .gitignore or add them with git add -f yourself, then choose Verify"
-    list_sub "The ignored files were not committed. Remove them from .gitignore or add them yourself with git add -f, then run ./setup.sh again and choose Verify."
+    record_failure "installed files are ignored by .gitignore or could not be checked" "check .gitignore and git status yourself, add the files with git add -f if needed, then choose Verify"
+    list_sub "Some files were not committed. Check .gitignore and git status yourself (git add -f adds an ignored file), then run ./setup.sh again and choose Verify."
   fi
   case "$COMMIT_STATE" in
     committed) list_add ok "Committed the installed files (not pushed)"; commit_note="committed";;
     nothing) commit_note="nothing to commit";;
     not_committed) list_add skip "Commit left to you; verification needs the files committed"
       commit_note="not committed (you chose to commit yourself)";;
-    *) if [ "$ignored_n" -gt 0 ]; then commit_note="installed files ignored by .gitignore"; else commit_note="commit failed"; fi;;
+    *) if [ "$ignored_n" -gt 0 ]; then commit_note="installed files ignored or could not be checked"; else commit_note="commit failed"; fi;;
   esac
   render
   if verify_install; then verify_ok=1; fi

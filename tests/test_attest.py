@@ -380,6 +380,24 @@ class AttestTests(unittest.TestCase):
             self.assertNotIn("SSH_AUTH_SOCK", env)
             self.assertEqual(env["SSH_ASKPASS_REQUIRE"], "never")
 
+    def test_working_tree_check_covers_the_folder_itself_and_every_ancestor(self) -> None:
+        plain = self.root / "plain" / "state"
+        plain.mkdir(parents=True)
+        self.assertFalse(attest._in_working_tree(plain))
+        direct = self.root / "direct"
+        (direct / ".git").mkdir(parents=True)
+        self.assertTrue(attest._in_working_tree(direct))  # .git directly inside the state folder
+        home_repo = self.root / "homerepo"
+        (home_repo / ".git").mkdir(parents=True)
+        (home_repo / ".local" / "state" / "codex-agents").mkdir(parents=True)
+        self.assertTrue(attest._in_working_tree(home_repo / ".local" / "state" / "codex-agents"))
+        # And the full check refuses a state folder that is itself a repository.
+        (direct / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
+        direct.chmod(0o755)
+        with mock.patch.object(attest, "_in_temp_root", return_value=False):
+            with self.assertRaises(attest.AttestError):
+                attest.check_trusted_state(direct)
+
     def test_change_passphrase_refuses_untrusted_state(self) -> None:
         key = self.configure_key()
         signers = self.state / "owner-allowed-signers"
@@ -690,8 +708,15 @@ class AttestTests(unittest.TestCase):
 class RealTerminalTests(unittest.TestCase):
     """A mocked input() cannot show what the terminal echoes, so use a real pseudo-terminal."""
 
-    @unittest.skipUnless(Path("/usr/bin/ssh-keygen").exists(), "needs the system ssh-keygen")
-    def test_a_rejected_key_location_entry_is_never_echoed(self) -> None:
+    NO_ECHO = ("import sys, termios\n"
+               "def broken(*a, **k):\n"
+               "    raise termios.error('simulated')\n"
+               "termios.tcsetattr = broken\n"
+               "import runpy\n"
+               "sys.argv = sys.argv[1:]\n"
+               "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+
+    def run_in_pty(self, secret: str, *, break_echo: bool = False) -> str:
         import pty
         import select
         import time
@@ -708,16 +733,17 @@ class RealTerminalTests(unittest.TestCase):
                        check=True, capture_output=True)
         fields = (root / "throwaway.pub").read_text().split()
         (state / "owner-allowed-signers").write_text(f"codex-agents-owner {fields[0]} {fields[1]}\n")
-        secret = "tangerine-Violin-8842-sample"
         env = dict(os.environ, HOME=str(home))
         env.pop("SSH_AUTH_SOCK", None)
+        args = [str(_SCRIPT), "--target", str(project), "--state-root", str(state)]
+        command = [sys.executable, "-c", self.NO_ECHO, *args] if break_echo else [sys.executable, *args]
         pid, fd = pty.fork()
         if pid == 0:
-            os.execve(sys.executable, [sys.executable, str(_SCRIPT), "--target", str(project),
-                                       "--state-root", str(state)], env)
+            os.execve(sys.executable, command, env)
         transcript = ""
         sent = False
-        end = time.time() + 30
+        start = time.time()
+        end = start + 30
         while time.time() < end:
             ready, _, _ = select.select([fd], [], [], 0.2)
             if ready:
@@ -728,7 +754,13 @@ class RealTerminalTests(unittest.TestCase):
                 if not chunk:
                     break
                 transcript += chunk
-            if not sent and "file location" in transcript and "Press Enter to use" in transcript:
+            if break_echo and not sent and time.time() - start > 2:
+                try:  # if the program were still reading, this would be echoed back
+                    os.write(fd, (secret + "\r").encode())
+                except OSError:
+                    pass
+                sent = True
+            if not sent and "Press Enter to use" in transcript:
                 time.sleep(0.3)
                 os.write(fd, (secret + "\r").encode())
                 sent = True
@@ -737,10 +769,32 @@ class RealTerminalTests(unittest.TestCase):
         except OSError:
             pass
         os.close(fd)
-        self.assertTrue(sent, transcript)
+        self.assertTrue(sent or break_echo, transcript)
+        return transcript
+
+    @unittest.skipUnless(Path("/usr/bin/ssh-keygen").exists(), "needs the system ssh-keygen")
+    def test_a_rejected_key_location_entry_is_never_echoed(self) -> None:
+        secret = "tangerine-Violin-8842-sample"
+        transcript = self.run_in_pty(secret)
         self.assertIn("That is not a file location.", transcript)
         self.assertNotIn(secret, transcript)
         self.assertNotIn("Violin", transcript)
+
+    @unittest.skipUnless(Path("/usr/bin/ssh-keygen").exists(), "needs the system ssh-keygen")
+    def test_a_slash_prefixed_entry_is_never_printed_back(self) -> None:
+        for secret in ("/tangerine-violin-8842", "~/tangerine-violin-8842"):
+            with self.subTest(secret=secret):
+                transcript = self.run_in_pty(secret)
+                self.assertNotIn("tangerine", transcript)
+                self.assertNotIn("violin-8842", transcript)
+                self.assertIn("Stopped:", transcript)
+
+    @unittest.skipUnless(Path("/usr/bin/ssh-keygen").exists(), "needs the system ssh-keygen")
+    def test_if_echo_cannot_be_turned_off_nothing_is_read(self) -> None:
+        secret = "tangerine-violin-8842"
+        transcript = self.run_in_pty(secret, break_echo=True)
+        self.assertNotIn(secret, transcript)
+        self.assertIn("cannot hide what you type", transcript)
 
 
 if __name__ == "__main__":

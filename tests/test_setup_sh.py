@@ -478,6 +478,22 @@ class SetupScriptTests(unittest.TestCase):
         self.assertEqual(changed.stdout, b"")  # status never lists them: the reason for the check
         self.assertEqual(sorted(ignored.stdout.split(b"\0")[:-1]), [b".codex/ours.json", b".codex/sp ace.json"])
 
+    def test_a_failed_ignored_file_query_is_reported_not_read_as_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            stubs = Path(directory) / "bin"
+            stubs.mkdir()
+            real_git = shutil.which("git")
+            (stubs / "git").write_text(
+                f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
+            (stubs / "git").chmod(0o755)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       PATH=f"{stubs}:{os.environ['PATH']}")
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-ignored-paths", str(project), ".codex/a"],
+                capture_output=True, env=env)
+        self.assertEqual(result.stdout, b"!\0")
+
     def test_profile_larger_than_the_read_limit_is_unreadable(self) -> None:
         good = 'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = true\n'
         padded = good + "# pad\n" * 12000 + "network_access = false\n"
@@ -937,6 +953,33 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertIn("nothing to commit", final)
         self.assertNotIn("commit failed", final)
         self.assertNotIn("The commit", final)
+        self.assertEqual(self.commit_count(project), before)
+
+    def test_a_failed_ignored_file_query_never_says_nothing_to_commit(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        self.finish_after_install()
+        real_git = shutil.which("git", path=os.environ["PATH"])
+        (self.fakes / "git").write_text(
+            f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
+        (self.fakes / "git").chmod(0o755)
+        before = self.commit_count(project)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\r")
+        for wait in ("install can be updated", "Keep the existing configuration", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("could not check whether installed files are ignored")
+        self.assertNotIn("Nothing to commit", self.screen)
+        final = self.finish_after_install()
+        self.assertNotIn("nothing to commit", final)
+        self.assertIn("could not be checked", final)
         self.assertEqual(self.commit_count(project), before)
 
     def test_only_paths_with_changes_are_committed(self) -> None:

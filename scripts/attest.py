@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 
 NAMESPACE = "codex-agents-owner-v1"
@@ -326,7 +327,16 @@ def choose_new_key() -> Path:
 def read_location(prompt: str) -> str:
     """Read a file location with terminal echo off, so a mistyped passphrase is not shown."""
 
-    return getpass.getpass(prompt).strip()
+    with warnings.catch_warnings():
+        # If echo cannot be turned off, getpass would warn and read with echo on: stop instead.
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt).strip()
+        except getpass.GetPassWarning:
+            raise AttestError(
+                "this terminal cannot hide what you type, so nothing was read. "
+                "Run this in a normal terminal window."
+            ) from None
 
 
 def _accept_location(entered: str) -> Path:
@@ -334,9 +344,7 @@ def _accept_location(entered: str) -> Path:
 
     if not entered.startswith("~/") and not os.path.isabs(entered):
         raise AttestError(NOT_A_PATH)
-    key = _expand(entered)
-    print(f"Using the file location {key}")  # shown only now that it is a path
-    return key
+    return _expand(entered)  # never printed here: a mistyped passphrase can look like a path
 
 
 def configured_public_key(state_root: Path) -> tuple[str, str] | None:
@@ -383,8 +391,8 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
 
 
 NOT_A_PATH = (
-    "That is not a file location. If you typed your passphrase here, it was shown on screen; "
-    "you can change it from ./setup.sh (Change the owner key passphrase)."
+    "That is not a file location. If you typed your passphrase here, it was not shown, but "
+    "you can change it from ./setup.sh (Change the owner key passphrase) if you are unsure."
 )
 
 
@@ -416,7 +424,8 @@ def locate_key_file(configured: tuple[str, str]) -> Path:
     """Find and validate the private key file for the configured owner key (no passphrase)."""
 
     key = _default_key_file(configured)
-    if key is not None:
+    found = key is not None
+    if found:
         print(f"Using the owner key file at {key}")
     else:
         print("Where is the private key file for this owner key?")
@@ -425,6 +434,8 @@ def locate_key_file(configured: tuple[str, str]) -> Path:
         entered = read_location(f"Press Enter to use {DEFAULT_KEY}, or type another file location: ")
         key = _accept_location(entered) if entered else _expand(DEFAULT_KEY)
     validate_private_key(key)
+    if not found:
+        print(f"Using the private key file at {key}")  # only after it validated as a key file
     return key
 
 
@@ -438,15 +449,10 @@ def _in_temp_root(path: Path) -> bool:
 
 
 def _in_working_tree(path: Path) -> bool:
-    """Whether a Git working tree contains path (home itself is not searched)."""
+    """Whether a Git working tree contains path: the folder itself and every ancestor, to /."""
 
-    home = Path.home()
-    for parent in Path(os.path.realpath(path)).parents:
-        if parent == home or parent == Path(parent.anchor):
-            break
-        if os.path.lexists(parent / ".git"):
-            return True
-    return False
+    real = Path(os.path.realpath(path))
+    return any(os.path.lexists(folder / ".git") for folder in (real, *real.parents))
 
 
 def check_trusted_state(state_root: Path) -> None:
