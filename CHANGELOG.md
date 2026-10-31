@@ -38,6 +38,32 @@
     result, or dropping or inventing the fence, is refused.
   - Both bridged launches pass `--` before the prompt, so an objective can never be read
     as a client option.
+- **Owner-side hardening (v1 security review).**
+  - `setup.sh` and `scripts/attest.py` keep every working file in a fresh owner-only folder in
+    the per-user cache folder (macOS) or `$XDG_RUNTIME_DIR` (Linux, refused when unset), created
+    through no-follow, ownership-checked descriptors; nothing goes to `/tmp` or `$TMPDIR`, where
+    a sandboxed agent could swap the enrolled key, the statement or the install plan.
+  - `attest.py` passes the billing grant on stdin, rebuilds the signing payload from the approved
+    statement (the runtime's `authenticated_owner_record` construction) and refuses any other
+    bytes, checks with `ssh-keygen -Y check-novalidate` that the signature covers them, and after
+    enrolment refuses unless the configured owner key is the one it showed.
+  - Every Python the wizard starts, `attest.py` included, is the real file behind `python3` on
+    `PATH` (refused in a temporary folder, the project or a virtual environment) and runs with
+    `-I -B -S`; `attest.py` imports only the standard library. The project's CLI runs only after
+    its runtime files match this repository's copy byte for byte (same version, no extra
+    modules), with `-X pycache_prefix=/dev/null` so a planted `__pycache__` file is never loaded.
+  - Git on the project runs with `-c core.hooksPath=/dev/null -c core.fsmonitor=false`
+    (`--no-optional-locks` for status); the wizard says its commit skips the project's hooks.
+  - `scripts/install.py remove` first removes the Codex commands rule and its protected runtime
+    copy through the project's `remove-codex-rule`; an installed CLI without that command makes
+    it stop and name the rule file to delete. The Commands step now says every Codex session
+    loads the rule, which runs a protected copy, and never to use the home folder's parent or `/`
+    as a Codex workspace.
+  - The installer merges Claude Code permission deny rules into `.claude/settings.json` for every
+    owner-only CLI subcommand (the parser's commands minus the 23 primary-host ones) and `Edit`
+    rules for `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`, keeping user
+    entries; `verify` reports missing rules and `remove` takes out only what install added. These
+    rules are a policy layer, not a sandbox.
 - **Bridged child containment (0.8.8).**
   - Bridged Codex children run with `--ignore-rules`: `--ignore-user-config` skips only
     `config.toml`, so a child still loaded the owner's execpolicy rules, and the setup-written

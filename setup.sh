@@ -11,6 +11,13 @@
 # Written for bash 3.2 (macOS): no associative arrays, no case-conversion expansions,
 # no mapfile or readarray. Only standard tools plus tput/stty and python3.
 #
+# Owner authority stays out of reach of the AI agents this sets up. Every Python it starts
+# is the real python3 file found on PATH (never a symlink, a virtual environment's copy, or
+# one in a temporary folder or the project), run with -I -B -S so nothing from the working
+# folder, the environment or site-packages loads. Its working files live in a host-private
+# folder no agent sandbox can write. The project's CLI runs only after its files match this
+# repository's copy byte for byte, and Git on the project never runs repository hooks.
+#
 # Test hook (no terminal needed):
 #   ./setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE
 # where CODEX, CLAUDE and BRIDGE are "on" or "off" and MODELS is a comma-separated
@@ -20,10 +27,13 @@
 #   ./setup.sh --print-codex-primary FILE      prints yes when a Codex session may orchestrate
 #   ./setup.sh --print-changed-paths PROJECT PATH...  NUL-delimited PATHs with real changes
 #   ./setup.sh --print-ignored-paths PROJECT PATH...  NUL-delimited PATHs ignored by .gitignore
+#   ./setup.sh --print-python                  prints the trusted Python, or "refused: REASON"
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# Git options for every command on the project: no repository hooks, no file-system monitor.
+GIT_SAFE=(-c core.hooksPath=/dev/null -c core.fsmonitor=false)
 SETUP_VERSION=1
 CLAUDE_MODELS_ALL="claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5"
 STEP_NAMES=("Checks" "Project" "Providers" "Install" "Collector" "Billing" "Profile" "Commands" "Done")
@@ -129,6 +139,69 @@ expand_home() {
 }
 
 # ---------------------------------------------------------------------------
+# The trusted Python
+# ---------------------------------------------------------------------------
+# real_file PATH : prints PATH with every symlink resolved, or fails.
+real_file() {
+  local path=$1 link dir n=0
+  while [ -L "$path" ]; do
+    n=$((n + 1)); [ "$n" -le 40 ] || return 1
+    link=$(readlink "$path") || return 1
+    case "$link" in /*) path=$link;; *) path="$(dirname -- "$path")/$link";; esac
+  done
+  [ -f "$path" ] || return 1
+  dir=$(CDPATH='' cd -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$dir" "$(basename -- "$path")"
+}
+
+# inside_dir PATH ROOT : succeeds when PATH is ROOT or lies below it.
+inside_dir() {
+  case "$1" in "$2"|"$2"/*) return 0;; esac
+  return 1
+}
+
+# inside_temp PATH : succeeds when PATH lies in a temporary folder a sandboxed session can write.
+inside_temp() {
+  local root real
+  for root in /tmp /var/tmp "${TMPDIR:-}" "$( [ "$(uname -s)" = Darwin ] && /usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"; do
+    case "$root" in /*) ;; *) continue;; esac
+    real=$(CDPATH='' cd -- "$root" 2>/dev/null && pwd -P) || continue
+    inside_dir "$1" "$real" && return 0
+  done
+  return 1
+}
+
+# resolve_python -> PY, PY_PROBLEM : the python3 on PATH as its real file. Refused when it
+# lies in a temporary folder or belongs to a virtual environment (whose pyvenv.cfg could point
+# it at other code); the project check follows once the project is known.
+PY=""
+PY_PROBLEM=""
+resolve_python() {
+  local found
+  PY=""; PY_PROBLEM=""
+  found=$(command -v python3 2>/dev/null) || { PY_PROBLEM=missing; return 1; }
+  case "$found" in /*) ;; *) PY_PROBLEM=missing; return 1;; esac
+  PY=$(real_file "$found") || { PY=""; PY_PROBLEM=missing; return 1; }
+  if inside_temp "$PY"; then PY_PROBLEM=temporary
+  elif [ -e "$(dirname -- "$PY")/pyvenv.cfg" ] || [ -e "$(dirname -- "$(dirname -- "$PY")")/pyvenv.cfg" ]; then
+    PY_PROBLEM=venv
+  fi
+  [ -z "$PY_PROBLEM" ] && return 0
+  PY=""
+  return 1
+}
+
+# python_problem_text : a plain sentence for PY_PROBLEM.
+python_problem_text() {
+  case "$PY_PROBLEM" in
+    temporary) echo "The python3 on your PATH is in a temporary folder, where an AI agent could change it.";;
+    venv) echo "The python3 on your PATH belongs to a virtual environment, whose settings an AI agent could change.";;
+    project) echo "The python3 on your PATH is inside this project, where an AI agent could change it.";;
+    *) echo "python3 was not found.";;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # JSON helper (python3 is required anyway)
 # ---------------------------------------------------------------------------
 IFS= read -r -d '' PY_HELPER <<'PY'
@@ -221,7 +294,8 @@ elif op in ("plan", "planpaths", "paths"):
         if isinstance(old, dict):
             for rel in sorted(set(old) - set(f for f in files if isinstance(f, str))):
                 out.append(("UNSAFE", None) if unsafe(rel) else ("REMOVE", rel))
-        for rel in claude.get("changed_paths") or []:
+        settings = data.get("claude_settings") or {}
+        for rel in (claude.get("changed_paths") or []) + (settings.get("changed_paths") or []):
             if unsafe(rel):
                 out.append(("UNSAFE", None))
             else:
@@ -254,6 +328,7 @@ elif op in ("plan", "planpaths", "paths"):
             if action != "preserve":
                 found.add(rel)
         found.update(claude.get("changed_paths") or [])
+        found.update((data.get("claude_settings") or {}).get("changed_paths") or [])
         found.add(".codex/orchestration/install-manifest.json")
         found.add(".codex/orchestration/provider-routing.json")
         if any(unsafe(rel) for rel in found):
@@ -261,7 +336,8 @@ elif op in ("plan", "planpaths", "paths"):
         keep = []
         for rel in sorted(found):
             result = subprocess.run(
-                ["git", "--literal-pathspecs", "-C", project, "ls-files", "-z", "--", rel],
+                ["git", "-C", project, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                 "--literal-pathspecs", "ls-files", "-z", "--", rel],
                 capture_output=True)
             if result.returncode != 0:
                 sys.exit(4)
@@ -364,7 +440,8 @@ elif op == "raw":
     for key in ("refused", "error"):
         if isinstance(data.get(key), str):
             parts.append(data[key])
-    for source in (data.get("codex") or {}, data.get("claude") or {}):
+    for source in (data.get("codex") or {}, data.get("claude") or {}, data.get("claude_settings") or {},
+                   data.get("codex_rule") or {}):
         for key in ("errors", "project_errors", "package_errors"):
             for item in source.get(key) or []:
                 if isinstance(item, str):
@@ -374,7 +451,18 @@ elif op == "raw":
                 parts.append(source[key])
     print(" ".join(parts).lower().replace("\n", " "))
 PY
-pj() { python3 -I -c "$PY_HELPER" "$@"; }
+pj() { "$PY" -I -B -S -c "$PY_HELPER" "$@"; }
+
+# owner_tool ARGS... : one of attest.py's non-interactive owner checks, run isolated in the
+# trusted Python: `scratch PREFIX` prints a new private working folder, `check-runtime
+# PROJECT` succeeds only when the project's orchestrator is this repository's exact copy.
+owner_tool() {
+  "$PY" -I -B -S -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("agent_orchestration_attest", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.exit(module.owner_tool(sys.argv[2:]))' "$ROOT_DIR/scripts/attest.py" "$@"
+}
 
 # uncommitted_managed PROJECT : the paths still uncommitted in the managed folders, one per
 # line, for display. `git status -z` records are `XY path` and, for a rename or copy (R or C),
@@ -393,7 +481,7 @@ uncommitted_managed() {
     esac
     if [ -z "$out" ]; then out=$name; else out="$out
 $name"; fi
-  done < <(git -C "$1" status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null)
+  done < <(git -C "$1" "${GIT_SAFE[@]}" --no-optional-locks status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null)
   printf '%s' "$out"
 }
 
@@ -417,7 +505,7 @@ changed_paths() {
       if [ "$cand" = "$name" ]; then printf '%s\0' "$name"; fi
       if [ -n "$src" ] && [ "$cand" = "$src" ]; then printf '%s\0' "$src"; fi
     done
-  done < <(git -C "$project" --literal-pathspecs status --porcelain -z --untracked-files=all -- "$@" 2>/dev/null || printf '!\0')
+  done < <(git -C "$project" "${GIT_SAFE[@]}" --no-optional-locks --literal-pathspecs status --porcelain -z --untracked-files=all -- "$@" 2>/dev/null || printf '!\0')
   if [ "$bad" -eq 1 ]; then
     for cand in "$@"; do printf '%s\0' "$cand"; done
   fi
@@ -436,7 +524,7 @@ ignored_paths() {
     for cand in "$@"; do
       if [ "$cand" = "$rec" ]; then printf '%s\0' "$rec"; break; fi
     done
-  done < <(git -C "$project" --literal-pathspecs ls-files -z --others --ignored --exclude-standard -- "$@" 2>/dev/null || printf '!\0')
+  done < <(git -C "$project" "${GIT_SAFE[@]}" --literal-pathspecs ls-files -z --others --ignored --exclude-standard -- "$@" 2>/dev/null || printf '!\0')
 }
 
 # codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
@@ -487,6 +575,8 @@ Space toggles, q quits. Set NO_COLOR=1 for plain output.
 EOF
 }
 
+resolve_python
+
 case "${1:-}" in
   --print-provider-routing)
     if [ "$#" -ne 5 ]; then
@@ -517,6 +607,8 @@ case "${1:-}" in
   --print-ignored-paths)
     if [ "$#" -lt 2 ]; then echo "usage: setup.sh --print-ignored-paths PROJECT PATH..." >&2; exit 2; fi
     ignored_paths "${@:2}"; exit 0;;
+  --print-python)
+    if [ -n "$PY" ]; then printf '%s\n' "$PY"; else printf 'refused: %s\n' "$PY_PROBLEM"; fi; exit 0;;
   --helper)
     shift; pj "$@"; exit "$?";;
   -h|--help) usage; exit 0;;
@@ -616,7 +708,7 @@ stop_active() {
 on_signal() { printf '\n'; show_cursor; exit 130; }
 trap cleanup EXIT
 trap 'REDRAW=1' WINCH
-trap on_signal INT TERM
+trap on_signal INT TERM HUP
 
 # ---------------------------------------------------------------------------
 # Screen drawing
@@ -845,11 +937,18 @@ LAST_OUT=""
 LAST_ERR=""
 LAST_RC=0
 
+# init_logdir : the private working folder for logs, the install plan and generated inputs.
+# It is never in /tmp or $TMPDIR, which a sandboxed AI agent can write: attest.py creates it,
+# owner-only, in the per-user cache folder (macOS) or $XDG_RUNTIME_DIR (Linux).
 init_logdir() {
-  LOGDIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/agent-orch-setup.XXXXXX") || {
-    echo "Could not create a private temporary directory." >&2; exit 1; }
-  chmod 700 "$LOGDIR"
-  mkdir "$LOGDIR/inputs"
+  local why
+  if LOGDIR=$(owner_tool scratch setup- 2>/dev/null) && [ -n "$LOGDIR" ] && [ -d "$LOGDIR" ] && [ ! -L "$LOGDIR" ]; then
+    mkdir -m 700 "$LOGDIR/inputs" && return 0
+  fi
+  LOGDIR=""
+  why="On macOS it lives in your user cache folder; on Linux setup needs XDG_RUNTIME_DIR, which a normal login session sets."
+  printf '%s\n%s\n' "Could not create a private working folder for setup, so nothing was changed." "$why" >&2
+  exit 1
 }
 
 # run_cmd LABEL CMD... : runs with a spinner in its own process group. Output stays in the
@@ -923,6 +1022,14 @@ explain_installer() {
       msg="A managed path is a symlink or cannot be used safely. Replace it with a real file or folder.";;
     *"differs"*|*conflict*|*collision*|*"modified obsolete"*|*"already exists"*)
       msg="A file in the project collides with a managed file (it differs from what would be installed). Move or commit it, then retry.";;
+    *"permission rules"*)
+      msg="The Claude Code permission rules that keep owner commands away from a Claude session are missing from .claude/settings.json. Update the install (choose 'Update the install and walk through every step'), then commit.";;
+    *"settings.json"*|*"agent-orchestration-permissions"*)
+      msg="The project's .claude/settings.json could not be merged safely: it must be a regular file holding a JSON object whose permissions.deny is a list. Fix it, commit, and retry.";;
+    *"not an exact copy"*)
+      msg="The orchestrator installed in this project is not an exact copy of this setup's version, so it was not run. Update the install, or restore the project's files with git.";;
+    *"codex commands rule"*)
+      msg="The Codex commands rule could not be removed by the installed orchestrator. Run the remove command shown in the summary yourself to see which file to delete.";;
     *"configuration is missing"*|*"required"*"configuration"*)
       msg="Project configuration is missing (project-agent-routing.json or operational-checks.json).";;
     *"not committed"*|*"verification"*)
@@ -954,7 +1061,7 @@ save_summary() {
       return 0;;
   esac
   dir=$(dirname -- "$dest")
-  if [ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+  if [ "$(git -C "$dir" "${GIT_SAFE[@]}" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
     list_add warn "That folder is inside a Git working tree, so the summary could be committed by accident."
     menu 0 "Save it somewhere else" "Save it here anyway"
     if [ "$MENU_IDX" -eq 0 ]; then save_summary; return 0; fi
@@ -1028,14 +1135,18 @@ step_checks() {
     else
       list_add fail "git not found"; list_sub "Fix: install Git (macOS: xcode-select --install)."; hard=1
     fi
-    if command -v python3 >/dev/null 2>&1; then
-      if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
-        list_add ok "python3: $(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
+    if ! resolve_python; then
+      if [ "$PY_PROBLEM" = missing ]; then
+        list_add fail "python3 not found"; list_sub "Fix: install Python 3.11 or later."
       else
-        list_add fail "python3 is older than 3.11"; list_sub "Fix: install Python 3.11 or later and put it first on PATH."; hard=1
+        list_add fail "python3 cannot be trusted"; list_sub "$(python_problem_text)"
+        list_sub "Fix: put a system Python, such as Homebrew's or python.org's, first on PATH."
       fi
+      hard=1
+    elif "$PY" -I -B -S -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+      list_add ok "python3: $("$PY" -I -B -S -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
     else
-      list_add fail "python3 not found"; list_sub "Fix: install Python 3.11 or later."; hard=1
+      list_add fail "python3 is older than 3.11"; list_sub "Fix: install Python 3.11 or later and put it first on PATH."; hard=1
     fi
     if command -v codex >/dev/null 2>&1; then
       if run_identity codex login status >/dev/null; then
@@ -1101,11 +1212,16 @@ resolve_dir() { (CDPATH='' cd -- "$1" 2>/dev/null && pwd -P); }
 basic_problem() {
   local dir=$1 top
   [ -d "$dir" ] || { echo "That path is not a directory."; return 1; }
-  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || {
+  top=$(git -C "$dir" "${GIT_SAFE[@]}" rev-parse --show-toplevel 2>/dev/null) || {
     echo "That directory is not inside a Git working tree. Run: git init"; return 1; }
   top=$(resolve_dir "$top")
   if [ "$top" != "$dir" ]; then
     echo "That is inside a Git project but not its top. Use the project root instead: $top"
+    return 1
+  fi
+  if inside_dir "$PY" "$dir"; then
+    PY_PROBLEM=project
+    echo "$(python_problem_text) Put a system Python, such as Homebrew's or python.org's, first on PATH."
     return 1
   fi
   return 0
@@ -1114,7 +1230,7 @@ basic_problem() {
 # managed_problem DIR : an install or update needs clean managed paths.
 managed_problem() {
   local dirty
-  dirty=$(git -C "$1" status --porcelain --untracked-files=all -- .codex .agents .claude 2>/dev/null | head -n 3)
+  dirty=$(git -C "$1" "${GIT_SAFE[@]}" --no-optional-locks status --porcelain --untracked-files=all -- .codex .agents .claude 2>/dev/null | head -n 3)
   if [ -n "$dirty" ]; then
     echo "Uncommitted changes exist in managed paths (.codex, .agents, .claude). Commit or discard them first."
     return 1
@@ -1231,7 +1347,7 @@ step_project() {
     body "Previewing the install for: $dir"
     render
     PREVIEW_FILE="$LOGDIR/preview.json"
-    run_cmd "Previewing the install" python3 "$ROOT_DIR/scripts/install.py" install --target "$dir" "${INSTALL_OPTS[@]}"
+    run_cmd "Previewing the install" "$PY" -I -B -S "$ROOT_DIR/scripts/install.py" install --target "$dir" "${INSTALL_OPTS[@]}"
     rc=$?
     cp "$LAST_OUT" "$PREVIEW_FILE"
     screen_reset; begin_step 2
@@ -1400,7 +1516,7 @@ show_plan() {
 
 # manual_installer OPERATION PROJECT [--apply] : the exact, shell-quoted command to run by hand.
 manual_installer() {
-  printf 'python3 %q %s --target %q%s' "$ROOT_DIR/scripts/install.py" "$1" "$2" "${3:+ $3}"
+  printf 'python3 -I -B -S %q %s --target %q%s' "$ROOT_DIR/scripts/install.py" "$1" "$2" "${3:+ $3}"
 }
 
 # view_plan [TEXT [TITLE]] : TEXT (default: every add, update and remove path) in a scrollable
@@ -1445,7 +1561,7 @@ view_plan() {
 
 VERIFY_LIMITED=0
 verify_install() { # verify_install -> sets LAST_* and records problems in LIST
-  run_cmd "Verifying the install" python3 "$ROOT_DIR/scripts/install.py" verify --target "$PROJECT"
+  run_cmd "Verifying the install" "$PY" -I -B -S "$ROOT_DIR/scripts/install.py" verify --target "$PROJECT"
   local rc=$? line
   if [ "$rc" -eq 0 ]; then
     list_add ok "Verification passed: the install is ready"
@@ -1480,7 +1596,7 @@ step_install() {
   esac
   screen_reset; begin_step 4
   render
-  if ! run_cmd "Installing" python3 "$ROOT_DIR/scripts/install.py" install --target "$PROJECT" "${INSTALL_OPTS[@]}" --apply; then
+  if ! run_cmd "Installing" "$PY" -I -B -S "$ROOT_DIR/scripts/install.py" install --target "$PROJECT" "${INSTALL_OPTS[@]}" --apply; then
     screen_reset; begin_step 4
     explain_installer "The install failed" "$(manual_installer "install" "$PROJECT" --apply)"
     list_sub "The installer rolls back a partial install where it can."
@@ -1576,9 +1692,9 @@ step_install() {
     fi
     COMMIT_STATE=failed
   else
-    body "Next: commit the installed files in the project. Only these $n_paths paths are staged and committed, nothing is pushed. The exact commands are below; choose 'Show every path' for the full list."
-    list_cmd "git -C $q_project --literal-pathspecs add -A -- <the $n_paths paths below>"
-    list_cmd "git -C $q_project --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
+    body "Next: commit the installed files in the project. Only these $n_paths paths are staged and committed, nothing is pushed. The commit skips the project's Git hooks, so no script in the project runs as you. The exact commands are below; choose 'Show every path' for the full list."
+    list_cmd "git -C $q_project ${GIT_SAFE[*]} --literal-pathspecs add -A -- <the $n_paths paths below>"
+    list_cmd "git -C $q_project ${GIT_SAFE[*]} --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
     shown=0
     for path in "${COMMIT_PATHS[@]}"; do
       [ "$shown" -ge 10 ] && break
@@ -1589,7 +1705,7 @@ step_install() {
     while :; do
       menu 0 "Commit now (recommended)" "I will commit myself" "Show every path"
       [ "$MENU_IDX" -eq 2 ] || break
-      view_plan "$(printf 'git --literal-pathspecs add -A -- %s\n' "${COMMIT_PATHS[@]}")"
+      view_plan "$(printf 'git -c core.hooksPath=/dev/null -c core.fsmonitor=false --literal-pathspecs add -A -- %s\n' "${COMMIT_PATHS[@]}")"
     done
     screen_reset; begin_step 4
     list_add ok "Packages installed"
@@ -1598,14 +1714,14 @@ step_install() {
       render
       RUN_QUIET=1
       COMMIT_STATE=failed
-      if run_cmd "Staging" git -C "$PROJECT" --literal-pathspecs add -A -- "${COMMIT_PATHS[@]}" &&
-         run_cmd "Committing" git -C "$PROJECT" --literal-pathspecs commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- "${COMMIT_PATHS[@]}"; then
+      if run_cmd "Staging" git -C "$PROJECT" "${GIT_SAFE[@]}" --literal-pathspecs add -A -- "${COMMIT_PATHS[@]}" &&
+         run_cmd "Committing" git -C "$PROJECT" "${GIT_SAFE[@]}" --literal-pathspecs commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- "${COMMIT_PATHS[@]}"; then
         RUN_QUIET=0
         commit_done=1
         COMMIT_STATE=committed
       else
         RUN_QUIET=0
-        failure_detail "The commit did not go through" "Git refused it. Usual causes: your Git identity (user.name and user.email) is not set, or a commit hook stopped it. Commit the files yourself, then run ./setup.sh again and choose Verify."
+        failure_detail "The commit did not go through" "Git refused it. Usual causes: your Git identity (user.name and user.email) is not set, or commit signing failed. Commit the files yourself, then run ./setup.sh again and choose Verify."
       fi
     fi
   fi
@@ -1652,6 +1768,35 @@ step_install() {
 }
 
 # ---------------------------------------------------------------------------
+# The project's CLI
+# ---------------------------------------------------------------------------
+# runtime_matches : succeeds when the project's installed orchestrator is byte for byte this
+# repository's copy. Otherwise RUNTIME_WHY holds attest.py's plain reason (control characters
+# removed), and LAST_RC is set for the failure summary.
+RUNTIME_WHY=""
+runtime_matches() {
+  RUNTIME_WHY=$(owner_tool check-runtime "$PROJECT" 2>&1 >/dev/null) && return 0
+  LAST_RC=1
+  RUNTIME_WHY=${RUNTIME_WHY//[[:cntrl:]]/ }
+  [ -n "$RUNTIME_WHY" ] || RUNTIME_WHY="the installed orchestrator could not be checked"
+  return 1
+}
+
+# runtime_refusal : explain on screen that the project's CLI was not run.
+runtime_refusal() {
+  failure_detail "The project's orchestrator was not run" "It is not this setup's exact copy, so running it with your authority is unsafe. Update the install (choose 'Update the install and walk through every step'), or restore the project's files with git."
+  list_sub "Reason: $RUNTIME_WHY"
+}
+
+# run_project_cli LABEL ARGS... : the project's installed CLI, isolated in the trusted Python,
+# with no cached bytecode read from its __pycache__ folders. Callers check runtime_matches first.
+run_project_cli() {
+  local label=$1
+  shift
+  run_cmd "$label" "$PY" -I -B -S -X pycache_prefix=/dev/null "$PROJECT/.codex/orchestration/cli.py" "$@"
+}
+
+# ---------------------------------------------------------------------------
 # Step 5: learning collector
 # ---------------------------------------------------------------------------
 version_hint() {
@@ -1678,8 +1823,13 @@ step_collector() {
     2) echo "Stopped."; exit 0;;
   esac
   screen_reset; begin_step 5
+  if ! runtime_matches; then
+    runtime_refusal
+    mark_step 5 fail "orchestrator differs from this setup"
+    pause; return 1
+  fi
   render
-  run_cmd "Registering the collector" python3 "$cli" learning-register --project-root "$PROJECT"
+  run_project_cli "Registering the collector" learning-register --project-root "$PROJECT"
   if [ "$?" -ne 0 ]; then
     failure_detail "Collector registration failed"
     version_hint
@@ -1688,7 +1838,7 @@ step_collector() {
   fi
   list_add ok "Collector registered"
   render
-  run_cmd "Checking collector status" python3 "$cli" learning-status --project-root "$PROJECT"
+  run_project_cli "Checking collector status" learning-status --project-root "$PROJECT"
   ready=$(pj get "$LAST_OUT" ready)
   if [ "$ready" = true ]; then
     list_add ok "Collector status: ready (runtime $(pj get "$LAST_OUT" collector_runtime_version))"
@@ -1727,10 +1877,16 @@ step_billing() {
       2) echo "Stopped."; exit 0;;
     esac
   fi
+  if ! runtime_matches; then
+    screen_reset; begin_step 6
+    runtime_refusal
+    mark_step 6 fail "orchestrator differs from this setup"
+    pause; return 0
+  fi
   while :; do
     show_cursor
     printf '\033[H\033[2J'
-    python3 "$ROOT_DIR/scripts/attest.py" --target "$PROJECT"
+    "$PY" -I -B -S "$ROOT_DIR/scripts/attest.py" --target "$PROJECT"
     rc=$?
     # Keep attest.py's own summary on screen until the owner has read it.
     printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
@@ -1766,7 +1922,7 @@ step_passphrase() {
   while :; do
     show_cursor
     printf '\033[H\033[2J'
-    python3 "$ROOT_DIR/scripts/attest.py" --change-passphrase
+    "$PY" -I -B -S "$ROOT_DIR/scripts/attest.py" --change-passphrase
     rc=$?
     printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
     IFS= read -r _ || true
@@ -1870,7 +2026,7 @@ TEMP_PROJECT=0
 # session can write. It uses this repository's own copy of the check, never the project's,
 # whose files such a session could have replaced.
 project_in_temp() {
-  python3 -I -B -S -c 'import os, sys
+  "$PY" -I -B -S -c 'import os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from codex_agents.host_paths import temp_roots, within
@@ -1885,8 +2041,8 @@ temp_project_refusal() {
   list_sub "Move the project out of the temporary folder, for example into your home folder, and run setup again. Nothing was written."
 }
 
-check_rule() { # check_rule CLI -> RULE_STATUS (installed, missing, stale or empty), RULE_FILE
-  run_cmd "Checking the Codex commands rule" python3 "$1" host-command --project-root "$PROJECT"
+check_rule() { # check_rule -> RULE_STATUS (installed, missing, stale or empty), RULE_FILE
+  run_project_cli "Checking the Codex commands rule" host-command --project-root "$PROJECT"
   RULE_STATUS=$(pj get "$LAST_OUT" codex_rule)
   RULE_FILE=$(pj get "$LAST_OUT" rule_file)
   case "$RULE_STATUS" in
@@ -1898,7 +2054,7 @@ check_rule() { # check_rule CLI -> RULE_STATUS (installed, missing, stale or emp
 commands_screen() {
   screen_reset; begin_step 8
   body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it, delete the rule file shown below."
-  body "File: $RULE_FILE (mode 0600). It applies to Codex sessions started in this project's root folder after it is written. Your Codex config.toml is never edited."
+  body "Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). It runs a protected copy of the orchestrator kept in your Codex settings folder, so a session opened on a folder above this project cannot change what it runs. Never start Codex with your home folder's parent or / as its workspace."
   if [ "$RULE_STATUS" = stale ]; then
     list_add warn "A rule for this project already exists and differs from this one, for example after a Python upgrade (the rule names the exact Python build) or a package update. It stays unchanged unless you replace it; until then Codex sessions may not reach the orchestrator."
   fi
@@ -1938,8 +2094,13 @@ step_commands() {
     mark_step 8 fail "project in a temporary folder"
     pause; return 0
   fi
+  if ! runtime_matches; then
+    runtime_refusal
+    mark_step 8 fail "orchestrator differs from this setup"
+    pause; return 1
+  fi
   render
-  check_rule "$cli"
+  check_rule
   if [ -z "$RULE_STATUS" ]; then
     case "$(pj raw "$LAST_OUT")" in
       *python*) text="This Python cannot be trusted to run outside Codex's sandbox: it is a virtual environment's, sits in the project or a temporary folder, or other users can change it. Run setup with a system Python, such as Homebrew's or python.org's.";;
@@ -1971,7 +2132,7 @@ step_commands() {
         return 0;;
       1) break;;
       2)
-        run_cmd "Preparing the rule" python3 "$cli" install-codex-rule --project-root "$PROJECT" --print
+        run_project_cli "Preparing the rule" install-codex-rule --project-root "$PROJECT" --print
         text=$(pj get "$LAST_OUT" rule_text)
         [ -n "$text" ] && view_plan "$text" "Codex commands rule"
         commands_screen;;
@@ -1981,7 +2142,7 @@ step_commands() {
   [ "$RULE_STATUS" = stale ] && replace=--replace
   screen_reset; begin_step 8
   render
-  run_cmd "Writing the Codex commands rule" python3 "$cli" install-codex-rule --project-root "$PROJECT" ${replace:+"$replace"}
+  run_project_cli "Writing the Codex commands rule" install-codex-rule --project-root "$PROJECT" ${replace:+"$replace"}
   outcome=$(pj get "$LAST_OUT" codex_rule)
   screen_reset; begin_step 8
   case "$outcome" in
@@ -2013,7 +2174,13 @@ verify_rule() {
     temp_project_refusal
     mark_step 8 fail "project in a temporary folder"; return 0
   fi
-  check_rule "$cli"
+  if ! runtime_matches; then
+    local STEP=8  # file the failure under step 8, not the verify screen's step 4
+    runtime_refusal
+    mark_step 8 fail "orchestrator differs from this setup"
+    return 0
+  fi
+  check_rule
   case "$RULE_STATUS" in installed|stale) RULE_EXISTS=1;; esac
   case "$RULE_STATUS" in
     installed)
@@ -2104,8 +2271,8 @@ summary_screen() {
       list_sub "Codex sessions cannot reach the orchestrator until the Codex commands rule exists. Run ./setup.sh again and allow it in step 8."
     fi
   fi
-  list_plain " - To remove everything, run:"
-  list_cmd "python3 $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
+  list_plain " - To remove everything, including the Codex commands rule, run:"
+  list_cmd "python3 -I -B -S $(printf '%q' "$ROOT_DIR/scripts/install.py") remove --target $(printf '%q' "$PROJECT") --apply"
   if [ "$RULE_EXISTS" -eq 1 ] && [ -n "$RULE_FILE" ]; then
     list_plain " - The Codex commands rule is outside the project. To undo it, delete:"
     list_cmd "$(printf '%q' "$RULE_FILE")"
@@ -2158,8 +2325,8 @@ main() {
   local start=${1:-$PWD} n
   setup_colors
   term_size
-  init_logdir
   step_checks
+  init_logdir
   while :; do
     GO_BACK=0
     reset_attempt

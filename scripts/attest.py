@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Guided owner billing attestation for an orchestrated project.
 
-Usage: ``python3 scripts/attest.py --target <project> [--state-root <dir>]``, or
-``python3 scripts/attest.py --change-passphrase`` to change the owner key's passphrase.
+Usage: ``python3 -I -B -S scripts/attest.py --target <project> [--state-root <dir>]``, or
+``python3 -I -B -S scripts/attest.py --change-passphrase`` to change the owner key's passphrase.
 
 Admission requires, per provider account, an owner-signed statement that the account
 cannot be charged beyond its subscription. This command walks the human owner through
@@ -10,6 +10,11 @@ it. What proves a person signed is the owner key's passphrase: the key is refuse
 it is encrypted, and signing runs without ssh-agent so a loaded key cannot sign silently.
 The command also insists on an interactive terminal, but that alone does not keep a
 program out; the passphrase does.
+
+The isolation flags, which ./setup.sh always passes, keep anything in the working directory,
+the environment or site-packages out of this process; it imports only the standard library. Its working files live in a host-private folder that no AI agent's sandbox can
+write, it runs the project's orchestration CLI only after checking that CLI byte for byte
+against this repository's copy, and it signs only the statement the owner approved.
 """
 
 from __future__ import annotations
@@ -17,8 +22,11 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import hashlib
 import json
 import os
+import re
+import secrets
 import shutil
 import signal
 import stat
@@ -48,40 +56,369 @@ KEY_ADVICE = (
 _TEMP_DIRS: set[Path] = set()
 _CLEANUP_FAILURES: list[Path] = []
 
+# This repository's own copy of the native package: the bytes an installed project's
+# orchestration runtime must match before an owner tool runs it.
+NATIVE_PACKAGE = Path(__file__).resolve().parents[1] / "packages" / "codex-agents" / "native-package"
+RUNTIME_RELATIVE = Path(".codex") / "orchestration"
+MANIFEST_RELATIVE = RUNTIME_RELATIVE / "install-manifest.json"
+# Every Python an owner tool starts gets these: isolated mode (no environment variables,
+# user site-packages or script directory on the path), no bytecode written, no
+# site-packages, and no cached bytecode read from the project's __pycache__ folders (the
+# cache prefix points below /dev/null, where no folder can exist).
+PYTHON_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
+GETCONF = "/usr/bin/getconf"
+SCRATCH_CONTAINER = "agent-orchestration-owner"
+SCRATCH_BASE: str | None = None  # tests only; the platform's private folder otherwise
+MACOS_ADMIN_GROUP = 80
+_IMPORTABLE = (".py", ".pyc", ".pyo", ".pyw", ".so", ".pyd")
+
 
 class AttestError(RuntimeError):
     """A step failed in a way the owner should read about; never carries identifiers."""
 
 
-# --- terminal, temporary directories, signals -------------------------------------------
+# --- terminal ---------------------------------------------------------------------------
 
 
 def _is_terminal() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def make_temp(prefix: str) -> Path:
-    path = Path(tempfile.mkdtemp(prefix=prefix))  # created 0700
-    path.chmod(0o700)
-    _TEMP_DIRS.add(path)
-    return path
+# --- host-private scratch ---------------------------------------------------------------
+# Working files (the public key being enrolled, the statement being signed, its signature)
+# never go to /tmp or $TMPDIR: a sandboxed AI agent running as this same user can write
+# there and could swap a file between two steps. They live in a fresh owner-only folder
+# inside the per-user cache folder on macOS, or $XDG_RUNTIME_DIR elsewhere, which those
+# sandboxes cannot write. This mirrors host_paths.private_directory in the runtime.
 
 
-def remove_temp(path: Path) -> bool:
+def within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _darwin_directory(name: str) -> str | None:
+    try:
+        info = os.lstat(GETCONF)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
+            return None
+        completed = subprocess.run([GETCONF, name], env={"PATH": os.defpath}, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and os.path.isabs(value) else None
+
+
+def temp_roots() -> set[Path]:
+    """Every temporary folder a sandboxed session may write, resolved."""
+
+    candidates = ["/tmp", "/var/tmp", tempfile.gettempdir(), os.environ.get("TMPDIR") or ""]
+    if sys.platform == "darwin":
+        candidates.append(_darwin_directory("DARWIN_USER_TEMP_DIR") or "")
+    return {Path(os.path.realpath(item)) for item in candidates if os.path.isabs(item)}
+
+
+NO_SCRATCH = (
+    "no private working folder is available (macOS: your user cache folder; Linux: "
+    "$XDG_RUNTIME_DIR, which a normal login session sets). Working files are never put in a "
+    "temporary folder, where an AI agent could change them"
+)
+
+
+def scratch_base(project: Path | None = None) -> Path:
+    """The existing host folder that holds private scratch, outside every sandbox's reach."""
+
+    if SCRATCH_BASE is not None:
+        value: str | None = SCRATCH_BASE
+    elif sys.platform == "darwin":
+        value = _darwin_directory("DARWIN_USER_CACHE_DIR")
+    else:
+        value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value or not os.path.isabs(value):
+        raise AttestError(NO_SCRATCH)
+    resolved = Path(os.path.realpath(value))
+    untrusted = [*temp_roots(), *([Path(os.path.realpath(project))] if project else [])]
+    if any(within(resolved, root) or within(root, resolved) for root in untrusted):
+        raise AttestError(NO_SCRATCH)
+    return Path(value)
+
+
+def _component_problem(info: os.stat_result) -> bool:
+    if info.st_uid not in (0, os.geteuid()):
+        return True
+    others = info.st_mode & stat.S_IWOTH
+    group = info.st_mode & stat.S_IWGRP and not (
+        sys.platform == "darwin" and info.st_gid == MACOS_ADMIN_GROUP)
+    return bool(others or group) and not (
+        stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX and info.st_uid == 0)
+
+
+def _open_verified_directory(path: Path) -> tuple[int, Path]:
+    """Open an existing folder by descriptors, never following a symlink.
+
+    Root-owned system links (such as /var on macOS) are resolved first; any other symlink
+    refuses. Every component must belong to you or root and be writable by no one else.
+    """
+
+    full = Path(os.path.abspath(path))
+    for _ in range(40):
+        current = Path(full.anchor)
+        for index, part in enumerate(full.parts[1:]):
+            current = current / part
+            try:
+                info = os.lstat(current)
+            except OSError as exc:
+                raise AttestError(NO_SCRATCH) from exc
+            if stat.S_ISLNK(info.st_mode):
+                if info.st_uid != 0:
+                    raise AttestError("the private working folder's path passes through a symbolic link")
+                full = Path(os.path.realpath(current), *full.parts[index + 2:])
+                break
+        else:
+            break
+    else:
+        raise AttestError("the private working folder's path has too many symbolic links")
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in full.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            if _component_problem(os.fstat(descriptor)):
+                raise AttestError("the private working folder's path can be changed by other users")
+    except OSError as exc:
+        os.close(descriptor)
+        raise AttestError("the private working folder's path passes through a symbolic link") from exc
+    except AttestError:
+        os.close(descriptor)
+        raise
+    return descriptor, full
+
+
+def _private_child(parent: int, name: str, *, create: bool) -> int:
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    info = os.fstat(descriptor)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        os.close(descriptor)
+        raise AttestError("the private working folder is not yours alone")
+    return descriptor
+
+
+def make_scratch(prefix: str, project: Path | None = None) -> Path:
+    """Create a fresh owner-only folder at <private base>/agent-orchestration-owner/<prefix><hex>."""
+
+    if not re.fullmatch(r"[a-z]+-", prefix):
+        raise AttestError("invalid working folder name")
+    base_fd, canonical = _open_verified_directory(scratch_base(project))
+    try:
+        try:
+            container_fd = _private_child(base_fd, SCRATCH_CONTAINER, create=True)
+        except OSError as exc:
+            raise AttestError(NO_SCRATCH) from exc
+        try:
+            for _ in range(64):
+                name = f"{prefix}{secrets.token_hex(6)}"
+                try:
+                    os.mkdir(name, 0o700, dir_fd=container_fd)
+                except FileExistsError:
+                    continue
+                os.close(_private_child(container_fd, name, create=False))
+                path = canonical / SCRATCH_CONTAINER / name
+                _TEMP_DIRS.add(path)
+                return path
+            raise AttestError("a private working folder could not be created")
+        finally:
+            os.close(container_fd)
+    finally:
+        os.close(base_fd)
+
+
+def remove_scratch(path: Path) -> bool:
     shutil.rmtree(path, ignore_errors=True)
     if path.exists():
         if path not in _CLEANUP_FAILURES:
             _CLEANUP_FAILURES.append(path)
-        print("Warning: a temporary directory could not be removed; delete it yourself:", path,
+        print("Warning: a private working folder could not be removed; delete it yourself:", path,
               file=sys.stderr)
         return False
     _TEMP_DIRS.discard(path)
     return True
 
 
+# --- the trusted interpreter and the project's runtime ----------------------------------
+
+
+def trusted_python(project: Path | None = None) -> str:
+    """The interpreter every child Python runs on: this one, as its real file.
+
+    The real file, never a symlink that could be retargeted, and never a virtual
+    environment's copy (whose pyvenv.cfg could point it at other code). It may not lie in a
+    temporary folder or the project, which a sandboxed AI agent can write.
+    """
+
+    executable = Path(os.path.realpath(sys.executable)) if sys.executable else None
+    if executable is None or not executable.is_absolute() or not executable.is_file():
+        raise AttestError("this Python's own program file cannot be found")
+    untrusted = [*temp_roots(), *([Path(os.path.realpath(project))] if project else [])]
+    if any(within(executable, root) for root in untrusted):
+        raise AttestError("this Python sits in a temporary folder or in the project, where an AI "
+                          "agent could change it. Run this with a system Python, such as Homebrew's "
+                          "or python.org's")
+    if any((folder / "pyvenv.cfg").exists() for folder in (executable.parent, executable.parent.parent)):
+        raise AttestError("this Python belongs to a virtual environment. Run this with a system "
+                          "Python, such as Homebrew's or python.org's")
+    return str(executable)
+
+
+def cli_command(project: Path, args: list[str]) -> list[str]:
+    """The isolated command line that runs the project's installed CLI."""
+
+    return [trusted_python(project), *PYTHON_FLAGS, str(project / CLI_RELATIVE), *args]
+
+
+def _runtime_bundle() -> dict[str, bytes]:
+    """This repository's copy of every runtime file, keyed by project-relative path."""
+
+    source = NATIVE_PACKAGE / RUNTIME_RELATIVE
+    files: dict[str, bytes] = {}
+    for path in sorted(source.rglob("*")):
+        if "__pycache__" in path.parts or path.name == ".DS_Store":
+            continue
+        if path.is_symlink():
+            raise AttestError("this setup's own package copy contains a symbolic link")
+        if path.is_file():
+            relative = path.relative_to(NATIVE_PACKAGE).as_posix()
+            if relative != MANIFEST_RELATIVE.as_posix():
+                files[relative] = path.read_bytes()
+    if not files:
+        raise AttestError("this setup's own package copy is missing")
+    return files
+
+
+def _read_below(root_fd: int, relative: str, limit: int = 8 * 1024 * 1024) -> bytes | None:
+    """Read a regular file under root_fd without following any symlink; None if absent."""
+
+    parts = relative.split("/")
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        info = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            return b""  # never equal to a real file's bytes; a symlink or other type refuses
+        handle = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        try:
+            chunks, size = [], 0
+            while size <= limit:
+                chunk = os.read(handle, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(handle)
+    except FileNotFoundError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+RUNTIME_ADVICE = (
+    "so it was not run. Update the install from this setup (./setup.sh, then Update the "
+    "install), or restore the project's files with git"
+)
+
+
+def check_project_runtime(project: Path) -> None:
+    """Refuse unless the project's orchestration runtime is exactly this repository's copy.
+
+    The installed version must equal this setup's, every runtime file must have identical
+    bytes, and the folders Python imports from may hold no other module or package, so the
+    CLI an owner tool runs with the owner's authority is code this repository ships.
+    """
+
+    expected_version = (NATIVE_PACKAGE / "VERSION").read_text(encoding="ascii").strip()
+    bundle = _runtime_bundle()
+    lead = "the orchestrator installed in this project is not an exact copy of this setup's version"
+    try:
+        root_fd = os.open(os.path.realpath(project), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise AttestError(f"{lead}: the project folder cannot be opened, {RUNTIME_ADVICE}") from exc
+    try:
+        raw = _read_below(root_fd, MANIFEST_RELATIVE.as_posix(), limit=1024 * 1024)
+        try:
+            manifest = json.loads(raw) if raw else None
+        except (UnicodeDecodeError, ValueError):
+            manifest = None
+        installed = manifest.get("version") if isinstance(manifest, dict) else None
+        if not isinstance(installed, str):
+            raise AttestError(f"{lead}: its install record is missing or unreadable, {RUNTIME_ADVICE}")
+        if installed != expected_version:
+            shown = re.sub(r"[^0-9A-Za-z.+-]", "", installed)[:20] or "unknown"
+            raise AttestError(f"{lead}: version {shown} is installed and this setup is version "
+                              f"{expected_version}, {RUNTIME_ADVICE}")
+        for relative, expected in bundle.items():
+            current = _read_below(root_fd, relative)
+            if current is None or hashlib.sha256(current).digest() != hashlib.sha256(expected).digest():
+                raise AttestError(f"{lead}: {relative} differs from this setup's copy, {RUNTIME_ADVICE}")
+        known = set(bundle)
+        folders = {os.path.dirname(relative) for relative in bundle}
+        # The folders Python imports from: the CLI's own (first on sys.path) and its package.
+        importable = (RUNTIME_RELATIVE.as_posix(), (RUNTIME_RELATIVE / "codex_agents").as_posix())
+        for folder in (item for item in importable if item in folders):
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            try:
+                for name in os.listdir(fd):
+                    relative = f"{folder}/{name}"
+                    if name == "__pycache__" or relative in known or relative in folders:
+                        continue
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode) or name.endswith(_IMPORTABLE):
+                        raise AttestError(f"{lead}: an extra Python module or folder sits in {folder}, "
+                                          f"{RUNTIME_ADVICE}")
+            finally:
+                os.close(fd)
+    except OSError as exc:
+        raise AttestError(f"{lead}: its files cannot be read safely, {RUNTIME_ADVICE}") from exc
+    finally:
+        os.close(root_fd)
+
+
+def owner_tool(argv: list[str]) -> int:
+    """Non-interactive owner checks that ./setup.sh runs; prints only fixed text or a path.
+
+    ``scratch PREFIX`` creates a private working folder and prints it; ``check-runtime
+    PROJECT`` exits 0 only when the project's runtime is this repository's copy.
+    """
+
+    try:
+        if len(argv) == 2 and argv[0] == "scratch":
+            print(make_scratch(argv[1]))
+            return 0
+        if len(argv) == 2 and argv[0] == "check-runtime":
+            check_project_runtime(Path(argv[1]))
+            return 0
+    except AttestError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print("unknown owner tool", file=sys.stderr)
+    return 2
+
+
+# --- signals ----------------------------------------------------------------------------
+
+
 def _on_signal(signum: int, _frame: object) -> None:
     for path in list(_TEMP_DIRS):
-        remove_temp(path)
+        remove_scratch(path)
     sys.exit(128 + signum)
 
 
@@ -166,11 +503,14 @@ def ask_yes_no(prompt: str) -> bool:
     return input(f"{prompt} [y/N] ").strip().lower() in {"y", "yes"}
 
 
-def run_cli(target: Path, args: list[str], state_root: Path | None) -> dict:
-    command = [sys.executable, str(target / CLI_RELATIVE), *args]
+def run_cli(target: Path, args: list[str], state_root: Path | None, *, stdin: str | None = None) -> dict:
+    """Run the project's CLI isolated; it must already have passed check_project_runtime."""
+
+    command = cli_command(target, args)
     if state_root is not None:
         command += ["--state-root", str(state_root)]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, text=True,
+                            input=stdin if stdin is not None else "")
     try:
         report = json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
@@ -244,7 +584,7 @@ def _split_public(text: str) -> tuple[str, str]:
 
 
 def fingerprint(key_type: str, blob: str) -> str:
-    scratch = make_temp("attest-pub-")
+    scratch = make_scratch("pub-")
     try:
         public = scratch / "owner.pub"
         public.write_text(f"{key_type} {blob}\n")
@@ -254,7 +594,7 @@ def fingerprint(key_type: str, blob: str) -> str:
             raise AttestError("ssh-keygen could not read that public key")
         return fields[1]
     finally:
-        remove_temp(scratch)
+        remove_scratch(scratch)
 
 
 def describe_key(key_type: str, blob: str) -> str:
@@ -411,13 +751,16 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
             if existing != derived:
                 raise AttestError("the .pub file next to the key does not match the private key")
         print(f"Owner key: {describe_key(*derived)}")
-        scratch = make_temp("attest-enrol-")
+        scratch = make_scratch("enrol-", target)
         try:
             public = scratch / "owner.pub"
             public.write_text(f"{derived[0]} {derived[1]}\n")
             run_cli(target, ["learning-configure-owner-key", "--public-key", str(public)], cli_state)
         finally:
-            remove_temp(scratch)
+            remove_scratch(scratch)
+        # Trust only what the state now holds: it must be exactly the key shown above.
+        if configured_public_key(state_root) != derived:
+            raise AttestError(ENROLLED_MISMATCH)
         print("Owner public key configured.")
         return key
     print(f"Owner key already configured: {describe_key(*configured)}")
@@ -426,6 +769,12 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
         raise AttestError("that private key does not match the configured owner key")
     return key
 
+
+ENROLLED_MISMATCH = (
+    "the owner key now configured is not the key shown above, so nothing was signed. Do not "
+    "attest until you know why: delete owner-allowed-signers in the learning state folder and "
+    "run the attestation again"
+)
 
 NOT_A_PATH = (
     "That is not a file location. If you typed your passphrase here, it was not shown, but "
@@ -581,6 +930,58 @@ def _skip(provider: str) -> bool:
     return False
 
 
+def canonical_json(value: object) -> bytes:
+    """The runtime's canonical JSON (learning_contracts.canonical_json)."""
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def content_digest(value: object) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def billing_record(grant: dict) -> dict:
+    """The record the runtime builds from a grant (providers.billing_attestation_record)."""
+
+    material = {field: grant[field] for field in sorted(grant) if field != "version"}
+    body = {"schema_version": 1, "record_type": "billing_attestation", **material,
+            "observed_at_ms": grant["issued_at"]}
+    return {**body, "record_id": f"billing_attestation:{content_digest(body)}"}
+
+
+PROJECT_ID = re.compile(r"prj_[0-9a-f]{32}")
+
+
+def approved_payload(grant: dict, prepared: dict) -> bytes:
+    """The bytes to sign, rebuilt here from the approved grant; refuse anything else.
+
+    The runtime signs ``{"purpose": "authenticated_owner_record", "project_id": ...,
+    "record_type": "billing_attestation", "record_digest": content_digest(record)}`` as
+    canonical JSON (OwnerGrantAuthority.owner_record_payload). The record digest is computed
+    here from the statement the owner approved, so a payload for any other statement, record
+    type or purpose is refused. Only the registered project's identifier comes from the CLI.
+    """
+
+    try:
+        returned = base64.b64decode(prepared["signing_payload_b64"], validate=True)
+        claimed = json.loads(returned)
+    except (KeyError, TypeError, ValueError):
+        raise AttestError("the orchestration CLI returned no usable statement to sign") from None
+    project_id = claimed.get("project_id") if isinstance(claimed, dict) else None
+    record = billing_record(grant)
+    expected = canonical_json({
+        "purpose": "authenticated_owner_record",
+        "project_id": project_id,
+        "record_type": "billing_attestation",
+        "record_digest": content_digest(record),
+    })
+    if (not isinstance(project_id, str) or not PROJECT_ID.fullmatch(project_id)
+            or returned != expected or prepared.get("record", record) != record):
+        raise AttestError("the statement the orchestration CLI asked to sign is not the one you "
+                          "approved, so nothing was signed")
+    return expected
+
+
 def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | None) -> bool:
     print(f"\n== {provider.capitalize()} ==")
     records = run_cli(
@@ -617,13 +1018,14 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
     }
     if credits_disabled:
         grant["codex_credits_spending_disabled"] = True
-    work = make_temp("attest-")
+    # The grant travels on stdin, never through a file another program could swap.
+    grant_text = json.dumps(grant, sort_keys=True)
+    base = ["learning-record-billing-attestation", "--provider", provider,
+            "--project-root", str(target), "--grant", "-"]
+    prepared = run_cli(target, base, cli_state, stdin=grant_text)
+    payload = approved_payload(grant, prepared)
+    work = make_scratch("sign-", target)
     try:
-        grant_path = work / "grant.json"
-        grant_path.write_text(json.dumps(grant, sort_keys=True))
-        base = ["learning-record-billing-attestation", "--provider", provider,
-                "--project-root", str(target), "--grant", str(grant_path)]
-        payload = base64.b64decode(run_cli(target, base, cli_state)["signing_payload_b64"])
         payload_path = work / "payload"
         payload_path.write_bytes(payload)
         print("Now sign the statement. Enter your key's passphrase when asked.")
@@ -638,9 +1040,14 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
                     continue
                 raise AttestError("stopped: the passphrase did not unlock the key")
             raise AttestError("signing did not finish")
-        run_cli(target, [*base, "--signature", str(signature)], cli_state)
+        # The signature must cover exactly the approved bytes, whatever the file now holds.
+        checked = ssh(["-Y", "check-novalidate", "-n", NAMESPACE, "-s", str(signature)],
+                      input=payload, capture_output=True)
+        if checked.returncode != 0:
+            raise AttestError("the signature does not cover the approved statement; nothing was recorded")
+        run_cli(target, [*base, "--signature", str(signature)], cli_state, stdin=grant_text)
     finally:
-        remove_temp(work)
+        remove_scratch(work)
     print(f"{provider.capitalize()} attested.")
     return True
 
@@ -681,6 +1088,8 @@ def main(argv: list[str] | None = None) -> int:
         check_ssh_keygen()
         if not (target / CLI_RELATIVE).is_file():
             raise AttestError("the target has no installed orchestration CLI; run the installer first")
+        trusted_python(target)
+        check_project_runtime(target)
         providers = enabled_providers(target)
         key = ensure_owner_key(target, state_root, cli_state)
         done = [p for p in providers if attest_provider(target, key, p, cli_state)]
