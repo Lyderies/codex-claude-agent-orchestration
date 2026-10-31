@@ -354,8 +354,77 @@ Claude to Claude and Codex to Codex.
   assignment context, binds the verifier, so the verifier's context stays the
   repository paths it read; any other verifier (a same-provider or native one, or one
   without a record) is refused. The check receipt has a `write_binding` with the
-  `bridge_run_id`, the `patch_digest` and `tested_tree_digest`, which stays null until
-  integration.
-- The primary does not apply the patch yet. Integration comes in a later slice and will
-  require `write_verification_state` to be `accepted`.
+  `bridge_run_id`, the `patch_digest` and `tested_tree_digest`, which stays null there:
+  that QA runs before integration, and the integration record carries the tested tree.
+- After an accepted verification the primary runs `learning-integrate-write
+  --project-root <root> --bridge-run-id <worker bridge run>`. Never apply a patch by
+  hand. The command is one serialized operation under the ledger writer lock:
+  - It first reconciles any `promoting` intent an interrupted attempt left (see below).
+  - It refuses unless the write result's ownership passed, `write_verification_state`
+    is `accepted` (`write_not_verified`), no `integrated` record exists
+    (`write_already_integrated`), no reconciliation needed the owner
+    (`write_integration_needs_owner`) and the calling host owns the run's
+    orchestration (`host_client_mismatch`, which records nothing).
+  - The primary checkout must be on a named branch at the patch's source commit
+    (`write_base_moved`), with no staged or unmerged change and every tracked file
+    equal to that commit, compared by hashing raw bytes (`write_primary_dirty`), and
+    nothing (untracked or ignored) at a path the patch adds (`write_primary_collision`).
+    Unrelated untracked files are allowed.
+  - No attribute-aware Git command runs anywhere: no `merge`, `checkout`, `switch` or
+    `worktree add` with a checkout, so no repository filter, attribute, `fsmonitor` or
+    merge option applies. A detached worktree is registered with `--no-checkout` in a
+    private directory under the system temp directory, outside the repository; the
+    source commit's raw blobs are written into it from `cat-file --batch`, with their
+    modes and without following symlinks; it is verified with `verify_tree_at_commit`,
+    and the patch, read only through the verified `write_result_artifact`, is applied.
+  - The project's operational checks (`.codex/orchestration/operational-checks.json`)
+    run in that worktree through the same sandboxed runner as
+    `learning-run-operational-checks`, whose configuration loader also uses hardened
+    Git and raw-byte comparison. Any unavailable or failed check refuses with
+    `write_checks_failed` and nothing is promoted.
+  - The commit is built with plumbing under a private `GIT_INDEX_FILE`
+    (`hash-object --no-filters`, `update-index --index-info`, `write-tree`,
+    `commit-tree --no-gpg-sign`) with the primary's configured `user.name` and
+    `user.email` (`write_identity_missing` without them); the message names the task's
+    assignment and family, the worker and verifier providers, the patch digest and the
+    bridge run. The worktree must equal that commit (`write_tested_tree_mismatch`); its
+    tree object ID is the tested tree digest.
+  - Promotion is by hand under Git's own locks. `HEAD.lock`, the branch's ref lock and
+    `index.lock` are created exclusively; any that exists refuses with
+    `write_promotion_busy`. Under them the branch, cleanliness and collisions are
+    verified again (`write_promotion_race`), the original bytes and modes of every
+    touched path are kept, and a `promoting` intent (candidate commit, source commit,
+    branch) is recorded. The new index is built in a private file in the Git directory
+    (`update-index --index-info` under that index file); the working-tree files are
+    written from the patch's raw bytes (exclusive create, atomic replace, unlink), each
+    journaled with its device and inode; the commit is written to the ref lock (every
+    byte, then fsync) and the reflog lines are appended; the private index is renamed
+    over `index` while `index.lock` stays held as a reservation; the ref lock is renamed
+    into place; and only then are the locks removed. Any failure before publication
+    removes only the entries the journal shows this operation installed (and only while
+    they are still the same file), restores replaced and deleted files, truncates the
+    reflogs, reinstalls the old index the same way and removes every lock it created
+    (`write_promotion_race` when something appeared at an added path,
+    `write_promotion_failed` otherwise), or `write_integration_needs_owner` if the
+    rollback could not complete. Termination signals are held from before the locks
+    until the record is written, and through cleanup.
+  - Every attempt appends ledger-only `write_integration` records (the write run,
+    bridge run, patch digest, source and new commit, branch, tested tree digest, check
+    report digest, `outcome` `promoting`, `integrated` or `refused`, and the refusal
+    `reason`). A cancelled attempt records `write_integration_interrupted`. The host
+    is authorised for the target run before anything is reconciled. An unfinished
+    `promoting` intent of a run this host owns is reconciled from the branch: at the
+    candidate commit it is `integrated`; anything else, including the branch back at the
+    source commit (a crash after publication followed by a reset looks the same), is
+    `write_integration_needs_owner` and blocks re-integration of that run.
+    `write_promotion_failed` is recorded only when the command itself completed the
+    rollback. The worktree is removed with `git worktree
+    remove --force` and `prune` on every terminal state.
+  - Every Git call disables hooks and the filesystem monitor, lazy fetch and
+    replacement objects, reads attributes from the empty tree (`--attr-source`, so Git
+    2.44 or later is required) with no global attributes file, and uses literal
+    pathspecs. Commands that write an index run with an empty private work tree and an
+    index whose timestamp is zero, so Git never re-reads a racily clean file through a
+    filter that `info/attributes` could still select. A refused integration is not
+    retried automatically: re-plan the task with fresh verification.
 

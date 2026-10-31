@@ -2198,7 +2198,7 @@ class LearningLedger:
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
             "host_run_profile", "probe_admission", "write_result", "write_plan",
-            "write_verification", "write_verifier_result",
+            "write_verification", "write_verifier_result", "write_integration",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -4641,6 +4641,196 @@ class LearningLedger:
             return "accepted"
         return "missing"
 
+    def write_integration_target(
+        self, project_id: str, bridge_run_id: str, *, host_client: str
+    ) -> dict[str, Any]:
+        """What integrating one write result needs, and the precondition that refuses it.
+
+        The write result must be recorded, and the calling host must own the
+        orchestration its run was opened in (`host_client_mismatch`
+        otherwise, before anything is recorded). The returned `refusal` is
+        `write_integration_needs_owner` when a reconciliation left that
+        reason, `write_result_not_passed` when ownership did not pass,
+        `write_not_verified` when `write_verification_state` is not
+        `accepted`, `write_already_integrated` when an `integrated`
+        `write_integration` exists, and otherwise None. The caller holds the
+        writer lock for the whole integration.
+        """
+
+        from .hosts import HostClientMismatch
+
+        if not isinstance(bridge_run_id, str) or re.fullmatch(
+            r"brg_[0-9a-f]{32}", bridge_run_id
+        ) is None:
+            raise LedgerError("bridge run id is invalid")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT content FROM records WHERE project_id=? AND record_type='write_result' "
+                "AND source='lifecycle' "
+                "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?",
+                (project_id, bridge_run_id),
+            ).fetchone()
+            if row is None:
+                raise LedgerError("write integration needs a recorded write result")
+            try:
+                record = validate_learning_record(json.loads(bytes(row["content"])))
+            except (ContractError, TypeError, ValueError) as exc:
+                raise LedgerError("write result record is invalid") from exc
+            binding = self._connection.execute(
+                "SELECT orchestration_id FROM host_run_bindings WHERE project_id=? AND run_id=?",
+                (project_id, record["run_id"]),
+            ).fetchone()
+            if binding is None:
+                raise LedgerError("write result run is unavailable")
+            # As `host_owner`: a run bound before orchestrations existed was
+            # only ever opened by the Codex host.
+            owner = "codex-host-v1"
+            if binding["orchestration_id"] is not None:
+                orchestration = self._connection.execute(
+                    "SELECT client_version FROM orchestrations "
+                    "WHERE project_id=? AND orchestration_id=?",
+                    (project_id, str(binding["orchestration_id"])),
+                ).fetchone()
+                owner = None if orchestration is None else str(orchestration["client_version"])
+            if owner is None or owner != host_client:
+                raise HostClientMismatch("host_client_mismatch")
+            assignment_id = None
+            family = None
+            worker_provider = None
+            verifier_providers: list[str] = []
+            refusal = None
+            if self._write_integration_needs_owner_locked(project_id, bridge_run_id):
+                refusal = "write_integration_needs_owner"
+            elif record["ownership"] != "passed":
+                refusal = "write_result_not_passed"
+            elif self.write_verification_state(project_id, bridge_run_id) != "accepted":
+                refusal = "write_not_verified"
+            elif self._write_integrated_locked(project_id, bridge_run_id):
+                refusal = "write_already_integrated"
+            else:
+                _, worker_provider, family = self._write_target_locked(
+                    project_id,
+                    {"bridge_run_id": bridge_run_id, "patch_digest": record["patch_digest"]},
+                )
+                start = self._connection.execute(
+                    "SELECT content FROM records WHERE project_id=? AND record_type='event' "
+                    "AND source='host' AND json_extract(CAST(content AS TEXT),'$.run_id')=? "
+                    "AND json_extract(CAST(content AS TEXT),'$.event_code')='subagent_started'",
+                    (project_id, record["run_id"]),
+                ).fetchone()
+                assignment_id = json.loads(bytes(start["content"]))["assignment_id"]
+                verifier_providers = sorted({
+                    verification["verifier_provider"]
+                    for verification in (
+                        validate_learning_record(json.loads(bytes(item["content"])))
+                        for item in self._connection.execute(
+                            "SELECT content FROM records WHERE project_id=? "
+                            "AND record_type='write_verification' AND source='lifecycle' "
+                            "AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?",
+                            (project_id, bridge_run_id),
+                        ).fetchall()
+                    )
+                    if verification["patch_digest"] == record["patch_digest"]
+                    and verification["verifier_provider"] != worker_provider
+                })
+        return {
+            "write_result": record,
+            "refusal": refusal,
+            "assignment_id": assignment_id,
+            "task_family": family,
+            "worker_provider": worker_provider,
+            "verifier_providers": verifier_providers,
+        }
+
+    def _write_integrations_locked(self, project_id: str, bridge_run_id: str | None) -> list:
+        query = (
+            "SELECT content FROM records WHERE project_id=? AND record_type='write_integration' "
+            "AND source='lifecycle'"
+        )
+        arguments: tuple = (project_id,)
+        if bridge_run_id is not None:
+            query += " AND json_extract(CAST(content AS TEXT),'$.bridge_run_id')=?"
+            arguments += (bridge_run_id,)
+        rows = self._connection.execute(query + " ORDER BY source_sequence", arguments).fetchall()
+        return [validate_learning_record(json.loads(bytes(row["content"]))) for row in rows]
+
+    def _write_integrated_locked(self, project_id: str, bridge_run_id: str) -> bool:
+        return any(
+            record["outcome"] == "integrated"
+            for record in self._write_integrations_locked(project_id, bridge_run_id)
+        )
+
+    def _write_integration_needs_owner_locked(self, project_id: str, bridge_run_id: str) -> bool:
+        return any(
+            record["reason"] == "write_integration_needs_owner"
+            for record in self._write_integrations_locked(project_id, bridge_run_id)
+        )
+
+    def unfinished_write_integrations(self, project_id: str) -> list[dict[str, Any]]:
+        """Every `promoting` intent that no later record of its bridge run finished."""
+
+        with self._lock:
+            latest: dict[str, dict[str, Any]] = {}
+            for record in self._write_integrations_locked(project_id, None):
+                latest[record["bridge_run_id"]] = record
+        return [record for record in latest.values() if record["outcome"] == "promoting"]
+
+    def record_write_integration(
+        self,
+        project_id: str,
+        *,
+        base: dict[str, Any],
+        outcome: str,
+        reason: str | None,
+        new_commit: str | None,
+        tested_tree_digest: str | None,
+        checks_receipt_digest: str | None,
+        branch: str | None,
+    ) -> dict[str, Any]:
+        """Append one `write_integration` for the write result (or intent) `base` names.
+
+        Refused attempts may repeat. At most one `integrated` record exists
+        per write result, a `promoting` intent needs no unfinished intent and
+        no integration before it, and `integrated` needs no earlier one.
+        """
+
+        timestamp = self._clock_ms()
+        material = {
+            "schema_version": 1,
+            "record_type": "write_integration",
+            "run_id": base["run_id"],
+            "bridge_run_id": base["bridge_run_id"],
+            "patch_digest": base["patch_digest"],
+            "source_commit": base["source_commit"],
+            "new_commit": new_commit,
+            "tested_tree_digest": tested_tree_digest,
+            "checks_receipt_digest": checks_receipt_digest,
+            "branch": branch,
+            "outcome": outcome,
+            "reason": reason,
+            "observed_at_ms": timestamp,
+        }
+        try:
+            record = validate_learning_record(
+                {**material, "record_id": f"write_integration:{content_digest(material)}"}
+            )
+        except ContractError as exc:
+            raise LedgerError("write integration record is invalid") from exc
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            earlier = self._write_integrations_locked(project_id, record["bridge_run_id"])
+            if outcome in {"promoting", "integrated"} and any(
+                item["outcome"] == "integrated" for item in earlier
+            ):
+                raise LedgerError("write result is already integrated")
+            if outcome == "promoting" and earlier and earlier[-1]["outcome"] == "promoting":
+                raise LedgerError("write integration has an unfinished promotion")
+            self._append_checked_locked(
+                project_id, record, producer="lifecycle", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return record
+
     def launch_recheck(
         self, project_id: str, *, run_handle: str, identity: dict[str, Any]
     ) -> str | None:
@@ -5971,8 +6161,10 @@ class LearningLedger:
     ) -> dict[str, Any] | None:
         """The patch a check receipt binds when the checked run is a write child.
 
-        `tested_tree_digest` is the tree the checks ran on. Until integration
-        runs them in a worktree with the patch applied (G3 S1d) it is null.
+        `tested_tree_digest` stays null here: this QA runs before integration.
+        Integration (`learning-integrate-write`) runs the checks again on the
+        patched tree and records that tree's digest in its own
+        `write_integration` record, which binds the same bridge run and patch.
         """
 
         row = self._connection.execute(

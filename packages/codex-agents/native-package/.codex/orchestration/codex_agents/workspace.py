@@ -93,13 +93,22 @@ _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _O_CLOEXEC
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _O_CLOEXEC
 # Global options that keep project-side Git machinery out of every plumbing
 # call: no lazy fetch from a promisor remote, no replacement objects, no
-# hooks, no filesystem monitor.
+# hooks, no filesystem monitor and no global attributes file.
+# `git_hardening(root)` adds `--attr-source=<empty tree>`, so the repository's
+# `.gitattributes` cannot select a filter, eol conversion or diff driver.
 _GIT_HARDENING = (
     "--no-lazy-fetch",
     "--no-replace-objects",
     "-c", "core.hooksPath=/dev/null",
     "-c", "core.fsmonitor=false",
+    "-c", "core.attributesFile=/dev/null",
 )
+# The empty tree of each object format; Git knows it without storing it.
+EMPTY_TREES = {
+    "sha1": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+    "sha256": "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",
+}
+_OBJECT_FORMATS: dict[str, str] = {}
 _PATCH_KEYS = {"schema_version", "source_commit", "manifest_digest", "changes"}
 _CHANGE_KEYS = {"path", "op", "old_blob", "old_mode", "new_sha256", "mode", "content_b64"}
 _GIT_MODES = {REGULAR_MODE, EXECUTABLE_MODE}
@@ -313,7 +322,7 @@ _LAZY_FETCH_SUPPORTED: bool | None = None
 
 
 def _require_trusted_git(root: Path) -> None:
-    """Refuse a Git without `--no-lazy-fetch`, and any partial clone, before reading objects.
+    """Refuse a Git without `--no-lazy-fetch` or `--attr-source`, and any partial clone.
 
     A partial clone resolves a missing object by fetching it through the
     repository's remote configuration (`core.sshCommand`, URLs, helpers),
@@ -322,7 +331,10 @@ def _require_trusted_git(root: Path) -> None:
 
     global _LAZY_FETCH_SUPPORTED
     if _LAZY_FETCH_SUPPORTED is None:
-        probe = bridge._git(root, "--no-lazy-fetch", "version")
+        # `--no-lazy-fetch` needs Git 2.44 and `--attr-source` Git 2.40.
+        probe = bridge._git(
+            root, "--no-lazy-fetch", f"--attr-source={EMPTY_TREES['sha1']}", "version"
+        )
         _LAZY_FETCH_SUPPORTED = probe.returncode == 0
     if not _LAZY_FETCH_SUPPORTED:
         raise WorkspaceRefused("git_unsupported")
@@ -338,8 +350,30 @@ def _require_trusted_git(root: Path) -> None:
         raise WorkspaceRefused("git_unsupported")
 
 
+def git_hardening(root: Path | str) -> tuple[str, ...]:
+    """The hardening options for one repository, with attributes read from the empty tree.
+
+    The object format is read once per root with `rev-parse`, which consults
+    no attributes. A root that is not a repository refuses with
+    `repository_root_invalid` and an unknown format with
+    `object_format_unsupported`; no format is ever assumed.
+    """
+
+    key = os.path.realpath(root)
+    object_format = _OBJECT_FORMATS.get(key)
+    if object_format is None:
+        found = bridge._git(Path(key), *_GIT_HARDENING, "rev-parse", "--show-object-format", text=True)
+        if found.returncode != 0:
+            raise WorkspaceRefused("repository_root_invalid")
+        object_format = found.stdout.strip()
+        if object_format not in EMPTY_TREES:
+            raise WorkspaceRefused("object_format_unsupported")
+        _OBJECT_FORMATS[key] = object_format
+    return (*_GIT_HARDENING, f"--attr-source={EMPTY_TREES[object_format]}")
+
+
 def _plumbing(root: Path, *arguments: str, text: bool = False):
-    return bridge._git(root, *_GIT_HARDENING, *arguments, text=text)
+    return bridge._git(root, *git_hardening(root), *arguments, text=text)
 
 
 def _git_blob_id(content: bytes, object_format: str) -> str:
