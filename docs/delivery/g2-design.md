@@ -421,10 +421,22 @@ safety comes from redundant layers.
   parent or `/` as its workspace, and none adds `~` or `~/.codex` as a writable root with
   `--add-dir`. Such a session could write `~/.codex` (the rule and its copy) and every
   tool installed under the home folder (a Python under `~/.pyenv`, Claude Code under
-  `~/.local`, a Homebrew prefix the user owns), which the rule then runs. Home-installed
-  tools stay supported; that workspace restriction is what makes them safe. The wizard's
-  consent screen, the README and the Codex skill state it in those words. Sessions opened
-  on a project, or on a folder between the project and the home folder, are supported.
+  `~/.local`), which the rule then runs. The wizard's consent screen, the README and the
+  Codex skill state it in those words. Sessions opened on a project, or on any other
+  folder, are supported, so a program the rule's commands run must not sit where such a
+  session could reach it.
+- **Trusted installation folders.** The interpreter the rule names (and its standard
+  library), every provider client and git must resolve under one of
+  `host_paths.TRUSTED_INSTALL_ROOTS` (`/usr/bin`, `/bin`, `/usr/libexec`, `/usr/local`,
+  `/opt/homebrew`, Linuxbrew's default prefix, `/Library/Frameworks/Python.framework`,
+  `/Library/Developer/CommandLineTools`, `/Applications`, `/nix/store`) or in a hidden
+  top-level folder of the account's home folder (`~/.local`, `~/.pyenv`, `~/.codex`),
+  besides the existing checks (canonical, owned by the user or root, writable by no one
+  else, outside the project and temporary directories, never the macOS `/usr/bin/python3`
+  shim). A Linux system Python's prefix, `/usr` itself, is accepted. An allowlist rather
+  than "outside the home folder", because a sibling such as `~/Work/tools` or
+  `/srv/work/tools` could be part of a permitted session's workspace. The list is one
+  constant that the owner tools import too, so both sides apply the same rule.
 - **Protected rule target.** The S5b rule named `<project>/.codex/orchestration/cli.py`.
   A session opened on a parent folder, or one where `.codex` is absent, can rewrite that
   file, and the user-layer rule would then run it outside the sandbox.
@@ -479,10 +491,10 @@ safety comes from redundant layers.
   - **Only the real `~/.codex`.** A session opened at the home folder has `~/.codex` as
     its workspace root's `.codex`, which Codex keeps read-only, and a session opened on a
     project cannot write it at all; the rules directory sits there too, so the copy adds
-    no new exposure. A `CODEX_HOME` elsewhere, or a `~/.codex` that is a symlink, may
-    resolve into a folder a home-folder session can write, so `install-codex-rule`
-    refuses both with a plain reason, as it refuses a home folder reached through a
-    symlink and a `~/.codex` another user owns or can change.
+    no new exposure. The home folder is the account's, from the system account database
+    (`pwd`), never HOME alone: a HOME or `CODEX_HOME` that disagrees with it, a `~/.codex`
+    that is a symlink, a home folder reached through a symlink and a `~/.codex` another
+    user owns or can change are all refused with a plain reason.
 - **Real git, no xcrun shim.** On macOS `/usr/bin/git` is an xcrun shim that consults a
   lookup cache under `$TMPDIR`, which the sandbox can write. `git_executable()` resolves a
   real binary: the Command Line Tools git, then the active developer directory's (from
@@ -503,7 +515,10 @@ safety comes from redundant layers.
   deletes it; every ledger start clamps each kept result's expiry to its outcome's
   ingestion time plus seven days (which shortens results an earlier version kept for 90)
   and deletes what is past it; the persistent collector runs the same sweep every minute;
-  and a read past the limit refuses even before a sweep. Project deletion removes it as
+  and a read past the limit refuses even before a sweep. A registration is removed only
+  after its file is gone, so a failed deletion stays registered (and expired, so never
+  read) and is retried at the next sweep. Each collector request must arrive whole within
+  five seconds, so a slow sender cannot postpone a sweep. Project deletion removes it as
   before. Only the outcome's digests and closed metadata stay.
 - **Codex children are bridged.** A native Codex child shares the Codex primary's session
   and therefore its command rule. Routing now dispatches every Codex child through the
@@ -542,7 +557,9 @@ safety comes from redundant layers.
   - The threat model above is an instruction to the owner, not something the runtime can
     detect: a session opened on the home folder, its parent or `/`, or one given `~` or
     `~/.codex` with `--add-dir`, can change the copy, the rules and home-installed tools
-    that the rule runs.
+    that the rule runs. A session opened on a trusted installation folder itself (say
+    `/opt/homebrew` or `~/.pyenv`) could change the tools there too; nobody opens one
+    there, and no check can tell.
   - A Codex primary can still spawn a native Codex child with its own collaboration tool,
     ignoring the route; that child shares the primary's session and rule. Routing never
     asks for one and the Codex skill forbids it, but nothing at the spawn boundary stops

@@ -16,11 +16,14 @@ from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
-from codex_agents import bridge, host_commands, learning_store
+from codex_agents import bridge, host_commands, host_paths, learning_store
 from codex_agents.host_commands import HostCommandError, interpreter_path
 from codex_agents.host_paths import (
     PYTHON_ISOLATION_FLAGS,
+    TRUSTED_INSTALL_ROOTS,
     HostPathError,
+    executable_location_problem,
+    install_location_problem,
     private_directory,
     remove_private_directory,
     temp_roots,
@@ -109,6 +112,13 @@ class TrustedLocationTests(unittest.TestCase):
         self.bin = self.base / "bin"
         self.bin.mkdir(mode=0o755)
         os.chmod(self.bin, 0o755)
+        # The stand-in interpreter's folder counts as an installation folder here.
+        roots = mock.patch.object(
+            host_paths, "TRUSTED_INSTALL_ROOTS",
+            (*host_paths.TRUSTED_INSTALL_ROOTS, os.path.realpath(self.bin)),
+        )
+        roots.start()
+        self.addCleanup(roots.stop)
         self.python = self.bin / "python3"
         self.python.write_text("#!/bin/sh\n")
         self.python.chmod(0o755)
@@ -199,6 +209,60 @@ class TrustedLocationTests(unittest.TestCase):
                 mock.patch.object(sys, "prefix", sys.base_prefix):
             with self.assertRaisesRegex(HostCommandError, "cannot be trusted"):
                 interpreter_path()
+
+
+class InstallRootTests(unittest.TestCase):
+    """Programs the rule's commands run come only from trusted installation folders."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(os.path.realpath(self.temporary.name))
+        self.home = self.base / "home"
+        patcher = mock.patch.object(host_paths, "account_home", lambda: self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def program(self, *parts: str) -> Path:
+        path = self.base.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        return path
+
+    def test_a_sibling_install_in_a_workspace_is_refused(self) -> None:
+        # A session opened on ~/Work (or /srv/work) can change ~/Work/tools.
+        for sibling in (
+            self.program("home", "Work", "tools", "python3"),
+            self.program("srv", "work", "tools", "python3"),
+        ):
+            with self.subTest(path=sibling):
+                self.assertIn("trusted installation folder", install_location_problem(sibling))
+                self.assertIn(
+                    "trusted installation folder", executable_location_problem(sibling, [])
+                )
+        sibling = self.program("home", "Work", "tools", "python3")
+        with mock.patch.object(host_commands, "temp_roots", lambda: set()), \
+                mock.patch.object(sys, "executable", str(sibling)), \
+                mock.patch.object(sys, "prefix", sys.base_prefix):
+            with self.assertRaisesRegex(HostCommandError, "trusted installation folder"):
+                interpreter_path()
+
+    def test_hidden_home_folders_and_the_listed_roots_are_accepted(self) -> None:
+        for accepted in (
+            self.program("home", ".local", "bin", "claude"),
+            self.program("home", ".pyenv", "versions", "3.12.9", "bin", "python3.12"),
+            self.program("home", ".codex", "packages", "codex"),
+        ):
+            with self.subTest(path=accepted):
+                self.assertIsNone(install_location_problem(accepted))
+                self.assertIsNone(executable_location_problem(accepted, []))
+        self.assertIn("home folder", install_location_problem(self.home))
+        for root in ("/usr/bin", "/opt/homebrew", "/Library/Developer/CommandLineTools",
+                     "/nix/store"):
+            self.assertIn(root, TRUSTED_INSTALL_ROOTS)
+            self.assertIsNone(install_location_problem(Path(root) / "tool"))
+        self.assertIsNotNone(install_location_problem(Path("/srv/tools/python3")))
 
 
 class PythonLaunchTests(unittest.TestCase):

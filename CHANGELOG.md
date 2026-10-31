@@ -13,8 +13,14 @@
     (configuration and schemas included). Setup refuses a project whose
     `.codex/orchestration` holds anything else (a planted `socket.py`, a package, bytecode,
     an extension module), and the copy refuses an extra entry of its own before its folder
-    is importable. Only the real `~/.codex` is supported: a `CODEX_HOME` elsewhere or a
-    symlinked `~/.codex` is refused, and `host-command` reports it as `unsupported`. The copy serves only its bound project, only
+    is importable. Only the account's real `~/.codex` is supported (the home folder comes
+    from the system account database): a HOME or `CODEX_HOME` that disagrees with it or a
+    symlinked `~/.codex` is refused, and `host-command` reports it as `unsupported`.
+  - The interpreter the rule names, provider clients and git must come from a trusted
+    installation folder (`host_paths.TRUSTED_INSTALL_ROOTS`: system folders, Homebrew,
+    python.org, Xcode and its Command Line Tools, Nix) or a hidden top-level folder of the
+    home folder such as `~/.local` or `~/.pyenv`; a sibling install such as `~/Work/tools`
+    is refused. The copy serves only its bound project, only
     the primary-host commands, and only while the project's installed files still match
     it. A project without an install manifest gets no rule. `host-command` reports
     `installed` only when rule, copy and project all match (earlier rules are `stale`),
@@ -41,7 +47,9 @@
   - A worker result kept for its verifier is deleted when its orchestration closes, and
     seven days after its outcome at most: each ledger start clamps older expiries (90 days
     before) and sweeps, the collector sweeps every minute, and an expired result is never
-    read. Only digests stay.
+    read. A failed deletion stays registered and is retried, and a collector request must
+    arrive within five seconds, so a slow sender cannot hold off the sweep. Only digests
+    stay.
   - Every Codex child is bridged (`codex exec --ignore-rules`, read-only), from a Codex
     primary too, so no child shares the primary's command rule. Codex routes that need
     write access are not eligible, and the native-only legacy fallback is refused for

@@ -22,7 +22,7 @@ from typing import Any
 
 from .contracts import ContractError
 from .git_plumbing import XCRUN_NO_CACHE
-from .host_paths import temp_roots, trusted_location_problem
+from .host_paths import executable_location_problem, temp_roots
 from .learning_contracts import (
     CLAUDE_AUTH_METHODS,
     CLAUDE_OVERAGE_DISABLED_REASONS,
@@ -210,10 +210,10 @@ def resolve_client(name: str, *, untrusted: Iterable[Path] = ()) -> tuple[str, s
 
     A client runs outside the Codex sandbox, so before anything executes it its
     resolved file must pass the same location checks as the interpreter: no
-    symlink left on its path, no component another user could change, and not
-    inside a temporary directory or an `untrusted` root (the project). A link
-    on the search path that points into a writable checkout is refused, never
-    run and hashed.
+    symlink left on its path, no component another user could change, not
+    inside a temporary directory or an `untrusted` root (the project), and not
+    in an ordinary folder under the home folder. A link on the search path that
+    points into a writable checkout is refused, never run and hashed.
     """
 
     found = shutil.which(name, path=trusted_search_path())
@@ -222,7 +222,7 @@ def resolve_client(name: str, *, untrusted: Iterable[Path] = ()) -> tuple[str, s
             f"{name} client is unavailable on the trusted path", "client_unavailable"
         )
     real = os.path.realpath(found)
-    if trusted_location_problem(Path(real), [*temp_roots(), *untrusted]) is not None:
+    if executable_location_problem(Path(real), [*temp_roots(), *untrusted]) is not None:
         raise ObservationError(
             f"{name} client is not in a trusted location", "client_unavailable"
         )

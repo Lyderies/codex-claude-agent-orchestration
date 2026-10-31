@@ -205,11 +205,15 @@ class RuleTests(unittest.TestCase):
         self.no_temp_roots.start()
         self.addCleanup(self.no_temp_roots.stop)
         self.project = self.make_project("project")
-        # The rule and its copy live only in the real ~/.codex of this HOME.
-        self.home = self.base / "home"
+        # The rule and its copy live only in the account's real ~/.codex; here the
+        # account database names this test's home.
+        self.home = Path(os.path.realpath(self.base)) / "home"
         self.home.mkdir()
         self.codex_home = self.home / ".codex"
         self.environ = {"HOME": str(self.home)}
+        account = mock.patch.object(host_commands, "account_home", lambda: self.home)
+        account.start()
+        self.addCleanup(account.stop)
 
     def make_project(self, name: str) -> Path:
         return stand_in_project(self.base / name)
@@ -288,8 +292,8 @@ class RuleTests(unittest.TestCase):
 
     @NEEDS_TRUSTED_PYTHON
     def test_the_interpreter_is_the_running_one_unresolved(self) -> None:
-        self.assertEqual(BASE_PYTHON, argv_prefix(self.project)[0])
-        self.assertIn(_quoted(BASE_PYTHON), render_rule(self.project))
+        self.assertEqual(BASE_PYTHON, argv_prefix(self.project, environ=self.environ)[0])
+        self.assertIn(_quoted(BASE_PYTHON), render_rule(self.project, environ=self.environ))
 
     def test_temporary_projects_never_get_a_rule(self) -> None:
         self.no_temp_roots.stop()
@@ -453,8 +457,8 @@ class RuleTests(unittest.TestCase):
     def test_codex_loads_the_rule_and_its_self_tests(self) -> None:
         project = self.make_project('proj "q" \\ s;x')
         rules = self.base / "check.rules"
-        rules.write_text(render_rule(project, PYTHON))
-        prefix = argv_prefix(project, PYTHON)
+        rules.write_text(render_rule(project, PYTHON, self.environ))
+        prefix = argv_prefix(project, PYTHON, self.environ)
 
         def check(*argv: str) -> dict:
             completed = subprocess.run(
@@ -496,11 +500,15 @@ class ProtectedCopyTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.project = install_package(self.base / "project")
-        # The rule and its copy live only in the real ~/.codex of this HOME.
-        self.home = self.base / "home"
+        # The rule and its copy live only in the account's real ~/.codex; here the
+        # account database names this test's home.
+        self.home = Path(os.path.realpath(self.base)) / "home"
         self.home.mkdir()
         self.codex_home = self.home / ".codex"
         self.environ = {"HOME": str(self.home)}
+        account = mock.patch.object(host_commands, "account_home", lambda: self.home)
+        account.start()
+        self.addCleanup(account.stop)
 
     def install(self, **kwargs) -> dict:
         return install_rule(self.project, self.environ, PYTHON, **kwargs)
@@ -727,11 +735,28 @@ class ProtectedCopyTests(unittest.TestCase):
         self.codex_home.chmod(0o700)
         self.assertEqual("created", self.install()["codex_rule"])
 
+    def test_a_home_other_than_the_accounts_is_refused(self) -> None:
+        # HOME is the caller's; the account database decides where ~/.codex is.
+        other = self.base / "other-home"
+        other.mkdir()
+        environ = {"HOME": str(os.path.realpath(other))}
+        for attempt in (
+            lambda: install_rule(self.project, environ, PYTHON),
+            lambda: rule_status(self.project, environ, PYTHON),
+        ):
+            with self.assertRaisesRegex(CodexHomeUnsupported, "not this account's home folder"):
+                attempt()
+        self.assertEqual([], os.listdir(other))
+        self.assertFalse(self.codex_home.exists())
+        # Without HOME, the account's home is used.
+        self.assertEqual("created", install_rule(self.project, {}, PYTHON)["codex_rule"])
+
     def test_copies_in_the_project_or_temporary_directories_are_refused(self) -> None:
         # A home folder inside the project would put ~/.codex there too.
-        inside = self.project / "home"
+        inside = Path(os.path.realpath(self.project)) / "home"
         inside.mkdir()
-        with self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
+        with mock.patch.object(host_commands, "account_home", lambda: inside), \
+                self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
             install_rule(self.project, {"HOME": str(inside)}, PYTHON)
         with mock.patch.object(host_commands, "temp_roots", lambda: {self.codex_home}):
             with self.assertRaisesRegex(HostCommandError, "project or a temporary directory"):
@@ -811,20 +836,33 @@ class HostCommandCliTests(unittest.TestCase):
         self.home.mkdir()
         self.codex_home = self.home / ".codex"
         self.environ = {"HOME": str(self.home)}
+        # Setup commands run in this process, where the account database can be
+        # pointed at this test's home; the copy runs as its own process.
+        account = mock.patch.object(host_commands, "account_home", lambda: self.home)
+        account.start()
+        self.addCleanup(account.stop)
 
     def run_cli(
         self, *arguments: str, expected: int = 0, cli_path: Path | None = None,
         own_project: bool = True, env: dict | None = None,
     ) -> dict:
         project = ["--project-root", str(self.project)] if own_project else []
+        environment = {
+            **without_codex_home(os.environ), **self.environ, **(env or {}),
+            "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+        }
+        if cli_path is None:
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "argv", ["cli.py", *arguments, *project]), \
+                    mock.patch.dict(os.environ, environment, clear=True), \
+                    contextlib.redirect_stdout(stdout):
+                code = cli.main()
+            self.assertEqual(expected, code, stdout.getvalue())
+            return json.loads(stdout.getvalue())
         completed = subprocess.run(
-            [sys.executable, *PYTHON_FLAGS, str(cli_path or ORCHESTRATION_ROOT / "cli.py"),
-             *arguments, *project],
+            [sys.executable, *PYTHON_FLAGS, str(cli_path), *arguments, *project],
             capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
-            env={
-                **without_codex_home(os.environ), **self.environ, **(env or {}),
-                "XDG_STATE_HOME": str(self.home / ".local" / "state"),
-            },
+            env=environment,
         )
         self.assertEqual(expected, completed.returncode, completed.stderr or completed.stdout)
         return json.loads(completed.stdout)
@@ -943,6 +981,15 @@ class HostCommandCliTests(unittest.TestCase):
         self.assertIn("holds files it should not", refused["error"])
         self.assertFalse(marker.exists())
         self.assertEqual("stale", self.run_cli("host-command", expected=1)["codex_rule"])
+
+    def test_host_command_reports_an_overridden_home(self) -> None:
+        other = self.base / "other-home"
+        other.mkdir()
+        report = self.run_cli(
+            "host-command", expected=1, env={"HOME": os.path.realpath(other)}
+        )
+        self.assertEqual("unsupported", report["codex_rule"])
+        self.assertIn("not this account's home folder", report["reason"])
 
     def test_host_command_reports_an_unsupported_codex_home(self) -> None:
         elsewhere = self.base / "codex-config"

@@ -17,7 +17,7 @@ from unittest import mock
 from tests.support import BUNDLE_ROOT, TEMP_ROOT
 from tests.learning_support import assignment, routing_fields
 
-from codex_agents import git_plumbing
+from codex_agents import git_plumbing, host_paths
 from codex_agents.bridge import BridgeRefused, export_committed_paths
 from codex_agents.contracts import ContractError
 from codex_agents.host_commands import PYTHON_FLAGS
@@ -360,6 +360,13 @@ class GitExecutableTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
+        # The stand-in binaries' folder counts as an installation folder here.
+        roots = mock.patch.object(
+            host_paths, "TRUSTED_INSTALL_ROOTS",
+            (*host_paths.TRUSTED_INSTALL_ROOTS, os.path.realpath(self.base)),
+        )
+        roots.start()
+        self.addCleanup(roots.stop)
 
     def fake_git(self, name: str) -> str:
         path = self.base / name / "git"
@@ -373,7 +380,7 @@ class GitExecutableTests(unittest.TestCase):
         if executable is None:
             self.skipTest("no trusted git binary on this machine")
         self.assertEqual(os.path.realpath(executable), executable)
-        self.assertIsNone(git_plumbing.trusted_location_problem(
+        self.assertIsNone(host_paths.executable_location_problem(
             Path(executable), list(git_plumbing.temp_roots())
         ))
         if sys.platform == "darwin":
@@ -402,6 +409,11 @@ class GitExecutableTests(unittest.TestCase):
         if sys.platform == "darwin":
             with mock.patch.object(git_plumbing, "git_candidates", lambda: ("/usr/bin/git",)):
                 self.assertIsNone(git_plumbing.git_executable())
+        # Outside every trusted installation folder (a sibling of a workspace), never.
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (trusted,)), \
+                mock.patch.object(git_plumbing, "temp_roots", lambda: set()), \
+                mock.patch.object(host_paths, "TRUSTED_INSTALL_ROOTS", ("/usr/bin",)):
+            self.assertIsNone(git_plumbing.git_executable())
         # A git inside the repository it would inspect is never run.
         with mock.patch.object(git_plumbing, "git_candidates", lambda: (trusted,)), \
                 mock.patch.object(git_plumbing, "temp_roots", lambda: set()):

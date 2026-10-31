@@ -18,7 +18,7 @@ from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
-from codex_agents import providers
+from codex_agents import host_paths, providers
 from codex_agents.contracts import ContractError
 from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_contracts import (
@@ -352,14 +352,22 @@ class ProviderObservationTests(unittest.TestCase):
                         tmpdir=root, digest_key=KEY, observed_at_ms=NOW, environ={},
                     )
                 self.assertEqual("client_unavailable", caught.exception.reason_code)
-                # Outside any temporary root, the project still refuses it.
+                # Outside any temporary root, the project still refuses it, and so
+                # does a folder that is no trusted installation folder (a sibling
+                # of a workspace, such as ~/Work/tools or /srv/work/tools).
                 with mock.patch.object(providers, "temp_roots", lambda: set()):
                     with self.assertRaisesRegex(ContractError, "trusted location"):
                         providers.resolve_client("claude", untrusted=[root / "project"])
-                    self.assertEqual(
-                        os.path.realpath(target),
-                        providers.resolve_client("claude", untrusted=[])[0],
-                    )
+                    with self.assertRaisesRegex(ContractError, "trusted location"):
+                        providers.resolve_client("claude", untrusted=[])
+                    with mock.patch.object(
+                        host_paths, "TRUSTED_INSTALL_ROOTS",
+                        (*host_paths.TRUSTED_INSTALL_ROOTS, os.path.realpath(checkout)),
+                    ):
+                        self.assertEqual(
+                            os.path.realpath(target),
+                            providers.resolve_client("claude", untrusted=[])[0],
+                        )
             self.assertFalse(marker.exists())
 
     def test_claude_output_is_bounded_while_streaming(self) -> None:

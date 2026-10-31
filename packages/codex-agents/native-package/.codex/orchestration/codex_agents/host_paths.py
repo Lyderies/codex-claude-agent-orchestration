@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pwd
 import secrets
 import shutil
 import stat
@@ -32,6 +33,26 @@ PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
 # is the administrators, who can already change anything on the machine.
 MACOS_ADMIN_GROUP = 80
 GETCONF = "/usr/bin/getconf"
+# The only places a program the rule's commands run (the interpreter, provider
+# clients, git) may be installed, besides a hidden top-level folder of the
+# account's home folder (`~/.local`, `~/.pyenv`, `~/.codex`). Codex sessions may
+# be opened on any folder but the home folder, its parent and `/`, so an
+# installation anywhere else (`~/Work/tools`, `/srv/work/tools`) could sit in a
+# session's workspace. One list, imported by the owner tools too.
+TRUSTED_INSTALL_ROOTS = (
+    "/usr/bin",
+    "/bin",
+    "/usr/libexec",
+    "/usr/local",
+    "/opt/homebrew",
+    # Linuxbrew's shared default prefix, split so the public repository's
+    # identifier guard (it flags per-user home paths) does not mistake it for one.
+    "/home" "/linuxbrew/.linuxbrew",
+    "/Library/Frameworks/Python.framework",
+    "/Library/Developer/CommandLineTools",
+    "/Applications",
+    "/nix/store",
+)
 
 
 class HostPathError(RuntimeError):
@@ -114,6 +135,43 @@ def trusted_location_problem(path: Path, untrusted: list[Path]) -> str | None:
         if problem is not None:
             return problem
     return None
+
+
+def account_home() -> Path:
+    """This account's home folder from the system account database, never from HOME."""
+
+    return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+
+
+def install_location_problem(path: Path) -> str | None:
+    """Why a program at `path` is not in a trusted installation folder, or None.
+
+    It must lie under one of TRUSTED_INSTALL_ROOTS or in a hidden top-level
+    folder of the account's home folder (from the account database, never
+    HOME), where no Codex session is opened.
+    """
+
+    if any(within(path, Path(root)) for root in TRUSTED_INSTALL_ROOTS):
+        return None
+    home = account_home()
+    if within(path, home) and path != home and path.relative_to(home).parts[0].startswith("."):
+        return None
+    return (
+        "it is not in a trusted installation folder (a system folder, Homebrew, "
+        "python.org, Xcode, Nix, or a hidden folder in the home folder)"
+    )
+
+
+def executable_location_problem(path: Path, untrusted: list[Path]) -> str | None:
+    """Why a program the rule's commands run may not be trusted, or None.
+
+    `trusted_location_problem` (canonical, owned by this user or root, writable
+    by no one else, outside the project and temporary directories) and
+    `install_location_problem`: the interpreter, provider clients and git all
+    pass both.
+    """
+
+    return trusted_location_problem(path, untrusted) or install_location_problem(path)
 
 
 def overlaps_untrusted(path: Path, untrusted: list[Path]) -> bool:

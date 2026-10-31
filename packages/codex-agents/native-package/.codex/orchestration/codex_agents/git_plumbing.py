@@ -31,7 +31,7 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
-from .host_paths import temp_roots, trusted_location_problem, within
+from .host_paths import executable_location_problem, temp_roots, within
 
 # Real git binaries, in order of preference. On macOS every developer tool in
 # /usr/bin (git, python3, make, ...) is an xcrun shim, so /usr/bin is never used
@@ -106,8 +106,9 @@ def git_executable(untrusted: Iterable[Path] = ()) -> str | None:
 
     Each candidate is pinned as its realpath and must be a regular executable
     file outside every temporary directory and every `untrusted` root (callers
-    pass the repository they inspect), with no symlink on its path and no
-    component another user could change. On macOS the xcrun shim in /usr/bin is
+    pass the repository they inspect) and every ordinary folder under the home
+    folder, with no symlink on its path and no component another user could
+    change. On macOS the xcrun shim in /usr/bin is
     never accepted. None when no candidate passes; callers then fail closed.
     """
 
@@ -122,7 +123,7 @@ def git_executable(untrusted: Iterable[Path] = ()) -> str | None:
             continue
         if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
             continue
-        if trusted_location_problem(Path(real), untrusted) is None:
+        if executable_location_problem(Path(real), untrusted) is None:
             return real
     return None
 

@@ -48,6 +48,8 @@ from pathlib import Path, PurePosixPath
 from .host_paths import (
     PYTHON_ISOLATION_FLAGS,
     HostPathError,
+    account_home,
+    install_location_problem,
     open_private_directories,
     remove_tree_at,
     temp_roots,
@@ -217,15 +219,22 @@ def interpreter_path(
         # cache under $TMPDIR; the real interpreter it would run is elsewhere.
         raise HostCommandError("the Python interpreter cannot be trusted: it is an xcrun shim")
     untrusted = [*temp_roots(), *([project_root] if project_root is not None else [])]
-    for path in (Path(value), Path(os.path.realpath(sys.base_prefix))):
+    prefix = Path(os.path.realpath(sys.base_prefix))
+    for path in (Path(value), prefix):
         problem = trusted_location_problem(path, untrusted)
+        # The interpreter and its standard library come from a trusted
+        # installation folder; a Linux system Python's prefix is /usr itself.
+        if problem is None and not (path == prefix and prefix == Path("/usr")):
+            problem = install_location_problem(path)
         if problem is not None:
             raise HostCommandError(f"the Python interpreter cannot be trusted: {problem}")
     return value
 
 
 def _home_folder(environ: Mapping[str, str]) -> Path:
-    value = environ.get("HOME") if "HOME" in environ else str(Path.home())
+    """The home folder the environment names (HOME), or the account's own."""
+
+    value = environ.get("HOME") if "HOME" in environ else str(account_home())
     if not value or not os.path.isabs(value):
         raise CodexHomeUnsupported("the home folder is not an absolute path")
     return Path(os.path.normpath(value))
@@ -251,9 +260,10 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
     workspace's own `.codex`), and a session opened inside a project cannot
     reach it. A `CODEX_HOME` elsewhere, or a `~/.codex` that is a symlink, may
     resolve into a folder a home-folder session can write, so neither is
-    supported. The home folder must be canonical, with no symlink and no
-    component another user could change, and `~/.codex`, when present, a real
-    directory of this user's that no one else can write.
+    supported, and neither is a HOME other than the account's home folder in
+    the system account database. The home folder must be canonical, with no
+    symlink and no component another user could change, and `~/.codex`, when
+    present, a real directory of this user's that no one else can write.
     """
 
     environ = os.environ if environ is None else environ
@@ -269,6 +279,11 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
         raise CodexHomeUnsupported(
             "the home folder's path passes through a symbolic link; the Codex rule "
             "needs a home folder at its real path"
+        )
+    if home != account_home():
+        raise CodexHomeUnsupported(
+            "HOME is not this account's home folder; the Codex rule and its protected "
+            "copy work only in the account's own ~/.codex"
         )
     problem = trusted_location_problem(home, [])
     if problem is not None:
@@ -1037,8 +1052,9 @@ def remove_rule(
 
     The project need not still hold an installed package (removal may come
     after the package files are gone, or the project may sit in a temporary
-    folder), so only its resolved path is used. It looks in `~/.codex` and,
-    for rules an earlier version wrote, in a different `CODEX_HOME`. Symlinks
+    folder), so only its resolved path is used. It looks in the account's
+    `~/.codex` and, for rules an earlier version wrote, under a different HOME
+    or `CODEX_HOME`. Symlinks
     are never followed: a symlinked rules or copy directory refuses. Returns
     the paths removed, or an empty list when there was nothing.
     """
@@ -1047,13 +1063,17 @@ def remove_rule(
     root = Path(os.path.realpath(Path(project_root).expanduser()))
     _checked_text(str(root), "project root")
     digest = project_digest(root)
-    homes = [_home_folder(environ) / ".codex"]
-    try:
-        configured = configured_codex_home(environ)
-    except CodexHomeUnsupported:
-        configured = homes[0]  # an unusable CODEX_HOME never held a rule of ours
-    if os.path.realpath(configured) != os.path.realpath(homes[0]):
-        homes.append(configured)
+    homes = [account_home() / ".codex"]
+    candidates = []
+    for named in (_home_folder, configured_codex_home):
+        try:
+            candidates.append(named(environ) / ".codex" if named is _home_folder
+                              else named(environ))
+        except CodexHomeUnsupported:
+            pass  # an unusable HOME or CODEX_HOME never held a rule of ours
+    for candidate in candidates:
+        if all(os.path.realpath(candidate) != os.path.realpath(seen) for seen in homes):
+            homes.append(candidate)
     removed: list[str] = []
     for home in homes:
         removed.extend(_remove_from(home, digest))

@@ -107,6 +107,9 @@ WORKER_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 # The persistent collector deletes expired worker results this often, so the
 # limit holds even while no lifecycle command opens the ledger.
 WORKER_RESULT_SWEEP_SECONDS = 60.0
+# A collector request must arrive whole within this, well inside the sweep
+# interval, so a slow or stalled sender can never postpone a sweep.
+COLLECTOR_REQUEST_DEADLINE_SECONDS = 5.0
 # Registered worker results: their raw text, kept for a verifier in the same
 # orchestration; the select yields project, path and orchestration status.
 _WORKER_RESULT_FILES = (
@@ -1271,13 +1274,14 @@ class LearningLedger:
         return connection
 
     def _expire_worker_results_locked(self, now: int) -> list[tuple[str, str]]:
-        """Drop the registrations of worker results that may no longer be kept.
+        """Mark the worker results that may no longer be kept; return them.
 
         Every kept result's expiry is first clamped to its outcome's ingestion
         time plus the retention, which also shortens results an earlier
-        version kept for 90 days. A result past that, or whose orchestration
-        has closed, loses its registration; the caller deletes the file.
-        Returns the (project, relative path) pairs dropped.
+        version kept for 90 days. A result whose orchestration has closed is
+        marked expired now. Registrations stay until the file is really gone
+        (`sweep_worker_results`), and an expired one is never read. Returns the
+        (project, relative path) pairs due for deletion.
         """
 
         self._connection.execute(
@@ -1290,39 +1294,54 @@ class LearningLedger:
             "AND r.record_id=stored_files.source_record_id)",
             (WORKER_RESULT_RETENTION_MS, WORKER_RESULT_RETENTION_MS),
         )
-        dropped = []
+        due = []
         for row in self._connection.execute(_WORKER_RESULT_FILES).fetchall():
             if row["status"] in {"active", "paused"} and (
                 row["expires_at_ms"] is not None and int(row["expires_at_ms"]) > now
             ):
                 continue
             self._connection.execute(
-                "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
-                (str(row["project_id"]), str(row["relative_path"])),
+                "UPDATE stored_files SET expires_at_ms=MIN(COALESCE(expires_at_ms,?),?) "
+                "WHERE project_id=? AND relative_path=?",
+                (now, now, str(row["project_id"]), str(row["relative_path"])),
             )
-            dropped.append((str(row["project_id"]), str(row["relative_path"])))
-        return dropped
+            due.append((str(row["project_id"]), str(row["relative_path"])))
+        return due
 
     def sweep_worker_results(self) -> int:
-        """Delete worker results past their retention or orchestration; return how many."""
+        """Delete worker results past their retention or orchestration; return how many.
 
+        A registration is removed only after its file is gone, so a failed
+        deletion is retried at the next sweep instead of being forgotten.
+        """
+
+        removed = 0
         with self._lock:
             with self._connection:
-                dropped = self._expire_worker_results_locked(self._clock_ms())
-            for project_id, relative in dropped:
-                with contextlib.suppress(OSError, LedgerError):
+                due = self._expire_worker_results_locked(self._clock_ms())
+            for project_id, relative in due:
+                try:
                     self._remove_registered_path(project_id, relative)
-        return len(dropped)
+                except (OSError, LedgerError):
+                    continue  # still registered and expired: retried, never read
+                with self._connection:
+                    self._connection.execute(
+                        "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
+                        (project_id, relative),
+                    )
+                removed += 1
+        return removed
 
     def _reconcile_managed_files(self) -> None:
         """Reconcile crash-orphaned files and registrations before serving work.
 
         A worker result whose orchestration has closed, or that is past its
-        retention, loses its registration here, so the sweep below deletes it.
+        retention, is deleted first (`sweep_worker_results`); one whose file
+        cannot be deleted stays registered and expired, so it is retried and
+        never read.
         """
 
-        with self._connection:
-            self._expire_worker_results_locked(self._clock_ms())
+        self.sweep_worker_results()
         rows = self._connection.execute(
             "SELECT project_id,relative_path FROM stored_files"
         ).fetchall()
@@ -2696,19 +2715,9 @@ class LearningLedger:
                 goal_time_used_seconds=resolved_goal_time,
                 observed_at_ms=timestamp,
             )
-            # The boundary's worker results were kept only for its verifiers.
-            results = self._connection.execute(
-                _WORKER_RESULT_FILES + " AND s.project_id=? AND b.orchestration_id=?",
-                (project_id, orchestration_id),
-            ).fetchall()
-            for result_row in results:
-                self._connection.execute(
-                    "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
-                    (project_id, str(result_row["relative_path"])),
-                )
-        for result_row in results:
-            with contextlib.suppress(OSError, LedgerError):
-                self._remove_registered_path(project_id, str(result_row["relative_path"]))
+        # The boundary's worker results were kept only for its verifiers; now
+        # that it is closed, the sweep deletes them (and retries what it cannot).
+        self.sweep_worker_results()
         self.state.harden_database_files()
         return self.orchestration_report(project_id, orchestration_id)
 
@@ -8780,9 +8789,10 @@ class CollectorServer:
                 except TimeoutError:
                     continue
                 with connection:
-                    connection.settimeout(1)
                     response = self._handle(connection)
-                    connection.sendall(canonical_json(response) + b"\n")
+                    connection.settimeout(1)
+                    with contextlib.suppress(OSError):
+                        connection.sendall(canonical_json(response) + b"\n")
         finally:
             listener.close()
             self._socket = None
@@ -8791,8 +8801,17 @@ class CollectorServer:
 
     def _handle(self, connection: socket.socket) -> dict[str, Any]:
         raw = bytearray()
+        deadline = time.monotonic() + COLLECTOR_REQUEST_DEADLINE_SECONDS
         while b"\n" not in raw:
-            chunk = connection.recv(8192)
+            # One absolute deadline for the whole request, not per receive.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"ok": False, "code": "request_timeout"}
+            connection.settimeout(remaining)
+            try:
+                chunk = connection.recv(8192)
+            except TimeoutError:
+                return {"ok": False, "code": "request_timeout"}
             if not chunk:
                 break
             raw.extend(chunk)

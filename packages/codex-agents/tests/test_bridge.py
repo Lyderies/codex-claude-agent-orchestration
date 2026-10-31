@@ -9,10 +9,12 @@ import os
 import pwd
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -3299,6 +3301,85 @@ class VerifierHandoffTests(ClaudePrimaryCase):
             "SELECT COUNT(*) FROM stored_files WHERE project_id=?", (self.project_id,)
         ).fetchone()[0]
         self.assertEqual(0, rows)
+
+    def test_a_failed_deletion_keeps_the_result_registered_until_a_retry(self) -> None:
+        worker = self.run_native_worker()
+        digest = worker["recorded"]["host_outcome_digest"]
+        stored = next(self.state.artifacts.rglob(f"host_result_{digest}.json"))
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        self.addCleanup(ledger.close)
+        with ledger._connection:
+            ledger._connection.execute(
+                "UPDATE stored_files SET expires_at_ms=? WHERE project_id=?",
+                (time.time_ns() // 1_000_000 - 1, self.project_id),
+            )
+        with mock.patch.object(
+            ledger, "_remove_registered_path", side_effect=LedgerError("unlink failed")
+        ):
+            self.assertEqual(0, ledger.sweep_worker_results())
+        # The file is still there, so its registration is too, expired and unreadable.
+        self.assertTrue(stored.exists())
+        rows = ledger._connection.execute(
+            "SELECT expires_at_ms FROM stored_files WHERE project_id=?", (self.project_id,)
+        ).fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertLessEqual(int(rows[0]["expires_at_ms"]), time.time_ns() // 1_000_000)
+        with self.assertRaisesRegex(LedgerError, "it expired"):
+            ledger.verification_worker_result(self.project_id, self.verifier_task(digest))
+        # The next sweep retries and finishes the job.
+        self.assertEqual(1, ledger.sweep_worker_results())
+        self.assertFalse(stored.exists())
+        self.assertEqual(0, ledger._connection.execute(
+            "SELECT COUNT(*) FROM stored_files WHERE project_id=?", (self.project_id,)
+        ).fetchone()[0])
+
+    def test_a_slow_sender_cannot_postpone_the_collectors_sweep(self) -> None:
+        worker = self.run_native_worker()
+        digest = worker["recorded"]["host_outcome_digest"]
+        stored = next(self.state.artifacts.rglob(f"host_result_{digest}.json"))
+        ledger = LearningLedger(self.state, client_capabilities=self.clients)
+        self.addCleanup(ledger.close)
+        replies: list[bytes] = []
+
+        def trickle() -> None:
+            # One byte every 0.1 s and never a newline: each receive is quick,
+            # so only a deadline on the whole request ends it.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(self.state.socket))
+                client.settimeout(5)
+                for _ in range(40):
+                    try:
+                        client.sendall(b"{")
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                with contextlib.suppress(OSError):
+                    replies.append(client.recv(4096))
+
+        with mock.patch.object(learning_store, "WORKER_RESULT_SWEEP_SECONDS", 0.1), \
+                mock.patch.object(learning_store, "COLLECTOR_REQUEST_DEADLINE_SECONDS", 0.5):
+            server = CollectorServer(ledger, client_capabilities=self.clients)
+            server.start()
+            try:
+                sender = threading.Thread(target=trickle)
+                sender.start()
+                time.sleep(0.2)  # the collector is now reading the slow request
+                with ledger._lock, ledger._connection:
+                    ledger._connection.execute(
+                        "UPDATE stored_files SET expires_at_ms=? WHERE project_id=?",
+                        (time.time_ns() // 1_000_000 - 1, self.project_id),
+                    )
+                started = time.monotonic()
+                while stored.exists() and time.monotonic() - started < 10:
+                    time.sleep(0.05)
+                elapsed = time.monotonic() - started
+                sender.join(10)
+            finally:
+                server.stop()
+        self.assertFalse(stored.exists())
+        # Swept long before the four-second trickle could have ended on its own.
+        self.assertLess(elapsed, 2.0)
+        self.assertTrue(replies and b"request_timeout" in replies[0], replies)
 
     def test_a_native_claude_verifier_of_codex_work_passes_qa(self) -> None:
         # A bridged Codex worker, then a native Claude verifier for it.

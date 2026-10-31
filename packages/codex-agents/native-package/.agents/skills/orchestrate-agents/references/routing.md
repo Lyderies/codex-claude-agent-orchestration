@@ -106,7 +106,8 @@ commands fail there (`filesystem operation failed`, plus a `hint` under a Codex 
 `./setup.sh` (Codex commands step) offers, with the owner's consent, one Codex command
 rule per project in the user's rules layer: `~/.codex/rules/agent-orchestration-<12 hex
 digits>.rules`, named by a digest of the resolved project root. Only the real `~/.codex`
-is supported: a `CODEX_HOME` elsewhere, a symlinked `~/.codex` or a home folder reached
+is supported, with the home folder taken from the system account database: a HOME or
+`CODEX_HOME` that disagrees with it, a symlinked `~/.codex` or a home folder reached
 through a symlink is refused (`host-command` reports `unsupported` with a `reason`),
 because such a folder may resolve somewhere a session can write. The rule allows,
 outside the sandbox and without a prompt, exactly the resolved base interpreter (never a
@@ -149,8 +150,10 @@ index refresh, fsmonitor, filters, diff drivers, hooks, pager, transport or lazy
 and refuse a git directory inside the working tree or in a temporary directory and a
 partial clone, through a real git binary outside the project and every temporary
 directory (never the macOS `/usr/bin/git` xcrun shim, whose lookup cache sits in
-`$TMPDIR`); provider clients must resolve outside the project and every temporary
-directory; the collector and watchdog start with the same isolation
+`$TMPDIR`); the interpreter, provider clients and git must come from a trusted
+installation folder (`host_paths.TRUSTED_INSTALL_ROOTS`, or a hidden top-level folder
+of the account's home folder such as `~/.local`), never a sibling install such as
+`~/Work/tools`; the collector and watchdog start with the same isolation
 flags; bridge
 exports, control
 files and child temporary directories live in an owner-only directory under the per-user

@@ -3,12 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from unittest import mock
 import contextlib
+import os
 import subprocess
 import sys
 
 from codex_agents.learning_adapters import empty_usage
 from codex_agents.learning_contracts import candidate_base_digest, content_digest
-from codex_agents import providers
+from codex_agents import host_paths, providers
 from codex_agents.providers import billing_attestation_record
 from codex_agents.learning_engine import (
     OWNER_SIGNATURE_NAMESPACE,
@@ -601,11 +602,16 @@ def trusted_tools(tools: Path):
     """Make the fake clients the trusted search path, as installed clients would be.
 
     The fakes live in the system temp directory, which a real client may never
-    resolve into, so no temporary root counts here; the project root still does.
+    resolve into, so no temporary root counts here and their folder counts as a
+    trusted installation folder; the project root still does not.
     """
 
     with mock.patch.object(providers, "TRUSTED_SEARCH_DIRECTORIES", (str(tools),)), \
-            mock.patch.object(providers, "temp_roots", lambda: set()):
+            mock.patch.object(providers, "temp_roots", lambda: set()), \
+            mock.patch.object(
+                host_paths, "TRUSTED_INSTALL_ROOTS",
+                (*host_paths.TRUSTED_INSTALL_ROOTS, os.path.realpath(tools)),
+            ):
         yield
 
 
