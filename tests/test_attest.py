@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -291,6 +292,56 @@ class AttestTests(unittest.TestCase):
         key.chmod(0o640)
         with self.assertRaises(attest.AttestError):
             attest.validate_private_key(key)
+
+    def _fake_lstat(self, overrides: dict[Path, tuple[int, int]]):
+        real = os.lstat
+
+        def fake(path):
+            info = real(path)
+            if Path(path) in overrides:
+                uid, mode = overrides[Path(path)]
+                fields = list(info)
+                fields[0], fields[4] = mode, uid
+                return os.stat_result(fields)
+            return info
+
+        return mock.patch.object(attest, "_lstat", fake)
+
+    def test_root_owned_world_writable_parent_without_sticky_is_refused(self) -> None:
+        key = self.configure_key()
+        with self._fake_lstat({self.home: (0, stat.S_IFDIR | 0o777)}):
+            with self.assertRaises(attest.AttestError):
+                attest.check_path_safe(key)
+
+    def test_root_owned_sticky_parent_is_accepted_when_rest_is_safe(self) -> None:
+        key = self.configure_key()
+        with self._fake_lstat({self.home: (0, stat.S_IFDIR | 0o1777)}):
+            attest.check_path_safe(key)
+            key.parent.chmod(0o770)  # an unsafe remaining component still fails
+            with self.assertRaises(attest.AttestError):
+                attest.check_path_safe(key)
+
+    def test_root_owned_symlink_to_unsafe_target_is_refused(self) -> None:
+        unsafe = self.root / "unsafe"
+        (unsafe / "keys").mkdir(parents=True)
+        unsafe.chmod(0o777)
+        link = self.root / "link"
+        link.symlink_to(unsafe)
+        safe = self.root / "safe"
+        (safe / "keys").mkdir(parents=True)
+        safe.chmod(0o755)
+        safe_link = self.root / "safelink"
+        safe_link.symlink_to(safe)
+        root_owned = {link: (0, stat.S_IFLNK | 0o777), safe_link: (0, stat.S_IFLNK | 0o777)}
+        with self._fake_lstat(root_owned):
+            with self.assertRaises(attest.AttestError):
+                attest.check_path_safe(link / "keys" / "k")
+            attest.check_path_safe(safe_link / "keys" / "k")
+        with self.assertRaises(attest.AttestError):  # user-owned symlink: refused
+            attest.check_path_safe(safe_link / "keys" / "k")
+
+    def test_normal_home_path_passes(self) -> None:
+        attest.check_path_safe(self.configure_key())
 
     def test_existing_or_dangling_output_files_block_creation(self) -> None:
         self.set_providers(codex=True)

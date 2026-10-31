@@ -186,10 +186,17 @@ def enabled_providers(target: Path) -> list[str]:
 # --- key path safety --------------------------------------------------------------------
 
 
-def check_path_safe(path: Path) -> None:
-    """Refuse symlinks and unsafe owners or modes on every existing component of ``path``.
+def _lstat(path: Path) -> os.stat_result:
+    return os.lstat(path)
 
-    Components owned by root (for example a system ``/tmp`` link) are trusted.
+
+def check_path_safe(path: Path) -> None:
+    """Refuse unsafe components, whoever owns them.
+
+    Every existing component must be owned by you or root. A directory writable by group or
+    others is refused unless it has the sticky bit, since another user could rename and
+    replace it. A symlink must be root-owned (a system link such as ``/var``) and is followed:
+    its resolved target must pass the same rules before the walk continues.
     """
 
     if not path.is_absolute():
@@ -198,18 +205,25 @@ def check_path_safe(path: Path) -> None:
     for part in path.parts[1:]:
         current = current / part
         try:
-            info = current.lstat()
+            info = _lstat(current)
         except FileNotFoundError:
             return
         except OSError as exc:
             raise AttestError("a key path component could not be checked") from exc
-        if info.st_uid == 0 and not stat.S_ISREG(info.st_mode):
-            continue
+        if info.st_uid not in (0, os.getuid()):
+            raise AttestError("a key path component is owned by another user")
         if stat.S_ISLNK(info.st_mode):
-            raise AttestError("key paths may not pass through symbolic links")
-        if info.st_uid != os.getuid():
-            raise AttestError("a key path component is not owned by you")
-        if stat.S_ISDIR(info.st_mode) and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            if info.st_uid != 0:
+                raise AttestError("key paths may not pass through symbolic links")
+            resolved = Path(os.path.realpath(current))
+            if resolved != current:
+                check_path_safe(resolved)
+            current = resolved
+        elif (
+            stat.S_ISDIR(info.st_mode)
+            and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and not info.st_mode & stat.S_ISVTX
+        ):
             raise AttestError("a key path directory is writable by other users")
 
 
