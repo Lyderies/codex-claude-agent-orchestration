@@ -34,10 +34,13 @@ from .contracts import (
 from .git_plumbing import git_executable as find_git
 from .git_plumbing import repository_layout_problem, run_git
 from .host_paths import (
+    PYTHON_ISOLATION_FLAGS,
     HostPathError,
     darwin_directory,
+    overlaps_untrusted,
     private_directory,
     remove_private_directory,
+    temp_roots,
 )
 from .learning_contracts import SUPPORTED_MODELS
 from .providers import (
@@ -338,7 +341,10 @@ while True:
 def _start_watchdog(group: int, deadline_epoch: float) -> None:
     try:
         subprocess.Popen(
-            [sys.executable, "-I", "-c", WATCHDOG_SOURCE, str(group), repr(deadline_epoch)],
+            [
+                sys.executable, *PYTHON_ISOLATION_FLAGS, "-c", WATCHDOG_SOURCE,
+                str(group), repr(deadline_epoch),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1028,10 +1034,18 @@ def scratch_base() -> Path:
     return Path(value)
 
 
-def private_workspace(prefix: str, *, claude: bool) -> Path:
-    """Create an owner-only workspace in the scratch base; Claude's is boundary-checked."""
+def private_workspace(prefix: str, *, claude: bool, project_root: Path | None) -> Path:
+    """Create an owner-only workspace in the scratch base; Claude's is boundary-checked.
+
+    The base may neither lie inside nor contain the project or any temporary
+    directory, since a sandboxed session could then pre-create or race what the
+    host writes there. This holds for every base, whatever the platform.
+    """
 
     base = scratch_base()
+    untrusted = [*temp_roots(), *([project_root] if project_root is not None else [])]
+    if overlaps_untrusted(base, untrusted):
+        raise BridgeRefused("host_scratch_unavailable")
     if claude:
         check_context_boundary(base)
     try:
@@ -1075,7 +1089,9 @@ PROBE_DEADLINE_SECONDS = 120
 MAX_PROBE_EVENTS = 64
 
 
-def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | None]:
+def claude_billing_probe(
+    environ: Mapping[str, str], *, project_root: Path | None = None
+) -> tuple[list[Any], str | None]:
     """Run one minimal locked Claude turn; return every rate_limit_info it reported
     and why it failed, if it did.
 
@@ -1091,7 +1107,7 @@ def claude_billing_probe(environ: Mapping[str, str]) -> tuple[list[Any], str | N
 
     if api_keys_present(environ):
         raise BridgeRefused("a provider API key is set")
-    workspace = private_workspace("probe-", claude=True)
+    workspace = private_workspace("probe-", claude=True, project_root=project_root)
     try:
         if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
@@ -1213,7 +1229,9 @@ def dispatch(
     if provider == "claude":
         if managed_configuration_present():
             raise BridgeRefused("managed_settings_present")
-    workspace = private_workspace("dispatch-", claude=provider == "claude")
+    workspace = private_workspace(
+        "dispatch-", claude=provider == "claude", project_root=project_root
+    )
     try:
         export = workspace / "export"
         control = workspace / "control"

@@ -12,9 +12,10 @@ from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
-from codex_agents import bridge, host_commands
+from codex_agents import bridge, host_commands, learning_store
 from codex_agents.host_commands import HostCommandError, interpreter_path
 from codex_agents.host_paths import (
+    PYTHON_ISOLATION_FLAGS,
     HostPathError,
     private_directory,
     remove_private_directory,
@@ -116,7 +117,39 @@ class TrustedLocationTests(unittest.TestCase):
         target.write_text("#!/bin/sh\n")
         link = self.bin / "python-link"
         link.symlink_to(target)
-        self.assertIn("writable", trusted_location_problem(link, []))
+        # A path through a symlink is never trusted as given; its target is checked.
+        self.assertEqual("the path is not canonical", trusted_location_problem(link, []))
+        self.assertIn("writable", trusted_location_problem(
+            Path(os.path.realpath(link)), []
+        ))
+
+    def test_the_rule_pins_the_resolved_interpreter_past_any_link_chain(self) -> None:
+        # alias -> hop (in a directory the model could write) -> trusted target.
+        hop_directory = self.base / "hop"
+        hop_directory.mkdir(mode=0o755)
+        os.chmod(hop_directory, 0o755)
+        hop = hop_directory / "python3"
+        hop.symlink_to(self.python)
+        alias = self.bin / "python-alias"
+        alias.symlink_to(hop)
+        untrusted = {Path(os.path.realpath(hop_directory))}
+        with mock.patch.object(host_commands, "temp_roots", lambda: untrusted), \
+                mock.patch.object(sys, "executable", str(alias)), \
+                mock.patch.object(sys, "prefix", sys.base_prefix):
+            pinned = interpreter_path()
+        # The rule names the target itself, so retargeting the hop changes nothing.
+        self.assertEqual(os.path.realpath(self.python), pinned)
+        self.assertEqual(Path(pinned), Path(os.path.realpath(pinned)))
+        # A chain whose resolved target is itself in a writable place is refused.
+        planted = hop_directory / "planted-python3"
+        planted.write_text("#!/bin/sh\n")
+        hop.unlink()
+        hop.symlink_to(planted)
+        with mock.patch.object(host_commands, "temp_roots", lambda: untrusted), \
+                mock.patch.object(sys, "executable", str(alias)), \
+                mock.patch.object(sys, "prefix", sys.base_prefix):
+            with self.assertRaisesRegex(HostCommandError, "cannot be trusted"):
+                interpreter_path()
 
     def test_the_rule_names_a_trusted_base_interpreter(self) -> None:
         project = self.base / "project"
@@ -136,16 +169,47 @@ class TrustedLocationTests(unittest.TestCase):
             with self.assertRaisesRegex(HostCommandError, "virtual environment"):
                 interpreter_path()
         real = sys.executable
-        if trusted_location_problem(Path(real), list(temp_roots())) is None:
+        resolved = os.path.realpath(real)
+        if trusted_location_problem(Path(resolved), list(temp_roots())) is None:
             with mock.patch.object(sys, "prefix", str(venv)), \
                     mock.patch.object(sys, "executable", str(venv / "bin" / "python3")), \
                     mock.patch.object(sys, "_base_executable", real, create=True):
-                self.assertEqual(real, interpreter_path())
+                self.assertEqual(resolved, interpreter_path())
         # The temporary directory itself is never trusted.
         with mock.patch.object(sys, "executable", str(self.python)), \
                 mock.patch.object(sys, "prefix", sys.base_prefix):
             with self.assertRaisesRegex(HostCommandError, "cannot be trusted"):
                 interpreter_path()
+
+
+class PythonLaunchTests(unittest.TestCase):
+    """Every Python an allowlisted command starts outside the sandbox is isolated."""
+
+    def test_the_collector_and_the_watchdog_start_without_site_packages(self) -> None:
+        self.assertEqual(("-I", "-B", "-S"), PYTHON_ISOLATION_FLAGS)
+        launched: list[list[str]] = []
+
+        def record(argv, **options):
+            launched.append(list(argv))
+            raise OSError("not launched in this test")
+
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            state = LearningState(Path(directory) / "state")
+            learning_store.authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
+            with mock.patch.object(learning_store.subprocess, "Popen", record), \
+                    self.assertRaises(OSError):
+                learning_store._start_collector_locked(
+                    state, ORCHESTRATION_ROOT / "cli.py", project_root=Path(directory),
+                    timeout=0.1,
+                )
+        # The watchdog launch is only recorded; nothing is started or killed.
+        with mock.patch.object(bridge.subprocess, "Popen", lambda argv, **_: launched.append(
+            list(argv)
+        )):
+            bridge._start_watchdog(-1, 0.0)
+        self.assertEqual(2, len(launched))
+        for argv in launched:
+            self.assertEqual([sys.executable, "-I", "-B", "-S"], argv[:4])
 
 
 class HostScratchTests(unittest.TestCase):
@@ -173,8 +237,11 @@ class HostScratchTests(unittest.TestCase):
     def test_a_dispatch_workspace_is_private_and_planted_links_refuse(self) -> None:
         parent = self.base / "dispatch"
         parent.mkdir(mode=0o700)
-        with mock.patch.object(bridge, "WORKSPACE_PARENT", str(parent)):
-            workspace = bridge.private_workspace("dispatch-", claude=True)
+        project = self.base / "project"
+        project.mkdir()
+        with mock.patch.object(bridge, "WORKSPACE_PARENT", str(parent)), \
+                mock.patch.object(bridge, "temp_roots", lambda: set()):
+            workspace = bridge.private_workspace("dispatch-", claude=True, project_root=project)
             self.assertEqual(parent / bridge.SCRATCH_CONTAINER, workspace.parent)
             for name in ("export", "control", "tmp"):
                 self.assertEqual(0o700, mode(workspace / name))
@@ -185,8 +252,33 @@ class HostScratchTests(unittest.TestCase):
             elsewhere.mkdir(mode=0o700)
             container.symlink_to(elsewhere)
             with self.assertRaisesRegex(bridge.BridgeRefused, "host_scratch_unavailable"):
-                bridge.private_workspace("dispatch-", claude=False)
+                bridge.private_workspace("dispatch-", claude=False, project_root=project)
         self.assertEqual([], list(elsewhere.iterdir()))
+
+    def test_a_scratch_base_overlapping_a_writable_root_is_refused(self) -> None:
+        project = self.base / "project"
+        (project / "cache").mkdir(parents=True)
+        outer = self.base / "outer"
+        (outer / "inner").mkdir(parents=True)
+        # Against the real temporary directories: the test scratch is inside one.
+        with mock.patch.object(bridge, "WORKSPACE_PARENT", str(self.base)):
+            with self.assertRaisesRegex(bridge.BridgeRefused, "host_scratch_unavailable"):
+                bridge.private_workspace("dispatch-", claude=False, project_root=None)
+        cases = (
+            # The base inside a temporary directory, or containing one.
+            (outer / "inner", {outer}, None),
+            (outer, {outer / "inner"}, None),
+            # The base inside the project, or the project itself.
+            (project / "cache", set(), project),
+            (project, set(), project),
+        )
+        for base, temporary, root in cases:
+            with self.subTest(base=base.name), \
+                    mock.patch.object(bridge, "WORKSPACE_PARENT", str(base)), \
+                    mock.patch.object(bridge, "temp_roots", lambda temporary=temporary: temporary):
+                with self.assertRaisesRegex(bridge.BridgeRefused, "host_scratch_unavailable"):
+                    bridge.private_workspace("dispatch-", claude=False, project_root=root)
+                self.assertFalse((base / bridge.SCRATCH_CONTAINER).exists())
 
     def test_a_provider_observation_gets_a_private_temporary_directory(self) -> None:
         state = LearningState(self.base / "state")

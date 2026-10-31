@@ -1629,6 +1629,27 @@ $PROFILE_CONTENT"
 # The project CLI does the work: host-command only reads, install-codex-rule writes the rule
 # file. The wizard never builds the rule itself.
 RULE_STATUS=""
+TEMP_PROJECT=0
+
+# project_in_temp PROJECT : succeeds when the project lies in a temporary folder a Codex
+# session can write. It uses this repository's own copy of the check, never the project's,
+# whose files such a session could have replaced.
+project_in_temp() {
+  python3 -I -B -S -c 'import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from codex_agents.host_paths import temp_roots, within
+project = Path(os.path.realpath(sys.argv[2]))
+sys.exit(0 if any(within(project, root) for root in temp_roots()) else 1)' \
+    "$ROOT_DIR/packages/codex-agents/native-package/.codex/orchestration" "$1"
+}
+
+temp_project_refusal() {
+  TEMP_PROJECT=1
+  list_add fail "This project is in a temporary folder, which Codex sessions can change, so its commands can never safely run outside the sandbox."
+  list_sub "Move the project out of the temporary folder, for example into your home folder, and run setup again. Nothing was written."
+}
+
 check_rule() { # check_rule CLI -> RULE_STATUS (installed, missing, stale or empty), RULE_FILE
   run_cmd "Checking the Codex commands rule" python3 "$1" host-command --project-root "$PROJECT"
   RULE_STATUS=$(pj get "$LAST_OUT" codex_rule)
@@ -1644,7 +1665,7 @@ commands_screen() {
   body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it, delete the rule file shown below."
   body "File: $RULE_FILE (mode 0600). It applies to Codex sessions started in this project's root folder after it is written. Your Codex config.toml is never edited."
   if [ "$RULE_STATUS" = stale ]; then
-    list_add warn "A rule for this project already exists and differs from this one, for example because Python moved or the package was updated. It stays unchanged unless you replace it."
+    list_add warn "A rule for this project already exists and differs from this one, for example after a Python upgrade (the rule names the exact Python build) or a package update. It stays unchanged unless you replace it; until then Codex sessions may not reach the orchestrator."
   fi
 }
 
@@ -1675,6 +1696,11 @@ step_commands() {
   if [ ! -f "$cli" ]; then
     list_add skip "The project CLI is not installed, so there is nothing to allow yet."
     mark_step 8 skip "no installed CLI"
+    pause; return 0
+  fi
+  if project_in_temp "$PROJECT"; then
+    temp_project_refusal
+    mark_step 8 fail "project in a temporary folder"
     pause; return 0
   fi
   render
@@ -1748,6 +1774,10 @@ verify_rule() {
   fi
   CODEX_PRIMARY=1
   if [ ! -f "$cli" ]; then mark_step 8 skip "no installed CLI"; return 0; fi
+  if project_in_temp "$PROJECT"; then
+    temp_project_refusal
+    mark_step 8 fail "project in a temporary folder"; return 0
+  fi
   check_rule "$cli"
   case "$RULE_STATUS" in installed|stale) RULE_EXISTS=1;; esac
   case "$RULE_STATUS" in
@@ -1816,8 +1846,10 @@ step_done() {
   list_plain " - In Codex, start a session in the project's root folder with: $CODEX_CMD"
   list_sub "$CODEX_WHY"
   if [ "$CODEX_PRIMARY" -eq 1 ] && [ "$RULE_READY" -ne 1 ]; then
-    if [ "$RULE_STATUS" = stale ]; then
-      list_sub "The Codex commands rule for this project is stale: it differs from what setup would write now, so Codex sessions may not reach the orchestrator. Run ./setup.sh again and replace it in step 8."
+    if [ "$TEMP_PROJECT" -eq 1 ]; then
+      list_sub "This project is in a temporary folder, so Codex sessions cannot orchestrate it. Move it and run ./setup.sh again."
+    elif [ "$RULE_STATUS" = stale ]; then
+      list_sub "The Codex commands rule for this project is stale: it differs from what setup would write now (often after a Python upgrade), so Codex sessions may not reach the orchestrator. Run ./setup.sh again and replace it in step 8."
     else
       list_sub "Codex sessions cannot reach the orchestrator until the Codex commands rule exists. Run ./setup.sh again and allow it in step 8."
     fi

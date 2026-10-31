@@ -31,7 +31,7 @@ import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 
-from .host_paths import temp_roots, trusted_location_problem, within
+from .host_paths import PYTHON_ISOLATION_FLAGS, temp_roots, trusted_location_problem, within
 
 # The subcommands a primary host runs during an orchestration. Defined once; the
 # rule's allowlist and its tests read it from here.
@@ -61,10 +61,9 @@ PRIMARY_HOST_COMMANDS = (
     "learning-record-operational-qa",
 )
 CLI_RELATIVE = Path(".codex") / "orchestration" / "cli.py"
-# Isolated mode (no environment variables, user site-packages or script directory
-# on the path), no bytecode written into `.codex`, and no site-packages at all:
-# the CLI needs only the standard library and its own package.
-PYTHON_FLAGS = ("-I", "-B", "-S")
+# Isolated mode, no bytecode written into `.codex`, and no site-packages (see
+# host_paths): the CLI needs only the standard library and its own package.
+PYTHON_FLAGS = PYTHON_ISOLATION_FLAGS
 RULE_FILE_PREFIX = "agent-orchestration-"
 RULE_JUSTIFICATION = (
     "Agent orchestration: this project's everyday orchestrator commands need the "
@@ -120,6 +119,17 @@ def project_cli(project_root: Path) -> tuple[Path, Path]:
         raise HostCommandError("project CLI is not installed") from exc
     if not stat.S_ISREG(info.st_mode) or resolved != cli:
         raise HostCommandError("project CLI is a symlink or not a regular file")
+    # The rule runs this file outside the sandbox, so a project a Codex session can
+    # rewrite wholesale (one in a temporary directory) never gets one, and neither
+    # does a CLI another user could replace.
+    temporary = list(temp_roots())
+    if any(within(root, item) for item in temporary):
+        raise HostCommandError(
+            "the project lies in a temporary directory, which Codex sessions can change"
+        )
+    problem = trusted_location_problem(cli, temporary)
+    if problem is not None:
+        raise HostCommandError(f"the project CLI cannot be trusted: {problem}")
     return root, cli
 
 
@@ -129,13 +139,13 @@ def interpreter_path(
     """The trusted base interpreter the rule names, as Python reports it.
 
     It is ``sys.executable``, or the base interpreter of a virtual environment,
-    whose files the project or the model could change. It is never resolved
-    further; a realpath names a versioned build directory that the next patch
-    upgrade replaces. It is refused when it, its standard library prefix or any
-    component or symlink target on the way is inside the project or a temporary
-    directory, belongs to another user, or is writable by anyone else. The
-    wizard and a Codex primary both start ``python3`` from PATH, so they report
-    the same path, and any other interpreter makes the rule stale.
+    whose files the project or the model could change, pinned as its realpath:
+    no symlink on the way remains that could later be retargeted, and a Python
+    upgrade that moves the build makes the rule stale until setup runs again.
+    It is refused when it or its standard library prefix is inside the project
+    or a temporary directory, or when any component belongs to another user or
+    is writable by anyone else. The wizard and a Codex primary both start
+    ``python3`` from PATH, so they resolve to the same path.
 
     An explicit `interpreter` is a test seam: it is checked as text only.
     """
@@ -155,9 +165,10 @@ def interpreter_path(
             )
     if not value or not os.path.isabs(value):
         raise HostCommandError("interpreter path is not absolute")
+    value = os.path.realpath(value)
     _checked_text(value, "interpreter path")
     untrusted = [*temp_roots(), *([project_root] if project_root is not None else [])]
-    for path in (Path(value), Path(sys.base_prefix)):
+    for path in (Path(value), Path(os.path.realpath(sys.base_prefix))):
         problem = trusted_location_problem(path, untrusted)
         if problem is not None:
             raise HostCommandError(f"the Python interpreter cannot be trusted: {problem}")

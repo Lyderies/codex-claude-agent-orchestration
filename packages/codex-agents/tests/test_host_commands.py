@@ -44,6 +44,7 @@ from codex_agents.learning_store import (
     default_state_root,
 )
 from codex_agents.learning_adapters import load_client_capabilities
+from codex_agents.host_paths import darwin_directory, temp_roots, within
 
 # Commands only the owner runs. None may run outside a sandboxed Codex primary.
 OWNER_COMMANDS = {
@@ -69,11 +70,30 @@ OWNER_COMMANDS = {
     "install-codex-rule",
 }
 PYTHON = "/opt/example/bin/python3"
-# The interpreter the rule names when tests run: the base one, never a venv's.
-BASE_PYTHON = (
+# The interpreter the rule names when tests run: the base one, never a venv's,
+# fully resolved.
+BASE_PYTHON = os.path.realpath(
     getattr(sys, "_base_executable", sys.executable)
     if sys.prefix != sys.base_prefix else sys.executable
 )
+
+
+def non_temporary_directory(test: unittest.TestCase) -> Path:
+    """A fresh directory outside every temporary root (a rule refuses those), or skip."""
+
+    candidates = [os.environ.get("XDG_RUNTIME_DIR") or ""]
+    if sys.platform == "darwin":
+        candidates.insert(0, darwin_directory("DARWIN_USER_CACHE_DIR") or "")
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate) and not any(
+            within(Path(os.path.realpath(candidate)), root) for root in temp_roots()
+        ):
+            directory = Path(os.path.realpath(
+                tempfile.mkdtemp(prefix="codex-agents-test-", dir=candidate)
+            ))
+            test.addCleanup(shutil.rmtree, directory, True)
+            return directory
+    test.skipTest("no directory outside the temporary roots is available")
 
 
 def _python_trusted() -> bool:
@@ -118,6 +138,11 @@ class RuleTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
+        # These projects live in the system temp directory, which a real rule
+        # refuses (test_temporary_projects_never_get_a_rule); here none counts.
+        self.no_temp_roots = mock.patch.object(host_commands, "temp_roots", lambda: set())
+        self.no_temp_roots.start()
+        self.addCleanup(self.no_temp_roots.stop)
         self.project = self.make_project("project")
         self.codex_home = self.base / "codex-home"
         self.environ = {"CODEX_HOME": str(self.codex_home)}
@@ -188,6 +213,21 @@ class RuleTests(unittest.TestCase):
     def test_the_interpreter_is_the_running_one_unresolved(self) -> None:
         self.assertEqual(BASE_PYTHON, argv_prefix(self.project)[0])
         self.assertIn(_quoted(BASE_PYTHON), render_rule(self.project))
+
+    def test_temporary_projects_never_get_a_rule(self) -> None:
+        self.no_temp_roots.stop()
+        project = self.make_project("temporary")
+        self.assertTrue(any(within(project, root) for root in temp_roots()))
+        for attempt in (
+            lambda: render_rule(project, PYTHON),
+            lambda: argv_prefix(project, PYTHON),
+            lambda: write_rule(project, self.environ, PYTHON),
+            lambda: rule_status(project, self.environ, PYTHON),
+            lambda: rule_path(project, self.environ),
+        ):
+            with self.assertRaisesRegex(HostCommandError, "temporary directory"):
+                attempt()
+        self.assertFalse(self.codex_home.exists())
 
     def test_project_cli_must_be_a_regular_installed_file(self) -> None:
         with self.assertRaisesRegex(HostCommandError, "not installed"):
@@ -369,7 +409,7 @@ class HostCommandCliTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
-        self.project = self.base / "project"
+        self.project = non_temporary_directory(self) / "project"
         (self.project / ".codex" / "orchestration").mkdir(parents=True)
         (self.project / ".codex" / "orchestration" / "cli.py").write_text("# stand-in\n")
         self.codex_home = self.base / "codex-home"
@@ -632,12 +672,15 @@ class OwnRootTests(unittest.TestCase):
             self.assertIn("package_ready", report)
         # host-command is not pinned (it needs no state), and reads only.
         code, report = self.run_cli("host-command", "--project-root", str(self.project))
-        self.assertTrue("argv_prefix" in report or "cannot be trusted" in report["error"])
+        # This project is in the system temp directory, so it never gets a rule.
+        self.assertIn("temporary directory", report["error"])
 
     @NEEDS_TRUSTED_PYTHON
     def test_every_allowlisted_command_runs_under_the_exact_prefix(self) -> None:
-        prefix = argv_prefix(self.project)
-        self.assertEqual([BASE_PYTHON, *PYTHON_FLAGS, str(self.cli)], prefix)
+        # The project is in the system temp directory, which a rule refuses, so the
+        # prefix is assembled here exactly as argv_prefix would.
+        prefix = [interpreter_path(), *PYTHON_FLAGS, str(self.cli)]
+        self.assertEqual(BASE_PYTHON, prefix[0])
         for command in PRIMARY_HOST_COMMANDS:
             with self.subTest(command=command):
                 completed = subprocess.run(

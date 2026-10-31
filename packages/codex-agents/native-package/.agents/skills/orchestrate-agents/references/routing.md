@@ -106,10 +106,11 @@ commands fail there (`filesystem operation failed`, plus a `hint` under a Codex 
 rule per project in the user's rules layer:
 `${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<12 hex digits>.rules`, named by a
 digest of the resolved project root. It allows, outside the sandbox and without a prompt,
-exactly the absolute base interpreter (never a virtual environment's, and refused when it or
-its standard library is in the project, in a temporary directory or writable by another
-user), the isolation flags `-I -B -S`, the absolute project `cli.py`, then one of the
-primary-host subcommands (`PRIMARY_HOST_COMMANDS` in `codex_agents/host_commands.py`).
+exactly the resolved base interpreter (never a virtual environment's, and refused when it
+or its standard library is in the project, in a temporary directory, behind a symlink or
+writable by another user), the isolation flags `-I -B -S`, the absolute project `cli.py`,
+then one of the primary-host subcommands (`PRIMARY_HOST_COMMANDS` in
+`codex_agents/host_commands.py`). A project in a temporary directory never gets a rule.
 Owner commands (registration, attestation, owner keys, grants, backups, canaries,
 promotion, rollback, upgrade reconciliation and `install-codex-rule` itself) are not
 listed and stay sandboxed. `host-command --project-root <exact-root>` reads only and needs
@@ -120,12 +121,13 @@ so for these commands an installed CLI refuses a `--project-root` or `--root` ot
 its own project, a `--state-root` other than the default learning state, and any
 `--policy`, before doing any other work. Commands it runs outside the sandbox never use a
 sandbox-writable location: trust checks read the repository with git plumbing only (no
-index refresh, fsmonitor, filters, diff drivers, hooks or pager) and refuse a git directory
-inside the working tree or in a temporary directory; bridge exports, control files and
-child temporary directories live in an owner-only directory under the per-user cache
-directory on macOS (`$XDG_RUNTIME_DIR` elsewhere); operational-check snapshots and provider
-clients' temporary directories live under the learning state. A Claude primary does not
-use the rule.
+index refresh, fsmonitor, filters, diff drivers, hooks, pager, transport or lazy fetch)
+and refuse a git directory inside the working tree or in a temporary directory and a
+partial clone; the collector and watchdog start with `-I -B -S`; bridge exports, control
+files and child temporary directories live in an owner-only directory under the per-user
+cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere); operational-check snapshots and
+provider clients' temporary directories live under the learning state. A Claude primary
+does not use the rule.
 
 ## Provider admission
 

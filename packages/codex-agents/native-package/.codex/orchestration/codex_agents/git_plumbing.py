@@ -9,6 +9,13 @@ with no-follow opens and compare them with committed blobs, never through
 `git diff` or `git status`. Every call also switches the helpers off on the
 command line, which overrides any configuration file, and ignores system and
 global configuration.
+
+Plumbing can still fetch: a partial clone fetches a missing object from its
+promisor remote, whose transport (`ext::` runs a command) the repository's
+configuration, or a file it includes, can name. So no transport is allowed at
+all (an empty GIT_ALLOW_PROTOCOL overrides every `protocol.*.allow`), lazy
+fetching is off where git supports GIT_NO_LAZY_FETCH, and a repository with a
+promisor remote or partial-clone settings is refused before any object is read.
 """
 
 from __future__ import annotations
@@ -30,6 +37,9 @@ GIT_ENVIRONMENT = {
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_LITERAL_PATHSPECS": "1",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    # An empty list allows no transport, whatever protocol.*.allow says.
+    "GIT_ALLOW_PROTOCOL": "",
+    "GIT_NO_LAZY_FETCH": "1",
 }
 GIT_OPTIONS = (
     "--no-pager",
@@ -99,4 +109,15 @@ def repository_layout_problem(executable: str, root: Path) -> str | None:
             return "the project repository lies inside its working tree"
         if not project_is_temporary and any(within(directory, item) for item in temporary):
             return "the project repository lies in a temporary directory"
+    # `git config` only reads configuration files, included ones too; it runs nothing.
+    try:
+        promisor = run_git(
+            executable, root, "config", "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$",
+            text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "the project repository is unavailable"
+    if promisor.returncode != 1:
+        return "the project repository is a partial clone or names a promisor remote"
     return None

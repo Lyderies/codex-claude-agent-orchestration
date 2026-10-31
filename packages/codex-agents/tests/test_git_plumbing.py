@@ -20,7 +20,7 @@ from tests.learning_support import assignment, routing_fields
 from codex_agents import git_plumbing
 from codex_agents.bridge import BridgeRefused, export_committed_paths
 from codex_agents.contracts import ContractError
-from codex_agents.host_commands import PYTHON_FLAGS, argv_prefix
+from codex_agents.host_commands import PYTHON_FLAGS
 from codex_agents.learning_engine import (
     _committed_and_clean,
     load_operational_check_configuration,
@@ -132,7 +132,7 @@ class HostileOwnRepositoryTests(unittest.TestCase):
     def run_prefix(self, *arguments: str) -> subprocess.CompletedProcess:
         """Run the installed CLI the way the rule does (this Python, its isolation flags)."""
 
-        cli = argv_prefix(self.project, sys.executable)[-1]
+        cli = self.project / ".codex" / "orchestration" / "cli.py"
         return subprocess.run(
             [sys.executable, *PYTHON_FLAGS, cli, *arguments], capture_output=True, text=True,
             env=self.env, stdin=subprocess.DEVNULL, check=False,
@@ -182,7 +182,7 @@ class HostileOwnRepositoryTests(unittest.TestCase):
             export.mkdir()
             self.assertEqual(1, export_committed_paths(self.project, ["docs"], export))
         self.assertEqual("hello\n", (export / "docs" / "readme.txt").read_text())
-        self.assertLessEqual(set(subcommands), {"rev-parse", "ls-tree", "cat-file"})
+        self.assertLessEqual(set(subcommands), {"rev-parse", "ls-tree", "cat-file", "config"})
         self.assert_never_ran()
 
     def test_modified_files_are_still_detected(self) -> None:
@@ -285,6 +285,51 @@ class RepositoryLayoutTests(unittest.TestCase):
             self.assertIsNone(git_plumbing.repository_layout_problem(self.executable, main))
         self.assertFalse(marker.exists())
 
+    def test_a_partial_clone_never_fetches_through_a_planted_transport(self) -> None:
+        source = self.base / "source"
+        git(self.base, "init", "-q", str(source))
+        (source / "big.txt").write_text("needed later\n")
+        self.commit(source)
+        git(source, "config", "uploadpack.allowFilter", "true")
+        clone = self.base / "partial"
+        git(self.base, "clone", "-q", "--filter=blob:none", "--no-checkout",
+            f"file://{source}", str(clone))
+        blob = git(source, "rev-parse", "HEAD:big.txt").stdout.decode().strip()
+        # The origin goes away, and a file the protected configuration includes,
+        # which a sandboxed session could write, names a promisor remote whose
+        # ext:: transport runs a payload.
+        source.rename(self.base / "source-gone")
+        marker = self.base / "payload-ran"
+        payload = self.base / "payload.sh"
+        payload.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+        payload.chmod(0o755)
+        writable = self.base / "writable.inc"
+        writable.write_text(
+            f'[remote "planted"]\n\turl = ext::{payload} %G\n\tpromisor = true\n'
+            '[protocol "ext"]\n\tallow = always\n'
+        )
+        git(clone, "config", "include.path", str(writable))
+        git(clone, "cat-file", "blob", blob, check=False)
+        if not marker.exists():
+            self.skipTest("this git does not lazily fetch from the planted remote")
+        marker.unlink()
+        self.assertEqual(
+            "the project repository is a partial clone or names a promisor remote",
+            git_plumbing.repository_layout_problem(self.executable, clone),
+        )
+        # Even reading the missing object directly, no transport may run, and the
+        # empty protocol list alone suffices on a git without GIT_NO_LAZY_FETCH.
+        git_plumbing.run_git(self.executable, clone, "cat-file", "blob", blob)
+        without_lazy_switch = {
+            key: value for key, value in git_plumbing.GIT_ENVIRONMENT.items()
+            if key != "GIT_NO_LAZY_FETCH"
+        }
+        with mock.patch.object(git_plumbing, "GIT_ENVIRONMENT", without_lazy_switch):
+            git_plumbing.run_git(self.executable, clone, "cat-file", "blob", blob)
+        with self.assertRaisesRegex(BridgeRefused, "cannot be trusted"):
+            export_committed_paths(clone, ["big.txt"], self.base / "out")
+        self.assertFalse(marker.exists())
+
     def test_every_call_disables_repository_helpers(self) -> None:
         options = " ".join(git_plumbing.GIT_OPTIONS)
         for setting in ("core.fsmonitor=false", "core.hooksPath=/dev/null"):
@@ -294,6 +339,8 @@ class RepositoryLayoutTests(unittest.TestCase):
         self.assertEqual("1", git_plumbing.GIT_ENVIRONMENT["GIT_CONFIG_NOSYSTEM"])
         self.assertEqual("/dev/null", git_plumbing.GIT_ENVIRONMENT["GIT_CONFIG_GLOBAL"])
         self.assertEqual("0", git_plumbing.GIT_ENVIRONMENT["GIT_TERMINAL_PROMPT"])
+        self.assertEqual("", git_plumbing.GIT_ENVIRONMENT["GIT_ALLOW_PROTOCOL"])
+        self.assertEqual("1", git_plumbing.GIT_ENVIRONMENT["GIT_NO_LAZY_FETCH"])
         source = "".join(
             path.read_text() for path in sorted(
                 (BUNDLE_ROOT / ".codex" / "orchestration" / "codex_agents").glob("*.py")
@@ -302,7 +349,7 @@ class RepositoryLayoutTests(unittest.TestCase):
         # Every git call in the runtime is plumbing that reads refs and objects.
         calls = re.findall(r"(?:run_git\(|_git\(|\brun\(\[)[^)]*?\"([a-z-]+)\"", source)
         self.assertTrue(calls)
-        self.assertLessEqual(set(calls), {"rev-parse", "ls-tree", "cat-file"})
+        self.assertLessEqual(set(calls), {"rev-parse", "ls-tree", "cat-file", "config"})
         self.assertNotIn('"git", "-C"', source)
 
 

@@ -80,12 +80,14 @@
   project, the default learning state and its installed policy, refusing any other
   `--project-root`, `--root`, `--state-root` or `--policy` before it runs git or reaches
   the collector. Nothing such a command runs or trusts comes from a sandbox-writable place:
-  the rule names a trusted base interpreter with `-I -B -S` (never a virtual
-  environment's, a project's or a temporary one); trust checks use git plumbing only, with
-  every repository-configured helper off, and refuse a shared repository inside the
-  working tree or in a temporary directory; bridge exports, control files and child,
-  probe, operational-check and provider-client temporary directories move from the system
-  temp directory to owner-only host directories. A new rule never overwrites one that
+  the rule names the resolved, trusted base interpreter with `-I -B -S` (never a virtual
+  environment's, a project's or a temporary one), and the collector and watchdog it starts
+  get the same flags; a project in a temporary directory never gets a rule; trust checks
+  use git plumbing only, with every repository-configured helper and every transport off,
+  and refuse a shared repository inside the working tree or in a temporary directory and
+  a partial clone; bridge exports, control files and child, probe, operational-check and
+  provider-client temporary directories move from the system temp directory to owner-only
+  host directories that overlap no project or temporary directory. A new rule never overwrites one that
   another setup wrote meanwhile. A sandboxed collector failure now carries a hint. The
   result template and the bridged child's prompt state one evidence entry per criterion,
   at its most severe outcome, so neither a child nor a repair can soften a `fail`. The

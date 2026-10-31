@@ -605,8 +605,28 @@ class WizardTerminalTests(unittest.TestCase):
                     time.sleep(0.1)
         self.fail("the wizard did not exit")
 
-    def make_project(self, name: str = "project") -> tuple[Path, Path]:
-        project = self.base / name
+    def non_temporary_base(self) -> Path:
+        """A fresh folder outside every temporary root (a rule refuses those), or skip."""
+
+        candidates = [os.environ.get("XDG_RUNTIME_DIR") or ""]
+        if sys.platform == "darwin":
+            cache = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"],
+                                   capture_output=True, text=True, check=False).stdout.strip()
+            candidates.insert(0, cache)
+        temporary = {os.path.realpath(path) for path in
+                     ("/tmp", "/var/tmp", tempfile.gettempdir(), os.environ.get("TMPDIR") or "/tmp")}
+        for candidate in candidates:
+            real = os.path.realpath(candidate) if candidate else ""
+            if real and os.path.isdir(real) and not any(
+                real == root or real.startswith(root + os.sep) for root in temporary
+            ):
+                base = Path(os.path.realpath(tempfile.mkdtemp(prefix="agent-orch-test-", dir=real)))
+                self.addCleanup(shutil.rmtree, base, True)
+                return base
+        self.skipTest("no folder outside the temporary roots is available")
+
+    def make_project(self, name: str = "project", base: Path | None = None) -> tuple[Path, Path]:
+        project = (base or self.base) / name
         project.mkdir()
         subprocess.run(["git", "init", "-q", str(project)], check=True, env=self.env)
         (project / "qa-check").write_text("#!/usr/bin/python3\nprint(1)\n")
@@ -677,7 +697,7 @@ class WizardTerminalTests(unittest.TestCase):
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
     @NEEDS_TRUSTED_PYTHON
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
-        project, checks = self.make_project("my proj;x")
+        project, checks = self.make_project("my proj;x", self.non_temporary_base())
         self.to_project_prompt(project)
         self.send("\r")
         self.expect("Path to operational-checks.json")
@@ -843,7 +863,7 @@ class WizardTerminalTests(unittest.TestCase):
             self.send("\r")
         self.expect("Commit now")
 
-    def finish_after_install(self, trusted: bool = TRUSTED_PYTHON) -> str:
+    def finish_after_install(self, trusted: bool = TRUSTED_PYTHON, temporary: bool = True) -> str:
         """Skip the collector, billing, profile and commands steps; return the final screen."""
         self.expect("Continue")
         self.send("\r")
@@ -853,7 +873,10 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\r")
         self.expect("Not chosen")
         self.send("\r")
-        if trusted:
+        if temporary:
+            # Test projects live in the system temp folder, which never gets a rule.
+            self.expect("This project is in a temporary folder")
+        elif trusted:
             self.expect("No, not now")
         else:
             self.expect("This Python cannot be trusted")
@@ -962,6 +985,11 @@ class WizardTerminalTests(unittest.TestCase):
         self.drive_to_commit_menu(project, checks)
         self.send("\r")
         final = self.finish_after_install()
+        # A project in a temporary folder is told why and gets no rule.
+        self.assertIn("8. Commands: project in a temporary folder", final)
+        self.assertIn("This project is in a temporary folder, so Codex sessions cannot", final)
+        self.assertNotIn("To undo it, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
         self.assertIn("; committed", final)
         self.assertNotIn("not committed", final)
         self.assertNotIn("Left uncommitted", final)
@@ -976,7 +1004,7 @@ class WizardTerminalTests(unittest.TestCase):
     @NEEDS_TRUSTED_PYTHON
     def test_a_stale_rule_left_unchanged_keeps_its_undo_instruction(self) -> None:
         import hashlib
-        project, checks = self.make_project()
+        project, checks = self.make_project(base=self.non_temporary_base())
         digest = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:12]
         rules = self.home / ".codex" / "rules"
         rules.mkdir(parents=True, mode=0o700)
@@ -1012,7 +1040,7 @@ class WizardTerminalTests(unittest.TestCase):
     @NEEDS_TRUSTED_PYTHON
     def test_verify_reports_the_codex_commands_rule_without_writing_it(self) -> None:
         import json
-        project, checks = self.make_project()
+        project, checks = self.make_project(base=self.non_temporary_base())
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
@@ -1043,10 +1071,10 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertFalse((self.home / ".codex").exists())
 
     def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
-        project, checks = self.make_project()
+        project, checks = self.make_project(base=self.non_temporary_base())
         self.drive_to_commit_menu(project, checks, {"FAKE_UNTRUSTED": "1"})
         self.send("\r")
-        final = self.finish_after_install(trusted=False)
+        final = self.finish_after_install(trusted=False, temporary=False)
         self.assertIn("8. Commands: not checked", final)
         self.assertIn("until the Codex commands rule exists", final)
         self.assertNotIn("To undo it, delete:", final)

@@ -4073,7 +4073,7 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        infos, failure = claude_billing_probe(environ)
+        infos, failure = claude_billing_probe(environ, project_root=project_root)
         observed = self._clock_ms()
         headroom: list[dict[str, Any]] = []
         billing_records: list[dict[str, Any]] = []
@@ -9104,11 +9104,15 @@ def _start_collector_locked(
         raise
     except CollectorError:
         pass
+    from .host_paths import PYTHON_ISOLATION_FLAGS
+
     subprocess.Popen(
         [
             sys.executable,
-            "-I",
-            "-B",  # isolated mode ignores PYTHONDONTWRITEBYTECODE; keep managed paths clean
+            # Isolated, no bytecode in managed paths (isolated mode ignores
+            # PYTHONDONTWRITEBYTECODE), and no site-packages, so no .pth file or
+            # sitecustomize a sandboxed session could reach runs in the collector.
+            *PYTHON_ISOLATION_FLAGS,
             str(cli_path.resolve(strict=True)),
             "learning-serve",
             "--state-root",

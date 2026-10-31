@@ -241,15 +241,24 @@ build.
   0.164 the per-user cache directory, `/var/tmp`, `~/Library/Caches` and the learning state
   were shown not writable from the workspace-write sandbox.
 - **Interpreter.** The rule names the base interpreter, never a virtual environment's (a
-  project `.venv` would let the model replace the executable or add `.pth` startup code).
-  It is refused when the interpreter, its standard-library prefix, or any component or
-  symlink target on the way lies in the project or a temporary directory, belongs to
-  another user, or is writable by another user. One exception: on macOS a directory
-  writable by the `admin` group is accepted, because Homebrew and python.org install that
-  way and admin members can already administer the machine. `-I` ignores the environment
-  and user site-packages and keeps the script directory off the path, `-S` skips
-  site-packages entirely (the CLI needs only the standard library and its own package),
-  and `-B` writes no bytecode into `.codex`.
+  project `.venv` would let the model replace the executable or add `.pth` startup code),
+  pinned as its realpath: no symlink on the way remains that a sandboxed session could
+  later retarget, so a chain through a writable hop cannot redirect it, and a Python
+  upgrade makes the rule stale until setup runs again. The resolved interpreter and its
+  standard-library prefix are walked component by component: no component may be a
+  symlink, belong to another user or be writable by another user, and neither may lie in
+  the project or a temporary directory. One exception: on macOS a directory writable by
+  the `admin` group is accepted, because Homebrew and python.org install that way and
+  admin members can already administer the machine. `-I` ignores the environment and user
+  site-packages and keeps the script directory off the path, `-S` skips site-packages
+  entirely (no `.pth` file or `sitecustomize` runs; the CLI needs only the standard
+  library and its own package), and `-B` writes no bytecode into `.codex`. The collector
+  the CLI starts or restarts, and the bridge's deadline watchdog, get the same flags.
+- **Project.** The generator refuses a project in a temporary directory, which a session
+  can rewrite wholesale (including `cli.py`), and a CLI path with a symlink or a component
+  another user could change. It refuses before writing, printing or reporting `installed`;
+  the wizard checks the location with this repository's own code first and writes
+  nothing.
 - **Git plumbing only.** Every git call reached from the allowlisted commands uses only
   `rev-parse`, `ls-tree` and `cat-file`; committed blobs are compared with working-tree
   bytes read through no-follow opens, including an operational-check executable's mode.
@@ -260,15 +269,25 @@ build.
   `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_TERMINAL_PROMPT=0`.
   A git directory or common directory inside the working tree (other than `<root>/.git`),
   or in a temporary directory while the project is not, is refused before any other call:
-  that closes a linked worktree whose shared repository the model could rewrite.
+  that closes a linked worktree whose shared repository the model could rewrite. Plumbing
+  can still fetch a missing object from a promisor remote, whose transport (`ext::` runs a
+  command) a file the configuration includes could name, so `GIT_ALLOW_PROTOCOL` is empty
+  (no transport, whatever `protocol.*.allow` says), `GIT_NO_LAZY_FETCH=1` is set, and a
+  repository with partial-clone settings or a promisor remote is refused, read with
+  `git config`, which runs nothing. On `/usr/bin/git` 2.54.0 (Apple Git-157) the empty
+  protocol list and the lazy-fetch switch each stopped a planted `ext::` payload, and
+  `file://` and local-path fetches report "transport not allowed".
 - **Host-private scratch.** Bridge exports, control files (including Claude's settings),
   child and probe temporary directories live in an owner-only directory under the per-user
   cache directory on macOS (`$XDG_RUNTIME_DIR` elsewhere; dispatch refuses without one).
   Claude's workspace must stay outside home, where `~/.claude` would sit above it.
+  The scratch base may neither lie inside nor contain the project or any temporary
+  directory; dispatch and the probe refuse otherwise, on every platform.
   Operational-check snapshots and work directories, and provider clients' temporary
   directories, live under the learning state's `scratch` directory. Each directory is
-  created through retained directory descriptors with no-follow opens at every component,
-  owner-only, and removed afterwards; a planted symlink refuses.
+  created through directory descriptors with no-follow opens at every component,
+  owner-only, and removed afterwards; a planted symlink refuses. Later writes inside it
+  use paths, which only the host process can reach.
 - **Own-root invariant.** The rule fixes only the start of a command, so the arguments
   after the subcommand are the model's. An installed CLI therefore pins every allowlisted
   command, before any git, process or collector work: `--state-root` must resolve to the
@@ -296,8 +315,7 @@ build.
     unreachable now: every allowlisted command uses this project and the owner's state.
 - **Residual risks.**
   - The project must be the Codex session's workspace root: Codex keeps `.codex` read-only
-    only at the top of a writable root, and the rule runs that `cli.py`. A project kept in
-    a temporary directory is wholly sandbox-writable and must not get a rule.
+    only at the top of a writable root, and the rule runs that `cli.py`.
   - The interpreter check accepts admin-group-writable directories on macOS, and trusts
     the interpreter's standard library and dynamic libraries where they are installed.
   - A shared repository in a writable root other than the project and the temporary

@@ -19,6 +19,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+# The flags every Python launched outside the sandbox gets: isolated mode (no
+# environment variables, user site-packages or script directory on the path), no
+# bytecode written, and no site-packages at all, so no `.pth` or `sitecustomize`
+# runs. The runtime needs only the standard library and its own package.
+PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S")
 # Group members may write these on macOS by design (Homebrew, python.org); the group
 # is the administrators, who can already change anything on the machine.
 MACOS_ADMIN_GROUP = 80
@@ -76,11 +81,22 @@ def _component_problem(info: os.stat_result) -> str | None:
     return None
 
 
-def _walk_problem(path: Path, seen: int = 0) -> str | None:
-    """Check every component of an absolute path, following symlinks into their targets."""
+def trusted_location_problem(path: Path, untrusted: list[Path]) -> str | None:
+    """Why `path` may not be trusted to run outside the sandbox, or None.
 
-    if seen > 40:
-        return "a path has too many symbolic links"
+    The path must be canonical, so no symlink anywhere on it can later be
+    retargeted: callers pin ``os.path.realpath`` and check that. Every
+    component must belong to this user or root and be writable by no one else,
+    and the path may not lie inside an untrusted root (the project, temp roots).
+    """
+
+    if not path.is_absolute():
+        return "the path is not absolute"
+    if Path(os.path.realpath(path)) != path:
+        return "the path is not canonical"
+    roots = [Path(os.path.realpath(root)) for root in untrusted]
+    if any(within(path, root) for root in roots):
+        return "the path lies inside the project or a temporary directory"
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current = current / part
@@ -88,34 +104,23 @@ def _walk_problem(path: Path, seen: int = 0) -> str | None:
             info = os.lstat(current)
         except OSError:
             return "a path component is unavailable"
+        if stat.S_ISLNK(info.st_mode):
+            return "a path component is a symbolic link"
         problem = _component_problem(info)
         if problem is not None:
             return problem
-        if stat.S_ISLNK(info.st_mode):
-            target = Path(os.path.realpath(current))
-            problem = _walk_problem(target, seen + 1)
-            if problem is not None:
-                return problem
-            current = target
     return None
 
 
-def trusted_location_problem(path: Path, untrusted: list[Path]) -> str | None:
-    """Why `path` may not be trusted to run outside the sandbox, or None.
+def overlaps_untrusted(path: Path, untrusted: list[Path]) -> bool:
+    """Whether `path` is inside an untrusted root, or contains one."""
 
-    Every component of the path and of every symlink target must belong to this
-    user or root and be writable by no one else, and neither the path nor its
-    resolved target may lie inside an untrusted root (the project, temp roots).
-    """
-
-    if not path.is_absolute():
-        return "the path is not absolute"
     resolved = Path(os.path.realpath(path))
-    roots = [Path(os.path.realpath(root)) for root in untrusted]
-    for candidate in (path, resolved):
-        if any(within(candidate, root) for root in roots):
-            return "the path lies inside the project or a temporary directory"
-    return _walk_problem(path)
+    for root in untrusted:
+        root = Path(os.path.realpath(root))
+        if within(resolved, root) or within(root, resolved):
+            return True
+    return False
 
 
 def _open_verified_directory(path: Path) -> tuple[int, Path]:

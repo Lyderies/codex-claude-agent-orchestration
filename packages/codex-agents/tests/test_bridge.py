@@ -139,6 +139,9 @@ class BridgeTestCase(unittest.TestCase):
         self.managed = base / "managed-settings.json"
         for name, value in (
             ("WORKSPACE_PARENT", str(self.dispatch_parent)),
+            # The test scratch lives in the system temp directory, which production
+            # refuses (see test_host_paths); here no directory counts as temporary.
+            ("temp_roots", lambda: set()),
             ("MANAGED_SETTINGS_PATHS", {
                 "darwin": (str(self.managed),),
                 "linux": (str(self.managed),),
