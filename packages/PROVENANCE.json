@@ -154,7 +154,7 @@
         "native-package/.codex/orchestration/codex_agents/hosts.py": "G2 S3 Claude host client and orchestration skills",
         "native-package/.codex/orchestration/codex_agents/claude_host.py": "G2 S3 Claude host client and orchestration skills; G2 S4 security review fixes",
         "native-package/VERSION": "package version 0.8.0, so existing 0.7.2 collectors upgrade instead of refusing the changed build; 0.8.1 for the attested Codex credits waiver; 0.8.2 for the collector bytecode fix; 0.8.3 for the verifier worker-result handoff and lifecycle fixes; 0.8.4 for operational QA of either provider's verifier; 0.8.5 for the S5 review fixes; 0.8.6 for the Codex host command boundary; 0.8.7 for the Codex agent-path binding; 0.8.8 for G2 bridged child containment; 0.8.9 for G2 v1 runtime hardening",
-        "tests/test_runtime_release.py": "new: fails when the collector runtime changes without a version bump",
+        "tests/test_runtime_release.py": "new: fails when the collector runtime changes without a version bump; G2 v1 runtime hardening",
         "runtime-releases.json": "new: collector runtime digest recorded per package version; G2 S5 verifier worker-result handoff and lifecycle fixes; G2 S5b operational QA accepts either provider's verifier; G2 S5c review fixes (verifier outcome binding, canonical result size); G2 S5b Codex host command boundary; G2 bridged child containment; G2 v1 runtime hardening",
         "tests/fixtures/claude/claude_agents_verification_worker.md": "new: inert Claude verification worker fixture for native-verifier tests (G2 S5)",
         "native-package/.agents/skills/orchestrate-agents/references/contracts.md": "G2 S5b one evidence entry per criterion",
@@ -164,7 +164,9 @@
         "native-package/.codex/orchestration/codex_agents/git_plumbing.py": "new: plumbing-only git with repository helpers off and a repository layout check (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap); G2 v1 runtime hardening",
         "tests/test_git_plumbing.py": "new: hostile own-repository, layout and plumbing-only tests (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap); G2 v1 runtime hardening",
         "tests/test_host_paths.py": "new: private scratch, trusted interpreter and host scratch tests (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap); G2 bridged child containment; G2 v1 runtime hardening",
-        "native-package/.codex/orchestration/codex_agents/process_tree.py": "new: conservative descendant tracking by ancestry from single kernel process records (parent, group and birth time together), verified kill rounds and the identity-verified deadline watchdog (G2 bridged child containment)"
+        "native-package/.codex/orchestration/codex_agents/process_tree.py": "new: conservative descendant tracking by ancestry from single kernel process records (parent, group and birth time together), verified kill rounds and the identity-verified deadline watchdog (G2 bridged child containment)",
+        "native-package/.codex/hooks.json": "G2 v1 runtime hardening",
+        "native-package/.codex/orchestration/codex_agents/runtime_files.py": "new: the runtime file set the protected copy and runtime digest use (G2 v1 runtime hardening)"
       }
     },
     "claude-agents": {

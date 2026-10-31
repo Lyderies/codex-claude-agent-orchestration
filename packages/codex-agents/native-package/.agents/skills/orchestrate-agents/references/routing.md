@@ -104,44 +104,53 @@ A Codex primary runs the CLI inside Codex's workspace-write sandbox, which denie
 learning collector's local socket and the writes its state needs, so collector-backed
 commands fail there (`filesystem operation failed`, plus a `hint` under a Codex host).
 `./setup.sh` (Codex commands step) offers, with the owner's consent, one Codex command
-rule per project in the user's rules layer:
-`${CODEX_HOME:-~/.codex}/rules/agent-orchestration-<12 hex digits>.rules`, named by a
-digest of the resolved project root. It allows, outside the sandbox and without a prompt,
-exactly the resolved base interpreter (never a virtual environment's or a macOS xcrun
-shim, and refused when it or its standard library is in the project, in a temporary
-directory, behind a symlink or writable by another user), the isolation flags
-`-I -B -S -X pycache_prefix=/dev/null` (no bytecode written or read: `-B` alone still
-loads a planted `.pyc`), the absolute `cli.py` of an owner-only copy of the installed
-runtime, then
-one of the primary-host subcommands (`PRIMARY_HOST_COMMANDS` in
-`codex_agents/host_commands.py`). The copy lives at
-`${CODEX_HOME:-~/.codex}/agent-orchestration/<12 hex digits>/<manifest SHA-256>/`, next
-to the rules directory: Codex keeps `.codex` read-only only at the top of a session's
-workspace, so a session opened on a parent folder could rewrite the project's own
-`cli.py`, while a session that could change the copy could already write any rule.
-Setup copies every file the install manifest lists, verifies the copy byte for byte and
-that the runtime is this package's recorded build, and records the project root in the
-copy's binding; a project without an install manifest gets no copy and no rule. The
-copy runs only the primary-host commands (and the collector it starts), for its bound
-project, and only while the project's installed files are still byte for byte the copy;
-after a package update it refuses until setup runs again. A project in a temporary
-directory never gets a rule. Owner commands (registration, attestation, owner keys,
-grants, backups, canaries, promotion, rollback, upgrade reconciliation,
-`install-codex-rule` and `remove-codex-rule`) are not listed and stay sandboxed.
-`host-command --project-root <exact-root>` reads only and needs no collector. It prints
-`argv_prefix` (naming the copy), `runtime_copy` and `codex_rule`: `installed` only when
-the rule, the copy and the project's installed runtime all match; `missing` without a
-rule file; `stale` otherwise, as after a Python or package change, for a rule that names
-the project's own `cli.py`, without an install manifest, or for a symlink. The rule
-leaves every argument after the subcommand to the CLI, so for these commands the copy
-refuses a `--project-root` or `--root` other than its bound project, a `--state-root`
-other than the default learning state, and any `--policy`, before doing any other work. Commands it runs outside the sandbox never use a
+rule per project in the user's rules layer: `~/.codex/rules/agent-orchestration-<12 hex
+digits>.rules`, named by a digest of the resolved project root. Only the real `~/.codex`
+is supported: a `CODEX_HOME` elsewhere, a symlinked `~/.codex` or a home folder reached
+through a symlink is refused (`host-command` reports `unsupported` with a `reason`),
+because such a folder may resolve somewhere a session can write. The rule allows,
+outside the sandbox and without a prompt, exactly the resolved base interpreter (never a
+virtual environment's or a macOS xcrun shim, and refused when it or its standard library
+is in the project, in a temporary directory, behind a symlink or writable by another
+user), the isolation flags `-I -B -S -X pycache_prefix=/dev/null` (no bytecode written or
+read: `-B` alone still loads a planted `.pyc`), the absolute `cli.py` of an owner-only
+copy of the installed runtime, then one of the primary-host subcommands
+(`PRIMARY_HOST_COMMANDS` in `codex_agents/host_commands.py`). The copy lives at
+`~/.codex/agent-orchestration/<12 hex digits>/<runtime digest>/`, next to the rules
+directory: Codex keeps `.codex` read-only only at the top of a session's workspace, so a
+session opened on a parent folder could rewrite the project's own `cli.py`, while a
+session that could change the copy could already write any rule. The copy holds exactly
+this package's runtime files (`codex_agents/runtime_files.py`, a constant of the code
+doing the install, never the project's manifest), its own manifest and a binding to the
+project; the runtime digest covers every one of those files and must be this package's
+recorded build. Setup refuses when the project's `.codex/orchestration` holds anything
+else (a planted module such as `socket.py`, a package, bytecode or an extension module)
+and when there is no install manifest. The copy refuses an extra entry of its own before
+its directory is on the import path, runs only the primary-host commands (and the
+collector it starts) for its bound project, and only while the project's installed files
+are still byte for byte the copy; after a package update it refuses until setup runs
+again. Release data (`config/learning-releases.json`) is signed, not code: the copy reads
+the project's. A project in a temporary directory never gets a rule. Owner commands
+(registration, attestation, owner keys, grants, backups, canaries, promotion, rollback,
+upgrade reconciliation, `install-codex-rule` and `remove-codex-rule`) are not listed and
+stay sandboxed. `host-command --project-root <exact-root>` reads only and needs no
+collector. It prints `argv_prefix` (naming the copy), `runtime_copy` and `codex_rule`:
+`installed` only when the rule, the copy and the project's installed runtime all match;
+`missing` without a rule file; `unsupported` for a Codex home other than the real
+`~/.codex`; `stale` otherwise, as after a Python or package change, for a rule that names
+the project's own `cli.py`, without an install manifest, or for a symlink. The rule is
+safe only while no Codex session uses the home folder, its parent or `/` as its workspace,
+or adds `~` or `~/.codex` with `--add-dir`: such a session could write `~/.codex` and
+home-installed tools. The rule leaves every argument after the subcommand to the CLI, so
+for these commands the copy refuses a `--project-root` or `--root` other than its bound
+project, a `--state-root` other than the default learning state, and any `--policy`, before doing any other work. Commands it runs outside the sandbox never use a
 sandbox-writable location: trust checks read the repository with git plumbing only (no
 index refresh, fsmonitor, filters, diff drivers, hooks, pager, transport or lazy fetch)
 and refuse a git directory inside the working tree or in a temporary directory and a
-partial clone, through a real git binary (never the macOS `/usr/bin/git` xcrun shim,
-whose lookup cache sits in `$TMPDIR`); provider clients must resolve outside the project
-and every temporary directory; the collector and watchdog start with the same isolation
+partial clone, through a real git binary outside the project and every temporary
+directory (never the macOS `/usr/bin/git` xcrun shim, whose lookup cache sits in
+`$TMPDIR`); provider clients must resolve outside the project and every temporary
+directory; the collector and watchdog start with the same isolation
 flags; bridge
 exports, control
 files and child temporary directories live in an owner-only directory under the per-user
@@ -295,6 +304,12 @@ provider API key, and a run handle that was already dispatched.
   does a rejected status (`provider_rejected`). Any model other than the requested one
   in an assistant frame or the result's `modelUsage` (a fallback) leaves the result
   unreviewed with an unknown verdict. `read_containment` is `enforced`.
+- Every bridged child's prompt carries the objective, each required criterion's id and
+  description, the literal result template and its rules, after `--`. Codex children
+  also get the routed role's developer instructions as `-c developer_instructions=...`
+  (codex-cli 0.164.0 renders that as a developer message), read from the role's agent
+  file and refused unless the file and the instructions hash to what the run's execution
+  configuration recorded.
 - Codex children run `codex exec` read-only and ephemeral, between non-spending
   observations taken before and after. They load no user configuration and no
   execpolicy rules (`--ignore-user-config --ignore-rules`), so the owner's command rule
@@ -356,9 +371,11 @@ provider API key, and a run handle that was already dispatched.
   verification is kept, as its validated JSON, in an owner-only file under the
   learning state's `artifacts/` directory (at most 1 MiB), registered under the keyed
   result digest. It exists only to hand the result to a verifier in the same
-  orchestration: it is deleted when the orchestration closes, at most seven days after
-  it was recorded (at the next ledger start), and with the project. Only digests and
-  closed metadata stay in the ledger. A
+  orchestration: it is deleted when the orchestration closes and with the project, and
+  is kept at most seven days after its outcome was recorded (an older, longer expiry is
+  clamped at the next ledger start). The collector sweeps expired results every minute,
+  and a read past the limit refuses. Only digests and closed metadata stay in the
+  ledger. A
   bridged run's recorded `provider_usage` becomes its outcome usage
   (`client_observed`): Claude cache reads and writes are added to the input total,
   and counts the client did not report stay unknown.

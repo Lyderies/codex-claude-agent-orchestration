@@ -5,10 +5,16 @@
 - **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
   - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
     which a session opened on a parent folder could rewrite. `install-codex-rule` copies
-    the installed runtime, verified byte for byte and against this package's recorded
-    runtime, to an owner-only
-    `${CODEX_HOME:-~/.codex}/agent-orchestration/<project>/<runtime>/` copy bound to its
-    project, and the rule names that copy. The copy serves only its bound project, only
+    exactly this package's runtime files (a constant of the installing code, never the
+    project's manifest), verified byte for byte and against this package's recorded
+    runtime, to an owner-only `~/.codex/agent-orchestration/<project>/<runtime>/` copy
+    bound to its project, and the rule names that copy. The runtime digest, also the
+    collector's identity in `runtime-releases.json`, now covers every file the copy holds
+    (configuration and schemas included). Setup refuses a project whose
+    `.codex/orchestration` holds anything else (a planted `socket.py`, a package, bytecode,
+    an extension module), and the copy refuses an extra entry of its own before its folder
+    is importable. Only the real `~/.codex` is supported: a `CODEX_HOME` elsewhere or a
+    symlinked `~/.codex` is refused, and `host-command` reports it as `unsupported`. The copy serves only its bound project, only
     the primary-host commands, and only while the project's installed files still match
     it. A project without an install manifest gets no rule. `host-command` reports
     `installed` only when rule, copy and project all match (earlier rules are `stale`),
@@ -16,19 +22,26 @@
     --project-root <root>` removes the rule and the copy and prints
     `{"ready": true, "removed": [...]}` (an empty list when there is nothing, for any
     project, including one in a temporary folder).
+  - The supported threat model is stated plainly in the wizard, README, design and Codex
+    skill: while the rule exists, no Codex session may use the home folder, its parent or
+    `/` as its workspace, or add `~` or `~/.codex` with `--add-dir`; home-installed tools
+    such as Claude Code stay supported under that rule.
   - Every Python launched outside the sandbox (the rule's prefix, the collector, the
-    deadline watchdog) adds `-X pycache_prefix=/dev/null`: `-B` only stops writing
+    deadline watchdog, the learning hooks and the Claude skill's commands) adds
+    `-X pycache_prefix=/dev/null`: `-B` only stops writing
     bytecode, and CPython still loaded a planted `.pyc` from `__pycache__`. Rules without
     it are `stale`, and a copy holding any file its manifest does not list, bytecode
     included, fails verification.
   - Git runs from a real binary (Command Line Tools, Xcode or Homebrew on macOS, never
-    the `/usr/bin/git` xcrun shim whose cache sits in `$TMPDIR`), with `xcrun_nocache=1`
-    for git, provider clients and operational checks.
+    the `/usr/bin/git` xcrun shim whose cache sits in `$TMPDIR`) outside the inspected
+    repository, with `xcrun_nocache=1` for git, provider clients and operational checks.
   - A provider client is refused unless its resolved file passes the same location checks
     as the interpreter, outside the project and every temporary directory, before it
     runs.
   - A worker result kept for its verifier is deleted when its orchestration closes, and
-    after seven days at most; only digests stay.
+    seven days after its outcome at most: each ledger start clamps older expiries (90 days
+    before) and sweeps, the collector sweeps every minute, and an expired result is never
+    read. Only digests stay.
   - Every Codex child is bridged (`codex exec --ignore-rules`, read-only), from a Codex
     primary too, so no child shares the primary's command rule. Codex routes that need
     write access are not eligible, and the native-only legacy fallback is refused for
@@ -38,6 +51,10 @@
     result, or dropping or inventing the fence, is refused.
   - Both bridged launches pass `--` before the prompt, so an objective can never be read
     as a client option.
+  - Bridged children receive each required criterion's description, not only its id, and
+    a bridged Codex child receives its routed role's developer instructions (as
+    `-c developer_instructions=...`), refused unless they match the run's recorded
+    execution configuration.
 - **Owner-side hardening (v1 security review).**
   - `setup.sh` and `scripts/attest.py` keep every working file in a fresh owner-only folder in
     the per-user cache folder (macOS) or `$XDG_RUNTIME_DIR` (Linux, refused when unset), created

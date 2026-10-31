@@ -8,24 +8,29 @@ description: Route and supervise Codex subagents for multi-step research, planni
 Keep the primary agent as the decision owner and final synthesizer.
 
 Codex's sandbox blocks the learning collector, so lifecycle commands run outside it only
-through the owner's Codex command rule. Before any other CLI call, run
-`python3 .codex/orchestration/cli.py host-command --project-root <exact-root>`. If its
-`codex_rule` is not `installed`, stop and tell the owner to run `./setup.sh` (Codex
-commands step); do not retry or work around it. Otherwise run every later CLI command as
-exactly its `argv_prefix` (the absolute base interpreter, the isolation flags
-`-I -B -S -X pycache_prefix=/dev/null`, then the absolute `cli.py` of the owner-only
-runtime copy under the Codex home, never the project's own `.codex/orchestration/cli.py`)
-followed by the subcommand and its arguments: one command per call, with no shell
-compounds (`&&`, `;`, pipes, redirections or substitutions) and no environment-variable
-prefixes. Any other form
+through the owner's Codex command rule. Every Codex session on this machine loads that
+rule, and it runs a protected copy of the orchestrator in `~/.codex` that a session
+opened on a project cannot change. It is safe only while no Codex session uses the home
+folder, its parent or `/` as its workspace (or adds `~` or `~/.codex` with `--add-dir`):
+if this session's workspace is one of those, stop and tell the owner. Before any other
+CLI call, run `python3 -I -B -S -X pycache_prefix=/dev/null .codex/orchestration/cli.py
+host-command --project-root <exact-root>`. If its `codex_rule` is not `installed`, stop
+and tell the owner to run `./setup.sh` (Codex commands step), with its `reason` when it
+says `unsupported`; do not retry or work around it. Otherwise run every later CLI command
+as exactly its `argv_prefix` (the absolute base interpreter, the isolation flags
+`-I -B -S -X pycache_prefix=/dev/null`, then the absolute `cli.py` of the protected copy
+in `~/.codex`, never the project's own `.codex/orchestration/cli.py`) followed by the
+subcommand and its arguments: one command per call, with no shell compounds (`&&`, `;`,
+pipes, redirections or substitutions) and no environment-variable prefixes. Any other form
 stays sandboxed and fails. Below, every command, named alone or as `cli.py <command>`,
 runs with that prefix. A failure whose `hint` names the Codex sandbox means the prefix was
 not used exactly; one saying the installed runtime differs from its protected copy means
 the owner must run `./setup.sh` again. Lifecycle commands belong to the primary. Every
 child of a Codex primary is bridged: `dispatch` starts it outside this session, read-only,
 in a private export, and a Codex child loads no rules (`--ignore-rules`), so no child can
-use the command rule. Never spawn a native child; if a route ever says `dispatch: native`,
-stop and report it.
+use the command rule. Never spawn a native Codex child with your own collaboration tools:
+it would share this session and its rule. Use `dispatch` for every child; if a route ever
+says `dispatch: native`, stop and report it.
 
 1. Read the applicable project instructions and accepted decisions. Do not fill a
    material open choice with an assumption.
