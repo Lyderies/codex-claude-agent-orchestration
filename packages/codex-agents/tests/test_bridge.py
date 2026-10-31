@@ -356,6 +356,8 @@ class ClaudeBridgeTests(BridgeTestCase):
         # The prompt, last, states one evidence entry per criterion at its most severe outcome.
         self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
         self.assertIn("(fail, then not_run, then observed, then pass)", argv[-1])
+        # `--` ends the options, so the objective-led prompt is never read as one.
+        self.assertEqual("--", argv[-2])
         self.assertNotIn("--bare", argv)
         self.assertEqual("Read,Glob,Grep", argv[argv.index("--tools") + 1])
         self.assertEqual("dontAsk", argv[argv.index("--permission-mode") + 1])
@@ -366,7 +368,7 @@ class ClaudeBridgeTests(BridgeTestCase):
         self.assertNotEqual(str(self.project), invocation["cwd"])
         self.assertTrue(invocation["cwd"].startswith(str(self.dispatch_parent)))
         self.assertEqual(
-            {"HOME", "LANG", "LOGNAME", "PATH", "TMPDIR", "USER"},
+            {"HOME", "LANG", "LOGNAME", "PATH", "TMPDIR", "USER", "xcrun_nocache"},
             set(invocation["env"]) - {"PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING"},
         )
         self.assertEqual([], self.workspace_entries())
@@ -1673,6 +1675,7 @@ class CodexBridgeTests(BridgeTestCase):
         argv = invocation["argv"]
         self.assertEqual("read-only", argv[argv.index("-s") + 1])
         self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
+        self.assertEqual("--", argv[-2])
         for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules",
                      "--skip-git-repo-check", "--json"):
             self.assertIn(flag, argv)

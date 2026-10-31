@@ -3736,6 +3736,7 @@ class LearningLedger:
             with self._lock:
                 run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
         timestamp = self._clock_ms()
+        untrusted = self._registered_roots(project_id)
         # The client's TMPDIR is a fresh owner-only directory under the learning
         # state, never the system temp directory a sandboxed primary can write.
         try:
@@ -3749,6 +3750,7 @@ class LearningLedger:
                     observed_at_ms=timestamp,
                     tmpdir=tmpdir,
                     environ=environ,
+                    untrusted=untrusted,
                 )
             else:
                 records = observe_codex(
@@ -3759,11 +3761,23 @@ class LearningLedger:
                     environ=environ,
                     run_id=run_id,
                     phase=phase,
+                    untrusted=untrusted,
                 )
         finally:
             remove_private_directory(tmpdir)
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
+
+    def _registered_roots(self, project_id: str) -> tuple[Path, ...]:
+        """The registered project's root, which no provider client may live in."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT canonical_root FROM projects WHERE project_id=?", (project_id,)
+            ).fetchone()
+        if row is None or row["canonical_root"] is None:
+            return ()
+        return (Path(str(row["canonical_root"])),)
 
     def _open_run_for_provider_locked(
         self, project_id: str, run_handle: str, provider: str
@@ -4075,7 +4089,10 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        infos, failure = claude_billing_probe(environ, project_root=project_root)
+        infos, failure = claude_billing_probe(
+            environ, project_root=project_root,
+            untrusted=self._registered_roots(project_id),
+        )
         observed = self._clock_ms()
         headroom: list[dict[str, Any]] = []
         billing_records: list[dict[str, Any]] = []

@@ -16,19 +16,40 @@ configuration, or a file it includes, can name. So no transport is allowed at
 all (an empty GIT_ALLOW_PROTOCOL overrides every `protocol.*.allow`), lazy
 fetching is off where git supports GIT_NO_LAZY_FETCH, and a repository with a
 promisor remote or partial-clone settings is refused before any object is read.
+
+The git that runs is a real binary at a fixed location, never `/usr/bin/git` on
+macOS: that is an xcrun shim, which consults a lookup cache under `$TMPDIR`, a
+directory the sandboxed model can write.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
-from .host_paths import temp_roots, within
+from .host_paths import temp_roots, trusted_location_problem, within
+
+# Real git binaries, in order of preference. On macOS every developer tool in
+# /usr/bin (git, python3, make, ...) is an xcrun shim, so /usr/bin is never used
+# there; the active developer directory comes from xcode-select's root-owned link.
+DARWIN_GIT_CANDIDATES = (
+    "/Library/Developer/CommandLineTools/usr/bin/git",
+    "{developer_dir}/usr/bin/git",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+    "/opt/homebrew/bin/git",
+    "/usr/local/bin/git",
+)
+LINUX_GIT_CANDIDATES = ("/usr/bin/git",)
+XCODE_SELECT_LINK = "/var/db/xcode_select_link"
+# xcrun's lookup cache lives under $TMPDIR; any shim a child or git reaches skips it.
+XCRUN_NO_CACHE = {"xcrun_nocache": "1"}
 
 GIT_ENVIRONMENT = {
     "PATH": os.defpath,
+    **XCRUN_NO_CACHE,
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -55,8 +76,53 @@ GIT_OPTIONS = (
 )
 
 
+def _developer_directory() -> str | None:
+    """xcode-select's active developer directory, from its root-owned link only."""
+
+    try:
+        info = os.lstat(XCODE_SELECT_LINK)
+        if not stat.S_ISLNK(info.st_mode) or info.st_uid != 0:
+            return None
+        value = os.readlink(XCODE_SELECT_LINK)
+    except OSError:
+        return None
+    return value if os.path.isabs(value) else None
+
+
+def git_candidates() -> tuple[str, ...]:
+    if sys.platform != "darwin":
+        return LINUX_GIT_CANDIDATES
+    developer = _developer_directory()
+    return tuple(
+        candidate.format(developer_dir=developer) if developer else candidate
+        for candidate in DARWIN_GIT_CANDIDATES
+        if developer or "{developer_dir}" not in candidate
+    )
+
+
 def git_executable() -> str | None:
-    return shutil.which("git", path=os.defpath)
+    """The first real git binary whose location a sandboxed session cannot change.
+
+    Each candidate is pinned as its realpath and must be a regular executable
+    file outside every temporary directory, with no symlink on its path and no
+    component another user could change. On macOS the xcrun shim in /usr/bin is
+    never accepted. None when no candidate passes; callers then fail closed.
+    """
+
+    untrusted = list(temp_roots())
+    for candidate in git_candidates():
+        real = os.path.realpath(candidate)
+        if sys.platform == "darwin" and os.path.dirname(real) == "/usr/bin":
+            continue
+        try:
+            info = os.stat(real)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
+            continue
+        if trusted_location_problem(Path(real), untrusted) is None:
+            return real
+    return None
 
 
 def run_git(

@@ -825,6 +825,9 @@ def run_claude(
         "--verbose",
         "--max-turns", str(max_turns),
         "--append-system-prompt-file", str(system_prompt),
+        # The prompt starts with the assignment's objective; after `--` neither
+        # client can read it as an option (`-c...`, `--settings=...`).
+        "--",
         child_prompt(assignment, worker_result_path=worker_result_path),
     ]
     state: dict[str, Any] = {
@@ -1006,6 +1009,7 @@ def run_codex(
         "--json",
         "--output-schema", str(schema_path),
         "-o", str(last_message),
+        "--",
         child_prompt(assignment, worker_result_path=worker_result_path),
     ]
     state: dict[str, Any] = {
@@ -1198,7 +1202,10 @@ MAX_PROBE_EVENTS = 64
 
 
 def claude_billing_probe(
-    environ: Mapping[str, str], *, project_root: Path | None = None
+    environ: Mapping[str, str],
+    *,
+    project_root: Path | None = None,
+    untrusted: tuple[Path, ...] = (),
 ) -> tuple[list[Any], str | None]:
     """Run one minimal locked Claude turn; return every rate_limit_info it reported
     and why it failed, if it did.
@@ -1222,7 +1229,7 @@ def claude_billing_probe(
         empty = workspace / "export"
         control = workspace / "control"
         check_backend(environ, empty)
-        executable, _ = resolve_client("claude")
+        executable, _ = resolve_client("claude", untrusted=untrusted)
         settings = _private_file(
             control / "settings.json", json.dumps(claude_settings(PROBE_MODEL)).encode()
         )
@@ -1239,6 +1246,7 @@ def claude_billing_probe(
             "--output-format", "stream-json",
             "--verbose",
             "--max-turns", "1",
+            "--",
             PROBE_PROMPT,
         ]
         state: dict[str, Any] = {"init": False, "infos": []}
@@ -1376,7 +1384,7 @@ def dispatch(
         if not ledger.client_version_reviewed(provider, identity["client_version"]):
             raise BridgeRefused("provider client version is not reviewed")
         # The child is launched from the client the re-check just read.
-        executable, digest = resolve_client(provider)
+        executable, digest = resolve_client(provider, untrusted=[project_root])
         if (executable, digest) != (identity["client_path"], identity["client_sha256"]):
             raise BridgeRefused("provider client changed during the launch re-check")
         if provider == "codex":
