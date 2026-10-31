@@ -18,6 +18,7 @@
 #   ./setup.sh --print-expanded-path VALUE     prints VALUE with a leading ~ or $HOME expanded
 #   ./setup.sh --print-codex-hint WANTED READY prints the Codex command and why (1 or 0 each)
 #   ./setup.sh --print-codex-primary FILE      prints yes when a Codex session may orchestrate
+#   ./setup.sh --print-changed-paths PROJECT PATH...  NUL-delimited PATHs with real changes
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
@@ -267,7 +268,7 @@ elif op in ("plan", "planpaths", "paths"):
                 keep.append(rel)
         for rel in keep:
             sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
-elif op == "netprofile":
+elif op in ("netprofile", "profilecmp"):
     def read_profile(path):
         uid = os.geteuid()
         full = os.path.abspath(path)
@@ -317,6 +318,27 @@ elif op == "netprofile":
             os.close(dirfd)
 
     result = "no"
+    if op == "profilecmp":
+        # Compare the settings the wizard manages, not the bytes. Prints same, a short
+        # name for the first differing setting, or unreadable. Never prints contents.
+        try:
+            import tomllib
+            raw = read_profile(sys.argv[2])
+            if raw is None:
+                raise ValueError
+            data = tomllib.loads(raw.decode("utf-8"))
+            box = data.get("sandbox_workspace_write")
+            box = box if isinstance(box, dict) else {}
+            if data.get("sandbox_mode") != "workspace-write":
+                result = "sandbox_mode"
+            elif box.get("network_access") is not True:
+                result = "network_access"
+            else:
+                result = "same"
+        except Exception:
+            result = "unreadable"
+        print(result)
+        sys.exit(0)
     try:
         raw = read_profile(sys.argv[2])
         section, net = "", False
@@ -370,6 +392,28 @@ uncommitted_managed() {
 $name"; fi
   done < <(git -C "$1" status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null)
   printf '%s' "$out"
+}
+
+# changed_paths PROJECT PATH... : prints, NUL-delimited, the PATHs that really have changes
+# (modified, staged, deleted or untracked) according to `git status -z` with literal pathspecs.
+# If Git cannot answer, every PATH is printed, so a failure never hides a needed commit.
+changed_paths() {
+  local project=$1 rec st name bad=0 cand
+  shift
+  [ "$#" -gt 0 ] || return 0
+  while IFS= read -r -d '' rec; do
+    if [ "$rec" = '!' ]; then bad=1; continue; fi
+    st=${rec:0:2}; name=${rec:3}
+    case "$st" in
+      *R*|*C*) IFS= read -r -d '' _;;
+    esac
+    for cand in "$@"; do
+      if [ "$cand" = "$name" ]; then printf '%s\0' "$name"; break; fi
+    done
+  done < <(git -C "$project" --literal-pathspecs status --porcelain -z --untracked-files=all -- "$@" 2>/dev/null || printf '!\0')
+  if [ "$bad" -eq 1 ]; then
+    for cand in "$@"; do printf '%s\0' "$cand"; done
+  fi
 }
 
 # codex_network_on FILE : succeeds when the Codex profile sets network_access = true under
@@ -444,6 +488,9 @@ case "${1:-}" in
   --print-uncommitted)
     if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-uncommitted PROJECT" >&2; exit 2; fi
     uncommitted_managed "$2"; printf '\n'; exit 0;;
+  --print-changed-paths)
+    if [ "$#" -lt 2 ]; then echo "usage: setup.sh --print-changed-paths PROJECT PATH..." >&2; exit 2; fi
+    changed_paths "${@:2}"; exit 0;;
   --helper)
     shift; pj "$@"; exit "$?";;
   -h|--help) usage; exit 0;;
@@ -509,6 +556,7 @@ LIST=""
 declare -a STAT NOTE
 PROJECT=""
 MODE="full"
+INSTALL_EXISTS=0
 PROFILE_WANTED=0
 CODEX_PRIMARY=0
 RULE_FILE=""
@@ -867,10 +915,19 @@ explain_installer() {
 }
 
 save_summary() {
-  local dest
-  ask_text "Save the summary to (new file)" "$PWD/agent-orchestration-setup-summary.txt"
+  local dest dir
+  # The default is the home folder, never this repository's clone or the project: a summary
+  # saved inside a Git working tree could be committed by accident.
+  ask_text "Save the summary to (new file)" "$HOME/agent-orchestration-setup-summary.txt"
   dest=$ANSWER
   screen_reset; begin_step 9
+  dir=$(dirname -- "$dest")
+  if [ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+    list_add warn "That folder is inside a Git working tree, so the summary could be committed by accident."
+    menu 0 "Save it somewhere else" "Save it here anyway"
+    if [ "$MENU_IDX" -eq 0 ]; then save_summary; return 0; fi
+    screen_reset; begin_step 9
+  fi
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     list_add fail "$dest already exists; nothing written"
   elif ( umask 077; set -C; printf 'Agent orchestration setup: what failed\n%s' "$FAIL_SUMMARY" >"$dest" ) 2>/dev/null; then
@@ -1080,20 +1137,24 @@ step_project() {
     fi
     # Existing installs are detected first, so verify and re-attest never need an update preview.
     MODE=full
+    INSTALL_EXISTS=0
     if [ -f "$dir/.codex/orchestration/install-manifest.json" ]; then
+      INSTALL_EXISTS=1
       list_add ok "Project: $dir"
       body "An existing install was found in this project. Choose what to do."
       menu 0 "Update the install and walk through every step" \
              "Verify the install only" \
              "Re-run the billing attestation only" \
+             "Change the owner key passphrase" \
              "Choose another path" \
              "Quit"
       case $MENU_IDX in
         0) MODE=full;;
         1) MODE=verify;;
         2) MODE=attest;;
-        3) default=$dir; continue;;
-        4) echo "Stopped."; exit 0;;
+        3) MODE=passphrase;;
+        4) default=$dir; continue;;
+        5) echo "Stopped."; exit 0;;
       esac
       screen_reset; begin_step 2
     fi
@@ -1145,7 +1206,11 @@ step_project() {
     PROJECT=$dir
     PLAN_TEXT=$(pj plan "$PREVIEW_FILE" "$PROJECT" "$ROOT_DIR/packages/codex-agents/native-package")
     list_add ok "Project: $PROJECT"
-    body "A fresh install is possible. Continue to choose providers."
+    if [ "$INSTALL_EXISTS" -eq 1 ]; then
+      body "The install can be updated. Continue to choose providers."
+    else
+      body "A fresh install is possible. Continue to choose providers."
+    fi
     menu 0 "Continue" "Choose another path" "Quit"
     case $MENU_IDX in
       1) default=$dir; continue;;
@@ -1342,7 +1407,7 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 
 step_install() {
   local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
-  local commit_note paths_ok paths_rc
+  local commit_note paths_ok paths_rc nothing_to_commit candidates
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
   body "Install into: $PROJECT"
@@ -1401,7 +1466,23 @@ step_install() {
     COMMIT_PATHS=()
     n_paths=0
   fi
-  if [ "$paths_ok" -eq 0 ]; then
+  # Only paths that really have changes are listed and committed; an update that changed
+  # nothing must not offer a commit (git would exit 1 with nothing to commit).
+  nothing_to_commit=0
+  if [ "$paths_ok" -eq 1 ]; then
+    candidates=("${COMMIT_PATHS[@]}")
+    COMMIT_PATHS=()
+    while IFS= read -r -d '' path; do
+      COMMIT_PATHS+=("$path")
+    done < <(changed_paths "$PROJECT" "${candidates[@]}")
+    n_paths=${#COMMIT_PATHS[@]}
+    if [ "$n_paths" -eq 0 ]; then nothing_to_commit=1; fi
+  fi
+  if [ "$nothing_to_commit" -eq 1 ]; then
+    list_add ok "Nothing to commit: the project already has these files committed"
+    COMMIT_STATE=nothing
+    commit_done=1
+  elif [ "$paths_ok" -eq 0 ]; then
     # Never run git add with an empty or untrustworthy path list: that would stage everything.
     if [ "$paths_rc" -eq 3 ]; then
       LAST_RC=$paths_rc
@@ -1443,7 +1524,7 @@ step_install() {
         COMMIT_STATE=committed
       else
         RUN_QUIET=0
-        failure_detail "The commit failed" "Check your Git identity (user.name, user.email) and any commit hooks. Commit the files yourself, then run ./setup.sh again and choose Verify."
+        failure_detail "The commit did not go through" "Git refused it. Usual causes: your Git identity (user.name and user.email) is not set, or a commit hook stopped it. Commit the files yourself, then run ./setup.sh again and choose Verify."
       fi
     fi
   fi
@@ -1456,6 +1537,7 @@ step_install() {
   fi
   case "$COMMIT_STATE" in
     committed) list_add ok "Committed the installed files (not pushed)"; commit_note="committed";;
+    nothing) commit_note="nothing to commit";;
     not_committed) list_add skip "Commit left to you; verification needs the files committed"
       commit_note="not committed (you chose to commit yourself)";;
     *) commit_note="commit failed";;
@@ -1568,6 +1650,34 @@ step_billing() {
   pause
 }
 
+# Existing-install menu: change the owner key passphrase (hands the terminal to attest.py).
+step_passphrase() {
+  local rc
+  begin_step 6
+  body "This changes the passphrase on your owner key, the key you sign the billing statement with. You will be asked for the current passphrase, then a new one twice. You type them straight into ssh-keygen; this wizard never sees them."
+  menu 0 "Change the passphrase" "Skip for now" "Quit"
+  case $MENU_IDX in
+    1) mark_step 6 skip "passphrase not changed"; return 0;;
+    2) echo "Stopped."; exit 0;;
+  esac
+  show_cursor
+  printf '\033[H\033[2J'
+  python3 "$ROOT_DIR/scripts/attest.py" --change-passphrase
+  rc=$?
+  printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
+  IFS= read -r _ || true
+  screen_reset; begin_step 6
+  if [ "$rc" -eq 0 ]; then
+    list_add ok "The owner key passphrase was changed."
+    mark_step 6 ok "owner key passphrase changed"
+  else
+    list_add fail "The passphrase was not changed (exit code $rc, see its message)"
+    list_sub "Run it again later: ./setup.sh, then choose Change the owner key passphrase."
+    mark_step 6 fail "passphrase not changed"
+  fi
+  pause
+}
+
 # ---------------------------------------------------------------------------
 # Step 7: Codex orchestrator profile
 # ---------------------------------------------------------------------------
@@ -1601,6 +1711,21 @@ $PROFILE_CONTENT"
       mark_step 7 ok "already present"
       pause; return 0
     fi
+    case "$(pj profilecmp "$file" 2>/dev/null)" in
+      same)
+        list_add ok "Profile: exists with the same settings"
+        PROFILE_READY=1
+        mark_step 7 ok "exists with the same settings"
+        pause; return 0;;
+      sandbox_mode)
+        list_add warn "The profile exists, but sandbox_mode is not \"workspace-write\". It is left unchanged and its contents are not shown."
+        mark_step 7 skip "sandbox_mode differs, left alone"
+        pause; return 0;;
+      network_access)
+        list_add warn "The profile exists, but network_access is off. It is left unchanged and its contents are not shown."
+        mark_step 7 skip "network_access is off, left alone"
+        pause; return 0;;
+    esac
     list_add warn "The profile exists and differs from the proposed content. It is left unchanged and its contents are not shown."
     mark_step 7 skip "exists, differs, left alone"
     pause; return 0
@@ -1902,6 +2027,8 @@ main() {
       step_verify_only;;
     attest)
       step_billing;;
+    passphrase)
+      step_passphrase;;
   esac
   step_done
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Guided owner billing attestation for an orchestrated project.
 
-Usage: ``python3 scripts/attest.py --target <project> [--state-root <dir>]``.
+Usage: ``python3 scripts/attest.py --target <project> [--state-root <dir>]``, or
+``python3 scripts/attest.py --change-passphrase`` to change the owner key's passphrase.
 
 Admission requires, per provider account, an owner-signed statement that the account
 cannot be charged beyond its subscription. This command walks the human owner through
@@ -351,12 +352,76 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
         print("Owner public key configured.")
         return key
     print(f"Owner key already configured: {describe_key(*configured)}")
-    entered = input(f"Private key path [{DEFAULT_KEY}]: ").strip()
-    key = _expand(entered or DEFAULT_KEY)
-    validate_private_key(key)
+    key = locate_key_file(configured)
     if derive_public(key) != configured:
         raise AttestError("that private key does not match the configured owner key")
     return key
+
+
+NOT_A_PATH = (
+    "That is not a file location. If you typed your passphrase here, it was shown on screen; "
+    "you can change it from ./setup.sh (Change the owner key passphrase)."
+)
+
+
+def _default_key_file(configured: tuple[str, str]) -> Path | None:
+    """The key at the default location, when it is a plain file that can be the owner key.
+
+    A ``.pub`` file next to it, if present, must agree with the configured key; this check
+    needs no passphrase. The full check (deriving the public key) happens afterwards.
+    """
+
+    key = _expand(DEFAULT_KEY)
+    try:
+        check_path_safe(key)
+        if not stat.S_ISREG(key.lstat().st_mode):
+            return None
+    except (AttestError, OSError):
+        return None
+    adjacent = Path(str(key) + ".pub")
+    if os.path.lexists(adjacent):
+        try:
+            if _split_public(adjacent.read_text()) != configured:
+                return None
+        except (OSError, UnicodeDecodeError, AttestError):
+            return None
+    return key
+
+
+def locate_key_file(configured: tuple[str, str]) -> Path:
+    """Find and validate the private key file for the configured owner key (no passphrase)."""
+
+    key = _default_key_file(configured)
+    if key is not None:
+        print(f"Using the owner key file at {key}")
+    else:
+        print("Where is the private key file for this owner key?")
+        print("This asks for a file location, not your passphrase.")
+        entered = input(f"Press Enter to use {DEFAULT_KEY}, or type another file location: ").strip()
+        if entered and not entered.startswith("~/") and not os.path.isabs(entered):
+            raise AttestError(NOT_A_PATH)  # never echo the entry: it may be a passphrase
+        key = _expand(entered or DEFAULT_KEY)
+    validate_private_key(key)
+    return key
+
+
+def change_passphrase(state_root: Path) -> None:
+    """Hand the terminal to ssh-keygen -p for the configured owner key, then re-verify it."""
+
+    configured = configured_public_key(state_root)
+    if configured is None:
+        raise AttestError("no owner key is configured yet; run the billing attestation first")
+    print(f"Owner key: {describe_key(*configured)}")
+    key = locate_key_file(configured)
+    print("ssh-keygen will now ask for the current passphrase, then the new one twice.")
+    result = ssh(["-p", "-f", str(key)])
+    if result.returncode != 0:
+        raise AttestError("the passphrase was not changed")
+    validate_private_key(key)  # still encrypted, still safe
+    print("Checking the key with the new passphrase. Enter it when asked.")
+    if derive_public(key) != configured:
+        raise AttestError("that private key does not match the configured owner key")
+    print("Passphrase changed. The owner key is unchanged.")
 
 
 # --- attestation ------------------------------------------------------------------------
@@ -440,7 +505,9 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--target", required=True, type=Path, help="project with the packages installed")
+    parser.add_argument("--target", type=Path, help="project with the packages installed")
+    parser.add_argument("--change-passphrase", action="store_true",
+                        help="change the owner key's passphrase instead of attesting")
     parser.add_argument(
         "--state-root", type=Path,
         help="learning state directory (default: platform default; an installed project's "
@@ -451,8 +518,21 @@ def main(argv: list[str] | None = None) -> int:
         print("This is a human step: run it yourself in an interactive terminal. "
               "It will not run from a script, pipe or agent.", file=sys.stderr)
         return 2
-    target = args.target.resolve()
     state_root = (args.state_root or default_state_root()).expanduser()
+    if args.change_passphrase:
+        previous = _install_handlers()
+        try:
+            check_ssh_keygen()
+            change_passphrase(state_root)
+        except AttestError as exc:
+            print(f"Stopped: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            _restore_handlers(previous)
+        return 1 if _CLEANUP_FAILURES else 0
+    if args.target is None:
+        parser.error("--target is required")
+    target = args.target.resolve()
     cli_state = args.state_root.expanduser() if args.state_root else None
     previous = _install_handlers()
     try:

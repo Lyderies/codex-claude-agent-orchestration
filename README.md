@@ -49,8 +49,9 @@ It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to
 3. lets you choose which providers and Claude models children may use;
 4. installs, verifies and, if you agree, commits the files in the project (it never pushes). It
    stages exactly the files the installer reported plus `provider-routing.json`, and the summary
-   says `committed`, `not committed (you chose to commit yourself)` or `commit failed` and lists
-   anything left uncommitted;
+   says `committed`, `nothing to commit`, `not committed (you chose to commit yourself)` or
+   `commit failed` and lists anything left uncommitted. Only files that really changed are listed,
+   and when there are none it skips the commit question;
 5. registers the learning collector;
 6. hands the terminal to the billing attestation, which only you can sign;
 7. optionally creates the Codex orchestrator profile;
@@ -131,6 +132,11 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
      including an AI agent, can sign in your name.
    - It asks whether pay-as-you-go extra usage and Codex credit spending are turned off.
    - It has you sign each answer.
+
+   If the owner key is already configured, it finds the key file at `~/.ssh/codex-agents-owner`
+   by itself and only asks for a file location when it cannot (never for the passphrase there).
+   To change the key's passphrase, choose "Change the owner key passphrase" in `./setup.sh`, or run
+   `python3 scripts/attest.py --change-passphrase`.
 
    Run it again whenever your billing settings change.
 5. **Optional: let a Codex session orchestrate Claude children.** Codex runs commands without

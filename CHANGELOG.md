@@ -2,6 +2,16 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **Setup wizard polish.**
+  - The commit step lists and commits only files that really changed; with none it says
+    "Nothing to commit" and skips the question. An existing install is described as an update.
+  - `scripts/attest.py` finds the owner key at its default location without asking, and an entry
+    that is not a file location is refused without being echoed. `--change-passphrase` (also in
+    the wizard's existing-install menu) changes the owner key passphrase through `ssh-keygen -p`.
+  - The Codex profile step compares effective settings, so a profile with comments and the same
+    settings is reported as matching, and a differing setting is named.
+  - The saved failure summary defaults to the home folder and asks before saving into a Git
+    working tree.
 - **Provider-qualified routes.**
   - Policy v5 lists Codex and Claude models and roles.
   - Each family and route key has an ordered list of provider candidates, matching

@@ -49,6 +49,8 @@ class FakeWorld:
         self.work_dirs: list[Path] = []
         self.recorded: list[str] = []
         self.signed_names: list[str] = []
+        self.passphrase_changes: list[list[str]] = []
+        self.change_rc = 0
 
     def _cli(self, command: list[str]) -> subprocess.CompletedProcess:
         name = command[2]
@@ -93,6 +95,9 @@ class FakeWorld:
             if not self.encrypted:  # user left the passphrase empty
                 self.unencrypted_new = True
             return subprocess.CompletedProcess(command, 0)
+        if command[1] == "-p":
+            self.passphrase_changes.append([str(part) for part in command])
+            return subprocess.CompletedProcess(command, self.change_rc)
         if command[1] == "-y":
             if "-P" in command:
                 return subprocess.CompletedProcess(command, 1 if self.encrypted else 0, "", "")
@@ -140,7 +145,7 @@ class AttestTests(unittest.TestCase):
         (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
         return key
 
-    def run_main(self, answers: list[str], *, terminal: bool = True):
+    def run_main(self, answers: list[str], *, terminal: bool = True, change: bool = False):
         out, err = io.StringIO(), io.StringIO()
         prompts: list[str] = []
 
@@ -153,7 +158,9 @@ class AttestTests(unittest.TestCase):
                 mock.patch("builtins.input", fake_input), \
                 mock.patch.object(attest.Path, "home", return_value=self.home), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = attest.main(["--target", str(self.target), "--state-root", str(self.state)])
+            argv = ["--state-root", str(self.state)]
+            argv += ["--change-passphrase"] if change else ["--target", str(self.target)]
+            code = attest.main(argv)
         self.output = out.getvalue() + err.getvalue() + "".join(prompts)
         self.prompts = prompts
         return code
@@ -185,7 +192,7 @@ class AttestTests(unittest.TestCase):
         self.set_providers(codex=True)
         self.configure_key()
         with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
-            self.run_main(["", "y", "y", "y", "y"])
+            self.run_main(["y", "y", "y", "y"])
         keygen = [c for c in self.world.calls if "ssh-keygen" in c[0]]
         self.assertTrue(keygen)
         self.assertTrue(all(c[0] == "/usr/bin/ssh-keygen" for c in keygen))
@@ -251,16 +258,87 @@ class AttestTests(unittest.TestCase):
     def test_reuses_configured_key(self) -> None:
         key = self.configure_key()
         self.set_providers(codex=True)
-        self.assertEqual(self.run_main(["", "y", "y", "y"]), 0)  # blank path = default
+        self.assertEqual(self.run_main(["y", "y", "y"]), 0)  # key found at the default, no path prompt
         self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
         self.assertFalse(any("learning-configure-owner-key" in c for c in self.world.calls))
         self.assertIn(str(key), next(c for c in self.world.calls if "-Y" in c))
+
+    def test_default_key_is_found_without_prompting_for_a_path(self) -> None:
+        key = self.configure_key()
+        self.set_providers(codex=True)
+        self.assertEqual(self.run_main(["y", "y", "y"]), 0)
+        self.assertIn(f"Using the owner key file at {key}", self.output)
+        self.assertFalse(any("private key file" in prompt for prompt in self.prompts))
+        self.assertEqual(len(self.prompts), 3)  # only the billing questions
+
+    def test_default_key_with_a_different_pub_file_falls_back_to_asking(self) -> None:
+        key = self.configure_key()
+        Path(str(key) + ".pub").write_text("ssh-ed25519 AAAAdifferent c\n")
+        self.set_providers(codex=True)
+        self.run_main(["", "n"])
+        self.assertIn("This asks for a file location, not your passphrase.", self.output)
+
+    def test_missing_default_key_asks_in_words_that_are_not_a_passphrase_prompt(self) -> None:
+        (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
+        other = self.home / "elsewhere-key"
+        write_key(other)
+        self.set_providers(codex=True)
+        self.assertEqual(self.run_main(["~/elsewhere-key", "y", "y", "y"]), 0)
+        self.assertIn("This asks for a file location, not your passphrase.", self.output)
+        self.assertIn("Press Enter to use ~/.ssh/codex-agents-owner", self.prompts[0])
+        self.assertNotIn("passphrase:", self.prompts[0].lower())
+        self.assertIn(str(other), next(c for c in self.world.calls if "-Y" in c))
+
+    def test_a_non_path_entry_is_refused_and_never_echoed(self) -> None:
+        (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
+        self.set_providers(codex=True)
+        secret = "correct horse battery staple"
+        self.assertEqual(self.run_main([secret]), 1)
+        self.assertNotIn(secret, self.output)
+        self.assertNotIn("horse", self.output)
+        self.assertIn("That is not a file location.", self.output)
+        self.assertIn("Change the owner key passphrase", self.output)
+        self.assertFalse(any("-Y" in c for c in self.world.calls))
+
+    def test_change_passphrase_runs_fixed_keygen_with_p_and_verifies(self) -> None:
+        key = self.configure_key()
+        self.assertEqual(self.run_main([], change=True), 0)
+        self.assertEqual(self.world.passphrase_changes, [["/usr/bin/ssh-keygen", "-p", "-f", str(key)]])
+        self.assertNotIn("SSH_AUTH_SOCK", self.world.envs[-1])
+        calls = [c for c in self.world.calls if c[0] == "/usr/bin/ssh-keygen"]
+        self.assertEqual(calls[-1][:2], ["/usr/bin/ssh-keygen", "-y"])  # verified afterwards
+        self.assertFalse(any("-Y" in c for c in self.world.calls))
+        self.assertIn("Passphrase changed", self.output)
+
+    def test_change_passphrase_needs_a_configured_key_and_a_terminal(self) -> None:
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("no owner key is configured", self.output)
+        self.assertEqual(self.world.passphrase_changes, [])
+        self.configure_key()
+        self.assertEqual(self.run_main([], change=True, terminal=False), 2)
+        self.assertEqual(self.world.passphrase_changes, [])
+
+    def test_change_passphrase_failure_and_mismatch_are_reported(self) -> None:
+        self.configure_key()
+        self.world.change_rc = 1
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("was not changed", self.output)
+        self.world.change_rc = 0
+        self.world.derived = "ssh-ed25519 AAAAother\n"
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("does not match", self.output)
+
+    def test_change_passphrase_refuses_an_unencrypted_key(self) -> None:
+        self.configure_key()
+        self.world.encrypted = False
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertEqual(self.world.passphrase_changes, [])
 
     def test_configured_key_mismatch_is_refused(self) -> None:
         self.configure_key()
         self.set_providers(codex=True)
         self.world.derived = "ssh-ed25519 AAAAother\n"
-        self.assertEqual(self.run_main([""]), 1)
+        self.assertEqual(self.run_main([]), 1)
         self.assertIn("does not match", self.output)
 
     # agent, paths
@@ -269,7 +347,7 @@ class AttestTests(unittest.TestCase):
         self.configure_key()
         self.set_providers(codex=True)
         with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "/agent.sock"}):
-            self.run_main(["", "y", "y", "y"])
+            self.run_main(["y", "y", "y"])
         self.assertTrue(self.world.envs)
         self.assertTrue(all("SSH_AUTH_SOCK" not in env for env in self.world.envs))
 
@@ -374,7 +452,7 @@ class AttestTests(unittest.TestCase):
         self.configure_key()
         self.set_providers(codex=True, claude=True)
         # codex: buy off yes, spend yes, sign yes; claude: No
-        self.assertEqual(self.run_main(["", "y", "y", "y", "n"]), 0)
+        self.assertEqual(self.run_main(["y", "y", "y", "n"]), 0)
         self.assertEqual(self.world.recorded, ["codex"])
         self.assertIn(attest.QUESTIONS["claude"], self.prompts[-1])
         self.assertIn("Attested: codex", self.output)
@@ -387,22 +465,22 @@ class AttestTests(unittest.TestCase):
     def test_default_answer_is_no(self) -> None:
         self.configure_key()
         self.set_providers(claude=True, codex=False)
-        self.assertEqual(self.run_main(["", ""]), 1)
+        self.assertEqual(self.run_main([""]), 1)
         self.assertEqual(self.world.recorded, [])
 
     def test_codex_buy_not_off_refuses_attestation(self) -> None:
         self.configure_key()
         self.set_providers(codex=True)
-        self.assertEqual(self.run_main(["", "n"]), 1)
+        self.assertEqual(self.run_main(["n"]), 1)
         self.assertEqual(self.world.grants, {})
         self.assertIn("not attested while credits can still be bought", self.output)
 
     def test_codex_two_questions_and_field_only_when_spend_disabled(self) -> None:
         self.configure_key()
         self.set_providers(codex=True, claude=True)
-        self.run_main(["", "y", "y", "y", "y", "y"])
-        self.assertIn(attest.QUESTIONS["codex_buy"], self.prompts[1])
-        self.assertIn(attest.QUESTIONS["codex_spend"], self.prompts[2])
+        self.run_main(["y", "y", "y", "y", "y"])
+        self.assertIn(attest.QUESTIONS["codex_buy"], self.prompts[0])
+        self.assertIn(attest.QUESTIONS["codex_spend"], self.prompts[1])
         self.assertIn("credit spending disabled", self.output)
         self.assertIs(self.world.grants["codex"]["codex_credits_spending_disabled"], True)
         self.assertNotIn("codex_credits_spending_disabled", self.world.grants["claude"])
@@ -415,7 +493,7 @@ class AttestTests(unittest.TestCase):
     def test_codex_spend_not_off_omits_field(self) -> None:
         self.configure_key()
         self.set_providers(codex=True)
-        self.assertEqual(self.run_main(["", "y", "n", "y"]), 0)
+        self.assertEqual(self.run_main(["y", "n", "y"]), 0)
         self.assertNotIn("codex_credits_spending_disabled", self.world.grants["codex"])
         self.assertNotIn("credit spending disabled", self.output)
         self.assertIn("no paid overage, no usage credits.", self.output)
@@ -423,13 +501,13 @@ class AttestTests(unittest.TestCase):
     def test_final_confirmation_declined_does_not_sign(self) -> None:
         self.configure_key()
         self.set_providers(codex=True)
-        self.assertEqual(self.run_main(["", "y", "y", "n"]), 1)
+        self.assertEqual(self.run_main(["y", "y", "n"]), 1)
         self.assertEqual(self.world.grants, {})
         self.assertFalse(any("-Y" in c for c in self.world.calls))
 
     def test_codex_only_without_routing_file(self) -> None:
         self.configure_key()
-        self.run_main(["", "y", "y", "y"])
+        self.run_main(["y", "y", "y"])
         self.assertEqual(list(self.world.grants), ["codex"])
 
     def test_not_logged_in_is_skipped(self) -> None:
@@ -453,7 +531,7 @@ class AttestTests(unittest.TestCase):
             return path
 
         with mock.patch.object(attest, "make_temp", spy):
-            self.run_main(["", "y", "y", "y"])
+            self.run_main(["y", "y", "y"])
         self.assertEqual(len(self.world.work_dirs), 2)
         for directory in self.world.work_dirs:
             self.assertFalse(directory.exists())
@@ -464,7 +542,7 @@ class AttestTests(unittest.TestCase):
         self.configure_key()
         self.set_providers(codex=True)
         self.world.sign_ok = False
-        self.assertEqual(self.run_main(["", "y", "y", "y"]), 1)
+        self.assertEqual(self.run_main(["y", "y", "y"]), 1)
         self.assertIn("signing did not finish", self.output)
         self.assertEqual(self.world.recorded, [])
         for directory in self.world.work_dirs:
@@ -481,7 +559,7 @@ class AttestTests(unittest.TestCase):
             return real_rmtree(path, ignore_errors=ignore_errors)
 
         with mock.patch.object(attest.shutil, "rmtree", stubborn):
-            code = self.run_main(["", "y", "y", "y"])
+            code = self.run_main(["y", "y", "y"])
         self.assertEqual(code, 1)
         self.assertIn("could not be removed", self.output)
         for leftover in attest._CLEANUP_FAILURES:
@@ -508,7 +586,7 @@ class AttestTests(unittest.TestCase):
     def test_nothing_identifying_in_output(self) -> None:
         self.configure_key()
         self.set_providers(codex=True, claude=True)
-        self.run_main(["", "y", "y", "y", "y", "y"])
+        self.run_main(["y", "y", "y", "y", "y"])
         for fragment in SECRET_BITS + ("AAAAkey", "SECRETBODY", COMMENT):
             self.assertNotIn(fragment, self.output)
         self.assertIn("Plan: max", self.output)
