@@ -361,6 +361,8 @@ class WizardTerminalTests(unittest.TestCase):
             self.fail("the slow child is still running")
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the private log directory was kept")
 
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "operational checks use the macOS sandbox, so verify is not ready elsewhere")
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
         project, checks = self.make_project("my proj;x")
         self.to_project_prompt(project)
@@ -429,6 +431,18 @@ class WizardTerminalTests(unittest.TestCase):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn("user@example.invalid", text)
         self.assertEqual(oct(destination.stat().st_mode & 0o777), "0o600")
+
+    def test_linux_warns_that_operational_checks_need_macos(self) -> None:
+        (self.fakes / "uname").write_text('#!/bin/sh\necho Linux\n')
+        (self.fakes / "uname").chmod(0o755)
+        self.start(self.base)
+        self.expect("Operational checks need macOS today")
+        self.expect("known limitation")
+        self.assertNotIn("FAIL", self.screen)
+        self.send("q")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:
         (self.base / "-odd").mkdir()

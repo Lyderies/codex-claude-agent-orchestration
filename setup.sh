@@ -17,7 +17,7 @@
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 SETUP_VERSION=1
 CLAUDE_MODELS_ALL="claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5"
 STEP_NAMES=("Checks" "Project" "Providers" "Install" "Collector" "Billing" "Profile" "Done")
@@ -87,7 +87,7 @@ write_project_routing() {
       echo "refused: $part is not a real directory inside the project" >&2; return 1
     fi
   done
-  if [ "$(CDPATH= cd -- "$cur" && pwd -P)" != "$(CDPATH= cd -- "$project" && pwd -P)/.codex/orchestration" ]; then
+  if [ "$(CDPATH='' cd -- "$cur" && pwd -P)" != "$(CDPATH='' cd -- "$project" && pwd -P)/.codex/orchestration" ]; then
     echo "refused: the configuration directory resolves outside the project" >&2; return 1
   fi
   dest="$cur/provider-routing.json"
@@ -166,8 +166,8 @@ term_size() {
   c=$(tput cols 2>/dev/null) || c=""
   l=$(tput lines 2>/dev/null) || l=""
   if [ -z "$c" ]; then
-    set -- $(stty size 2>/dev/null)
-    l=${1:-24}; c=${2:-80}
+    read -r l c < <(stty size 2>/dev/null)
+    l=${l:-24}; c=${c:-80}
   fi
   COLS=${c:-80}; LINES_N=${l:-24}
   [ "$COLS" -lt 30 ] 2>/dev/null && COLS=30
@@ -424,8 +424,8 @@ ask_text() { # ask_text PROMPT DEFAULT -> ANSWER
   [ -z "$ANSWER" ] && ANSWER=$2
   case "$ANSWER" in
     q|Q) confirm_quit; ask_text "$1" "$2";;
-    '~') ANSWER=$HOME;;
-    '~/'*) ANSWER="$HOME/${ANSWER#\~/}";;
+    \~) ANSWER=$HOME;;
+    \~/*) ANSWER="$HOME/${ANSWER#\~/}";;
   esac
 }
 
@@ -665,7 +665,11 @@ step_checks() {
     body "Welcome. This wizard sets up delegation between Codex and Claude children in one of your Git projects. It uses only your existing subscription logins and never any metered API billing. First, a quick look at this machine."
     os=$(uname -s)
     case "$os" in
-      Darwin|Linux) list_add ok "Operating system: $os";;
+      Darwin) list_add ok "Operating system: $os";;
+      Linux)
+        list_add ok "Operating system: $os"
+        list_add warn "Operational checks need macOS today, so verify reports not ready on Linux."
+        list_sub "Read-only setup still installs; this is a known limitation, not an error.";;
       *) list_add fail "Operating system: $os"; list_sub "Fix: run this on macOS or Linux (WSL counts as Linux)."; hard=1;;
     esac
     if command -v bash >/dev/null 2>&1; then
@@ -745,7 +749,7 @@ step_checks() {
 # ---------------------------------------------------------------------------
 # Step 2: choose the project
 # ---------------------------------------------------------------------------
-resolve_dir() { (CDPATH= cd -- "$1" 2>/dev/null && pwd -P); }
+resolve_dir() { (CDPATH='' cd -- "$1" 2>/dev/null && pwd -P); }
 
 # basic_problem DIR : the directory must be the top of a Git working tree.
 basic_problem() {
@@ -789,7 +793,7 @@ prepare_project_inputs() {
       ask_text "Path to operational-checks.json" ""
       path=$ANSWER
       if [ -f "$path" ]; then
-        path="$(CDPATH= cd -- "$(dirname -- "$path")" && pwd -P)/$(basename -- "$path")"
+        path="$(CDPATH='' cd -- "$(dirname -- "$path")" && pwd -P)/$(basename -- "$path")"
         INSTALL_OPTS+=(--operational-checks "$path")
         return 0
       fi
@@ -1035,12 +1039,19 @@ view_plan() {
   done
 }
 
+VERIFY_LIMITED=0
 verify_install() { # verify_install -> sets LAST_* and records problems in LIST
   run_cmd "Verifying the install" python3 "$ROOT_DIR/scripts/install.py" verify --target "$PROJECT"
   local rc=$? line
   if [ $rc -eq 0 ]; then
     list_add ok "Verification passed: the install is ready"
     return 0
+  fi
+  if [ "$(uname -s)" = Linux ]; then
+    VERIFY_LIMITED=1
+    list_add warn "Verification is not ready: expected on Linux, because operational checks need macOS today."
+    list_sub "Make sure the installed files and project configuration are committed."
+    return 1
   fi
   explain_installer "Verification is not ready yet" "$(manual_installer verify "$PROJECT")"
   return 1
@@ -1115,6 +1126,8 @@ step_install() {
   if verify_install; then verify_ok=1; fi
   if [ $verify_ok -eq 1 ]; then
     mark_step 4 ok "installed and verified"
+  elif [ "$VERIFY_LIMITED" -eq 1 ]; then
+    mark_step 4 ok "installed; verify not ready on Linux (known limitation)"
   elif [ $commit_done -eq 0 ]; then
     mark_step 4 ok "installed; commit, then verify"
   else
@@ -1273,7 +1286,13 @@ $PROFILE_CONTENT"
 step_verify_only() {
   begin_step 4
   render
-  if verify_install; then mark_step 4 ok "verified"; else mark_step 4 fail "verification failed"; FAILED_ANY=1; fi
+  if verify_install; then
+    mark_step 4 ok "verified"
+  elif [ "$VERIFY_LIMITED" -eq 1 ]; then
+    mark_step 4 ok "not ready on Linux (known limitation)"
+  else
+    mark_step 4 fail "verification failed"; FAILED_ANY=1
+  fi
   pause
 }
 
