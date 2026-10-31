@@ -79,11 +79,96 @@ class SetupScriptTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck is not installed")
     def test_shellcheck(self) -> None:
         result = subprocess.run(
-            ["shellcheck", "-S", "warning", "-e", "SC2034,SC2155,SC2162,SC2086,SC2206,SC2207,SC2178",
+            ["shellcheck", "-S", "warning", "-e", "SC2034,SC2155,SC2162,SC2206,SC2207,SC2178",
              str(SETUP)],
             capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_leading_home_markers_are_expanded(self) -> None:
+        home = "/Users/<you>"
+        cases = {
+            "~": home,
+            "~/Code/app": f"{home}/Code/app",
+            "~/my app": f"{home}/my app",
+            "$HOME": home,
+            "$HOME/Code/app": f"{home}/Code/app",
+            "${HOME}/Code/app": f"{home}/Code/app",
+            "  ~/Code/app  ": f"{home}/Code/app",
+            "'~/Code/app'": f"{home}/Code/app",
+            '"$HOME/Code/app"': f"{home}/Code/app",
+            # Left alone: absolute and relative paths, other users, a ~ that is not leading.
+            "/Code/app": "/Code/app",
+            "Code/app": "Code/app",
+            "~other/Code": "~other/Code",
+            "/a/~/b": "/a/~/b",
+            "$HOMEWORK/x": "$HOMEWORK/x",
+        }
+        for shell in ("bash", "/bin/bash"):
+            if not (shutil.which(shell) or Path(shell).exists()):
+                continue
+            for value, expected in cases.items():
+                with self.subTest(shell=shell, value=value):
+                    result = subprocess.run(
+                        [shell, str(SETUP), "--print-expanded-path", value],
+                        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                        env=dict(os.environ, HOME=home))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected + "\n")
+
+    def codex_hint(self, wanted: str, ready: str, profile: str | None) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            if profile is not None:
+                (Path(directory) / "orchestrator.config.toml").write_text(profile)
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-codex-hint", wanted, ready],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                env=dict(os.environ, CODEX_HOME=directory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(TOKEN, result.stdout)
+        return result.stdout.splitlines()
+
+    def test_codex_hint_follows_the_profile_network_setting(self) -> None:
+        secret = f"# {TOKEN}\nmodel = \"x\"\n"
+        enabled = (
+            secret + "sandbox_mode = \"workspace-write\"\n\n"
+            "[other]\nnetwork_access = false\n\n"
+            "[sandbox_workspace_write]  # allow network\nnetwork_access   =   true # yes\n")
+        # A differing but network-enabled profile (the owner's case) is recommended.
+        for wanted, ready in (("1", "0"), ("0", "0"), ("1", "1")):
+            with self.subTest(wanted=wanted, ready=ready):
+                self.assertEqual(self.codex_hint(wanted, ready, enabled)[0], "codex -p orchestrator")
+        for name, profile in {
+            "network off": secret + "[sandbox_workspace_write]\nnetwork_access = false\n",
+            "setting in another table": secret + "[other]\nnetwork_access = true\n",
+            "setting before any table": "network_access = true\n",
+            "last assignment wins": "[sandbox_workspace_write]\nnetwork_access = true\nnetwork_access = false\n",
+            "commented out": "[sandbox_workspace_write]\n# network_access = true\n",
+        }.items():
+            with self.subTest(profile=name):
+                lines = self.codex_hint("1", "0", profile)
+                self.assertEqual(lines[0], "codex")
+                self.assertIn("network_access = true", lines[1])
+        missing = self.codex_hint("1", "0", None)
+        self.assertEqual(missing[0], "codex")
+        self.assertIn("missing", missing[1])
+        not_wanted = self.codex_hint("0", "0", None)
+        self.assertEqual(not_wanted[0], "codex")
+        self.assertIn("not chosen", not_wanted[1])
+        self.assertEqual(self.codex_hint("1", "1", None)[0], "codex -p orchestrator")
+
+    def test_codex_hint_ignores_a_symlinked_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            real = base / "real.toml"
+            real.write_text("[sandbox_workspace_write]\nnetwork_access = true\n")
+            home = base / "codex"
+            home.mkdir()
+            (home / "orchestrator.config.toml").symlink_to(real)
+            result = subprocess.run(
+                ["bash", str(SETUP), "--print-codex-hint", "1", "0"], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, env=dict(os.environ, CODEX_HOME=str(home)))
+        self.assertEqual(result.stdout.splitlines()[0], "codex")
 
     def test_refuses_without_a_terminal(self) -> None:
         result = subprocess.run(["bash", str(SETUP)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -269,6 +354,17 @@ class WizardTerminalTests(unittest.TestCase):
                 self.transcript += chunk.decode(errors="replace")
         self.fail(f"never saw {text!r}; last screen: {re.sub(chr(27) + r'.*?[A-Za-z]', '', self.screen[-1500:])!r}")
 
+    def settle(self, seconds: float = 0.6) -> None:
+        import select
+
+        end = time.time() + seconds
+        while time.time() < end:
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if ready:
+                chunk = os.read(self.fd, 65536).decode(errors="replace")
+                self.screen += chunk
+                self.transcript += chunk
+
     def send(self, data: str) -> None:
         self.screen = ""
         os.write(self.fd, data.encode())
@@ -391,6 +487,12 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Press Enter to exit")
         self.assertIn("my\\ proj\\;x", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
+        final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen.split("\x1b[2J")[-1]).replace("\r", "")
+        self.assertIn("4. Install: installed and verified; committed", final)
+        self.assertLess(final.index("7. Profile"), final.index("How to use it"))
+        self.assertLess(final.index("How to use it"), final.index("To remove everything, run:"))
+        self.assertRegex(final, r"To remove everything, run:\n\s+python3 .*install\.py.* remove --target ")
+        self.assertEqual(final.count("To remove everything"), 1)
         self.send("\r")
         self.assertEqual(self.finish(), 0)
         runs = self.py_log.read_text().split()
@@ -443,6 +545,124 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Quit setup?")
         self.send("y")
         self.assertEqual(self.finish(), 130)
+
+    def project_under_home(self) -> tuple[Path, Path]:
+        project, checks = self.make_project("staging")
+        (self.home / "Code").mkdir()
+        moved = self.home / "Code" / "proj"
+        project.rename(moved)
+        return moved, checks
+
+    def test_home_markers_in_the_project_path_are_expanded(self) -> None:
+        for typed in ("~/Code/proj", "$HOME/Code/proj", "${HOME}/Code/proj", "'~/Code/proj'"):
+            with self.subTest(typed=typed):
+                self.setUp()
+                project, _ = self.project_under_home()
+                self.to_project_prompt(project)
+                self.send(f"{typed}\r")
+                self.expect("Path to operational-checks.json")
+                self.assertNotIn("Cannot open", self.screen)
+                self._reap()
+                self.pid = 0
+
+    def test_a_lost_tilde_is_reported_exactly_and_offered_back(self) -> None:
+        project, checks = self.project_under_home()
+        self.to_project_prompt(project)
+        self.send("/Code/proj\r")
+        self.expect("Cannot open")
+        self.expect("Choose another path")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        self.assertIn("Cannot open: [/Code/proj]", plain)
+        self.assertIn("Type the full path, for example /Users/<you>/projects/app. Tab completes paths.", plain)
+        self.assertIn(f"that path does not exist, but this one does: {project}".lower(), plain.lower())
+        self.assertIn("Use the path shown above", plain)
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+
+    def test_cannot_open_without_a_home_match_offers_no_guess(self) -> None:
+        project, _ = self.project_under_home()
+        self.to_project_prompt(project)
+        self.send("~/Code/nowhere\r")
+        self.expect("Cannot open")
+        self.expect("Choose another path")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        self.assertIn(f"Cannot open: [{self.home}/Code/nowhere]", plain)
+        self.assertIn("You typed: [~/Code/nowhere]", plain)
+        self.assertIn("Tab completes paths", plain)
+        self.assertNotIn("but this one does", plain)
+        self.assertNotIn("Use the path shown above", plain)
+
+    def drive_to_commit_menu(self, project: Path, checks: Path, extra_env: dict | None = None) -> None:
+        self.start(project, extra_env)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Commit now")
+
+    def finish_after_install(self) -> str:
+        """Skip the collector, billing and profile steps, and return the final screen."""
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\x1b[B\r")
+        self.expect("Start the attestation")
+        self.send("\x1b[B\r")
+        self.expect("Not chosen")
+        self.send("\r")
+        self.expect("remove --target")
+        self.settle()
+        final = self.screen.split("\x1b[2J")[-1]
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", final).replace("\r", "")
+
+    def test_summary_says_not_committed_and_lists_what_is_left(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks)
+        self.send("\x1b[B\r")
+        final = self.finish_after_install()
+        self.assertIn("not committed (you chose to commit yourself)", final)
+        self.assertIn("Left uncommitted in the project:", final)
+        self.assertIn(".agents/skills/", final)
+        self.assertRegex(final, r"\.\.\. and \d+ more")
+        self.assertNotIn("commit failed", final)
+        status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
+                                capture_output=True, text=True, env=self.env).stdout
+        self.assertNotEqual(status, "")
+
+    def test_summary_says_commit_failed_when_a_hook_refuses(self) -> None:
+        project, checks = self.make_project()
+        hook = project / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        final = self.finish_after_install()
+        self.assertIn("commit failed", final)
+        self.assertNotIn("not committed", final)
+        self.assertIn("Left uncommitted in the project:", final)
+
+    def test_commit_stages_updated_files_and_provider_routing(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks)
+        self.send("\r")
+        final = self.finish_after_install()
+        self.assertIn("; committed", final)
+        self.assertNotIn("not committed", final)
+        self.assertNotIn("Left uncommitted", final)
+        tracked = subprocess.run(["git", "-C", str(project), "ls-files"],
+                                 capture_output=True, text=True, env=self.env).stdout.split()
+        self.assertIn(".codex/orchestration/provider-routing.json", tracked)
+        self.assertIn(".codex/orchestration/install-manifest.json", tracked)
+        status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
+                                capture_output=True, text=True, env=self.env).stdout
+        self.assertEqual(status, "")
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:
         (self.base / "-odd").mkdir()

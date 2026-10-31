@@ -47,7 +47,10 @@ It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to
 1. checks your machine and both sign-ins;
 2. lets you choose the project and previews the install;
 3. lets you choose which providers and Claude models children may use;
-4. installs, verifies and, if you agree, commits the files in the project (it never pushes);
+4. installs, verifies and, if you agree, commits the files in the project (it never pushes). It
+   stages exactly the files the installer reported plus `provider-routing.json`, and the summary
+   says `committed`, `not committed (you chose to commit yourself)` or `commit failed` and lists
+   anything left uncommitted;
 5. registers the learning collector;
 6. hands the terminal to the billing attestation, which only you can sign;
 7. optionally creates the Codex orchestrator profile;
@@ -57,7 +60,10 @@ Run it again on an installed project to update, verify or re-attest. It needs an
 terminal and refuses to run piped or scripted. Full command output goes to a private temporary log,
 shown only if something fails. Set `NO_COLOR=1` for plain output. In Claude Code, use the
 `agent-orchestration` skill afterwards. In Codex, start with `codex -p orchestrator` if the optional
-orchestrator profile (step 7) was created or already exists; otherwise start plain `codex`.
+orchestrator profile (step 7) was created, or if `~/.codex/orchestrator.config.toml` already sets
+`network_access = true` under `[sandbox_workspace_write]` (only that setting is read); otherwise
+start plain `codex`. Paths accept a leading `~`, `$HOME`, or surrounding quotes, and the wizard
+offers the `$HOME` match when a path with a lost `~` does not exist.
 
 ### Advanced: manual setup
 
