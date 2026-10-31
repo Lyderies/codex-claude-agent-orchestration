@@ -10,6 +10,7 @@ learning state and the rest of the home directory stay read-only to it.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import shutil
@@ -21,9 +22,12 @@ from pathlib import Path
 
 # The flags every Python launched outside the sandbox gets: isolated mode (no
 # environment variables, user site-packages or script directory on the path), no
-# bytecode written, and no site-packages at all, so no `.pth` or `sitecustomize`
-# runs. The runtime needs only the standard library and its own package.
-PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S")
+# bytecode written, no site-packages at all, so no `.pth` or `sitecustomize`
+# runs, and no bytecode read: `-B` only stops writing, and CPython still loads a
+# planted timestamp `.pyc` from `__pycache__`, so the cache moves to a prefix
+# that can never hold one. The runtime needs only the standard library and its
+# own package.
+PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
 # Group members may write these on macOS by design (Homebrew, python.org); the group
 # is the administrators, who can already change anything on the machine.
 MACOS_ADMIN_GROUP = 80
@@ -216,6 +220,67 @@ def private_directory(base: Path, container: str, prefix: str) -> Path:
             os.close(container_fd)
     finally:
         os.close(base_fd)
+
+
+def open_private_directories(base: Path, names: tuple[str, ...], *, create: bool) -> int | None:
+    """Open `<base>/<names...>` by descriptors, each level owner-only; None when absent.
+
+    `base` and its ancestors are verified like `private_directory`'s base, and
+    each named level is created (with `create`) and opened with no-follow
+    opens, so a planted symlink or a directory another user could change
+    refuses. The caller closes the returned descriptor.
+    """
+
+    try:
+        descriptor, _canonical = _open_verified_directory(base)
+    except OSError as exc:
+        raise HostPathError("a host directory is unavailable") from exc
+    try:
+        for name in names:
+            if not name or name in {".", ".."} or "/" in name:
+                raise HostPathError("a private host directory name is invalid")
+            try:
+                child = _private_child(descriptor, name, create=create)
+            except FileNotFoundError:
+                if create:
+                    raise HostPathError("a private host directory is unavailable") from None
+                os.close(descriptor)
+                return None
+            except OSError as exc:
+                raise HostPathError("a private host directory is unavailable") from exc
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    return descriptor
+
+
+def remove_tree_at(parent: int, name: str) -> bool:
+    """Remove `name` inside the directory `parent` without following any symlink.
+
+    A symlink or file at `name` is unlinked itself; a directory is emptied
+    through descriptors first. Returns whether anything was there.
+    """
+
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent)
+        return True
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        with os.scandir(descriptor) as entries:
+            children = [entry.name for entry in entries]
+        for child in children:
+            remove_tree_at(descriptor, child)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent)
+    return True
 
 
 def remove_private_directory(path: Path) -> None:

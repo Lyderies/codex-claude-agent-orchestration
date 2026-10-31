@@ -1087,7 +1087,18 @@ def _provider_admitted(
 
 
 def _dispatch(primary_provider: str, provider: str) -> str:
-    return "native" if provider == primary_provider else "bridge"
+    """How the primary runs a child of `provider`: only Claude children of a Claude
+    primary are spawned natively.
+
+    A native Codex child shares the Codex primary's session, and with it the
+    owner's command rule that runs the primary-host commands outside the
+    sandbox. Every Codex child therefore goes through the bridge (`codex exec`,
+    read-only, `--ignore-rules`), from either primary, so no child can use the
+    rule. A Codex route that needs write access is ineligible until write
+    containment exists.
+    """
+
+    return "native" if provider == primary_provider == "claude" else "bridge"
 
 
 def _claude_agent(policy: dict[str, Any], family: str) -> dict[str, str] | None:

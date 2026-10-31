@@ -118,7 +118,7 @@ class RoutingTests(unittest.TestCase):
     def test_security_route_uses_explicit_astra_high_candidate(self) -> None:
         route = route_task(self.task(family="security"), self.policy)
         self.assertEqual(("gpt-6-astra", "high"), (route["model"], route["effort"]))
-        self.assertEqual(("codex", "native"), (route["provider"], route["dispatch"]))
+        self.assertEqual(("codex", "bridge"), (route["provider"], route["dispatch"]))
         self.assertEqual("security_judgment", route["reason"])
 
     def test_only_evidenced_hard_end_to_end_work_uses_astra_high(self) -> None:
@@ -846,7 +846,9 @@ class ProviderRoutingTests(unittest.TestCase):
         path.write_text(json.dumps(policy))
         return path
 
-    def test_default_configuration_keeps_codex_routes_native(self) -> None:
+    def test_default_configuration_bridges_every_codex_child(self) -> None:
+        # A native Codex child would share the primary's session and its command
+        # rule, so a Codex primary bridges its Codex children too.
         for task in (
             self.task(),
             self.exploratory(),
@@ -856,7 +858,9 @@ class ProviderRoutingTests(unittest.TestCase):
             with self.subTest(task=task):
                 route = route_task(task, self.policy)
                 self.assertEqual("codex", route["provider"])
-                self.assertEqual("native", route["dispatch"])
+                self.assertEqual("bridge", route["dispatch"])
+                self.assertEqual("bridge", route["verifier"]["dispatch"])
+                self.assertEqual("read-only", route["sandbox_mode"])
                 self.assertEqual(
                     DEFAULT_PROVIDER_CONFIG_DIGEST, route["provider_config_digest"]
                 )
@@ -906,7 +910,7 @@ class ProviderRoutingTests(unittest.TestCase):
     def test_codex_primary_reaches_claude_only_through_the_bridge_flag(self) -> None:
         closed = route_task(self.exploratory(), self.provider_policy())
         self.assertEqual(
-            ("codex", "native", "gpt-6.1-sol"),
+            ("codex", "bridge", "gpt-6.1-sol"),
             (closed["provider"], closed["dispatch"], closed["model"]),
         )
         bridged = route_task(self.exploratory(), self.provider_policy(bridge=True))
@@ -1026,9 +1030,13 @@ class ProviderRoutingTests(unittest.TestCase):
             ".claude/agents/claude_agents_verification_worker.md",
             codex_work["verifier"]["agent_path"],
         )
-        # Without the bridge flag a Codex primary keeps its own verifier.
-        native = route_task(self.task(), policy)
-        self.assertEqual("codex", native["verifier"]["provider"])
+        # Without the bridge flag a Codex primary keeps its own provider's
+        # verifier, bridged like every Codex child.
+        codex_only = route_task(self.task(), policy)
+        self.assertEqual(
+            ("codex", "bridge"),
+            (codex_only["verifier"]["provider"], codex_only["verifier"]["dispatch"]),
+        )
         codex_disabled = self.provider_policy(codex={"enabled": False})
         same_vendor = route_task(
             self.exploratory(), codex_disabled, primary_provider="claude"

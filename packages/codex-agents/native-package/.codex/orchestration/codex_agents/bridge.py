@@ -30,6 +30,7 @@ from .contracts import (
     ContractError,
     result_preflight,
     validate_assignment,
+    validate_result,
 )
 from .git_plumbing import git_executable as find_git
 from .git_plumbing import repository_layout_problem, run_git
@@ -825,6 +826,9 @@ def run_claude(
         "--verbose",
         "--max-turns", str(max_turns),
         "--append-system-prompt-file", str(system_prompt),
+        # The prompt starts with the assignment's objective; after `--` neither
+        # client can read it as an option (`-c...`, `--settings=...`).
+        "--",
         child_prompt(assignment, worker_result_path=worker_result_path),
     ]
     state: dict[str, Any] = {
@@ -1006,6 +1010,7 @@ def run_codex(
         "--json",
         "--output-schema", str(schema_path),
         "-o", str(last_message),
+        "--",
         child_prompt(assignment, worker_result_path=worker_result_path),
     ]
     state: dict[str, Any] = {
@@ -1198,7 +1203,10 @@ MAX_PROBE_EVENTS = 64
 
 
 def claude_billing_probe(
-    environ: Mapping[str, str], *, project_root: Path | None = None
+    environ: Mapping[str, str],
+    *,
+    project_root: Path | None = None,
+    untrusted: tuple[Path, ...] = (),
 ) -> tuple[list[Any], str | None]:
     """Run one minimal locked Claude turn; return every rate_limit_info it reported
     and why it failed, if it did.
@@ -1222,7 +1230,7 @@ def claude_billing_probe(
         empty = workspace / "export"
         control = workspace / "control"
         check_backend(environ, empty)
-        executable, _ = resolve_client("claude")
+        executable, _ = resolve_client("claude", untrusted=untrusted)
         settings = _private_file(
             control / "settings.json", json.dumps(claude_settings(PROBE_MODEL)).encode()
         )
@@ -1239,6 +1247,7 @@ def claude_billing_probe(
             "--output-format", "stream-json",
             "--verbose",
             "--max-turns", "1",
+            "--",
             PROBE_PROMPT,
         ]
         state: dict[str, Any] = {"init": False, "infos": []}
@@ -1376,7 +1385,7 @@ def dispatch(
         if not ledger.client_version_reviewed(provider, identity["client_version"]):
             raise BridgeRefused("provider client version is not reviewed")
         # The child is launched from the client the re-check just read.
-        executable, digest = resolve_client(provider)
+        executable, digest = resolve_client(provider, untrusted=[project_root])
         if (executable, digest) != (identity["client_path"], identity["client_sha256"]):
             raise BridgeRefused("provider client changed during the launch re-check")
         if provider == "codex":
@@ -1441,10 +1450,7 @@ def dispatch(
     finally:
         remove_private_directory(workspace)
     reviewed = True
-    if result is None:
-        state = "timed_out" if report["outcome"] == "timed_out" else "failed"
-        result = _fenced_result(assignment, state, report["outcome"])
-    elif report.get("rerouted"):
+    if result is not None and report.get("rerouted"):
         # A reroute means the work was not done by the routed model: its verdict
         # is unknown, and the result stays unreviewed.
         reviewed = False
@@ -1456,7 +1462,24 @@ def dispatch(
                 "the provider rerouted this run to another model; verdict unknown",
             ],
         }
+    if result is not None:
+        # The primary records exactly this result, so one it could not record
+        # (invalid, or too large to keep for its verifier) is fenced here.
+        problem = _unrecordable(result, assignment)
+        if problem is not None:
+            result = None
+            report["outcome"] = problem
+    if result is None:
+        state = "timed_out" if report["outcome"] == "timed_out" else "failed"
+        result = _fenced_result(assignment, state, report["outcome"])
     fenced = report["outcome"] != "result"
+    terminal_state = result["execution_state"] if fenced else None
+    # The ledger binds a keyed digest of this result and these flags to the run;
+    # recording the run later requires the same result and terminal state.
+    ledger.record_dispatch_result(
+        project_id, run_handle=run_handle, bridge_run_id=intent["bridge_run_id"],
+        result=result, fenced=fenced, reviewed=reviewed, terminal_state=terminal_state,
+    )
     report.update(
         bridge_run_id=intent["bridge_run_id"],
         export_file_count=file_count,
@@ -1464,9 +1487,24 @@ def dispatch(
         reviewed=reviewed,
         # A fenced terminal state is an authoritative host fact for the
         # observation; a child's own result carries its state in the result.
-        terminal_state=result["execution_state"] if fenced else None,
+        terminal_state=terminal_state,
     )
     return {"result": result, "bridge_report": report}
+
+
+def _unrecordable(result: dict[str, Any], assignment: dict[str, Any]) -> str | None:
+    """Why the primary could not record this child result as returned, or None."""
+
+    from .learning_contracts import canonical_json
+    from .learning_store import MAX_WORKER_RESULT_BYTES
+
+    try:
+        validate_result(result, assignment=assignment)
+    except ContractError:
+        return "invalid_result"
+    if len(canonical_json(result)) > MAX_WORKER_RESULT_BYTES:
+        return "result_too_large"
+    return None
 
 
 def _record_unavailable(

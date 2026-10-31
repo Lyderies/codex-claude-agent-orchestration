@@ -598,9 +598,14 @@ def fake_provider_tools(directory: Path) -> dict[str, str]:
 
 @contextlib.contextmanager
 def trusted_tools(tools: Path):
-    """Make the fake clients the trusted search path, as installed clients would be."""
+    """Make the fake clients the trusted search path, as installed clients would be.
 
-    with mock.patch.object(providers, "TRUSTED_SEARCH_DIRECTORIES", (str(tools),)):
+    The fakes live in the system temp directory, which a real client may never
+    resolve into, so no temporary root counts here; the project root still does.
+    """
+
+    with mock.patch.object(providers, "TRUSTED_SEARCH_DIRECTORIES", (str(tools),)), \
+            mock.patch.object(providers, "temp_roots", lambda: set()):
         yield
 
 

@@ -104,6 +104,20 @@ COLLECTOR_RUNTIME_DIGEST = _collector_runtime_digest()
 PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
 DEFAULT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
+# A worker result kept for its verifier is raw child text, so it lives only while
+# its orchestration is open, and never longer than this; only digests stay.
+WORKER_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+# Registered worker results: their raw text, kept for a verifier in the same
+# orchestration; the select yields project, path and orchestration status.
+_WORKER_RESULT_FILES = (
+    "SELECT s.project_id,s.relative_path,s.expires_at_ms,o.status FROM stored_files s "
+    "LEFT JOIN records r ON r.project_id=s.project_id AND r.record_id=s.source_record_id "
+    "LEFT JOIN host_run_bindings b ON b.project_id=r.project_id "
+    "AND b.run_id=json_extract(CAST(r.content AS TEXT),'$.run_id') "
+    "LEFT JOIN orchestrations o ON o.project_id=b.project_id "
+    "AND o.orchestration_id=b.orchestration_id "
+    "WHERE s.kind='artifact' AND substr(s.file_id,1,12)='host_result_'"
+)
 REPAIR_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000
 MAX_PENDING_REPAIR_RECEIPTS = 4096
 MAX_PENDING_HOST_RUNS = 4096
@@ -1264,8 +1278,23 @@ class LearningLedger:
         return connection
 
     def _reconcile_managed_files(self) -> None:
-        """Reconcile crash-orphaned files and registrations before serving work."""
+        """Reconcile crash-orphaned files and registrations before serving work.
 
+        A worker result whose orchestration has closed, or that is past its
+        retention, loses its registration here, so the sweep below deletes it.
+        """
+
+        now = self._clock_ms()
+        with self._connection:
+            for row in self._connection.execute(_WORKER_RESULT_FILES).fetchall():
+                if row["status"] in {"active", "paused"} and (
+                    row["expires_at_ms"] is None or int(row["expires_at_ms"]) > now
+                ):
+                    continue
+                self._connection.execute(
+                    "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
+                    (str(row["project_id"]), str(row["relative_path"])),
+                )
         rows = self._connection.execute(
             "SELECT project_id,relative_path FROM stored_files"
         ).fetchall()
@@ -2202,7 +2231,8 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile", "probe_admission", "verification_binding",
+            "dispatch_result", "host_run_profile", "probe_admission",
+            "verification_binding",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -2638,6 +2668,19 @@ class LearningLedger:
                 goal_time_used_seconds=resolved_goal_time,
                 observed_at_ms=timestamp,
             )
+            # The boundary's worker results were kept only for its verifiers.
+            results = self._connection.execute(
+                _WORKER_RESULT_FILES + " AND s.project_id=? AND b.orchestration_id=?",
+                (project_id, orchestration_id),
+            ).fetchall()
+            for result_row in results:
+                self._connection.execute(
+                    "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
+                    (project_id, str(result_row["relative_path"])),
+                )
+        for result_row in results:
+            with contextlib.suppress(OSError, LedgerError):
+                self._remove_registered_path(project_id, str(result_row["relative_path"]))
         self.state.harden_database_files()
         return self.orchestration_report(project_id, orchestration_id)
 
@@ -3736,6 +3779,7 @@ class LearningLedger:
             with self._lock:
                 run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
         timestamp = self._clock_ms()
+        untrusted = self._registered_roots(project_id)
         # The client's TMPDIR is a fresh owner-only directory under the learning
         # state, never the system temp directory a sandboxed primary can write.
         try:
@@ -3749,6 +3793,7 @@ class LearningLedger:
                     observed_at_ms=timestamp,
                     tmpdir=tmpdir,
                     environ=environ,
+                    untrusted=untrusted,
                 )
             else:
                 records = observe_codex(
@@ -3759,11 +3804,23 @@ class LearningLedger:
                     environ=environ,
                     run_id=run_id,
                     phase=phase,
+                    untrusted=untrusted,
                 )
         finally:
             remove_private_directory(tmpdir)
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
+
+    def _registered_roots(self, project_id: str) -> tuple[Path, ...]:
+        """The registered project's root, which no provider client may live in."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT canonical_root FROM projects WHERE project_id=?", (project_id,)
+            ).fetchone()
+        if row is None or row["canonical_root"] is None:
+            return ()
+        return (Path(str(row["canonical_root"])),)
 
     def _open_run_for_provider_locked(
         self, project_id: str, run_handle: str, provider: str
@@ -4075,7 +4132,10 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        infos, failure = claude_billing_probe(environ, project_root=project_root)
+        infos, failure = claude_billing_probe(
+            environ, project_root=project_root,
+            untrusted=self._registered_roots(project_id),
+        )
         observed = self._clock_ms()
         headroom: list[dict[str, Any]] = []
         billing_records: list[dict[str, Any]] = []
@@ -4569,6 +4629,80 @@ class LearningLedger:
             "deadline_at_ms": record["deadline_at_ms"],
         }
 
+    def record_dispatch_result(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        bridge_run_id: str,
+        result: dict[str, Any],
+        fenced: bool,
+        reviewed: bool,
+        terminal_state: str | None,
+    ) -> dict[str, Any]:
+        """Bind what a dispatched child returned to its run, once.
+
+        The ledger keeps a keyed digest of the result, never its text, with the
+        bridge's fence, review and terminal-state facts. Recording the run's
+        result later requires exactly this result and terminal state, so a
+        primary can neither substitute a result nor drop a fence.
+        """
+
+        timestamp = self._clock_ms()
+        handle_digest = keyed_digest(self.state.digest_key(), run_handle)
+        with self._lock, self._connection:
+            binding = self._connection.execute(
+                "SELECT run_id,binding_state,consumed_at_ms FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if (
+                binding is None
+                or binding["binding_state"] != "pending"
+                or binding["consumed_at_ms"] is not None
+            ):
+                raise LedgerError("host run is not pending")
+            run_id = str(binding["run_id"])
+            intents = self._connection.execute(
+                "SELECT content FROM records WHERE project_id=? "
+                "AND record_type='dispatch_intent' AND source='lifecycle' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchall()
+            if (
+                len(intents) != 1
+                or json.loads(bytes(intents[0]["content"]))["bridge_run_id"] != bridge_run_id
+            ):
+                raise LedgerError("only the dispatched run records its child's result")
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_result' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("the dispatched child's result is already recorded")
+            material = {
+                "schema_version": 1,
+                "record_type": "dispatch_result",
+                "run_id": run_id,
+                "bridge_run_id": bridge_run_id,
+                "result_digest": keyed_digest(self.state.digest_key(), canonical_json(result)),
+                "fenced": fenced,
+                "reviewed": reviewed,
+                "terminal_state": terminal_state,
+                "observed_at_ms": timestamp,
+            }
+            try:
+                record = validate_learning_record(
+                    {**material, "record_id": f"dispatch_result:{content_digest(material)}"}
+                )
+            except ContractError as exc:
+                raise LedgerError("dispatch result is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="lifecycle", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return {"run_id": run_id, "bridge_run_id": bridge_run_id}
+
     def host_owner(
         self,
         project_id: str,
@@ -4833,6 +4967,27 @@ class LearningLedger:
             ).fetchone() is None:
                 # A bridged run's result can only come from its dispatched child.
                 raise LedgerError("a bridged run must be dispatched before its result")
+            if client_version == BRIDGE_CLIENT_VERSION:
+                # ... and it must be exactly what that child returned, with the
+                # bridge's terminal state: neither may be made up or dropped.
+                dispatched = self._connection.execute(
+                    "SELECT content FROM records WHERE project_id=? "
+                    "AND record_type='dispatch_result' AND source='lifecycle' "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                    (project_id, checked_observation["run_id"]),
+                ).fetchall()
+                if len(dispatched) != 1:
+                    raise LedgerError("a bridged run has no recorded child result")
+                recorded = json.loads(bytes(dispatched[0]["content"]))
+                if not secrets.compare_digest(
+                    keyed_digest(self.state.digest_key(), canonical_json(result)),
+                    recorded["result_digest"],
+                ):
+                    raise LedgerError("host result differs from the bridged child's result")
+                if terminal_state != recorded["terminal_state"]:
+                    raise LedgerError(
+                        "host terminal state differs from the bridged child's outcome"
+                    )
             if trusted_handle is not None and client_version == BRIDGE_CLIENT_VERSION:
                 # A bridged run's usage is what the bridge itself recorded for
                 # it in the ledger; the primary never supplies it.
@@ -5022,7 +5177,7 @@ class LearningLedger:
                             stored_result["relative_path"],
                             stored_result["result_digest"],
                             outcome["record_id"],
-                            timestamp + DEFAULT_RETENTION_MS,
+                            timestamp + WORKER_RESULT_RETENTION_MS,
                         ),
                     )
                 self._connection.execute("COMMIT")

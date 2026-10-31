@@ -47,6 +47,7 @@ RECORD_TYPES = {
     "billing_attestation",
     "admission_decision",
     "dispatch_intent",
+    "dispatch_result",
     "host_run_profile",
     "probe_admission",
     "observation_unavailable",
@@ -1942,6 +1943,36 @@ def validate_dispatch_intent(data: Any) -> dict[str, Any]:
     return data
 
 
+DISPATCH_RESULT_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "bridge_run_id",
+    "result_digest", "fenced", "reviewed", "terminal_state", "observed_at_ms",
+}
+
+
+def validate_dispatch_result(data: Any) -> dict[str, Any]:
+    """What a bridged child returned, as a keyed digest, and the bridge's own flags.
+
+    Written once by `dispatch`, after the child ends; the primary's result for
+    the run must match it, so a made-up result or a dropped fence is refused.
+    """
+
+    data = _closed(data, DISPATCH_RESULT_FIELDS, "dispatch_result")
+    _base(data, "dispatch_result")
+    _identifier(data["run_id"], "run_id")
+    if not isinstance(data["bridge_run_id"], str) or re.fullmatch(
+        r"brg_[0-9a-f]{32}", data["bridge_run_id"]
+    ) is None:
+        raise ContractError("bridge_run_id is invalid")
+    _digest(data["result_digest"], "result_digest")
+    _boolean(data["fenced"], "fenced")
+    _boolean(data["reviewed"], "reviewed")
+    _enum(data["terminal_state"], EXECUTION_STATES, "terminal_state", nullable=True)
+    if data["fenced"] != (data["terminal_state"] is not None):
+        raise ContractError("dispatch_result terminal state belongs only to a fenced outcome")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 HOST_RUN_PROFILE_FIELDS = {
     "schema_version", "record_type", "record_id", "run_id", "host_client",
     "backend_check", "model_pin", "subagent_type", "model_alias", "effort",
@@ -2104,6 +2135,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "billing_attestation": validate_billing_attestation,
     "admission_decision": validate_admission_decision,
     "dispatch_intent": validate_dispatch_intent,
+    "dispatch_result": validate_dispatch_result,
     "host_run_profile": validate_host_run_profile,
     "probe_admission": validate_probe_admission,
     "observation_unavailable": validate_observation_unavailable,

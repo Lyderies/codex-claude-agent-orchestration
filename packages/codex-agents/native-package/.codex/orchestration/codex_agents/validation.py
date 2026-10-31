@@ -735,11 +735,18 @@ def validate_package(root: Path) -> dict[str, Any]:
         if (routes[2]["model"], routes[2]["effort"]) != ("gpt-6-astra", "high"):
             package_errors.append("evidenced hard end-to-end task did not route to Astra/high")
         if any(
-            (route["provider"], route["dispatch"]) != ("codex", "native")
+            route["provider"] != "codex"
             or (route["verifier"] or {}).get("provider", "codex") != "codex"
             for route in routes
         ):
             package_errors.append("default routing selected a provider other than Codex")
+        # A Codex child never shares the primary's session (and its command rule).
+        if any(
+            route["dispatch"] != "bridge"
+            or (route["verifier"] or {}).get("dispatch", "bridge") != "bridge"
+            for route in routes
+        ):
+            package_errors.append("default routing did not bridge a Codex child")
     except (PolicyError, ValueError) as exc:
         package_errors.append(f"routing smoke test failed: {exc}")
     package_ready = not package_errors

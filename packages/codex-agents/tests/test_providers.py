@@ -18,6 +18,7 @@ from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
+from codex_agents import providers
 from codex_agents.contracts import ContractError
 from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_contracts import (
@@ -250,8 +251,11 @@ class ProviderObservationTests(unittest.TestCase):
                 self.assertTrue(calls[0][1]["start_new_session"])
                 # The child gets only a minimal environment; overrides are dropped.
                 self.assertEqual(
-                    {"HOME", "USER", "LOGNAME", "PATH", "LANG", "TMPDIR"}, set(calls[0][1]["env"])
+                    {"HOME", "USER", "LOGNAME", "PATH", "LANG", "TMPDIR", "xcrun_nocache"},
+                    set(calls[0][1]["env"]),
                 )
+                # Any xcrun shim the client reaches skips its $TMPDIR lookup cache.
+                self.assertEqual("1", calls[0][1]["env"]["xcrun_nocache"])
                 # TMPDIR is the caller's private directory, never the system one.
                 self.assertEqual(directory, calls[0][1]["env"]["TMPDIR"])
                 for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
@@ -325,6 +329,38 @@ class ProviderObservationTests(unittest.TestCase):
                     tmpdir=Path(directory), digest_key=KEY, observed_at_ms=NOW,
                     environ={"PATH": str(trusted)},
                 )
+
+    def test_clients_resolving_into_writable_locations_never_run(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            search = root / "bin"
+            search.mkdir()
+            marker = root / "client-ran"
+            checkout = root / "project" / "tools"
+            checkout.mkdir(parents=True)
+            target = checkout / "claude"
+            target.write_text(f"#!/bin/sh\n/usr/bin/touch {marker}\nexit 1\n")
+            target.chmod(0o755)
+            # The search path itself is trusted; its entry links into a checkout.
+            (search / "claude").symlink_to(target)
+            with mock.patch.object(
+                providers, "TRUSTED_SEARCH_DIRECTORIES", (str(search),)
+            ):
+                # The real temporary roots hold the target.
+                with self.assertRaisesRegex(ContractError, "trusted location") as caught:
+                    observe_claude(
+                        tmpdir=root, digest_key=KEY, observed_at_ms=NOW, environ={},
+                    )
+                self.assertEqual("client_unavailable", caught.exception.reason_code)
+                # Outside any temporary root, the project still refuses it.
+                with mock.patch.object(providers, "temp_roots", lambda: set()):
+                    with self.assertRaisesRegex(ContractError, "trusted location"):
+                        providers.resolve_client("claude", untrusted=[root / "project"])
+                    self.assertEqual(
+                        os.path.realpath(target),
+                        providers.resolve_client("claude", untrusted=[])[0],
+                    )
+            self.assertFalse(marker.exists())
 
     def test_claude_output_is_bounded_while_streaming(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
