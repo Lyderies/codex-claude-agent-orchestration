@@ -866,7 +866,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\x1b[B\r")
         self.expect("Rule created")
         self.send("\r")
-        self.expect("Press Enter to exit")
+        self.expect("Back to the main menu")
         self.assertIn("my\\ proj\\;x", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.assertNotIn("codex -p orchestrator", self.screen.split("Codex, start")[-1][:60])
         final = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen.split("\x1b[2J")[-1]).replace("\r", "")
@@ -911,7 +911,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("The install failed")
         self.expect("run it manually to see why")
         self.expect("Continue to the summary")
-        self.send("\r")
+        self.send("\x1b[B\r")
         self.expect("Save a summary of what failed")
         self.send("\x1b[B\r")
         self.expect("Save the summary to")
@@ -1033,7 +1033,7 @@ class WizardTerminalTests(unittest.TestCase):
             self.expect(wait)
             self.send("\r")
         self.expect("Continue to the summary")
-        self.send("\r")
+        self.send("\x1b[B\r")
         self.expect("Save a summary of what failed")
         self.send("\x1b[B\r")
         self.expect("Save the summary to")
@@ -1109,7 +1109,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Project path")
         self.send("\r")
         self.expect("Update the install")  # the existing-install menu, not the summary
-        self.assertNotIn("Press Enter to exit", self.screen)
+        self.assertNotIn("Exit", self.screen)
         self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
         self.expect("Start the attestation")
         self.send("\r")
@@ -1118,7 +1118,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.expect("attest.py ran")
         self.send("\r")
-        self.expect("Press Enter to exit")
+        self.expect("Back to the main menu")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
 
@@ -1143,6 +1143,80 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Update the install")
         self.settle()
         self.assertGreater(self.pid, 0)  # still running: a failure never ended the wizard
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.expect("Stopped.")
+        self.assertEqual(self.finish(), 0)
+
+    def test_failure_menu_defaults_to_the_main_menu_and_the_summary_can_go_back(self) -> None:
+        project, checks = self.make_project()
+        self.start(project, {"FAKE_FAIL": "1"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Back to the main menu")
+        self.send("\r")  # the default: back, not the summary
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right", "Install now"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Continue to the summary")
+        self.send("\x1b[B\r")
+        self.expect("Save a summary of what failed")
+        self.settle()
+        self.assertIn("Back to the main menu", self.screen)
+        self.send("\x1b[B\x1b[B\r")  # Back to the main menu from the summary
+        self.expect("Project path")
+        self.send("q\r")
+        self.expect("Quit setup?")  # only an explicit quit ends the script
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "operational checks use the macOS sandbox, so verify is not ready elsewhere")
+    @NEEDS_TRUSTED_PYTHON
+    def test_verify_retry_back_and_the_summary_return_to_the_menu(self) -> None:
+        import json
+        project, checks = self.make_project(base=self.non_temporary_base())
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)  # left uncommitted: verification fails
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("Try again")
+        self.send("\r")  # Try again: still failing, so the menu comes back
+        self.expect("Try again")
+        self.send("\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("Codex commands rule: missing")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Back to the main menu")  # the final summary
+        self.send("\x1b[B\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
         self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
         self.expect("Stopped.")
         self.assertEqual(self.finish(), 0)

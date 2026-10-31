@@ -975,9 +975,9 @@ save_summary() {
 GO_BACK=0
 RETRY=""
 failure_menu() {
-  menu 0 "Continue to the summary" "Back to the main menu" "Quit"
+  menu 0 "Back to the main menu" "Continue to the summary" "Quit"
   case $MENU_IDX in
-    1) GO_BACK=1;;
+    0) GO_BACK=1;;
     2) echo "Stopped."; exit 0;;
   esac
 }
@@ -2039,7 +2039,7 @@ step_verify_only() {
     begin_step 4
     render
     if verify_install; then
-      mark_step 4 ok "verified"
+      mark_step 4 ok "verified"; FAILED_ANY=0
     elif [ "$VERIFY_LIMITED" -eq 1 ]; then
       mark_step 4 ok "not ready on Linux (known limitation)"
     else
@@ -2104,15 +2104,17 @@ step_done() {
     list_cmd "$(printf '%q' "$RULE_FILE")"
   fi
   if [ "$FAILED_ANY" -eq 1 ] && [ -n "$FAIL_SUMMARY" ]; then
-    menu 0 "Exit" "Save a summary of what failed"
-    [ "$MENU_IDX" -eq 1 ] && save_summary
+    menu 0 "Exit" "Save a summary of what failed" "Back to the main menu"
+    case $MENU_IDX in
+      1) save_summary;;
+      2) GO_BACK=1;;
+    esac
     show_cursor
     return 0
   fi
-  render
+  menu 0 "Exit" "Back to the main menu"
+  [ "$MENU_IDX" -eq 1 ] && GO_BACK=1
   show_cursor
-  printf '  %sPress Enter to exit.%s ' "$C_DIM" "$C_RESET"
-  IFS= read -r _ || true
   printf '\n'
 }
 
@@ -2157,9 +2159,10 @@ main() {
       passphrase)
         step_passphrase;;
     esac
+    [ "$GO_BACK" -eq 1 ] && continue
+    step_done
     [ "$GO_BACK" -eq 1 ] || break
   done
-  step_done
 }
 
 main "$@"
