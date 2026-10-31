@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - Windows has no supported collector tra
     fcntl = None  # type: ignore[assignment]
 
 from .contracts import (
+    HOST_OUTCOME_DIGEST,
     RESULT_VALIDATION_REASON_CODES,
     ContractError,
     result_axes,
@@ -42,6 +43,7 @@ from .learning_contracts import (
     external_id,
     keyed_digest,
     parse_bounded_json,
+    provider_for_model,
     validate_learning_record,
     validate_event,
     validate_execution_configuration,
@@ -109,6 +111,9 @@ HOST_RUN_TTL_MS = 24 * 60 * 60 * 1000
 OPERATIONAL_CHECK_TTL_MS = 60 * 60 * 1000
 UPGRADE_RECONCILIATION_TTL_MS = 10 * 60 * 1000
 MAX_PENDING_OPERATIONAL_CHECKS = 256
+# The CLI reads a result as at most this many bytes, so a kept worker result
+# never needs more.
+MAX_WORKER_RESULT_BYTES = 1_048_576
 INGESTION_FRESH_MS = 30 * 60 * 1000
 MAX_REQUEST_BYTES = MAX_RECORD_BYTES + 16_384
 PRODUCER_AUTHORITY = {
@@ -2197,7 +2202,7 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile", "probe_admission",
+            "host_run_profile", "probe_admission", "verification_binding",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -3430,6 +3435,20 @@ class LearningLedger:
         ):
             raise LedgerError("route observation deadline is invalid")
         observation_deadline_at_ms = timestamp + observation_seconds * 1000
+        # A verifier bound to a worker outcome is opened only for that outcome,
+        # in this orchestration, and its assignment names exactly that outcome,
+        # so the result it is given and the outcome QA binds it to agree.
+        worker_outcome_digest = checked_task.get("verification_for_outcome")
+        if worker_outcome_digest is not None:
+            self.verification_worker_result(
+                project_id, checked_task,
+                orchestration_handle=orchestration_handle, with_result=False,
+            )
+            if checked_assignment["context"] != [worker_outcome_digest]:
+                raise LedgerError(
+                    "a bound verifier's assignment context must be exactly its "
+                    "verification_for_outcome"
+                )
         from .providers import AdmissionDenied
 
         provider = route.get("provider", "codex")
@@ -3593,6 +3612,25 @@ class LearningLedger:
                 self._store_admission_locked(
                     project_id, admission, run_id=run_id, timestamp=admitted_at
                 )
+                if worker_outcome_digest is not None:
+                    material = {
+                        "schema_version": 1,
+                        "record_type": "verification_binding",
+                        "run_id": run_id,
+                        "worker_outcome_digest": worker_outcome_digest,
+                        "observed_at_ms": timestamp,
+                    }
+                    try:
+                        binding_record = validate_learning_record({
+                            **material,
+                            "record_id": f"verification_binding:{content_digest(material)}",
+                        })
+                    except ContractError as exc:
+                        raise LedgerError("verification binding is invalid") from exc
+                    self._append_checked_locked(
+                        project_id, binding_record, producer="lifecycle",
+                        timestamp=timestamp,
+                    )
                 if host_profile is not None:
                     if host_profile.get("host_client") != orchestration["client_version"]:
                         raise LedgerError("host run profile differs from the orchestration host")
@@ -4659,6 +4697,19 @@ class LearningLedger:
             checked_result = validate_result(result, assignment=assignment)
         except ContractError as exc:
             raise LedgerError("host result admission rejected") from exc
+        if (
+            validate_execution_configuration(execution_configuration)[
+                "verification_required"
+            ] is True
+            and len(canonical_json(checked_result)) > MAX_WORKER_RESULT_BYTES
+        ):
+            # A result that will be verified must be kept for its verifier, and
+            # it is kept as canonical JSON, which escapes non-ASCII text. Refuse
+            # before anything is consumed, so the run stays open for a result
+            # that fits.
+            raise LedgerError(
+                "host result is too large to keep for its verifier as canonical JSON"
+            )
         axes = result_axes(checked_result, attempt=assignment.get("attempt", 1))
         if axes["admission_state"] != "unverified":
             raise LedgerError("host result cannot self-assign admission")
@@ -4767,6 +4818,13 @@ class LearningLedger:
             ).fetchone() is None:
                 # A bridged run's result can only come from its dispatched child.
                 raise LedgerError("a bridged run must be dispatched before its result")
+            if trusted_handle is not None and client_version == BRIDGE_CLIENT_VERSION:
+                # A bridged run's usage is what the bridge itself recorded for
+                # it in the ledger; the primary never supplies it.
+                usage = self._bridge_usage_locked(project_id, checked_observation["run_id"])
+                if usage is not None:
+                    host_evidence["usage"] = usage
+                    host_evidence["usage_source"] = "client_observed"
         from .learning_engine import build_host_result_records
 
         evaluation_candidate_digest = None
@@ -4852,6 +4910,14 @@ class LearningLedger:
             raise LedgerError("timed-out result lacks an authoritative host timeout fact")
         if reconciled is not None and reconciled["terminal_status"] != event["status"]:
             raise LedgerError("host result conflicts with the trusted terminal event")
+        host_outcome_digest = content_digest(outcome)
+        # A result that will be verified is kept, outside the database, so a
+        # bound verifier can be given exactly this result later.
+        stored_result = (
+            self._write_worker_result(project_id, host_outcome_digest, checked_result)
+            if execution_configuration["verification_required"] is True
+            else None
+        )
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -4931,17 +4997,158 @@ class LearningLedger:
                 outcome_result = self._append_checked_locked(
                     project_id, outcome, producer="host", timestamp=timestamp
                 )
+                if stored_result is not None and stored_result["created"]:
+                    self._connection.execute(
+                        "INSERT INTO stored_files VALUES(?,?,?,?,?,?,?)",
+                        (
+                            project_id,
+                            stored_result["file_id"],
+                            "artifact",
+                            stored_result["relative_path"],
+                            stored_result["result_digest"],
+                            outcome["record_id"],
+                            timestamp + DEFAULT_RETENTION_MS,
+                        ),
+                    )
                 self._connection.execute("COMMIT")
             except Exception:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
+                if stored_result is not None and stored_result["created"]:
+                    with contextlib.suppress(OSError):
+                        (self.state.root / stored_result["relative_path"]).unlink()
                 raise
         self.state.harden_database_files()
         return {
             "event": event,
             "outcome": outcome,
+            # The one identifier for this outcome: operational QA, routing
+            # evidence and verification_for_outcome all take it.
+            "host_outcome_digest": host_outcome_digest,
+            "worker_result_stored": stored_result is not None,
             "event_commit": event_result,
             "outcome_commit": outcome_result,
+        }
+
+    def _write_worker_result(
+        self, project_id: str, outcome_digest: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Write a run's validated result to an owner-only artifact file.
+
+        The database never holds result text: it registers the file under the
+        keyed result digest the outcome already cites, and the file expires and
+        is deleted with the outcome and with the project. Any failure refuses
+        the commit before the run is consumed; a verification-required result
+        is never recorded without its file.
+        """
+
+        payload = canonical_json(result)
+        if len(payload) > MAX_WORKER_RESULT_BYTES:
+            raise LedgerError(
+                "host result is too large to keep for its verifier as canonical JSON"
+            )
+        file_id = f"host_result_{outcome_digest}"
+        try:
+            path = self._write_owner_file("artifact", project_id, file_id, payload)
+        except FileExistsError as exc:
+            # The existing file is never replaced. When it is already registered
+            # for this exact outcome, the outcome is a replay: its kept result is
+            # already there, and the commit refuses or stands on its own checks.
+            # An unregistered file is an interrupted commit, removed at the next
+            # ledger start, and refuses this one.
+            with self._lock:
+                registered = self._connection.execute(
+                    "SELECT relative_path,content_digest FROM stored_files "
+                    "WHERE project_id=? AND file_id=? AND kind='artifact'",
+                    (project_id, file_id),
+                ).fetchone()
+            digest = keyed_digest(self.state.digest_key(), payload)
+            if registered is None or str(registered["content_digest"]) != digest:
+                raise LedgerError(
+                    "host result file for this outcome already exists"
+                ) from exc
+            return {
+                "file_id": file_id,
+                "relative_path": str(registered["relative_path"]),
+                "result_digest": digest,
+                "created": False,
+            }
+        except OSError as exc:
+            raise LedgerError("host result file could not be written") from exc
+        return {
+            "file_id": file_id,
+            "relative_path": path.relative_to(self.state.root).as_posix(),
+            "result_digest": keyed_digest(self.state.digest_key(), payload),
+            "created": True,
+        }
+
+    def _read_worker_result_locked(
+        self, project_id: str, outcome: dict[str, Any], outcome_digest: str
+    ) -> dict[str, Any]:
+        row = self._connection.execute(
+            "SELECT relative_path,content_digest,source_record_id FROM stored_files "
+            "WHERE project_id=? AND file_id=? AND kind='artifact'",
+            (project_id, f"host_result_{outcome_digest}"),
+        ).fetchone()
+        if row is None or row["source_record_id"] != outcome["record_id"]:
+            raise LedgerError("the worker result for verification_for_outcome is unavailable")
+        path = self.state.root / str(row["relative_path"])
+        try:
+            _assert_no_symlink_components(path)
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise OSError("not a regular file")
+                payload = handle.read(MAX_WORKER_RESULT_BYTES + 1)
+        except (OSError, StateError) as exc:
+            raise LedgerError(
+                "the worker result for verification_for_outcome is unavailable"
+            ) from exc
+        digest = keyed_digest(self.state.digest_key(), payload)
+        if (
+            len(payload) > MAX_WORKER_RESULT_BYTES
+            or not secrets.compare_digest(digest, str(row["content_digest"]))
+            or digest not in outcome["evidence_digests"]
+        ):
+            raise LedgerError("the worker result for verification_for_outcome is invalid")
+        result = json.loads(payload)
+        if canonical_json(result) != payload:
+            raise LedgerError("the worker result for verification_for_outcome is invalid")
+        return result
+
+    def _bridge_usage_locked(self, project_id: str, run_id: str) -> dict[str, Any] | None:
+        """Map a bridged run's recorded provider usage onto the outcome usage fields.
+
+        Claude reports cache reads and writes apart from input, so they are
+        added back to make the input total; a count that cannot be known, or
+        a pair the outcome contract rejects, stays unknown.
+        """
+
+        rows = self._connection.execute(
+            "SELECT content FROM records WHERE project_id=? AND record_type='provider_usage' "
+            "AND source='provider' AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+            (project_id, run_id),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        recorded = json.loads(bytes(rows[0]["content"]))
+        inputs = recorded["input_tokens"]
+        cached = recorded["cached_input_tokens"]
+        if recorded["provider"] == "claude":
+            parts = (inputs, cached, recorded["cache_creation_input_tokens"])
+            inputs = None if any(part is None for part in parts) else sum(parts)
+        outputs = recorded["output_tokens"]
+        reasoning = recorded["reasoning_output_tokens"]
+        if cached is not None and inputs is not None and cached > inputs:
+            cached = None
+        if reasoning is not None and outputs is not None and reasoning > outputs:
+            reasoning = None
+        return {
+            **empty_usage(),
+            "input_tokens": inputs,
+            "cached_tokens": cached,
+            "output_tokens": outputs,
+            "reasoning_tokens": reasoning,
         }
 
     def _operational_qa_scope_locked(
@@ -4950,6 +5157,14 @@ class LearningLedger:
         host_outcome_digest: str,
         verifier_host_outcome_digest: str,
     ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        for digest in (host_outcome_digest, verifier_host_outcome_digest):
+            if not isinstance(digest, str) or not HOST_OUTCOME_DIGEST.fullmatch(digest):
+                # Record identifiers (`out:...`) are not accepted: QA takes the
+                # host_outcome_digest that learning-record-host-result prints.
+                raise LedgerError(
+                    "operational QA takes the host_outcome_digest printed by "
+                    "learning-record-host-result"
+                )
         host_row = self._connection.execute(
             "SELECT content FROM records WHERE project_id=? AND content_digest=? "
             "AND record_type='outcome' AND source='host'",
@@ -4990,7 +5205,68 @@ class LearningLedger:
         ).fetchone()
         if orchestration is None or orchestration["status"] != "active":
             raise LedgerError("operational QA requires an active orchestration")
+        self._operational_verifier_provider_locked(
+            project_id, host_outcome, verifier_host_outcome
+        )
+        bindings = self._connection.execute(
+            "SELECT content FROM records WHERE project_id=? "
+            "AND record_type='verification_binding' AND source='lifecycle' "
+            "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+            (project_id, verifier_host_outcome["run_id"]),
+        ).fetchall()
+        if len(bindings) != 1:
+            raise LedgerError(
+                "operational QA requires a verifier opened with verification_for_outcome"
+            )
+        if json.loads(bytes(bindings[0]["content"]))["worker_outcome_digest"] != (
+            host_outcome_digest
+        ):
+            raise LedgerError(
+                "operational QA verifier was opened for another worker outcome"
+            )
         return host_outcome, verifier_host_outcome, orchestration_id
+
+    def _operational_verifier_provider_locked(
+        self,
+        project_id: str,
+        host_outcome: dict[str, Any],
+        verifier_host_outcome: dict[str, Any],
+    ) -> None:
+        """Bind the verifier's role to its admitted provider and to the worker's.
+
+        The verifier outcome's role and model are those of the route its run was
+        opened with (the ledger bound that configuration at open and commit), so
+        they must be the verification role and a model of the provider the run
+        was admitted for. A Claude verifier must be the other provider than the
+        worker. A Codex verifier of a Codex worker stays valid, because a
+        Codex-only project has no other provider to verify with.
+        """
+
+        roles = {
+            "codex": "codex_agents_verification_worker",
+            "claude": "claude_agents_verification_worker",
+        }
+        worker_provider = self._run_admission_locked(
+            project_id, host_outcome["run_id"]
+        )["provider"]
+        verifier_provider = self._run_admission_locked(
+            project_id, verifier_host_outcome["run_id"]
+        )["provider"]
+        try:
+            model_provider = provider_for_model(verifier_host_outcome["model"])
+        except ContractError as exc:
+            raise LedgerError("operational verifier model is not a provider model") from exc
+        if (
+            verifier_host_outcome["role"] != roles.get(verifier_provider)
+            or model_provider != verifier_provider
+        ):
+            raise LedgerError(
+                "operational verifier role is not the route role of its admitted provider"
+            )
+        if verifier_provider == worker_provider and verifier_provider != "codex":
+            raise LedgerError(
+                "operational verifier must be the other provider than the worker"
+            )
 
     def validate_operational_qa_scope(
         self,
@@ -5006,6 +5282,126 @@ class LearningLedger:
                 project_id, host_outcome_digest, verifier_host_outcome_digest
             )
         return {"ready": True, "orchestration_id": orchestration_id}
+
+    def verification_worker_result(
+        self,
+        project_id: str,
+        task: dict[str, Any],
+        *,
+        orchestration_handle: str | None = None,
+        run_handle: str | None = None,
+        with_result: bool = True,
+    ) -> dict[str, Any] | None:
+        """Resolve a verification task's bound worker outcome and its recorded result.
+
+        Returns None for a task without `verification_for_outcome`. Otherwise the
+        outcome must be a host outcome of this project, from a non-verification
+        run of the task's `verification_for_family`, admitted for the provider
+        named in `verification_for_provider`, in an active orchestration; with
+        an orchestration or run handle, that orchestration must be the handle's.
+        The result is read from the ledger and checked against the digest the
+        outcome cites, so a primary can never substitute it. `with_result=False`
+        checks the binding only, so a verifier that already ran can be recorded.
+        """
+
+        checked = validate_task(task)
+        digest = checked.get("verification_for_outcome")
+        if digest is None:
+            return None
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT content FROM records WHERE project_id=? AND record_type='outcome' "
+                "AND source='host' AND content_digest=?",
+                (project_id, digest),
+            ).fetchall()
+            if len(rows) != 1:
+                raise LedgerError("verification_for_outcome is not a recorded host outcome")
+            outcome = json.loads(bytes(rows[0]["content"]))
+            if outcome["task_slice"].startswith("verification-") or (
+                outcome["task_slice"].split("-")[0] != checked["verification_for_family"]
+            ):
+                raise LedgerError(
+                    "verification_for_outcome is not a worker outcome of "
+                    "verification_for_family"
+                )
+            binding = self._connection.execute(
+                "SELECT orchestration_id FROM host_run_bindings "
+                "WHERE project_id=? AND run_id=?",
+                (project_id, outcome["run_id"]),
+            ).fetchone()
+            if binding is None or binding["orchestration_id"] is None:
+                raise LedgerError("verification_for_outcome has no orchestration")
+            orchestration_id = str(binding["orchestration_id"])
+            orchestration = self._connection.execute(
+                "SELECT status FROM orchestrations WHERE project_id=? "
+                "AND orchestration_id=?",
+                (project_id, orchestration_id),
+            ).fetchone()
+            if orchestration is None or orchestration["status"] != "active":
+                raise LedgerError("verification_for_outcome orchestration is not active")
+            try:
+                admission = self._run_admission_locked(project_id, outcome["run_id"])
+            except LedgerError as exc:
+                raise LedgerError(
+                    "verification_for_outcome has no admitted provider"
+                ) from exc
+            if admission["provider"] != checked["verification_for_provider"]:
+                raise LedgerError(
+                    "verification_for_outcome comes from another provider than "
+                    "verification_for_provider"
+                )
+            if orchestration_handle is not None:
+                current = self._orchestration_for_handle_locked(
+                    project_id, orchestration_handle
+                )
+                if str(current["orchestration_id"]) != orchestration_id:
+                    raise LedgerError(
+                        "verification_for_outcome belongs to another orchestration"
+                    )
+            if run_handle is not None:
+                verifier = self._connection.execute(
+                    "SELECT orchestration_id FROM host_run_bindings "
+                    "WHERE project_id=? AND handle_digest=?",
+                    (project_id, keyed_digest(self.state.digest_key(), run_handle)),
+                ).fetchone()
+                if verifier is None or verifier["orchestration_id"] != orchestration_id:
+                    raise LedgerError(
+                        "verification_for_outcome belongs to another orchestration"
+                    )
+            worker_result = (
+                self._read_worker_result_locked(project_id, outcome, digest)
+                if with_result else None
+            )
+        return {
+            "host_outcome_digest": digest,
+            "provider": admission["provider"],
+            "orchestration_id": orchestration_id,
+            "worker_result": worker_result,
+        }
+
+    def billing_waived_by_attestation(
+        self, project_id: str, record: dict[str, Any]
+    ) -> bool:
+        """Whether admission would read this billing record's credits as not usable.
+
+        The same rule and the same attestation admission uses: the project's
+        latest owner-verified attestation for the record's account.
+        """
+
+        from .providers import _latest, credits_waived
+
+        provider = record.get("provider")
+        with self._lock:
+            attestations = self._provider_records_locked(
+                project_id, "billing_attestation", provider
+            )
+        attestation = _latest([
+            item for item in attestations
+            if item[0]["account_fingerprint"] == record.get("account_fingerprint")
+        ])
+        return credits_waived(
+            provider, record, None if attestation is None else attestation[0]
+        )
 
     def issue_operational_check_receipt(
         self,

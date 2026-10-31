@@ -511,6 +511,15 @@ def child(directory, name):
                 os.path.relpath(os.path.join(base, item), os.getcwd())
                 for base, _, items in os.walk(os.getcwd()) for item in items
             ),
+            # What the bridge placed in the reserved verifier input directory.
+            "reserved_inputs": {
+                item: {
+                    "content": open(os.path.join(base, item)).read(),
+                    "mode": oct(os.stat(os.path.join(base, item)).st_mode & 0o777),
+                }
+                for base, _, items in os.walk(os.path.join(os.getcwd(), ".orchestration-input"))
+                for item in items
+            },
         }) + "\\n")
     frames = os.path.join(directory, name + "-frames.jsonl")
     for line in open(frames) if os.path.exists(frames) else []:

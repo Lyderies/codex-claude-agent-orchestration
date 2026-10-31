@@ -51,6 +51,7 @@ RECORD_TYPES = {
     "probe_admission",
     "observation_unavailable",
     "provider_usage",
+    "verification_binding",
 }
 SOURCES = {
     "hook", "app_server", "host", "evaluator", "verifier", "owner", "lifecycle",
@@ -2064,6 +2065,23 @@ def validate_provider_usage(data: Any) -> dict[str, Any]:
     return data
 
 
+VERIFICATION_BINDING_FIELDS = {
+    "schema_version", "record_type", "record_id", "run_id", "worker_outcome_digest",
+    "observed_at_ms",
+}
+
+
+def validate_verification_binding(data: Any) -> dict[str, Any]:
+    """The worker outcome a verifier run was opened for; written only at open."""
+
+    data = _closed(data, VERIFICATION_BINDING_FIELDS, "verification_binding")
+    _base(data, "verification_binding")
+    _identifier(data["run_id"], "run_id")
+    _digest(data["worker_outcome_digest"], "worker_outcome_digest")
+    _integer(data["observed_at_ms"], "observed_at_ms")
+    return data
+
+
 VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "event": validate_event,
     "outcome": validate_outcome,
@@ -2090,6 +2108,7 @@ VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
     "probe_admission": validate_probe_admission,
     "observation_unavailable": validate_observation_unavailable,
     "provider_usage": validate_provider_usage,
+    "verification_binding": validate_verification_binding,
 }
 
 

@@ -2060,6 +2060,13 @@ class LearningStoreTests(unittest.TestCase):
             "objective": "Independently verify the result",
             "family": "verification",
         }
+        # QA accepts only a verifier opened for this exact worker outcome.
+        bound_verifier_task = {
+            **verifier_task,
+            "verification_for_family": "research",
+            "verification_for_provider": "codex",
+            "verification_for_outcome": content_digest(host),
+        }
         verifier_configuration = {
             **evaluator_configuration,
             "model": verifier["model"],
@@ -2096,7 +2103,7 @@ class LearningStoreTests(unittest.TestCase):
                 now_ms=150,
             )
         verifier_run = execute(
-            verifier, verifier_task, verifier_configuration, verifier_result, 140
+            verifier, bound_verifier_task, verifier_configuration, verifier_result, 140
         )
         check_receipt = self.ledger.issue_operational_check_receipt(
             self.project_a_id,
