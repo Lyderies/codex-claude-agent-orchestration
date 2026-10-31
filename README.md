@@ -51,17 +51,21 @@ It is a step-by-step terminal wizard (arrow keys, Enter, Space to toggle, `q` to
    stages exactly the files the installer reported plus `provider-routing.json`, and the summary
    says `committed`, `nothing to commit`, `not committed (you chose to commit yourself)` or
    `commit failed` and lists anything left uncommitted. Only files that really changed are listed,
-   and when there are none it skips the commit question;
+   and when there are none it skips the commit question. The commit skips the project's Git
+   hooks;
 5. registers the learning collector;
 6. hands the terminal to the billing attestation, which only you can sign;
 7. optionally creates the Codex orchestrator profile;
 8. when Codex sessions may orchestrate the project, offers the Codex commands rule, which lets
    only this project's everyday orchestrator commands run outside Codex's sandbox (owner
-   commands stay blocked; delete the rule file to undo it);
+   commands stay blocked). Every Codex session on the machine loads the rule; it runs a
+   protected copy of the orchestrator in the Codex settings folder, so a session opened on a
+   parent folder cannot change what it runs. Never start Codex with your home folder's parent
+   or `/` as its workspace. Delete the rule file, or run the remove command, to undo it;
 9. summarises the result and how to use it.
 
 Run it again on an installed project to update, verify or re-attest. It needs an interactive
-terminal and refuses to run piped or scripted. Full command output goes to a private temporary log,
+terminal and refuses to run piped or scripted. Full command output goes to a private log,
 shown only if something fails. Set `NO_COLOR=1` for plain output. In Claude Code, use the
 `agent-orchestration` skill afterwards. In Codex, start with `codex -p orchestrator` if the optional
 orchestrator profile (step 7) was created, or if `~/.codex/orchestrator.config.toml` already sets
@@ -71,6 +75,41 @@ rule (step 8) exists, because Codex's sandbox blocks the orchestrator's backgrou
 only when the session starts in the project's root folder. Paths
 accept a leading `~`, `$HOME`, or surrounding quotes, and the wizard offers the `$HOME` match
 when a path with a lost `~` does not exist.
+
+### How setup keeps your authority away from the agents
+
+The AI agents this sets up run as your user, so the setup tools assume an agent may have
+changed anything it can write: the project's working tree and the temporary folders.
+
+- **Trusted Python, isolated.** Every Python the wizard starts is the real file behind the
+  `python3` on your `PATH`, never a symlink, a virtual environment's copy, or one in a temporary
+  folder or the project, and it runs with `-I -B -S` so nothing in the working folder, the
+  environment or site-packages loads. Use a system Python such as Homebrew's or python.org's.
+- **Private working files.** Logs, the install plan, the key being enrolled and the statement
+  being signed live in a fresh owner-only folder in your per-user cache folder (macOS) or
+  `$XDG_RUNTIME_DIR` (Linux; setup refuses without it), never in `/tmp` or `$TMPDIR`.
+- **Only this release's orchestrator runs.** Before running the project's orchestration CLI,
+  setup and `attest.py` check its runtime files against this repository's copy byte for byte
+  (same version, identical files, no extra modules) and refuse otherwise; it then runs isolated
+  and never reads cached bytecode from the project.
+- **You sign only what you approved.** `attest.py` sends the statement on standard input,
+  rebuilds the exact bytes to sign from your answers, refuses to sign anything else, checks the
+  signature covers those bytes, and after enrolling a key checks that the configured key is the
+  one it showed you.
+- **No repository hooks.** Git commands on the project run with
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false`.
+- **Claude primaries cannot run owner commands.** The installer merges Claude Code permission
+  deny rules into the project's `.claude/settings.json` (and records what it added in
+  `.claude/agent-orchestration-permissions.json`): two `Bash` rules for each owner-only CLI
+  subcommand (registration, billing attestation, owner keys and grants, backups and deletion,
+  canaries, promotion and rollback, upgrade reconciliation, the Codex rule commands and every
+  other command that is not one of the 23 primary-host commands), in the forms
+  `Bash(*.codex/orchestration/cli.py <command>)` and `Bash(*.codex/orchestration/cli.py <command> *)`,
+  plus `Edit` rules for `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`.
+  Existing settings are kept; `verify` reports missing rules and `remove` takes out only the
+  entries install added. These rules are a policy layer on Claude Code's tools, not a sandbox: a
+  command spelled another way (for example through `bash -c` or a script that starts the CLI
+  itself) is not matched, so do not give a Claude primary more trust because of them.
 
 ### Advanced: manual setup
 
@@ -106,24 +145,29 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
 1. **Install** into the top of a Git project. Without `--apply` the command only previews:
 
    ```sh
-   python3 scripts/install.py install --target /path/to/project --apply
-   python3 scripts/install.py verify --target /path/to/project
+   python3 -I -B -S scripts/install.py install --target /path/to/project --apply
+   python3 -I -B -S scripts/install.py verify --target /path/to/project
    ```
 
-   Commit the installed files in the project.
+   Commit the installed files in the project, including `.claude/settings.json` and
+   `.claude/agent-orchestration-permissions.json`. To uninstall, run
+   `python3 -I -B -S scripts/install.py remove --target /path/to/project --apply`: it first removes
+   the Codex commands rule through the project's `remove-codex-rule` command (an older installed
+   version without that command makes it stop and name the rule file to delete), then the
+   permission entries it added, then both packages.
 2. **Enable providers.** Commit `.codex/orchestration/provider-routing.json` in the project. It
    says which providers and models children may use. Without it, only Codex children are
    allowed.
 3. **Register the learning collector** once, from the project:
 
    ```sh
-   python3 .codex/orchestration/cli.py learning-register --project-root "$PWD"
+   python3 -I -B -S .codex/orchestration/cli.py learning-register --project-root "$PWD"
    ```
 
 4. **Attest billing.** This is a one-time human step:
 
    ```sh
-   python3 scripts/attest.py --target /path/to/project
+   python3 -I -B -S scripts/attest.py --target /path/to/project
    ```
 
    No child runs until you confirm that each account cannot be charged beyond its subscription.
@@ -136,7 +180,7 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    If the owner key is already configured, it finds the key file at `~/.ssh/codex-agents-owner`
    by itself and only asks for a file location when it cannot (never for the passphrase there).
    To change the key's passphrase, choose "Change the owner key passphrase" in `./setup.sh`, or run
-   `python3 scripts/attest.py --change-passphrase`.
+   `python3 -I -B -S scripts/attest.py --change-passphrase`.
 
    Run it again whenever your billing settings change.
 5. **Optional: let a Codex session orchestrate Claude children.** Codex runs commands without
