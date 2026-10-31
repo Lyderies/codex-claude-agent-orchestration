@@ -2605,6 +2605,172 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         refused = self.run_checks(digest, verified["host_outcome_digest"], expected=2)
         self.assertIn("other provider than the worker", refused["error"])
 
+    def codex_worker(self, orchestration: dict, task_id: str) -> dict:
+        """A bridged Codex coding worker in the given orchestration, recorded."""
+
+        task = {**self.bounded(), "id": task_id}
+        route, assigned, context, route_path = self.lifecycle_inputs(task)
+        assigned = {**assigned, "assignment_id": f"{task_id}-assignment", "task_id": task_id}
+        context = (
+            "--task", context[1],
+            "--assignment", self.write(f"{task_id}-assignment.json", assigned),
+            "--parent-grant", context[5],
+        )
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration["orchestration_handle"],
+        )
+        worker_result = {**result(), "assignment_id": assigned["assignment_id"]}
+        self.frames("codex", [{"type": "turn.completed", "usage": {"input_tokens": 3}}])
+        (self.tools / "codex-last-message.json").write_text(
+            json.dumps(null_filled(worker_result))
+        )
+        dispatched = self.cli(
+            "dispatch", *context, "--route", route_path,
+            "--run-handle", opened["run_handle"],
+        )
+        recorded = self.record(
+            context, opened["run_handle"], dispatched["result"],
+            dispatched["bridge_report"]["terminal_state"],
+        )
+        return {
+            "digest": recorded["host_outcome_digest"], "assignment": assigned,
+            "result": dispatched["result"],
+        }
+
+    def native_verifier(self, orchestration: dict, task: dict, context_digest: str,
+                        agent_id: str, expected: int = 0) -> dict:
+        task_path = self.write(f"{task['id']}.json", task)
+        route = self.cli("learning-route", "--task", task_path)
+        self.assertEqual(("claude", "native"), (route["provider"], route["dispatch"]))
+        assigned = self.assignment_for(
+            route, assignment_id=f"{task['id']}-assignment", task_id=task["id"],
+            objective=task["objective"], context=[context_digest],
+            owned_paths=["source.txt"], verification_required=False,
+        )
+        context = (
+            "--task", task_path,
+            "--assignment", self.write(f"{task['id']}-assignment.json", assigned),
+            "--parent-grant", self.write("grant.json", PARENT_GRANT),
+        )
+        opened = self.cli(
+            "learning-open-host-run", *context,
+            "--route", self.write(f"{task['id']}-route.json", route),
+            "--orchestration-handle", orchestration["orchestration_handle"],
+            expected=expected,
+        )
+        if expected:
+            return opened
+        self.cli(
+            "learning-bind-host-agent", "--run-handle", opened["run_handle"],
+            "--agent-id", agent_id,
+        )
+        verifier_result = {**result(), "assignment_id": assigned["assignment_id"]}
+        recorded = self.record(context, opened["run_handle"], verifier_result)
+        return {
+            "digest": recorded["host_outcome_digest"], "assignment": assigned,
+            "result": verifier_result,
+        }
+
+    def qa_files(self, worker: dict, verifier: dict) -> dict:
+        return {
+            "--evaluator-assignment": self.write("qa-worker-assignment.json",
+                                                 worker["assignment"]),
+            "--evaluator-result": self.write("qa-worker-result.json", worker["result"]),
+            "--verifier-assignment": self.write("qa-verifier-assignment.json",
+                                                verifier["assignment"]),
+            "--verifier-result": self.write("qa-verifier-result.json", verifier["result"]),
+        }
+
+    def test_qa_binds_the_verifier_to_the_outcome_it_was_opened_for(self) -> None:
+        self.admit("codex")
+        self.admit("claude")
+        # Fresh Claude billing, so more than one Claude verifier is admitted.
+        self.frames("claude", [PROBE_INIT, FAVOURABLE, result_frame("OK")])
+        self.cli("provider-observe", "--provider", "claude", "--billing-probe")
+        orchestration = self.cli("learning-open-orchestration")
+        worker_a = self.codex_worker(orchestration, "task-a")
+        worker_b = self.codex_worker(orchestration, "task-b")
+
+        def bound(task_id: str, digest: str) -> dict:
+            return self.verifier_task(
+                digest, id=task_id, verification_for_family="coding",
+                verification_for_provider="codex",
+            )
+
+        # Bound to A, but its assignment names B: refused at open.
+        refused = self.native_verifier(
+            orchestration, bound("verify-a", worker_a["digest"]), worker_b["digest"],
+            "d06ab54604db1e0de", expected=2,
+        )
+        self.assertIn("must be exactly its verification_for_outcome", refused["error"])
+        verifier_a = self.native_verifier(
+            orchestration, bound("verify-a", worker_a["digest"]), worker_a["digest"],
+            "e17bc65715ec2f1ef",
+        )
+        # A verifier opened without the binding names A in its context only.
+        unbound_task = {
+            key: value for key, value in bound("verify-u", worker_a["digest"]).items()
+            if key != "verification_for_outcome"
+        }
+        unbound = self.native_verifier(
+            orchestration, unbound_task, worker_a["digest"], "f28cd76826fd3a2f0",
+        )
+        for worker, verifier, message in (
+            (worker_b, verifier_a, "opened for another worker outcome"),
+            (worker_a, unbound, "requires a verifier opened with verification_for_outcome"),
+        ):
+            with self.subTest(message=message):
+                refused = self.run_checks(worker["digest"], verifier["digest"], expected=2)
+                self.assertIn(message, refused["error"])
+        # The verifier opened for A is accepted for A.
+        checks = self.run_checks(worker_a["digest"], verifier_a["digest"])
+        qa = self.qa(
+            worker_a["digest"], verifier_a["digest"], checks["check_receipt"],
+            self.qa_files(worker_a, verifier_a),
+        )
+        self.assertTrue(qa["qa"]["accepted"])
+        # A receipt for A cannot be spent on B's QA either.
+        refused = self.qa(
+            worker_b["digest"], verifier_a["digest"], checks["check_receipt"],
+            self.qa_files(worker_b, verifier_a), expected=2,
+        )
+        self.assertIn("opened for another worker outcome", refused["error"])
+
+    def test_an_oversized_canonical_result_is_refused_before_the_run_is_consumed(
+        self,
+    ) -> None:
+        self.admit("claude")
+        route, assigned, context, route_path = self.lifecycle_inputs(self.task())
+        self.assertTrue(assigned["verification_required"])
+        orchestration = self.cli("learning-open-orchestration")
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", orchestration["orchestration_handle"],
+        )
+        self.cli(
+            "learning-bind-host-agent", "--run-handle", opened["run_handle"],
+            "--agent-id", WORKER_AGENT_ID,
+        )
+        # 400 KB of UTF-8 input, but 1.2 MB as canonical JSON, which escapes it.
+        emoji = {**result(), "summary": "\U0001F600" * 100_000}
+        emoji_path = Path(self.temporary.name) / "emoji-result.json"
+        emoji_path.write_text(json.dumps(emoji, ensure_ascii=False), encoding="utf-8")
+        self.assertLess(emoji_path.stat().st_size, 1_048_576)
+        self.cli("validate-result", *context, "--result", str(emoji_path))
+        observation = self.write("observation.json", {
+            "run_handle": opened["run_handle"], "result_attempts": ACCEPTED,
+        })
+        refused = self.cli(
+            "learning-record-host-result", *context, "--result", str(emoji_path),
+            "--observation", observation, expected=2,
+        )
+        self.assertIn("too large to keep for its verifier", refused["error"])
+        self.assertEqual([], list(self.state.artifacts.rglob("*.json")))
+        # The run is still open, and records a result that fits.
+        recorded = self.record(context, opened["run_handle"], result())
+        self.assertTrue(recorded["worker_result_stored"])
+
     def test_provider_observe_shows_an_attested_credits_waiver(self) -> None:
         rate_limits = json.loads((self.tools / "codex-result.json").read_text())
         rate_limits["rateLimits"]["credits"]["hasCredits"] = True

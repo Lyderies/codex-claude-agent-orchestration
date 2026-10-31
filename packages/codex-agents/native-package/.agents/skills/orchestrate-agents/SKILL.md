@@ -120,7 +120,9 @@ Keep the primary agent as the decision owner and final synthesizer.
    agent, model, effort, and sandbox. Give the verifier assignment the worker's
    `required_evidence`, `context: ["<worker host_outcome_digest>"]`, and the source
    files to check in `owned_paths` (listed in the task's `owned_paths` too, with
-   `<path>:read` permissions). The worker's result reaches the verifier only from the
+   `<path>:read` permissions). The context must be exactly that one digest, or the
+   open is refused, and operational QA accepts only a verifier opened with
+   `verification_for_outcome` for that worker. The worker's result reaches the verifier only from the
    ledger: a bridged verifier finds it read-only at
    `.orchestration-input/worker-result.json` in its export, and for a native verifier
    `learning-open-host-run` returns `verification_input.worker_result`, which goes in

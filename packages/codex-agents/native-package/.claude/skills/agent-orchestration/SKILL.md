@@ -58,7 +58,9 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
    worker's `host_outcome_digest`. Give the verifier assignment the same
    `required_evidence` as the worker, `context: ["<worker host_outcome_digest>"]`, and
    the source files to check in `owned_paths` (also listed in the task's
-   `owned_paths`, with `<path>:read` permissions). Route it, and run it through steps
+   `owned_paths`, with `<path>:read` permissions). The context must be exactly that one
+   digest, or the open is refused, and operational QA accepts only a verifier opened
+   with `verification_for_outcome` for that worker. Route it, and run it through steps
    3 to 6. The worker's result comes from the ledger, never from a file you write:
    - `dispatch: bridge` (a Codex verifier): `dispatch` places the recorded result,
      read-only, at `.orchestration-input/worker-result.json` in the verifier's export

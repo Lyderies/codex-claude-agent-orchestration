@@ -265,7 +265,14 @@ provider API key, and a run handle that was already dispatched.
   (`codex_agents_verification_worker` or `claude_agents_verification_worker`). The
   verifier's role and model must be those of the provider its run was admitted for,
   and a Claude verifier must be the other provider than the worker; a Codex verifier
-  of Codex work stays valid for a Codex-only project.
+  of Codex work stays valid for a Codex-only project. The verifier must have been opened
+  with `verification_for_outcome` naming QA's worker outcome: the open stores that
+  binding with the run (a `verification_binding` lifecycle record) and refuses an
+  assignment whose `context` is not exactly `[<that digest>]`.
+- A result whose route requires verification must fit the 1 MiB bound as canonical JSON,
+  which escapes non-ASCII text; a larger one is refused before the run is consumed, so
+  the run can still record a result that fits. A result is never recorded without its
+  kept file.
 - Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
   typed codes, never prompts or file contents. A host result whose route requires
   verification is kept, as its validated JSON, in an owner-only file under the

@@ -64,6 +64,11 @@
   role, so a native Claude verifier of Codex work could never pass. It now accepts the routed
   verification role of either provider, bound to the verifier run's admitted provider; a
   Claude verifier must be the other provider than the worker.
+- **Review fixes (0.8.5).** A verifier's open now stores the worker outcome it was bound to and
+  refuses an assignment whose context names any other; operational QA accepts only a verifier
+  opened for its exact worker outcome. A verification-required result too large to keep as
+  canonical JSON is refused before the run is consumed, instead of being recorded without
+  the copy its verifier needs.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the
