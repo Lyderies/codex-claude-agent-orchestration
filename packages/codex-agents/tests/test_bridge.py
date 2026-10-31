@@ -2248,10 +2248,14 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         self.assertEqual(expected, code, stdout.getvalue())
         return json.loads(stdout.getvalue())
 
-    def run_native_worker(self) -> dict:
+    def run_native_worker(self, *, probe: bool = False) -> dict:
         """A native Claude research worker, opened, bound and recorded."""
 
         self.admit("claude")
+        if probe:
+            # Fresh billing, so later Claude runs are admitted after the worker.
+            self.frames("claude", [PROBE_INIT, FAVOURABLE, result_frame("OK")])
+            self.cli("provider-observe", "--provider", "claude", "--billing-probe")
         task = self.task()
         route, assigned, context, route_path = self.lifecycle_inputs(task)
         self.assertEqual(("claude", "native"), (route["provider"], route["dispatch"]))
@@ -2478,7 +2482,7 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         refused = self.cli("learning-route", "--task", self.write("v.json", task), expected=2)
         self.assertIn("is unavailable", refused["error"])
 
-    def test_a_native_verifier_gets_the_worker_result_from_open(self) -> None:
+    def test_a_native_claude_verifier_of_codex_work_passes_qa(self) -> None:
         # A bridged Codex worker, then a native Claude verifier for it.
         self.admit("codex")
         route, assigned, context, route_path = self.lifecycle_inputs(self.bounded())
@@ -2507,8 +2511,8 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         task = self.verifier_task(
             digest, verification_for_family="coding", verification_for_provider="codex",
         )
-        verifier_route, _, verifier_context, verifier_route_path = self.verifier_inputs(
-            task, digest
+        verifier_route, verifier_assigned, verifier_context, verifier_route_path = (
+            self.verifier_inputs(task, digest)
         )
         self.assertEqual(
             ("claude", "native"), (verifier_route["provider"], verifier_route["dispatch"])
@@ -2521,6 +2525,85 @@ class VerifierHandoffTests(ClaudePrimaryCase):
             {"host_outcome_digest": digest, "worker_result": dispatched["result"]},
             verifier_opened["verification_input"],
         )
+        # The native Claude verifier runs and is recorded; QA then accepts it.
+        self.cli(
+            "learning-bind-host-agent", "--run-handle", verifier_opened["run_handle"],
+            "--agent-id", "b84ef32482bf9c8bc",
+        )
+        verifier_result = {**result(), "assignment_id": verifier_assigned["assignment_id"]}
+        verified = self.record(verifier_context, verifier_opened["run_handle"], verifier_result)
+        self.assertEqual(
+            "claude_agents_verification_worker", verified["outcome"]["role"]
+        )
+        files = {
+            "--evaluator-assignment": self.write("worker-assignment.json", assigned),
+            "--evaluator-result": self.write("worker-result.json", dispatched["result"]),
+            "--verifier-assignment": self.write(
+                "verifier-assignment.json", verifier_assigned
+            ),
+            "--verifier-result": self.write("verifier-result.json", verifier_result),
+        }
+        checks = self.run_checks(digest, verified["host_outcome_digest"])
+        # A verifier assignment whose role is not the one its route named is
+        # refused, here the Codex verification role for a Claude verifier run.
+        relabelled = self.qa(
+            digest, verified["host_outcome_digest"], checks["check_receipt"],
+            {**files, "--verifier-assignment": self.write(
+                "relabelled.json",
+                {**verifier_assigned, "role": "codex_agents_verification_worker"},
+            )},
+            expected=2,
+        )
+        self.assertEqual("operational QA admission rejected", relabelled["error"])
+        qa = self.qa(digest, verified["host_outcome_digest"], checks["check_receipt"], files)
+        self.assertTrue(qa["qa"]["accepted"])
+
+    def run_checks(self, worker: str, verifier: str, expected: int = 0) -> dict:
+        with mock.patch.object(
+            cli, "run_operational_check_suite", side_effect=lambda _: passing_check_report()
+        ):
+            return self.cli(
+                "learning-run-operational-checks", "--host-outcome-digest", worker,
+                "--verifier-host-outcome-digest", verifier, expected=expected,
+            )
+
+    def qa(self, worker: str, verifier: str, receipt: str, files: dict,
+           expected: int = 0) -> dict:
+        return self.cli(
+            "learning-record-operational-qa", "--host-outcome-digest", worker,
+            "--verifier-host-outcome-digest", verifier, "--check-receipt", receipt,
+            *[item for pair in files.items() for item in pair], expected=expected,
+        )
+
+    def test_a_same_provider_claude_verifier_is_refused_by_qa(self) -> None:
+        worker = self.run_native_worker(probe=True)
+        digest = worker["recorded"]["host_outcome_digest"]
+        # With Codex disabled, the verifier falls back to the worker's provider.
+        config = self.project / ".codex/orchestration/provider-routing.json"
+        config.write_text(json.dumps({
+            "version": 1,
+            "providers": {"codex": {"enabled": False}, "claude": {"enabled": True}},
+            "codex_primary_may_bridge_to_claude": False,
+        }))
+        git(self.project, "commit", "-qam", "Claude only")
+        task = self.verifier_task(digest)
+        route, assigned, context, route_path = self.verifier_inputs(task, digest)
+        self.assertEqual(
+            ("claude", "native", "claude_agents_verification_worker"),
+            (route["provider"], route["dispatch"], route["role"]),
+        )
+        opened = self.cli(
+            "learning-open-host-run", *context, "--route", route_path,
+            "--orchestration-handle", worker["orchestration"]["orchestration_handle"],
+        )
+        self.cli(
+            "learning-bind-host-agent", "--run-handle", opened["run_handle"],
+            "--agent-id", "c95fa43593ca0d9cd",
+        )
+        verifier_result = {**result(), "assignment_id": assigned["assignment_id"]}
+        verified = self.record(context, opened["run_handle"], verifier_result)
+        refused = self.run_checks(digest, verified["host_outcome_digest"], expected=2)
+        self.assertIn("other provider than the worker", refused["error"])
 
     def test_provider_observe_shows_an_attested_credits_waiver(self) -> None:
         rate_limits = json.loads((self.tools / "codex-result.json").read_text())
@@ -2567,6 +2650,50 @@ class VerifierHandoffTests(ClaudePrimaryCase):
         finally:
             ledger.close()
         self.assertEqual("admitted", decision["reason_code"])
+
+
+class OperationalVerifierProviderTests(BridgeTestCase):
+    """The ledger binds an operational verifier's role to its admitted provider."""
+
+    def check(self, admitted: dict[str, str], verifier: dict) -> None:
+        worker = {"run_id": "run-worker", "role": "claude_agents_researcher",
+                  "model": "claude-opus-5-5"}
+        with mock.patch.object(
+            self.ledger, "_run_admission_locked",
+            side_effect=lambda _project, run_id: {"provider": admitted[run_id]},
+        ):
+            self.ledger._operational_verifier_provider_locked(
+                self.project_id, worker, {"run_id": "run-verifier", **verifier}
+            )
+
+    def test_role_model_and_provider_must_agree(self) -> None:
+        claude_verifier = {"role": "claude_agents_verification_worker",
+                           "model": "claude-opus-5-5"}
+        codex_verifier = {"role": "codex_agents_verification_worker",
+                          "model": "gpt-6.1-sol"}
+        # Accepted: the other provider, each with its own role and model.
+        self.check({"run-worker": "codex", "run-verifier": "claude"}, claude_verifier)
+        self.check({"run-worker": "claude", "run-verifier": "codex"}, codex_verifier)
+        # A Codex-only project keeps its Codex verifier.
+        self.check({"run-worker": "codex", "run-verifier": "codex"}, codex_verifier)
+        refused = {
+            "claude role, codex admission": (
+                {"run-worker": "claude", "run-verifier": "codex"}, claude_verifier,
+                "route role of its admitted provider",
+            ),
+            "codex model, claude role": (
+                {"run-worker": "codex", "run-verifier": "claude"},
+                {**claude_verifier, "model": "gpt-6.1-sol"},
+                "route role of its admitted provider",
+            ),
+            "same provider": (
+                {"run-worker": "claude", "run-verifier": "claude"}, claude_verifier,
+                "other provider than the worker",
+            ),
+        }
+        for name, (admitted, verifier, message) in refused.items():
+            with self.subTest(case=name), self.assertRaisesRegex(LedgerError, message):
+                self.check(admitted, verifier)
 
 
 class VerifierInputPathTests(unittest.TestCase):

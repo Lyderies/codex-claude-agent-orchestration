@@ -43,6 +43,7 @@ from .learning_contracts import (
     external_id,
     keyed_digest,
     parse_bounded_json,
+    provider_for_model,
     validate_learning_record,
     validate_event,
     validate_execution_configuration,
@@ -5133,7 +5134,52 @@ class LearningLedger:
         ).fetchone()
         if orchestration is None or orchestration["status"] != "active":
             raise LedgerError("operational QA requires an active orchestration")
+        self._operational_verifier_provider_locked(
+            project_id, host_outcome, verifier_host_outcome
+        )
         return host_outcome, verifier_host_outcome, orchestration_id
+
+    def _operational_verifier_provider_locked(
+        self,
+        project_id: str,
+        host_outcome: dict[str, Any],
+        verifier_host_outcome: dict[str, Any],
+    ) -> None:
+        """Bind the verifier's role to its admitted provider and to the worker's.
+
+        The verifier outcome's role and model are those of the route its run was
+        opened with (the ledger bound that configuration at open and commit), so
+        they must be the verification role and a model of the provider the run
+        was admitted for. A Claude verifier must be the other provider than the
+        worker. A Codex verifier of a Codex worker stays valid, because a
+        Codex-only project has no other provider to verify with.
+        """
+
+        roles = {
+            "codex": "codex_agents_verification_worker",
+            "claude": "claude_agents_verification_worker",
+        }
+        worker_provider = self._run_admission_locked(
+            project_id, host_outcome["run_id"]
+        )["provider"]
+        verifier_provider = self._run_admission_locked(
+            project_id, verifier_host_outcome["run_id"]
+        )["provider"]
+        try:
+            model_provider = provider_for_model(verifier_host_outcome["model"])
+        except ContractError as exc:
+            raise LedgerError("operational verifier model is not a provider model") from exc
+        if (
+            verifier_host_outcome["role"] != roles.get(verifier_provider)
+            or model_provider != verifier_provider
+        ):
+            raise LedgerError(
+                "operational verifier role is not the route role of its admitted provider"
+            )
+        if verifier_provider == worker_provider and verifier_provider != "codex":
+            raise LedgerError(
+                "operational verifier must be the other provider than the worker"
+            )
 
     def validate_operational_qa_scope(
         self,

@@ -261,6 +261,11 @@ provider API key, and a run handle that was already dispatched.
   first component folds to it, in any letter case, refuses, and the directory must
   not already exist in the export. A native verifier gets the result as
   `verification_input` from `learning-open-host-run`.
+- Operational QA accepts the routed verifier of either provider
+  (`codex_agents_verification_worker` or `claude_agents_verification_worker`). The
+  verifier's role and model must be those of the provider its run was admitted for,
+  and a Claude verifier must be the other provider than the worker; a Codex verifier
+  of Codex work stays valid for a Codex-only project.
 - Bridged runs use the `bridge-v1` ledger client. Records hold only digests, counts and
   typed codes, never prompts or file contents. A host result whose route requires
   verification is kept, as its validated JSON, in an owner-only file under the

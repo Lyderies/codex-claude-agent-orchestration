@@ -60,6 +60,10 @@
   `host_outcome_digest` that operational QA takes, a bridged run's outcome carries the
   bridge's recorded usage, `provider-observe` shows `paid_usage_waived_by_attestation`, and
   both skills give the exact QA commands with every argument.
+- **Claude verifiers pass operational QA (0.8.4).** QA accepted only the Codex verification
+  role, so a native Claude verifier of Codex work could never pass. It now accepts the routed
+  verification role of either provider, bound to the verifier run's admitted provider; a
+  Claude verifier must be the other provider than the worker.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the

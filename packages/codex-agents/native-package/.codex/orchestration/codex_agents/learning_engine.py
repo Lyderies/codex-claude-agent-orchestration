@@ -2557,6 +2557,14 @@ def build_verified_qa_records(
     return qa, outcome
 
 
+# Operational QA accepts the routed verifier of either provider: the policy's
+# Codex verification role and its Claude verification role.
+OPERATIONAL_VERIFIER_ROLES = frozenset({
+    "codex_agents_verification_worker",
+    "claude_agents_verification_worker",
+})
+
+
 def build_operational_qa_records(
     *,
     digest_key: bytes,
@@ -2617,7 +2625,7 @@ def build_operational_qa_records(
         verifier["assignment_id"] == evaluator["assignment_id"]
         or verifier["required_evidence"] != evaluator["required_evidence"]
         or verifier["context"] != [content_digest(host)]
-        or verifier["role"] != "codex_agents_verification_worker"
+        or verifier["role"] not in OPERATIONAL_VERIFIER_ROLES
         or evaluator["verification_required"] is not True
         or verifier["verification_required"] is not False
         or not verifier_host["task_slice"].startswith("verification-")
