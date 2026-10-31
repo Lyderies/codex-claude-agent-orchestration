@@ -16,6 +16,8 @@ from typing import Any
 
 ORCHESTRATION_ROOT = Path(__file__).resolve().parent
 BUNDLE_ROOT = ORCHESTRATION_ROOT.parent.parent
+# Present only in an installed project; the installer writes it next to this file.
+INSTALL_MANIFEST = ORCHESTRATION_ROOT / "install-manifest.json"
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
 from codex_agents.bridge import BridgeRefused  # noqa: E402
@@ -79,6 +81,7 @@ from codex_agents.learning_store import (  # noqa: E402
     authorize_collector_runtime,
     client_health_clear,
     client_health_snapshot,
+    default_state_root,
     empty_ingestion_snapshot,
     ensure_collector,
     require_authorized_collector_runtime,
@@ -96,6 +99,7 @@ from codex_agents.hosts import (  # noqa: E402
 from codex_agents.host_commands import (  # noqa: E402
     PRIMARY_HOST_COMMANDS,
     HostCommandError,
+    OwnRootRefused,
     argv_prefix as codex_argv_prefix,
     render_rule as render_codex_rule,
     rule_path as codex_rule_path,
@@ -185,11 +189,9 @@ def _add_assignment_context(
         help="trusted fallback receipt issued from an abandoned primary host run",
     )
     if allow_policy_override:
-        parser.add_argument(
-            "--policy",
-            type=Path,
-            default=ORCHESTRATION_ROOT / "config" / "routing-policy.json",
-        )
+        # None marks an absent --policy, which an installed CLI refuses; main fills
+        # in the installed policy after that check.
+        parser.add_argument("--policy", type=Path)
 
 
 def _add_learning_project(parser: argparse.ArgumentParser) -> None:
@@ -282,6 +284,46 @@ def _with_codex_hint(command: str, report: dict) -> dict:
     ):
         return {**report, "hint": CODEX_SANDBOX_HINT}
     return report
+
+
+def _resolved(path: Path) -> Path:
+    return Path(os.path.realpath(Path(path).expanduser()))
+
+
+def _require_own_roots(args: argparse.Namespace) -> None:
+    """Pin an installed CLI's primary-host commands to this project and its state.
+
+    The owner's Codex command rule may run these commands outside the sandbox
+    with arguments the model chose, so nothing may move a trust root: the state
+    root must be the default one, the project root must be the project holding
+    this CLI, and no policy file may be named. It keys on the install manifest
+    next to this file, which a sandboxed Codex session cannot create or remove
+    (`.codex/` is read-only there); the source tree keeps these options for
+    development and tests. Host markers play no part. It runs before any git,
+    process or collector work, and the checked, resolved values replace the
+    given ones so nothing is resolved twice.
+    """
+
+    if args.command not in PRIMARY_HOST_COMMANDS or not os.path.lexists(INSTALL_MANIFEST):
+        return
+    if getattr(args, "policy", None) is not None:
+        raise OwnRootRefused("--policy is refused: an installed CLI uses its installed policy")
+    state_root = getattr(args, "state_root", None)
+    if state_root is not None:
+        if _resolved(state_root) != _resolved(default_state_root()):
+            raise OwnRootRefused(
+                "--state-root is refused: an installed CLI uses only the default learning state"
+            )
+        args.state_root = None
+    for option, name in (("--project-root", "project_root"), ("--root", "root")):
+        value = getattr(args, name, None)
+        if value is None:
+            continue
+        if _resolved(value) != BUNDLE_ROOT:
+            raise OwnRootRefused(
+                f"{option} is refused: an installed CLI serves only its own project"
+            )
+        setattr(args, name, BUNDLE_ROOT)
 
 
 def _learning_ledger(args: argparse.Namespace) -> tuple[_RestartingLedger, str]:
@@ -555,20 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     inventory_parser = subparsers.add_parser("inventory", help="discover definitions inertly")
     inventory_parser.add_argument("--root", type=Path, default=BUNDLE_ROOT)
-    inventory_parser.add_argument(
-        "--policy",
-        type=Path,
-        default=ORCHESTRATION_ROOT / "config" / "discovery-policy.json",
-    )
+    inventory_parser.add_argument("--policy", type=Path)
 
     route_parser = subparsers.add_parser("route", help="route one task contract")
     route_parser.add_argument("--task", required=True, help="JSON file or - for stdin")
     route_parser.add_argument("--root", type=Path, default=BUNDLE_ROOT)
-    route_parser.add_argument(
-        "--policy",
-        type=Path,
-        default=ORCHESTRATION_ROOT / "config" / "routing-policy.json",
-    )
+    route_parser.add_argument("--policy", type=Path)
 
     learning_route = subparsers.add_parser(
         "learning-route", help="route one task with approved learning lifecycle state"
@@ -1117,6 +1151,11 @@ def main() -> int:
     _EXPLICIT_HOST_CLIENT = args.host_client
     _COLLECTOR_UNREACHED = False
     try:
+        _require_own_roots(args)
+        if getattr(args, "policy", False) is None:
+            args.policy = ORCHESTRATION_ROOT / "config" / (
+                "discovery-policy.json" if args.command == "inventory" else "routing-policy.json"
+            )
         if args.command == "validate":
             report = validate_package(args.root)
         elif args.command == "inventory":

@@ -27,7 +27,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .catalog import CatalogError, parse_claude_agent
-from .contracts import ContractError, result_preflight, validate_assignment
+from .contracts import (
+    ONE_EVIDENCE_ENTRY_RULE,
+    ContractError,
+    result_preflight,
+    validate_assignment,
+)
 from .learning_contracts import SUPPORTED_MODELS
 from .providers import (
     api_keys_present,
@@ -617,6 +622,7 @@ def child_prompt(assignment: dict[str, Any], *, worker_result_path: str | None =
         "Work only with the files in the current directory. When you finish, reply "
         "with exactly one JSON object and no other text, filling in this template:\n"
         f"{json.dumps(template, indent=2)}\n"
+        f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.\n"
     )
 
 

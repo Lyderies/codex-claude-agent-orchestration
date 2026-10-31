@@ -13,8 +13,10 @@ below. Owner commands (registration, attestation, owner keys, grants, backups,
 canaries, promotion and the like) are never listed, so they stay sandboxed.
 
 What the rule cannot check: it trusts the interpreter at that path, and it
-leaves every later argument, such as ``--project-root`` or ``--state-root``, to
-the CLI's own checks.
+leaves every later argument to the CLI. An installed CLI therefore pins these
+commands to its own project, the default learning state and its installed
+policy, refusing ``--project-root``, ``--root``, ``--state-root`` or ``--policy``
+values that would move them (``cli._require_own_roots``).
 """
 
 from __future__ import annotations
@@ -69,6 +71,13 @@ _REFUSED_CATEGORIES = {"Cc", "Cf", "Cs", "Zl", "Zp"}
 
 class HostCommandError(RuntimeError):
     """A rule cannot be built or written safely; messages never carry paths."""
+
+
+class OwnRootRefused(HostCommandError):
+    """An installed CLI's primary-host command named another project, state or policy.
+
+    Messages name the refused option, never its value.
+    """
 
 
 def _checked_text(value: str, what: str) -> str:

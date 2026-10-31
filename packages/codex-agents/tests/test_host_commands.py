@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
+from tests.support import BUNDLE_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 import cli
 from codex_agents.host_commands import (
@@ -31,7 +31,15 @@ from codex_agents.host_commands import (
     rule_status,
     write_rule,
 )
-from codex_agents.learning_store import CollectorError, LearningState
+from codex_agents.learning_store import (
+    PACKAGE_VERSION,
+    CollectorError,
+    LearningLedger,
+    LearningState,
+    authorize_collector_runtime,
+    default_state_root,
+)
+from codex_agents.learning_adapters import load_client_capabilities
 
 # Commands only the owner runs. None may run outside a sandboxed Codex primary.
 OWNER_COMMANDS = {
@@ -397,6 +405,157 @@ class SandboxHintTests(unittest.TestCase):
         with mock.patch.object(cli, "ensure_collector", rejected):
             report = self.run_main("learning-status")
         self.assertNotIn("hint", report)
+
+
+class OwnRootTests(unittest.TestCase):
+    """An installed CLI pins its primary-host commands to its project and state.
+
+    The owner's Codex rule may run them outside the sandbox with model-chosen
+    arguments, so another project, state root or policy is refused first.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.project = self.base / "project"
+        shutil.copytree(
+            BUNDLE_ROOT, self.project,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
+        )
+        (self.project / ".codex" / "orchestration" / "install-manifest.json").write_text(
+            json.dumps({"format": 1, "version": PACKAGE_VERSION, "files": {}})
+        )
+        self.cli = self.project / ".codex" / "orchestration" / "cli.py"
+        # The default learning state follows HOME (XDG_STATE_HOME on Linux), which
+        # a model cannot set for a command Codex runs outside the sandbox.
+        self.home = self.base / "home"
+        self.env = {
+            **os.environ, "HOME": str(self.home),
+            "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with mock.patch.dict(os.environ, self.env):
+            self.default_state = default_state_root()
+        self.other_state = self.base / "other-state"
+        # A model-built repository whose own configuration runs a command on any
+        # index refresh; it must never see a git call from an installed CLI.
+        self.other = self.base / "other"
+        self.marker = self.base / "hostile-git-ran"
+        hook = self.base / "fsmonitor.sh"
+        hook.write_text(f'#!/bin/sh\ntouch "{self.marker}"\nexit 1\n')
+        hook.chmod(0o755)
+        subprocess.run(["git", "init", "-q", str(self.other)], check=True)
+        (self.other / "file").write_text("x\n")
+        subprocess.run(
+            ["git", "-C", str(self.other), "config", "core.fsmonitor", str(hook)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.other), "status", "--porcelain"],
+            check=True, capture_output=True,
+        )
+        self.assertTrue(self.marker.exists(), "the hostile repository is not armed")
+        self.marker.unlink()
+
+    def run_cli(self, *arguments: str, cwd: Path | None = None) -> tuple[int, dict]:
+        completed = subprocess.run(
+            [sys.executable, str(self.cli), *arguments],
+            capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
+            env=self.env, cwd=cwd,
+        )
+        return completed.returncode, json.loads(completed.stdout)
+
+    def assert_refused(self, option: str, *arguments: str) -> None:
+        code, report = self.run_cli(*arguments)
+        self.assertEqual(2, code, arguments)
+        self.assertFalse(report["ready"])
+        self.assertTrue(report["error"].startswith(f"{option} is refused"), (arguments, report))
+        self.assertEqual({"ready", "error"}, set(report))
+
+    def test_other_roots_state_and_policy_are_refused_before_any_work(self) -> None:
+        own, other, state = str(self.project), str(self.other), str(self.other_state)
+        context = ("--assignment", "a.json", "--task", "t.json", "--parent-grant", "g.json")
+        lifecycle = {
+            "dispatch": (*context, "--route", "r.json", "--run-handle", "h"),
+            "provider-observe": ("--provider", "claude", "--billing-probe"),
+            "learning-open-host-run": (
+                *context, "--route", "r.json", "--orchestration-handle", "o",
+            ),
+            "learning-run-operational-checks": (
+                "--host-outcome-digest", "0" * 64, "--verifier-host-outcome-digest", "1" * 64,
+            ),
+            "learning-status": (),
+            "learning-open-orchestration": (),
+            "learning-route": ("--task", "t.json"),
+        }
+        for command, extra in lifecycle.items():
+            with self.subTest(command=command):
+                self.assert_refused("--project-root", command, *extra, "--project-root", other)
+                self.assert_refused(
+                    "--state-root", command, *extra, "--project-root", own, "--state-root", state,
+                )
+                # argparse keeps the last value; that is the one checked.
+                self.assert_refused(
+                    "--project-root", command, *extra,
+                    "--project-root", own, "--project-root", other,
+                )
+                # Abbreviations reach the same option.
+                self.assert_refused("--project-root", command, *extra, "--proj", other)
+        self.assert_refused("--root", "validate", "--root", other)
+        self.assert_refused("--root", "inventory", "--root", other)
+        self.assert_refused("--root", "route", "--task", "t.json", "--root", other)
+        self.assert_refused("--policy", "route", "--task", "t.json", "--policy", "p.json")
+        self.assert_refused("--policy", "inventory", "--policy", "p.json")
+        for command in ("validate-assignment", "result-preflight", "validate-result"):
+            with self.subTest(command=command):
+                result = ("--result", "r.json") if command == "validate-result" else ()
+                self.assert_refused("--policy", command, *context, *result, "--pol", "p.json")
+                self.assert_refused(
+                    "--project-root", command, *context, *result, "--project-root", other,
+                )
+                self.assert_refused(
+                    "--state-root", command, *context, *result, "--state-root", state,
+                )
+        self.assertFalse(self.marker.exists(), "an installed CLI ran git in another project")
+        self.assertFalse(self.other_state.exists())
+
+    def test_own_project_and_default_state_still_work(self) -> None:
+        state = LearningState(self.default_state)
+        authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
+        ledger = LearningLedger(
+            state,
+            client_capabilities=load_client_capabilities(
+                ORCHESTRATION_ROOT / "config" / "learning-clients.json"
+            ),
+        )
+        ledger.register_project(self.project, now_ms=1)
+        ledger.close()
+        link = self.base / "link"
+        link.symlink_to(self.project)
+        for arguments, cwd in (
+            (("--project-root", str(self.project)), None),
+            (("--project-root", str(link), "--state-root", str(self.default_state)), None),
+            (("--project-root", "."), self.project),
+        ):
+            with self.subTest(arguments=arguments):
+                code, report = self.run_cli("learning-open-orchestration", *arguments, cwd=cwd)
+                self.assertEqual(0, code, report)
+                self.assertTrue(report["ready"])
+        for arguments in ((), ("--root", str(self.project))):
+            code, report = self.run_cli("validate", *arguments)
+            self.assertIn("package_ready", report)
+        # Owner commands and the source tree are not pinned.
+        code, report = self.run_cli("host-command", "--project-root", str(self.project))
+        self.assertIn("argv_prefix", report)
+
+    def test_source_tree_cli_keeps_its_options(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(ORCHESTRATION_ROOT / "cli.py"), "learning-status",
+             "--state-root", str(self.other_state), "--project-root", str(self.project)],
+            capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
+            env=self.env,
+        )
+        self.assertNotIn("is refused", completed.stdout)
 
 
 if __name__ == "__main__":

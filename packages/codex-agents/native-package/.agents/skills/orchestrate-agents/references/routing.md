@@ -113,8 +113,10 @@ promotion, rollback, upgrade reconciliation and `install-codex-rule` itself) are
 listed and stay sandboxed. `host-command --project-root <exact-root>` reads only and needs
 no collector. It prints `argv_prefix` and `codex_rule`: `installed`, `missing`, or `stale`
 when the file differs from what setup would write now, as after a Python or package
-change, or is a symlink. The rule leaves every argument after the subcommand to the CLI's
-own checks. A Claude primary does not use it.
+change, or is a symlink. The rule leaves every argument after the subcommand to the CLI,
+so for these commands an installed CLI refuses a `--project-root` or `--root` other than
+its own project, a `--state-root` other than the default learning state, and any
+`--policy`, before doing any other work. A Claude primary does not use the rule.
 
 ## Provider admission
 

@@ -232,16 +232,43 @@ build.
   `missing` or `stale` (it differs from what setup would write now). The Codex skill runs it
   first and stops unless the rule is installed. A collector-backed command that cannot
   reach the collector under a Codex host keeps its error and adds a hint.
+- **Own-root invariant.** The rule fixes only the start of a command, so the arguments
+  after the subcommand are the model's. An installed CLI therefore pins every allowlisted
+  command, before any git, process or collector work: `--state-root` must resolve to the
+  default learning state, `--project-root` and `--root` must resolve to the project that
+  holds the running `cli.py`, and `--policy` is refused outright. The checked, resolved
+  values replace the given ones, so a swapped symlink cannot redirect a later use, and a
+  repeated option is checked at the value argparse keeps. Refusals name the option, never
+  its value. No flag turns the check off, and host markers play no part.
+  - **Why keyed to the installed CLI.** It applies when an install manifest sits next to
+    `cli.py`. A sandboxed Codex session cannot create or remove that file, because
+    `.codex/` is read-only there, and the rule only ever runs the installed `cli.py`. The
+    source tree has no manifest and keeps these options for development and tests.
+  - **Why the default state is safe to trust.** It follows `HOME` (or `XDG_STATE_HOME`
+    on Linux) in the process environment. A command Codex runs through the rule is a
+    fresh process with Codex's environment, and an environment-assignment prefix breaks
+    the rule's argument match, so the model cannot move it. Tests that drive an
+    installed CLI point `HOME` at a temporary directory instead of using an opt-out.
+  - **What it closes.** Before it, `validate --root`, `route --root`, `learning-route`
+    and the assignment and result checks ran git in a caller-chosen directory before
+    any registration check (provider-routing and operational-check trust both read the
+    repository). A model-built repository whose own `.git/config` sets
+    `core.fsmonitor` runs a command on the first index refresh, which through the rule
+    would run outside the sandbox. A model-built state directory would likewise have
+    let `dispatch` start a bridged child without the owner's attestation. Both are
+    unreachable now: every allowlisted command uses this project and the owner's state.
 - **Residual risks.**
   - The rule trusts the interpreter at its path.
-  - Every argument after the subcommand is left to the CLI's own checks of
-    `--project-root` and the other options. This includes `--state-root`: a sandboxed
-    model can build a state directory in a temporary directory, and an allowlisted command
-    pointed at it runs outside the sandbox against that ledger instead of the owner's, so
-    `dispatch` could start a bridged child without the owner's attestation. Refusing a
-    non-default state root for primary-host commands is the follow-up.
+  - Git still reads this project's own repository configuration. Codex keeps the
+    workspace's `.git` read-only, but a linked worktree's configuration lives in the
+    main checkout, which the model can change if that checkout is inside a writable
+    root of the session.
+  - Input files (task, assignment, grant, route, result) remain caller-chosen data,
+    validated as before.
   - Owner commands stay unreachable from a sandboxed Codex primary; registration,
-    attestation and the rule itself come from the owner's terminal.
+    attestation and the rule itself come from the owner's terminal. An owner who runs
+    `scripts/attest.py --state-root` against an installed project is refused at
+    `provider-observe`, because only the default state is accepted.
   - The Claude primary's permission rules are a separate follow-up.
 
 ## Deferred to G4

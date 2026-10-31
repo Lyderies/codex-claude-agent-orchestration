@@ -99,8 +99,9 @@ not used exactly.
    correctness. Steer only with new task-relevant information; interrupt on scope drift,
    repeated no-progress work, or exhausted bounds.
 8. Before spawning, run `result-preflight` with the exact assignment, task, and parent
-   grant and give the returned literal template to the child. This is non-mutating and
-   does not consume an attempt. Treat `observation_deadline_seconds` as an observation
+   grant and give the returned literal template and its `consistency_rules` to the
+   child. This is non-mutating and does not consume an attempt. Treat
+   `observation_deadline_seconds` as an observation
    bound, not a process-kill promise; only an authoritative host terminal fact may
    report `timed_out`. For native collaboration runs, the primary host must derive
    that fact from the native child status it observes; never copy a child-authored

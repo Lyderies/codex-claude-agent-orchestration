@@ -28,7 +28,7 @@ from codex_agents.bridge import (
     remove_optional_nulls,
     strict_output_schema,
 )
-from codex_agents.contracts import ContractError, validate_result
+from codex_agents.contracts import ONE_EVIDENCE_ENTRY_RULE, ContractError, validate_result
 from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_contracts import content_digest
 from codex_agents.learning_engine import installed_execution_configuration
@@ -340,6 +340,9 @@ class ClaudeBridgeTests(BridgeTestCase):
         argv = invocation["argv"]
         for flag in ("--strict-mcp-config", "--no-session-persistence", "--verbose"):
             self.assertIn(flag, argv)
+        # The prompt, last, states one evidence entry per criterion at its most severe outcome.
+        self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
+        self.assertIn("(fail, then not_run, then observed, then pass)", argv[-1])
         self.assertNotIn("--bare", argv)
         self.assertEqual("Read,Glob,Grep", argv[argv.index("--tools") + 1])
         self.assertEqual("dontAsk", argv[argv.index("--permission-mode") + 1])
@@ -1182,6 +1185,7 @@ class CodexBridgeTests(BridgeTestCase):
         invocation = [i for i in self.invocations("codex") if "exec" in i["argv"]][0]
         argv = invocation["argv"]
         self.assertEqual("read-only", argv[argv.index("-s") + 1])
+        self.assertIn(f"In the evidence list, {ONE_EVIDENCE_ENTRY_RULE}.", argv[-1])
         for flag in ("--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
                      "--json"):
             self.assertIn(flag, argv)

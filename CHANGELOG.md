@@ -75,11 +75,15 @@
   layer. It lets only the primary-host subcommands, run with the absolute interpreter and
   the absolute project `cli.py`, run outside the sandbox; owner commands stay sandboxed.
   `host-command` reports that exact command prefix and whether the rule is installed, and
-  the Codex skill runs it first and stops until the rule is in place. A sandboxed
-  collector failure now carries a hint. The result template states one evidence entry per
-  criterion, at its most severe outcome, so a repair cannot soften a `fail`. The
-  orchestration report's `runs.native_agent_bound` is now `agent_bound`, because it
-  counts bridged runs too.
+  the Codex skill runs it first and stops until the rule is in place. Because the rule
+  cannot constrain later arguments, an installed CLI pins these commands to its own
+  project, the default learning state and its installed policy, refusing any other
+  `--project-root`, `--root`, `--state-root` or `--policy` before it runs git or reaches
+  the collector. A sandboxed collector failure now carries a hint. The result template
+  and the bridged child's prompt state one evidence entry per criterion, at its most
+  severe outcome, so neither a child nor a repair can soften a `fail`. The orchestration
+  report's `runs.native_agent_bound` is now `agent_bound`, because it counts bridged runs
+  too.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
 fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the

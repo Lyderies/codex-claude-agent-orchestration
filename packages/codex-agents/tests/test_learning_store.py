@@ -43,6 +43,7 @@ from codex_agents.learning_store import (
     client_health_clear,
     client_health_increment,
     client_health_snapshot,
+    default_state_root,
     ensure_collector,
     _snapshot_project_partition,
     _start_collector_locked,
@@ -3442,25 +3443,37 @@ class LearningStoreTests(unittest.TestCase):
 
     def test_spoofed_project_manifest_cannot_replace_active_collector(self) -> None:
         bundle = self._installed_bundle("spoofed-package", version="99.0.0")
-        before_authorization = self.state.collector_authorization.read_bytes()
-        server = CollectorServer(self.ledger, client_capabilities=self.clients)
+        # An installed CLI serves only its own project and the default learning
+        # state, so this collector runs at the default location for a test HOME.
+        # The HOME is short because a Unix socket path is limited to about 100 bytes.
+        home = Path(tempfile.mkdtemp(prefix="home-", dir=os.path.realpath("/tmp")))
+        self.addCleanup(shutil.rmtree, home, True)
+        environment = {
+            **os.environ, "HOME": str(home), "XDG_STATE_HOME": str(home / ".local" / "state"),
+        }
+        with mock.patch.dict(os.environ, environment):
+            state = LearningState(default_state_root())
+        authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")
+        ledger = LearningLedger(state, client_capabilities=self.clients)
+        ledger.register_project(bundle, now_ms=1)
+        before_authorization = state.collector_authorization.read_bytes()
+        server = CollectorServer(ledger, client_capabilities=self.clients)
         server.start()
-        client = CollectorClient(self.state.socket)
+        client = CollectorClient(state.socket)
         try:
-            before = client.health(self.project_a)
+            before = client.health(bundle)
             completed = subprocess.run(
                 [
                     sys.executable,
                     str(bundle / ".codex" / "orchestration" / "cli.py"),
                     "learning-status",
-                    "--state-root",
-                    str(self.state.root),
                     "--project-root",
-                    str(self.project_a),
+                    str(bundle),
                 ],
                 text=True,
                 capture_output=True,
                 check=False,
+                env=environment,
             )
             self.assertEqual(1, completed.returncode, completed.stderr)
             self.assertFalse(json.loads(completed.stdout)["ready"])
@@ -3473,7 +3486,7 @@ class LearningStoreTests(unittest.TestCase):
                     / "hook-pre-tool.json"
                 ).read_text()
             )
-            hook_payload.update(cwd=str(self.project_a))
+            hook_payload.update(cwd=str(bundle))
             hook = subprocess.run(
                 [
                     sys.executable,
@@ -3484,7 +3497,7 @@ class LearningStoreTests(unittest.TestCase):
                         / "learning_hook.py"
                     ),
                     "--state-root",
-                    str(self.state.root),
+                    str(state.root),
                     "--client-version",
                     "codex-hooks-v1",
                 ],
@@ -3494,16 +3507,17 @@ class LearningStoreTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, hook.returncode, hook.stderr)
-            after = client.health(self.project_a)
+            after = client.health(bundle)
             self.assertEqual(before["started_at_ms"], after["started_at_ms"])
             self.assertEqual(PACKAGE_VERSION, after["runtime_version"])
             self.assertEqual(COLLECTOR_RUNTIME_DIGEST, after["runtime_digest"])
             self.assertEqual(
                 before_authorization,
-                self.state.collector_authorization.read_bytes(),
+                state.collector_authorization.read_bytes(),
             )
         finally:
             server.stop()
+            ledger.close()
 
     def test_only_owner_registration_maintenance_may_replace_older_runtime(
         self,

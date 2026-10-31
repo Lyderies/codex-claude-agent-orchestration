@@ -441,7 +441,11 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--target", required=True, type=Path, help="project with the packages installed")
-    parser.add_argument("--state-root", type=Path, help="learning state directory (default: platform default)")
+    parser.add_argument(
+        "--state-root", type=Path,
+        help="learning state directory (default: platform default; an installed project's "
+             "CLI accepts only the default)",
+    )
     args = parser.parse_args(argv)
     if not _is_terminal():
         print("This is a human step: run it yourself in an interactive terminal. "

@@ -22,7 +22,7 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
    `validate-assignment` and `result-preflight` with `--task`, `--assignment`,
    `--parent-grant` and `--project-root <exact-root>`. Both validate against the
    project's effective policy, so a cross-provider route validates only with
-   `--project-root`. Give the child the returned template.
+   `--project-root`. Give the child the returned template and its `consistency_rules`.
 4. **Observe and open.** Run `provider-observe --provider <route provider>`; before any
    Claude child run `provider-observe --provider claude --billing-probe` instead,
    because Claude admission needs billing from the last 30 minutes; it reuses recent
