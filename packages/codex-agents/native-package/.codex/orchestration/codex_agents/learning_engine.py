@@ -2568,6 +2568,14 @@ def build_verified_qa_records(
     return qa, outcome
 
 
+# Operational QA accepts the routed verifier of either provider: the policy's
+# Codex verification role and its Claude verification role.
+OPERATIONAL_VERIFIER_ROLES = frozenset({
+    "codex_agents_verification_worker",
+    "claude_agents_verification_worker",
+})
+
+
 def build_operational_qa_records(
     *,
     digest_key: bytes,
@@ -2578,8 +2586,16 @@ def build_operational_qa_records(
     check_report: dict[str, Any],
     verifier_assignment: dict[str, Any],
     verifier_result: dict[str, Any],
+    write_attributed: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Derive routine automatic QA without granting release authority."""
+    """Derive routine automatic QA without granting release authority.
+
+    The verifier is normally bound to the host run by its assignment context,
+    which names the host outcome's digest. For a write result
+    (`write_attributed`) the ledger has already bound it through a positive
+    other-provider `write_verification` of the exact patch, so the context
+    keeps the repository paths the bridged verifier read instead.
+    """
 
     host = validate_outcome(host_outcome)
     verifier_host = validate_outcome(verifier_host_outcome)
@@ -2627,8 +2643,8 @@ def build_operational_qa_records(
     if (
         verifier["assignment_id"] == evaluator["assignment_id"]
         or verifier["required_evidence"] != evaluator["required_evidence"]
-        or verifier["context"] != [content_digest(host)]
-        or verifier["role"] != "codex_agents_verification_worker"
+        or (not write_attributed and verifier["context"] != [content_digest(host)])
+        or verifier["role"] not in OPERATIONAL_VERIFIER_ROLES
         or evaluator["verification_required"] is not True
         or verifier["verification_required"] is not False
         or not verifier_host["task_slice"].startswith("verification-")

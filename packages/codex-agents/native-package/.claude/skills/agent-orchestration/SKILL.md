@@ -48,8 +48,9 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
      committed files, never this checkout. A successful `bridge_report` has
      `ownership: passed`, `changes`, `patch_digest` and `envelope_digest`; the patch and
      verifier envelope are stored by the ledger. Do not apply the patch yourself: the
-     integration step is not available yet. Any other `ownership` value is a failed run
-     with no patch. Write routes run only on macOS and only to Claude children; a
+     integration step is not available yet, and it will require
+     `write_verification_state` to be `accepted` (step 7). Any other `ownership` value
+     is a failed run with no patch. Write routes run only on macOS and only to Claude children; a
      denial says `write_children_unsupported_platform` or
      `codex_write_children_unavailable`.
 6. **Validate and record.** Run `validate-result` on the child's result, allowing at
@@ -60,8 +61,30 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
 7. **Verify.** Send every meaningful result to the route's verifier: create a
    verification task with `verification_for_family` and `verification_for_provider` set
    to the worker's family and provider, route it, and run it through steps 3 to 6.
+   - A write result (`ownership: passed`) must be verified by the other provider: a
+     Claude write child is verified by a read-only Codex child through the bridge. Add
+     `verification_for_write` with the worker's `bridge_report.bridge_run_id` and
+     `patch_digest` to that verification task. Routing it anywhere else, or with no
+     eligible Codex verifier, is denied `write_verifier_unavailable`; opening it for a
+     failed, unrecorded or different patch is refused.
+   - Do not name the envelope in the verifier's assignment: `dispatch` places it at the
+     reserved path `.orchestration-input/envelope.json`, which no assignment may name,
+     and tells the verifier to review the patch there and state it as one `artifacts`
+     entry `reviewed_patch_digest:<patch_digest>`. Do not put the digest in the
+     objective.
+   - `dispatch` records the verifier's own result every time, and its verdict
+     (`bridge_report.write_verification`) only when it states exactly the bound digest.
+     Record the `result` `dispatch` returned unchanged: any other result is refused. Check `learning-write-verification-state --bridge-run-id <worker
+     bridge run>`: only `accepted` (a completed, positive, other-provider verdict on the
+     current patch and none negative or blocked) lets integration proceed in a later
+     release; `missing`, `rejected` and `blocked` do not.
 8. **Operational QA.** Run `learning-run-operational-checks` with both host outcome
-   digests and pass its `check_receipt` to `learning-record-operational-qa`.
+   digests and pass its `check_receipt` to `learning-record-operational-qa`. The routed
+   verifier of either provider is accepted. For a write result, pass the verifier run
+   whose `write_verification` was recorded (keep its repository context); a native or
+   same-provider verifier is refused. The receipt's `write_binding` names the
+   `patch_digest`; its `tested_tree_digest` stays null until integration runs the
+   checks on the patched tree.
 9. **Close.** Report failed, blocked and unverified work plainly, then run
    `learning-close-orchestration` with the real terminal state. Claude Code has no
    native goal counters, so omit `--goal-tokens-used` and `--goal-time-used-seconds`
