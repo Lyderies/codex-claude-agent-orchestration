@@ -65,6 +65,7 @@ from .learning_contracts import (
     validate_promotion,
     validate_qa_evidence,
 )
+from .git_plumbing import XCRUN_NO_CACHE
 from .git_plumbing import git_executable as find_git
 from .git_plumbing import repository_layout_problem, run_git
 from .host_paths import HostPathError, private_directory, remove_private_directory
@@ -2010,7 +2011,7 @@ def load_operational_check_configuration(
         if descriptor >= 0:
             os.close(descriptor)
 
-    git_executable = find_git()
+    git_executable = find_git(untrusted=[root])
     if git_executable is None:
         raise ContractError("operational check configuration trust is unavailable")
     if repository_layout_problem(git_executable, root) is not None:
@@ -2135,6 +2136,9 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
 
     environment = {
         "PATH": os.defpath,
+        # A check that reaches a macOS xcrun shim (/usr/bin/python3, git, ...)
+        # must not read the shim's lookup cache.
+        **XCRUN_NO_CACHE,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1",

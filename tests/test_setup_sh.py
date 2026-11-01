@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -59,6 +60,102 @@ def interpreter_trusted() -> bool:
 
 
 TRUSTED_PYTHON = interpreter_trusted()
+SCRATCH_CONTAINER = "agent-orchestration-owner"
+FAKE_RULE = '"""A stand-in for the CLI\'s host-command and install-codex-rule replies (FAKE_RULE)."""\nimport hashlib, json, os, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nwith open(os.environ["FAKE_RULE_LOG"], "a") as log:\n    log.write(" ".join(args) + "\\n")\ncommand = next(item for item in args if item in ("host-command", "install-codex-rule"))\nroot = Path(os.path.realpath(args[args.index("--project-root") + 1]))\ndigest = hashlib.sha256(str(root).encode()).hexdigest()[:12]\nhome = Path(os.environ["HOME"]) / ".codex"\nrule = str(home / "rules" / f"agent-orchestration-{digest}.rules")\ncopy = str(home / "agent-orchestration" / digest / ("0" * 64))\nstatus = os.environ["FAKE_RULE"]\nif command == "host-command":\n    report = {"ready": status == "installed", "codex_rule": status, "rule_file": rule, "runtime_copy": copy}\nelif "--print" in args:\n    report = {"ready": True, "rule_file": rule, "runtime_copy": copy,\n              "rule_text": \'prefix_rule(pattern = ["python3"], decision = "allow")\\n\'}\nelse:\n    report = {"ready": True, "codex_rule": "replaced" if "--replace" in args else "created",\n              "rule_file": rule, "runtime_copy": copy, "runtime_copy_status": "created"}\nprint(json.dumps(report))\n'
+ACCOUNT_HOME = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+
+
+def _host_paths():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("setup_tests_host_paths",
+                                                  ORCHESTRATION / "codex_agents" / "host_paths.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+HOST_PATHS = _host_paths()
+
+
+def _rule_may_name(python: str) -> bool:
+    """Whether the runtime's interpreter_path accepts `python` (what host-command checks)."""
+
+    completed = subprocess.run(
+        [python, "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from codex_agents.host_commands import interpreter_path; interpreter_path()",
+         str(ORCHESTRATION)],
+        capture_output=True, stdin=subprocess.DEVNULL, check=False)
+    return completed.returncode == 0
+
+
+def trusted_interpreter() -> tuple[str | None, bool]:
+    """A Python 3.11+ the wizard will run: in one of the runtime's trusted installation folders
+    and not macOS's /usr/bin shim. CI's toolcache Python is not, so another is looked for. One
+    the Codex rule may also name is preferred; the second value says whether it can."""
+
+    candidates = [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                  "/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/usr/bin/python3"]
+    usable = []
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real in usable or not os.path.isfile(real) or (
+                sys.platform == "darwin" and os.path.dirname(real) == "/usr/bin"):
+            continue
+        if HOST_PATHS.install_location_problem(Path(real)) is not None:
+            continue
+        version = subprocess.run([real, "-I", "-c", "import sys; sys.exit(sys.version_info < (3, 11))"],
+                                 capture_output=True, check=False)
+        if version.returncode == 0:
+            usable.append(real)
+    for real in usable:
+        if _rule_may_name(real):
+            return real, True
+    return (usable[0], False) if usable else (None, False)
+
+
+TRUSTED_PY, RULE_MAY_NAME_TRUSTED_PY = trusted_interpreter()
+if TRUSTED_PY and TRUSTED_PY != os.path.realpath(sys.executable):
+    # Every setup.sh this process starts finds that interpreter first on PATH.
+    _SHIM = Path(tempfile.mkdtemp(prefix="setup-tests-python-"))
+    (_SHIM / "python3").symlink_to(TRUSTED_PY)
+    os.environ["PATH"] = f"{_SHIM}{os.pathsep}{os.environ['PATH']}"
+
+
+def account_home_folder(test: unittest.TestCase) -> Path:
+    """A fresh folder inside a hidden top-level folder of the account's home, which the
+    runtime's rule trusts for installed programs; removed after the test."""
+
+    parent = ACCOUNT_HOME / ".cache" / "agent-orch-tests"
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    test.addCleanup(shutil.rmtree, folder, True)
+    return folder
+
+
+def trusted_git() -> str:
+    """The git binary setup.sh trusts (never the PATH one)."""
+
+    return subprocess.run(["bash", str(SETUP), "--print-git"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def outside_temporary_folders() -> Path | None:
+    """An existing folder outside every temporary root: the wizard's private working folder
+    and its trusted Python may not live in one."""
+
+    candidates = []
+    if sys.platform == "darwin":
+        candidates.append(subprocess.run(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"], capture_output=True,
+                                         text=True, check=False).stdout.strip())
+    candidates += [os.environ.get("XDG_RUNTIME_DIR") or "", str(ROOT)]
+    temporary = [Path(os.path.realpath(path)) for path in
+                 ("/tmp", "/var/tmp", tempfile.gettempdir(), os.environ.get("TMPDIR") or "/tmp")]
+    for candidate in candidates:
+        real = Path(os.path.realpath(candidate)) if candidate else None
+        if real and real.is_dir() and not any(real == root or root in real.parents for root in temporary):
+            return real
+    return None
 NEEDS_TRUSTED_PYTHON = unittest.skipUnless(
     TRUSTED_PYTHON, "this machine's Python cannot be named by the Codex rule"
 )
@@ -272,9 +369,8 @@ class SetupScriptTests(unittest.TestCase):
                                     capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
-        self.assertIn(".codex/new name.txt (from .codex/old name .txt)", lines)
-        self.assertIn(".codex/extra", lines)
-        self.assertEqual(len(lines), 2, lines)
+        # Found with plumbing: a rename is its new and its old name, each kept whole.
+        self.assertEqual(lines, [".codex/extra", ".codex/new name.txt", ".codex/old name .txt"])
 
     def helper(self, *args: str, stdin: bytes = b"", env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(SETUP), "--helper", *args], input=stdin, capture_output=True,
@@ -347,7 +443,7 @@ class SetupScriptTests(unittest.TestCase):
             plan = Path(directory) / "plan.nul"
             # `.codex/local*` is only a wildcard to Git, never a file here: it must not match local-other.
             plan.write_bytes(b".codex/local*\0.codex/ok\0")
-            result = self.helper("paths", str(apply), str(project), str(plan))
+            result = self.helper("paths", str(apply), str(project), str(plan), trusted_git())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b".codex/ok\0")
             # Invalid UTF-8 in the plan fails closed with no output (core.quotePath=false).
@@ -356,19 +452,247 @@ class SetupScriptTests(unittest.TestCase):
             except OSError:
                 pass
             plan.write_bytes(b".codex/ok\0.codex/bad\xff\0")
-            result = self.helper("paths", str(apply), str(project), str(plan))
+            result = self.helper("paths", str(apply), str(project), str(plan), trusted_git())
             self.assertEqual(result.returncode, 3)
             self.assertEqual(result.stdout, b"")
             # A missing plan file fails closed too.
-            result = self.helper("paths", str(apply), str(project), str(Path(directory) / "missing"))
+            result = self.helper("paths", str(apply), str(project), str(Path(directory) / "missing"), trusted_git())
             self.assertEqual(result.returncode, 3)
             self.assertEqual(result.stdout, b"")
             # A tracked file with an invalid-UTF-8 name does not break a valid list.
             subprocess.run(git + ["add", "-A"], check=True, env=env)
             plan.write_bytes(b".codex/ok\0")
-            result = self.helper("paths", str(apply), str(project), str(plan))
+            result = self.helper("paths", str(apply), str(project), str(plan), trusted_git())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b".codex/ok\0")
+
+    def test_every_git_call_uses_the_trusted_binary_with_helpers_off(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        # No git is ever run by name from PATH: only "$GIT", through g() for the project.
+        for line in code:
+            stripped = line.strip()
+            if re.search(r'(^|[;&|]\s*|run_cmd "[^"]*" |\$\()git\s', stripped):
+                self.fail(f"git run from PATH: {stripped}")
+        self.assertIn("xcrun_nocache=1 GIT_ALLOW_PROTOCOL='' GIT_NO_LAZY_FETCH=1 "
+                      '"$GIT" -C "$project" "${GIT_SAFE[@]}" "$@"', text)
+        uses = [line for line in code if re.search(r'\bg "\$', line)]
+        self.assertGreaterEqual(len(uses), 4)
+        # No porcelain: status, add and commit go through the installer's plumbing.
+        for line in uses:
+            self.assertIsNone(re.search(r'\bg "\$[^"]*"( --?[a-z-]+)* (status|add|commit|diff)\b', line), line)
+        self.assertIn('owner_git commit "$PROJECT"', text)
+        self.assertIn('owner_git changes "$1" .codex .agents .claude', text)
+        safe = re.search(r"^GIT_SAFE=\((.*)\)$", text, re.M).group(1).split()
+        self.assertEqual(safe, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                                "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
+                                "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        # The helper's own git call is the trusted binary too.
+        self.assertIn('[git, "-C", project, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",', text)
+
+    def test_the_helper_pattern_matches_the_installer(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("install_for_pattern", ROOT / "scripts" / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        pattern = re.search(r"^GIT_HELPER_KEYS='(.*)'$", SETUP.read_text(encoding="utf-8"), re.M).group(1)
+        self.assertEqual(pattern, module.GIT_HELPER_KEYS)
+
+    def test_the_trusted_git_is_never_the_path_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stubs = Path(directory)
+            (stubs / "git").write_text("#!/bin/sh\necho planted\n")
+            (stubs / "git").chmod(0o755)
+            found = subprocess.run(["bash", str(SETUP), "--print-git"], capture_output=True, text=True,
+                                   env=dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}")).stdout.strip()
+        self.assertNotEqual(found, str(stubs / "git"))
+        if found != "none":
+            self.assertTrue(os.path.isabs(found))
+            if sys.platform == "darwin":
+                self.assertNotEqual(os.path.dirname(found), "/usr/bin")  # the xcrun shim
+
+    def test_helper_programs_in_the_repository_stop_porcelain_git(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            marker = Path(directory) / "filter-ran"
+            script = Path(directory) / "filter.sh"
+            script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+            script.chmod(0o755)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            run = lambda *args: subprocess.run(["bash", str(SETUP), *args], capture_output=True, env=env)  # noqa: E731
+            self.assertEqual(run("--print-git-helpers", str(project)).stdout.strip(), b"none")
+            subprocess.run(["git", "-C", str(project), "config", "filter.planted.clean", str(script)],
+                           check=True, env=env)
+            (project / ".git" / "info").mkdir(exist_ok=True)
+            (project / ".git" / "info" / "attributes").write_text("* filter=planted\n")
+            (project / ".codex").mkdir()
+            (project / ".codex" / "a").write_text("x")
+            self.assertIn(b"filter.planted.clean", run("--print-git-helpers", str(project)).stdout)
+            # Status is never run: every candidate counts as changed, the ignored query fails.
+            self.assertEqual(run("--print-changed-paths", str(project), ".codex/a").stdout, b".codex/a\0")
+            self.assertEqual(run("--print-ignored-paths", str(project), ".codex/a").stdout, b"!\0")
+            self.assertIn(b"not checked", run("--print-uncommitted", str(project)).stdout)
+            self.assertFalse(marker.exists())
+            subprocess.run(["git", "-C", str(project), "config", "--unset", "filter.planted.clean"],
+                           check=True, env=env)
+            subprocess.run(["git", "-C", str(project), "config", "include.path", "../elsewhere"],
+                           check=True, env=env)
+            self.assertIn(b"include.path", run("--print-git-helpers", str(project)).stdout)
+
+    def test_status_helpers_never_run_a_planted_fsmonitor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.git_project(directory)
+            marker = Path(directory) / "monitor-ran"
+            monitor = Path(directory) / "monitor.sh"
+            monitor.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+            monitor.chmod(0o755)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            subprocess.run(["git", "-C", str(project), "config", "core.fsmonitor", str(monitor)],
+                           check=True, env=env)
+            (project / ".codex").mkdir()
+            (project / ".codex" / "a").write_text("x")
+            for hook in (["--print-changed-paths", str(project), ".codex/a"],
+                         ["--print-ignored-paths", str(project), ".codex/a"],
+                         ["--print-uncommitted", str(project)]):
+                result = subprocess.run(["bash", str(SETUP), *hook], capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_every_python_the_wizard_starts_is_isolated(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        # Every use of "$PY" either launches it isolated or only inspects the path.
+        inspecting = ("inside_temp ", "inside_dir ", "dirname -- ", "[ -n ", "printf '%s\\n' ",
+                      "python_location_problem ")
+        launches = 0
+        for line in code:
+            for match in re.finditer(r'"\$PY"', line):
+                before, after = line[:match.start()], line[match.end():]
+                if before.endswith(inspecting):
+                    continue
+                launches += 1
+                with self.subTest(line=line.strip()):
+                    self.assertTrue(after.startswith(' "${PYF[@]}" '), line.strip())
+        self.assertGreaterEqual(launches, 12)
+        self.assertIn("PYF=(-I -B -S -X pycache_prefix=/dev/null)", text)
+        # The commands shown to the owner carry the same flags.
+        for line in code:
+            if "python3 -I" in line:
+                self.assertIn("python3 -I -B -S -X pycache_prefix=/dev/null", line)
+        # No bare python3 is ever run: only the resolved, checked "$PY".
+        for line in code:
+            stripped = line.strip()
+            if re.match(r'^(run_cmd "[^"]*" )?python3\b', stripped) or re.search(r'\$\(python3\b', stripped):
+                self.fail(f"bare python3 launch: {stripped}")
+        # Owner commands run this repository's CLI, never the project's copy.
+        self.assertIn('run_cmd "$label" "$PY" "${PYF[@]}" "$CLONE_CLI" "$@"', text)
+        self.assertIn('CLONE_CLI="$ORCH_DIR/cli.py"', text)
+        self.assertNotIn('"$PROJECT/.codex/orchestration/cli.py" "$@"', text)
+
+    def python_for(self, path_entry: Path, home: str = "/nonexistent-home-for-tests",
+                   cwd: Path | None = None) -> str:
+        result = subprocess.run(["bash", str(SETUP), "--print-python"], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=f"{path_entry}:/usr/bin:/bin", HOME=home),
+                                cwd=cwd)
+        return result.stdout.strip()
+
+    def test_python_must_be_in_a_trusted_installation_folder(self) -> None:
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        sibling = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside)) / "tools"
+        self.addCleanup(shutil.rmtree, sibling.parent, True)
+        hidden = account_home_folder(self) / "bin"
+        for folder, expected in ((sibling, "refused: install"), (hidden, None)):
+            with self.subTest(folder=str(folder)):
+                folder.mkdir(parents=True)
+                (folder / "python3").write_text("#!/bin/sh\nexit 99\n")  # never run
+                (folder / "python3").chmod(0o755)
+                self.assertEqual(self.python_for(folder), expected or str(folder.resolve() / "python3"))
+
+    def test_the_trusted_installation_folders_match_the_runtime(self) -> None:
+        printed = subprocess.run(["bash", str(SETUP), "--print-trusted-roots"], capture_output=True,
+                                 text=True, check=True).stdout.split()
+        self.assertEqual(tuple(printed), HOST_PATHS.TRUSTED_INSTALL_ROOTS)
+
+    def test_python_inside_the_starting_project_is_refused_before_it_runs(self) -> None:
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        base = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
+        self.addCleanup(shutil.rmtree, base, True)
+        project = base / "project"
+        (project / "tools" / "bin").mkdir(parents=True)
+        (project / ".git").mkdir()
+        ran = base / "ran"
+        (project / "tools" / "bin" / "python3").write_text(f"#!/bin/sh\ntouch '{ran}'\n")
+        (project / "tools" / "bin" / "python3").chmod(0o755)
+        (project / "src").mkdir()
+        self.assertEqual(self.python_for(project / "tools" / "bin", cwd=project / "src"), "refused: project")
+        self.assertFalse(ran.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the xcrun shim is macOS's")
+    def test_the_macos_python_shim_is_refused(self) -> None:
+        if not Path("/usr/bin/python3").exists():
+            self.skipTest("no /usr/bin/python3")
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.python_for(Path(directory)), "refused: shim")
+
+    def test_python_is_the_real_file_and_never_temporary_or_a_virtual_environment(self) -> None:
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        base = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
+        self.addCleanup(shutil.rmtree, base, True)
+        if TRUSTED_PY is None:
+            self.skipTest("no Python in a trusted installation folder")
+        real = TRUSTED_PY
+        linked = base / "linked"
+        linked.mkdir()
+        (linked / "python3").symlink_to(real)
+        self.assertEqual(self.python_for(linked), real)  # a symlink runs as its real file
+        venv = base / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python3").write_text("#!/bin/sh\nexit 99\n")
+        (venv / "bin" / "python3").chmod(0o755)
+        (venv / "pyvenv.cfg").write_text("home = /elsewhere\n")
+        self.assertEqual(self.python_for(venv / "bin"), "refused: venv")
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            shutil.copy(real, temporary / "python3")
+            self.assertEqual(self.python_for(temporary), "refused: temporary")
+            # A link from a safe folder into a temporary one is judged by its real file.
+            (linked / "python3").unlink()
+            (linked / "python3").symlink_to(temporary / "python3")
+            self.assertEqual(self.python_for(linked), "refused: temporary")
+
+    def test_only_the_macos_only_check_failure_is_quiet_on_linux(self) -> None:
+        import json
+        sandbox = ("operational check sandbox preflight failed; validate from an owner shell or "
+                   "approved unsandboxed command boundary")
+        limited = {"ready": False, "codex": {"package_ready": True, "project_errors": [sandbox]},
+                   "claude": {"result": "verified"}, "claude_settings": {"ready": True}}
+        cases = {
+            "ready": {**limited, "ready": True},
+            "linux-limited": limited,
+            "failed": None,
+        }
+        failures = [
+            {**limited, "claude_settings": {"ready": False, "missing": ["Edit(/.git/**)"]}},
+            {**limited, "codex": {"package_ready": True, "project_errors": [sandbox, "not committed and clean"]}},
+            {**limited, "codex": {"package_ready": False, "project_errors": [sandbox]}},
+            {**limited, "claude": {"error": "managed_file_modified"}},
+            {"refused": "the project's Git settings name programs Git would run"},
+            {},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "verify.json"
+            for expected, data in cases.items():
+                for sample in ([data] if data is not None else failures):
+                    with self.subTest(expected=expected, sample=str(sample)[:60]):
+                        report.write_text(json.dumps(sample))
+                        result = self.helper("verifyclass", str(report))
+                        self.assertEqual(result.stdout.decode().strip(), expected)
 
     def test_every_git_call_with_paths_is_literal(self) -> None:
         text = SETUP.read_text(encoding="utf-8")
@@ -480,18 +804,11 @@ class SetupScriptTests(unittest.TestCase):
 
     def test_a_failed_ignored_file_query_is_reported_not_read_as_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project = self.git_project(directory)
-            stubs = Path(directory) / "bin"
-            stubs.mkdir()
-            real_git = shutil.which("git")
-            (stubs / "git").write_text(
-                f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
-            (stubs / "git").chmod(0o755)
-            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
-                       PATH=f"{stubs}:{os.environ['PATH']}")
+            # Not a repository: the trusted git cannot answer.
             result = subprocess.run(
-                ["bash", str(SETUP), "--print-ignored-paths", str(project), ".codex/a"],
-                capture_output=True, env=env)
+                ["bash", str(SETUP), "--print-ignored-paths", directory, ".codex/a"],
+                capture_output=True, env=dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null",
+                                              GIT_CEILING_DIRECTORIES=str(Path(directory).parent)))
         self.assertEqual(result.stdout, b"!\0")
 
     def test_profile_larger_than_the_read_limit_is_unreadable(self) -> None:
@@ -500,6 +817,21 @@ class SetupScriptTests(unittest.TestCase):
         self.assertGreater(len(padded), 65536)
         self.assertEqual(self.profile_compare(padded), "unreadable")
         self.assertEqual(self.profile_compare(good + "# pad\n" * 100), "same")
+
+    def test_commands_and_commit_screens_say_what_the_rule_and_commit_do(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        self.assertIn("Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). "
+                      "It runs a protected copy of the orchestrator in ~/.codex that sessions opened on a "
+                      "project cannot change. Never open Codex on your home folder, its parent or / while "
+                      "the rule exists.", text)
+        self.assertNotIn("It applies to Codex sessions started in this project's root folder", text)
+        self.assertIn("Setup commits with Git's plumbing commands only (hash-object, update-index, write-tree, "
+                      "commit-tree, update-ref), which start no hook, filter, signing program, pager or "
+                      "maintenance whatever the project's Git settings say", text)
+        self.assertNotIn("no script in the project runs as you", text)
+        self.assertNotIn("or a commit hook stopped it", text)
+        self.assertIn("Keep this setup folder outside every folder you open in Codex", text)
+        self.assertIn("including the Codex commands rule", text)
 
     def test_wizard_messages_for_the_polished_screens(self) -> None:
         text = SETUP.read_text(encoding="utf-8")
@@ -605,11 +937,23 @@ class SetupScriptTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform != "win32", "needs a pseudo-terminal")
 class WizardTerminalTests(unittest.TestCase):
     def setUp(self) -> None:
+        if TRUSTED_PY is None:
+            self.skipTest("no Python in a trusted installation folder")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(os.path.realpath(self._tmp.name))
-        self.fakes = self.base / "bin"
+        # The fake python3 and the private working folder may not sit in a temporary folder.
+        outside = outside_temporary_folders()
+        if outside is None:
+            self.skipTest("no folder outside the temporary roots is available")
+        self.outside = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
+        self.addCleanup(shutil.rmtree, self.outside, True)
+        # The fake python3 must sit in a trusted installation folder: a hidden folder of the
+        # account's home, by the runtime's rule.
+        self.fakes = account_home_folder(self) / "bin"
         self.fakes.mkdir()
+        (self.fakes / "fake_rule.py").write_text(FAKE_RULE)
+        self.rule_log = self.base / "rule.log"
         self.home = self.base / "home"
         self.home.mkdir()
         self.tmpdir = self.base / "tmp"
@@ -618,37 +962,77 @@ class WizardTerminalTests(unittest.TestCase):
         (self.fakes / "claude").write_text(
             '#!/bin/sh\necho \'{"loggedIn": true, "subscriptionType": "max", "authMethod": "x"}\'\n')
         self.py_log = self.base / "python.log"
+        self.py_args = self.base / "python-args.log"
+        self.py_full = self.base / "python-full.log"
         self.slow_pid = self.base / "slow.pid"
         (self.fakes / "python3").write_text(
             "#!/bin/sh\n"
             f'echo "$PYTHONDONTWRITEBYTECODE" >> "{self.py_log}"\n'
+            f'echo "$1 $2 $3 $4 $5" >> "{self.py_args}"\n'
+            f'printf "%s\\n" "$*" >> "{self.py_full}"\n'
+            'if [ -n "$FAKE_PLANT" ]; then case "$*" in *install.py*--apply*)'
+            ' "$0.real" "$@"; rc=$?; git -C "$FAKE_PLANT" config filter.planted.clean "$FAKE_PLANT_SCRIPT";'
+            ' exit $rc;; esac; fi\n'
             'if [ -n "$FAKE_FAIL" ]; then case "$*" in *install.py*--apply*)'
             ' echo \'{"error": "boom ' + TOKEN + ' user@example.invalid"}\'; echo ' + TOKEN + ' >&2; exit 2;; esac; fi\n'
             f'if [ -n "$FAKE_SLOW" ]; then case "$*" in *install.py*install*)'
             f' echo $$ > "{self.slow_pid}"; exec sleep 60;; esac; fi\n'
             'for a in "$@"; do if [ "$a" = paths ] && [ -n "$FAKE_PJ_FAIL" ]; then exit 1; fi; done\n'
-            'if [ -n "$FAKE_ATTEST" ]; then case "$*" in *attest.py*)'
+            'if [ -n "$FAKE_ATTEST" ]; then case "$*" in *"attest.py --"*)'
             ' n=$(cat "$FAKE_ATTEST" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_ATTEST";'
             ' echo "attest stub run $n"; [ "$n" -le "${FAKE_ATTEST_FAILS:-0}" ] && exit 1; exit 0;; esac; fi\n'
             'if [ -n "$FAKE_UNTRUSTED" ]; then case "$*" in *host-command*)'
             ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
             ' exit 2;; esac; fi\n'
-            f'exec "{sys.executable}" "$@"\n')
+            'if [ -n "$FAKE_RULE" ]; then case "$*" in *"cli.py host-command"*|*"cli.py install-codex-rule"*)'
+            f' exec "{TRUSTED_PY}" "{self.fakes / "fake_rule.py"}" "$@";; esac; fi\n'
+            f'exec "{TRUSTED_PY}" "$@"\n')
+        (self.fakes / "python3.real").symlink_to(TRUSTED_PY)
         for fake in self.fakes.iterdir():
-            fake.chmod(0o755)
+            if not fake.is_symlink():
+                fake.chmod(0o755)
         # CODEX_HOME is dropped so the commands step can only write under the test's HOME.
+        # CODEX_THREAD_ID is dropped too, so nothing reads real Codex session records.
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR",
-                                 "PYTHONDONTWRITEBYTECODE", "CODEX_HOME")}
+                                 "PYTHONDONTWRITEBYTECODE", "CODEX_HOME", "CODEX_THREAD_ID")}
         self.env.update(
             PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
+            FAKE_RULE_LOG=str(self.rule_log),
             TMPDIR=str(self.tmpdir), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
             GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
             GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        if sys.platform == "darwin":  # the per-user cache folder, from getconf
+            cache = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"], capture_output=True,
+                                   text=True, check=True).stdout.strip()
+            self.scratch = Path(os.path.realpath(cache)) / SCRATCH_CONTAINER
+        else:  # a private XDG_RUNTIME_DIR for this test
+            runtime = self.outside / "run"
+            runtime.mkdir(mode=0o700)
+            self.env["XDG_RUNTIME_DIR"] = str(runtime)
+            self.scratch = runtime / SCRATCH_CONTAINER
+        self.scratch_before = self.scratch_entries()
         self.pid = 0
         self.fd = -1
         self.screen = ""
         self.transcript = ""
+
+    def scratch_entries(self) -> set[str]:
+        try:
+            return {name for name in os.listdir(self.scratch) if name.startswith("setup-")}
+        except FileNotFoundError:
+            return set()
+
+    def assert_no_working_files_left(self) -> None:
+        self.assertEqual(list(self.tmpdir.iterdir()), [], "something was written to TMPDIR")
+        self.assertEqual(self.scratch_entries() - self.scratch_before, set(),
+                         "the private working folder was kept")
+
+    def assert_python_isolated(self) -> None:
+        lines = self.py_args.read_text().splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertEqual(line, "-I -B -S -X pycache_prefix=/dev/null", line)
 
     def start(self, cwd: Path, extra_env: dict | None = None) -> None:
         import fcntl
@@ -671,6 +1055,9 @@ class WizardTerminalTests(unittest.TestCase):
             os.close(self.fd)
         except OSError:
             pass
+        # A wizard killed with SIGKILL cannot remove its private working folder.
+        for name in self.scratch_entries() - self.scratch_before:
+            shutil.rmtree(self.scratch / name, ignore_errors=True)
 
     def _kill_and_wait(self) -> None:
         try:
@@ -764,6 +1151,7 @@ class WizardTerminalTests(unittest.TestCase):
     def make_project(self, name: str = "project", base: Path | None = None) -> tuple[Path, Path]:
         project = (base or self.base) / name
         project.mkdir()
+        project.chmod(0o755)  # never group-writable, whatever the runner's umask
         subprocess.run(["git", "init", "-q", str(project)], check=True, env=self.env)
         (project / "qa-check").write_text("#!/usr/bin/python3\nprint(1)\n")
         (project / "qa-check").chmod(0o700)
@@ -791,6 +1179,59 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.expect("Project path")
 
+    def write_codex_session(self, workspace: Path, thread: str) -> None:
+        """A synthetic Codex 0.164 session record for a session opened on `workspace`."""
+
+        import json
+        folder = self.home / ".codex" / "sessions" / "2026" / "11" / "01"
+        folder.mkdir(parents=True, exist_ok=True)
+        # No /tmp entry: this checkout sits in a temporary folder, which every real
+        # session can write, so the warning would always name it.
+        entries = [
+            {"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
+            {"path": {"type": "path", "path": str(workspace)}, "access": "write"},
+        ]
+        lines = [
+            {"timestamp": "2026-11-01T10:00:00Z", "type": "session_meta", "payload": {
+                "id": thread, "cwd": str(workspace), "runtime_workspace_roots": [str(workspace)]}},
+            {"timestamp": "2026-11-01T10:00:01Z", "type": "turn_context", "payload": {
+                "cwd": str(workspace), "sandbox_policy": {"type": "workspace-write"},
+                "file_system_sandbox_policy": {"entries": entries}}},
+        ]
+        (folder / f"rollout-2026-11-01T10-00-00-{thread}.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in lines))
+
+    def test_a_codex_session_able_to_write_this_clone_is_warned_about(self) -> None:
+        self.write_codex_session(ROOT.parent, "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b")
+        self.start(self.base)
+        self.expect("Read the warning above")
+        self.expect("Up/Down move")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn(f"A Codex session on 2026-11-01 could write to {ROOT.parent}, which holds "
+                      "this setup folder", plain)
+        self.assertIn("never on your home folder", plain)
+        self.send("\r")  # Continue: it is a warning, not a stop
+        self.expect("Project path")
+        # Quit through the wizard: bash 5 runs the INT trap only once `read -e` returns.
+        self.send("q\r")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+        self.assertEqual(list((self.home / ".codex").iterdir()), [self.home / ".codex" / "sessions"])
+
+    def test_a_project_codex_session_is_not_warned_about(self) -> None:
+        project = self.base / "some-project"
+        project.mkdir()
+        self.write_codex_session(project, "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5c")
+        self.start(self.base)
+        self.expect("Everything looks good")
+        self.expect("Up/Down move")
+        self.assertNotIn("A Codex session on", self.screen)
+        self.send("q")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+
     def test_quit_on_the_first_screen_changes_nothing(self) -> None:
         self.start(self.base)
         self.expect("Step 1 of 9")
@@ -800,7 +1241,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("y")
         self.assertEqual(self.finish(), 130)
         self.assertEqual(list(self.home.iterdir()), [])
-        self.assertEqual(list(self.tmpdir.iterdir()), [])
+        self.assert_no_working_files_left()
 
     def test_sigterm_during_a_slow_command_leaves_no_child(self) -> None:
         project, checks = self.make_project()
@@ -827,13 +1268,15 @@ class WizardTerminalTests(unittest.TestCase):
             time.sleep(0.1)
         else:
             self.fail("the slow child is still running")
-        self.assertEqual(list(self.tmpdir.iterdir()), [], "the private log directory was kept")
+        self.assert_no_working_files_left()
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
-    @NEEDS_TRUSTED_PYTHON
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
+        # The Codex rule's replies come from the fake CLI (the runtime's account-home check
+        # refuses a test HOME); test_install drives the real rule lifecycle in process.
         project, checks = self.make_project("my proj;x", self.non_temporary_base())
+        self.env["FAKE_RULE"] = "missing"
         self.to_project_prompt(project)
         self.send("\r")
         self.expect("Path to operational-checks.json")
@@ -859,6 +1302,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.expect("Yes, allow these commands")
         self.assertIn("owner commands", self.screen)
+        commands = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B|\r|\n|  +", " ", self.screen)
+        self.assertIn("Every Codex session on this machine loads this rule", re.sub(" +", " ", commands))
         self.send("\x1b[B\x1b[B\r")
         self.expect("Codex commands rule: lines")
         self.send("q")
@@ -873,25 +1318,32 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertIn("4. Install: installed and verified; committed", final)
         self.assertLess(final.index("7. Profile"), final.index("8. Commands: created"))
         self.assertLess(final.index("8. Commands"), final.index("How to use it"))
-        self.assertLess(final.index("How to use it"), final.index("To remove everything, run:"))
-        self.assertRegex(final, r"To remove everything, run:\n\s+python3 .*install\.py.* remove --target ")
+        self.assertLess(final.index("How to use it"), final.index("To remove everything"))
+        self.assertRegex(final, r"To remove everything, including the Codex commands rule, run:\n"
+                                r"\s+python3 -I -B -S .*install\.py.* remove --target ")
         self.assertEqual(final.count("To remove everything"), 1)
-        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-[0-9a-f]{12}\.rules")
+        self.assertRegex(final, r"to undo only the rule, delete:\n\s+\S*/\.codex/rules/agent-orchestration-[0-9a-f]{12}\.rules")
+        self.assertRegex(final, r"and its copy:\n\s+\S*/\.codex/agent-orchestration/")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
-        rules = list((self.home / ".codex" / "rules").iterdir())
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(oct(rules[0].stat().st_mode & 0o777), "0o600")
         cli = project / ".codex" / "orchestration" / "cli.py"
-        expected = subprocess.run(
-            [sys.executable, str(cli), "install-codex-rule", "--project-root", str(project), "--print"],
-            capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1"), check=True)
-        import json
-        self.assertEqual(rules[0].read_text(), json.loads(expected.stdout)["rule_text"])
-        self.assertIn(json.dumps(str(cli)), rules[0].read_text())
+        # The rule was written by this checkout's own CLI, for this project.
+        clone = str(ORCHESTRATION / "cli.py")
+        rule_calls = self.rule_log.read_text().splitlines()
+        self.assertEqual([call.split(clone + " ", 1)[1] for call in rule_calls if "install-codex-rule" in call],
+                         [f"install-codex-rule --project-root {project} --print",
+                          f"install-codex-rule --project-root {project}"])
         runs = self.py_log.read_text().split()
         self.assertTrue(runs and set(runs) == {"1"}, runs)
-        self.assertEqual(list(self.tmpdir.iterdir()), [])
+        self.assert_python_isolated()
+        self.assert_no_working_files_left()
+        # Owner commands ran this checkout's CLI with --project-root, never the project's copy.
+        launched = self.py_full.read_text().splitlines()
+        clone = str(ORCHESTRATION / "cli.py")
+        owner = [line for line in launched if clone in line]
+        self.assertTrue(any("host-command" in line for line in owner), launched)
+        self.assertTrue(any("install-codex-rule" in line for line in owner), launched)
+        self.assertFalse(any(str(cli) in line for line in launched), launched)
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
@@ -929,6 +1381,14 @@ class WizardTerminalTests(unittest.TestCase):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn("user@example.invalid", text)
         self.assertEqual(oct(destination.stat().st_mode & 0o777), "0o600")
+        self.assert_python_isolated()
+        self.assert_no_working_files_left()
+        # Preview and install read one private snapshot of the chosen checks file, never the file.
+        installs = [line for line in self.py_full.read_text().splitlines() if "install.py install" in line]
+        self.assertEqual(len(installs), 2)
+        for line in installs:
+            self.assertNotIn(str(checks), line)
+            self.assertRegex(line, SCRATCH_CONTAINER + r"/setup-[0-9a-f]+/inputs/operational-checks\.json")
 
     def commit_count(self, project: Path) -> int:
         return int(subprocess.run(["git", "-C", str(project), "rev-list", "--count", "HEAD"],
@@ -960,32 +1420,41 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertNotIn("The commit", final)
         self.assertEqual(self.commit_count(project), before)
 
-    def test_a_failed_ignored_file_query_never_says_nothing_to_commit(self) -> None:
+    def test_a_helper_planted_during_the_run_stops_git_and_the_commit(self) -> None:
         project, checks = self.make_project()
-        self.drive_to_commit_menu(project, checks)
-        self.send("\r")
-        self.finish_after_install()
-        real_git = shutil.which("git", path=os.environ["PATH"])
-        (self.fakes / "git").write_text(
-            f'#!/bin/sh\ncase "$*" in *ls-files*--others*) exit 128;; esac\nexec "{real_git}" "$@"\n')
-        (self.fakes / "git").chmod(0o755)
+        marker = self.base / "filter-ran"
+        script = self.base / "filter.sh"
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+        script.chmod(0o755)
+        (project / ".git" / "info").mkdir(exist_ok=True)
+        (project / ".git" / "info" / "attributes").write_text("* filter=planted\n")
         before = self.commit_count(project)
-        self.start(project)
-        self.expect("Everything looks good")
-        self.send("\r")
-        self.expect("Project path")
-        self.send("\r")
-        self.expect("Update the install")
-        self.send("\r")
-        for wait in ("install can be updated", "Keep the existing configuration", "Install now"):
-            self.expect(wait)
-            self.send("\r")
-        self.expect("could not check whether installed files are ignored")
+        # The filter appears in .git/config right after the install, as a session opened on a
+        # parent folder could do it.
+        self.drive_to_commit_menu(project, checks, {"FAKE_PLANT": str(project), "FAKE_PLANT_SCRIPT": str(script)})
+        self.assertIn("could not check whether installed files are ignored", self.screen)
         self.assertNotIn("Nothing to commit", self.screen)
+        self.send("\r")  # Commit now
+        self.expect("Not committed")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        self.assertIn("filter.planted.clean", plain)
         final = self.finish_after_install()
         self.assertNotIn("nothing to commit", final)
-        self.assertIn("could not be checked", final)
         self.assertEqual(self.commit_count(project), before)
+        self.assertFalse(marker.exists(), "the planted filter ran")
+
+    def test_helpers_in_the_project_settings_stop_setup_before_any_git_porcelain(self) -> None:
+        project, checks = self.make_project()
+        subprocess.run(["git", "-C", str(project), "config", "core.pager", "./pager.sh"],
+                       check=True, env=self.env)
+        self.to_project_prompt(project)
+        self.send("\r")
+        self.expect("Choose another path")
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B|\r|\n", " ", self.screen)
+        self.assertIn("core.pager", plain)
+        self.assertIn("will not run Git commands that could start them", re.sub(r"\s+", " ", plain))
+        self.send("\x1b[B\r")
+        self.assertEqual(self.finish(), 1)
 
     def test_only_paths_with_changes_are_committed(self) -> None:
         import json
@@ -993,7 +1462,7 @@ class WizardTerminalTests(unittest.TestCase):
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
@@ -1190,17 +1659,16 @@ class WizardTerminalTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
-    @NEEDS_TRUSTED_PYTHON
     def test_verify_retry_back_and_the_summary_return_to_the_menu(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)  # left uncommitted: verification fails
-        self.start(project)
+        self.start(project, {"FAKE_RULE": "missing"})
         self.expect("Everything looks good")
         self.send("\r")
         self.expect("Project path")
@@ -1421,7 +1889,7 @@ class WizardTerminalTests(unittest.TestCase):
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         (project / ".codex" / "local*").write_text("local\n")
@@ -1456,17 +1924,63 @@ class WizardTerminalTests(unittest.TestCase):
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
 
-    def test_summary_says_commit_failed_when_a_hook_refuses(self) -> None:
+    def test_the_commit_never_runs_project_hooks(self) -> None:
         project, checks = self.make_project()
-        hook = project / ".git" / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\nexit 1\n")
-        hook.chmod(0o755)
+        ran = self.base / "hook-ran"
+        for hooks in (project / ".git" / "hooks", project / "githooks"):
+            hooks.mkdir(exist_ok=True)
+            for name in ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"):
+                (hooks / name).write_text(f"#!/bin/sh\necho {name} >> '{ran}'\nexit 1\n")
+                (hooks / name).chmod(0o755)
+        subprocess.run(["git", "-C", str(project), "config", "core.hooksPath", "githooks"],
+                       check=True, env=self.env)
         self.drive_to_commit_menu(project, checks)
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
+        self.assertIn("Setup commits with Git's plumbing commands only", re.sub(r"\s+", " ", plain))
         self.send("\r")
+        final = self.finish_after_install()
+        self.assertIn("; committed", final)
+        self.assertFalse(ran.exists(), "a project hook ran")
+
+    def test_summary_says_commit_failed_when_git_refuses(self) -> None:
+        project, checks = self.make_project()
+        # Signing is switched off for the commit, so a signing setting never stops it.
+        subprocess.run(["git", "-C", str(project), "config", "commit.gpgSign", "true"], check=True, env=self.env)
+        self.drive_to_commit_menu(project, checks, {"GIT_AUTHOR_NAME": "", "GIT_COMMITTER_NAME": ""})
+        self.send("\r")
+        self.expect("Git identity")
         final = self.finish_after_install()
         self.assertIn("commit failed", final)
         self.assertNotIn("not committed", final)
         self.assertIn("Left uncommitted in the project:", final)
+
+    def test_a_modified_orchestrator_is_never_run(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks, {"FAKE_ATTEST": str(self.base / "attest.count")})
+        self.send("\r")
+        self.finish_after_install()
+        cli = project / ".codex" / "orchestration" / "cli.py"
+        cli.write_text(cli.read_text() + "\nprint('changed')\n")
+        subprocess.run(["git", "-C", str(project), "commit", "-qam", "change"], check=True, env=self.env)
+        self.py_args.write_text("")
+        self.start(project, {"FAKE_ATTEST": str(self.base / "attest.count")})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\r")  # Re-run the billing attestation only
+        self.expect("Start the attestation")
+        self.send("\r")
+        self.expect("does not match this setup")
+        self.expect(".codex/orchestration/cli.py differs")  # the reason line may arrive later
+        self.assertFalse((self.base / "attest.count").exists(), "attest.py ran")
+        self.send("\r")
+        self.expect("Back to the main menu")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
+        self.assertFalse(any("cli.py" in line for line in self.py_args.read_text().splitlines()))
+        self.assert_python_isolated()
 
     def test_commit_stages_updated_files_and_provider_routing(self) -> None:
         project, checks = self.make_project()
@@ -1476,7 +1990,7 @@ class WizardTerminalTests(unittest.TestCase):
         # A project in a temporary folder is told why and gets no rule.
         self.assertIn("8. Commands: project in a temporary folder", final)
         self.assertIn("This project is in a temporary folder, so Codex sessions cannot", final)
-        self.assertNotIn("To undo it, delete:", final)
+        self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
         self.assertIn("; committed", final)
         self.assertNotIn("not committed", final)
@@ -1489,17 +2003,11 @@ class WizardTerminalTests(unittest.TestCase):
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
 
-    @NEEDS_TRUSTED_PYTHON
     def test_a_stale_rule_left_unchanged_keeps_its_undo_instruction(self) -> None:
         import hashlib
         project, checks = self.make_project(base=self.non_temporary_base())
         digest = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:12]
-        rules = self.home / ".codex" / "rules"
-        rules.mkdir(parents=True, mode=0o700)
-        stale = rules / f"agent-orchestration-{digest}.rules"
-        stale.write_text("# an older rule for this project\n")
-        stale.chmod(0o600)
-        self.drive_to_commit_menu(project, checks)
+        self.drive_to_commit_menu(project, checks, {"FAKE_RULE": "stale"})
         self.send("\r")
         self.expect("Continue")
         self.send("\r")
@@ -1521,23 +2029,22 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertIn("8. Commands: exists, differs, left alone", final)
         self.assertIn("rule for this project is stale", final)
         self.assertNotIn("until the Codex commands rule exists", final)
-        self.assertRegex(final, r"To undo it, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
+        self.assertRegex(final, r"to undo only the rule, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
                          + digest + r"\.rules")
-        self.assertEqual("# an older rule for this project\n", stale.read_text())
+        self.assertNotIn("install-codex-rule", self.rule_log.read_text())  # left unchanged
 
-    @NEEDS_TRUSTED_PYTHON
     def test_verify_reports_the_codex_commands_rule_without_writing_it(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
-        self.start(project)
+        self.start(project, {"FAKE_RULE": "missing"})
         self.expect("Everything looks good")
         self.send("\r")
         self.expect("Project path")
@@ -1555,7 +2062,40 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertEqual(self.finish(), 0)
         self.assertIn("8. Commands: missing", final)
         self.assertIn("Codex sessions cannot reach the orchestrator", final)
-        self.assertNotIn("To undo it, delete:", final)
+        self.assertNotIn("to undo only the rule, delete:", final)
+        self.assertFalse((self.home / ".codex").exists())
+
+    @unittest.skipUnless(RULE_MAY_NAME_TRUSTED_PY,
+                         "host-command checks the interpreter before the Codex home; none here passes")
+    def test_an_unsupported_codex_home_is_explained_with_its_fix(self) -> None:
+        import json
+        project, checks = self.make_project(base=self.non_temporary_base())
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
+        # The real CLI, with HOME pointed at a test folder: not the account's home folder.
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Verify the install only")
+        self.send("\x1b[B\r")
+        self.expect("cannot be used with this Codex setup")
+        self.expect("Continue")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("HOME is not this account's home folder", plain)
+        self.assertIn("run setup with HOME set to your own home folder", plain)
+        self.assertNotIn("may be older", plain)
+        self.send("\r")
+        self.expect("Back to the main menu")
+        self.send("\r")
+        self.assertEqual(self.finish(), 0)
         self.assertFalse((self.home / ".codex").exists())
 
     def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
@@ -1565,7 +2105,7 @@ class WizardTerminalTests(unittest.TestCase):
         final = self.finish_after_install(trusted=False, temporary=False)
         self.assertIn("8. Commands: not checked", final)
         self.assertIn("until the Codex commands rule exists", final)
-        self.assertNotIn("To undo it, delete:", final)
+        self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
 
     def test_path_starting_with_a_dash_is_resolved(self) -> None:

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 # ruff: noqa: I001 -- tests.support bootstraps the native package import path.
 
+import importlib.util
 import os
+import py_compile
 import stat
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,11 +16,14 @@ from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
 
-from codex_agents import bridge, host_commands, learning_store
+from codex_agents import bridge, host_commands, host_paths, learning_store
 from codex_agents.host_commands import HostCommandError, interpreter_path
 from codex_agents.host_paths import (
     PYTHON_ISOLATION_FLAGS,
+    TRUSTED_INSTALL_ROOTS,
     HostPathError,
+    executable_location_problem,
+    install_location_problem,
     private_directory,
     remove_private_directory,
     temp_roots,
@@ -105,6 +112,13 @@ class TrustedLocationTests(unittest.TestCase):
         self.bin = self.base / "bin"
         self.bin.mkdir(mode=0o755)
         os.chmod(self.bin, 0o755)
+        # The stand-in interpreter's folder counts as an installation folder here.
+        roots = mock.patch.object(
+            host_paths, "TRUSTED_INSTALL_ROOTS",
+            (*host_paths.TRUSTED_INSTALL_ROOTS, os.path.realpath(self.bin)),
+        )
+        roots.start()
+        self.addCleanup(roots.stop)
         self.python = self.bin / "python3"
         self.python.write_text("#!/bin/sh\n")
         self.python.chmod(0o755)
@@ -197,11 +211,65 @@ class TrustedLocationTests(unittest.TestCase):
                 interpreter_path()
 
 
+class InstallRootTests(unittest.TestCase):
+    """Programs the rule's commands run come only from trusted installation folders."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(os.path.realpath(self.temporary.name))
+        self.home = self.base / "home"
+        patcher = mock.patch.object(host_paths, "account_home", lambda: self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def program(self, *parts: str) -> Path:
+        path = self.base.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        return path
+
+    def test_a_sibling_install_in_a_workspace_is_refused(self) -> None:
+        # A session opened on ~/Work (or /srv/work) can change ~/Work/tools.
+        for sibling in (
+            self.program("home", "Work", "tools", "python3"),
+            self.program("srv", "work", "tools", "python3"),
+        ):
+            with self.subTest(path=sibling):
+                self.assertIn("trusted installation folder", install_location_problem(sibling))
+                self.assertIn(
+                    "trusted installation folder", executable_location_problem(sibling, [])
+                )
+        sibling = self.program("home", "Work", "tools", "python3")
+        with mock.patch.object(host_commands, "temp_roots", lambda: set()), \
+                mock.patch.object(sys, "executable", str(sibling)), \
+                mock.patch.object(sys, "prefix", sys.base_prefix):
+            with self.assertRaisesRegex(HostCommandError, "trusted installation folder"):
+                interpreter_path()
+
+    def test_hidden_home_folders_and_the_listed_roots_are_accepted(self) -> None:
+        for accepted in (
+            self.program("home", ".local", "bin", "claude"),
+            self.program("home", ".pyenv", "versions", "3.12.9", "bin", "python3.12"),
+            self.program("home", ".codex", "packages", "codex"),
+        ):
+            with self.subTest(path=accepted):
+                self.assertIsNone(install_location_problem(accepted))
+                self.assertIsNone(executable_location_problem(accepted, []))
+        self.assertIn("home folder", install_location_problem(self.home))
+        for root in ("/usr/bin", "/opt/homebrew", "/Library/Developer/CommandLineTools",
+                     "/nix/store"):
+            self.assertIn(root, TRUSTED_INSTALL_ROOTS)
+            self.assertIsNone(install_location_problem(Path(root) / "tool"))
+        self.assertIsNotNone(install_location_problem(Path("/srv/tools/python3")))
+
+
 class PythonLaunchTests(unittest.TestCase):
     """Every Python an allowlisted command starts outside the sandbox is isolated."""
 
     def test_the_collector_and_the_watchdog_start_without_site_packages(self) -> None:
-        self.assertEqual(("-I", "-B", "-S"), PYTHON_ISOLATION_FLAGS)
+        self.assertEqual(("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"), PYTHON_ISOLATION_FLAGS)
         launched: list[list[str]] = []
 
         def record(argv, **options):
@@ -223,7 +291,38 @@ class PythonLaunchTests(unittest.TestCase):
             bridge._start_watchdog(-1, "0.0", 0.0)
         self.assertEqual(2, len(launched))
         for argv in launched:
-            self.assertEqual([sys.executable, "-I", "-B", "-S"], argv[:4])
+            self.assertEqual([sys.executable, *PYTHON_ISOLATION_FLAGS], argv[:6])
+
+
+    def test_a_planted_bytecode_file_never_loads(self) -> None:
+        # -B only stops writing; the pycache prefix stops reading a planted .pyc.
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            (root / "pkg").mkdir()
+            source = root / "pkg" / "mod.py"
+            source.write_text('print("source")\n')
+            planted = root / "planted.py"
+            planted.write_text('print("PLANTED")\n')
+            cache = Path(importlib.util.cache_from_source(str(source)))
+            cache.parent.mkdir()
+            py_compile.compile(str(planted), cfile=str(cache), dfile=str(source))
+            data = bytearray(cache.read_bytes())
+            info = source.stat()
+            # A timestamp .pyc that matches the source is what Python trusts.
+            data[8:16] = struct.pack(
+                "<II", int(info.st_mtime) & 0xFFFFFFFF, info.st_size & 0xFFFFFFFF
+            )
+            cache.write_bytes(bytes(data))
+            program = f"import sys; sys.path.insert(0, {str(root / 'pkg')!r}); import mod"
+
+            def run(*flags: str) -> str:
+                return subprocess.run(
+                    [sys.executable, *flags, "-c", program], capture_output=True,
+                    text=True, check=True, stdin=subprocess.DEVNULL,
+                ).stdout.strip()
+
+            self.assertEqual("PLANTED", run("-I", "-B", "-S"))
+            self.assertEqual("source", run(*PYTHON_ISOLATION_FLAGS))
 
 
 class HostScratchTests(unittest.TestCase):

@@ -15,9 +15,55 @@ from pathlib import Path
 from typing import Any
 
 ORCHESTRATION_ROOT = Path(__file__).resolve().parent
+# The project this CLI serves. A protected runtime copy (the one the owner's Codex
+# rule runs) replaces it below with the project its binding names.
 BUNDLE_ROOT = ORCHESTRATION_ROOT.parent.parent
-# Present only in an installed project; the installer writes it next to this file.
+# Present only in an installed project or its protected copy; the installer
+# writes it next to this file.
 INSTALL_MANIFEST = ORCHESTRATION_ROOT / "install-manifest.json"
+# Present only in a protected runtime copy.
+RUNTIME_BINDING = ORCHESTRATION_ROOT / "runtime-binding.json"
+
+
+def _copy_holds_only_its_runtime() -> bool:
+    """Whether a protected copy's tree is exactly the files its manifest lists.
+
+    It runs before this directory goes on the import path, with only modules
+    already loaded, so an extra module (a top-level `socket.py`, a package,
+    bytecode, an extension module) is refused before anything could import it.
+    """
+
+    try:
+        with open(INSTALL_MANIFEST, "rb") as handle:
+            listed = json.loads(handle.read(1_048_577))["files"]
+        expected = {
+            name.removeprefix(".codex/orchestration/") for name in listed
+        } | {INSTALL_MANIFEST.name, RUNTIME_BINDING.name}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    directories = {
+        "/".join(item.split("/")[:index])
+        for item in expected for index in range(1, item.count("/") + 1)
+    }
+    for current, subdirectories, names in os.walk(ORCHESTRATION_ROOT, followlinks=False):
+        base = os.path.relpath(current, ORCHESTRATION_ROOT)
+        for name in [*subdirectories, *names]:
+            relative = name if base == "." else f"{base}/{name}"
+            path = os.path.join(current, name)
+            if os.path.islink(path) or relative not in (
+                directories if name in subdirectories else expected
+            ):
+                return False
+    return True
+
+
+if os.path.lexists(RUNTIME_BINDING) and not _copy_holds_only_its_runtime():
+    print(json.dumps({
+        "ready": False,
+        "error": "the protected runtime copy holds files it should not; ask the owner "
+        "to run ./setup.sh (Codex commands step)",
+    }, indent=2, sort_keys=True))
+    raise SystemExit(2)
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
 from codex_agents.bridge import BridgeRefused  # noqa: E402
@@ -98,13 +144,21 @@ from codex_agents.hosts import (  # noqa: E402
 )
 from codex_agents.host_commands import (  # noqa: E402
     PRIMARY_HOST_COMMANDS,
+    CodexHomeUnsupported,
     HostCommandError,
     OwnRootRefused,
     argv_prefix as codex_argv_prefix,
+    bound_project_root,
+    configured_codex_home,
+    install_rule as install_codex_rule,
+    installer_root,
+    remove_rule as remove_codex_rule,
     render_rule as render_codex_rule,
     rule_path as codex_rule_path,
     rule_status as codex_rule_status,
-    write_rule as write_codex_rule,
+    runtime_binding,
+    runtime_copy_problem,
+    runtime_copy_root,
 )
 from codex_agents.claude_host import (  # noqa: E402
     ClaudeHostDenied,
@@ -124,7 +178,31 @@ from codex_agents.routing import (  # noqa: E402
     load_policy,
     route_task,
 )
+from codex_agents.runtime_files import RELEASES_FILE  # noqa: E402
+from codex_agents.session_guard import (  # noqa: E402
+    SessionRefused,
+    check_current_session,
+    scan_recent_sessions,
+    session_guard_status,
+)
 from codex_agents.validation import validate_package  # noqa: E402
+
+# A protected runtime copy serves the project its owner-only binding names, never
+# the place it sits; a binding that does not verify refuses every command.
+_RUNTIME_BINDING_ERROR: str | None = None
+_BINDING: dict[str, str] | None = None
+try:
+    _BOUND_PROJECT = bound_project_root(ORCHESTRATION_ROOT)
+    _BINDING = runtime_binding(ORCHESTRATION_ROOT)
+except HostCommandError as _binding_error:
+    _BOUND_PROJECT, _RUNTIME_BINDING_ERROR = None, str(_binding_error)
+PROTECTED_RUNTIME = _BOUND_PROJECT is not None or _RUNTIME_BINDING_ERROR is not None
+if _BOUND_PROJECT is not None:
+    BUNDLE_ROOT = _BOUND_PROJECT
+# Signed release data is not runtime code: a protected copy reads its project's.
+RELEASES_PATH = BUNDLE_ROOT / ".codex" / "orchestration" / RELEASES_FILE
+# The copy runs only what the rule allows, plus the collector it starts.
+PROTECTED_RUNTIME_COMMANDS = frozenset(PRIMARY_HOST_COMMANDS) | {"learning-serve"}
 
 
 def _bounded_input(path: str) -> bytes:
@@ -288,6 +366,42 @@ def _with_codex_hint(command: str, report: dict) -> dict:
 
 def _resolved(path: Path) -> Path:
     return Path(os.path.realpath(Path(path).expanduser()))
+
+
+def _require_protected_runtime(args: argparse.Namespace) -> None:
+    """Refuse what a protected runtime copy must not run, before anything else.
+
+    The copy is what the owner's Codex rule runs outside the sandbox. It
+    serves only the primary-host commands (and the collector it starts), only
+    while the project's installed runtime is still byte-for-byte this copy (a
+    package update, or a change to the project's installed files, stops it
+    until the owner runs setup again), and only for a Codex session whose own
+    record shows it cannot write the folders the rule depends on
+    (`session_guard`).
+    """
+
+    if not PROTECTED_RUNTIME:
+        return
+    if _RUNTIME_BINDING_ERROR is not None:
+        raise HostCommandError(_RUNTIME_BINDING_ERROR)
+    if args.command not in PROTECTED_RUNTIME_COMMANDS:
+        raise HostCommandError("a protected runtime copy runs only the primary-host commands")
+    if args.command == "learning-serve":
+        return
+    if runtime_copy_problem(ORCHESTRATION_ROOT.parent.parent, BUNDLE_ROOT) is not None:
+        raise HostCommandError(
+            "the project's installed runtime differs from its protected copy; ask the "
+            "owner to run ./setup.sh (Codex commands step)"
+        )
+    # The calling Codex session may not be able to write anything the rule
+    # depends on: its home folder, ~/.codex, this copy, the clone, tool folders.
+    try:
+        check_current_session(
+            ORCHESTRATION_ROOT.parent.parent,
+            Path(_BINDING["clone_root"]) if _BINDING is not None else None,
+        )
+    except SessionRefused as exc:
+        raise HostCommandError(str(exc)) from None
 
 
 def _require_own_roots(args: argparse.Namespace) -> None:
@@ -538,7 +652,7 @@ def _trusted_host_route(
     )
     selection_slice = model_selection_slice(task)
     released = load_released_candidate_digests(
-        ORCHESTRATION_ROOT / "config" / "learning-releases.json",
+        RELEASES_PATH,
         verify_signature=lambda payload, signature: OwnerGrantAuthority(
             ledger.state.owner_allowed_signers()
         ).verify_release_signature(payload, signature),
@@ -1136,6 +1250,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the rule that would be written, without writing it",
     )
 
+    remove_codex_rule_parser = subparsers.add_parser(
+        "remove-codex-rule",
+        help="owner removal: delete the Codex command rule and runtime copy for one project",
+    )
+    remove_codex_rule_parser.add_argument("--project-root", required=True, type=Path)
+
+    # Read-only: which recent Codex sessions could write this clone or the home folder.
+    session_scan = subparsers.add_parser(
+        "codex-session-scan",
+        help="setup: list recent Codex sessions that could write this clone or the home folder",
+    )
+    session_scan.add_argument("--clone-root", required=True, type=Path)
+
     for subparser in subparsers.choices.values():
         subparser.add_argument(
             "--host-client",
@@ -1151,6 +1278,7 @@ def main() -> int:
     _EXPLICIT_HOST_CLIENT = args.host_client
     _COLLECTOR_UNREACHED = False
     try:
+        _require_protected_runtime(args)
         _require_own_roots(args)
         if getattr(args, "policy", False) is None:
             args.policy = ORCHESTRATION_ROOT / "config" / (
@@ -1211,7 +1339,7 @@ def main() -> int:
                     BUNDLE_ROOT, base_route, client_capability=clients[client_version]
                 )
                 released = load_released_candidate_digests(
-                    ORCHESTRATION_ROOT / "config" / "learning-releases.json",
+                    RELEASES_PATH,
                     verify_signature=lambda payload, signature: OwnerGrantAuthority(
                         ledger.state.owner_allowed_signers()
                     ).verify_release_signature(payload, signature),
@@ -1234,6 +1362,12 @@ def main() -> int:
                     _require_host_owner(
                         ledger, project_id, run_handle=args.fallback_from_run_handle
                     )
+                    if base_route.get("dispatch") == "bridge":
+                        # The fallback answers a native host's model rejection; a
+                        # bridged child (every Codex child) ends fenced instead.
+                        raise ContractError(
+                            "the legacy fallback applies only to native children"
+                        )
                     receipt = ledger.issue_legacy_fallback_receipt(
                         project_id,
                         run_handle=args.fallback_from_run_handle,
@@ -2069,7 +2203,7 @@ def main() -> int:
                     )
                 else:
                     released = load_released_candidate_digests(
-                        ORCHESTRATION_ROOT / "config" / "learning-releases.json",
+                        RELEASES_PATH,
                         verify_signature=lambda payload, signature: OwnerGrantAuthority(
                             ledger.state.owner_allowed_signers()
                         ).verify_release_signature(payload, signature),
@@ -2825,13 +2959,42 @@ def main() -> int:
             )
             report = {"ready": True, "record": record}
         elif args.command == "host-command":
-            status = codex_rule_status(args.project_root)
-            report = {
-                "ready": status == "installed",
-                "argv_prefix": codex_argv_prefix(args.project_root),
-                "codex_rule": status,
-                "rule_file": str(codex_rule_path(args.project_root)),
-            }
+            try:
+                status = codex_rule_status(args.project_root)
+            except CodexHomeUnsupported as exc:
+                # The rule and its copy live only in the real ~/.codex.
+                report = {
+                    "ready": False, "argv_prefix": None, "codex_rule": "unsupported",
+                    "reason": str(exc), "rule_file": None, "runtime_copy": None,
+                }
+            else:
+                try:
+                    # The rule runs the protected copy, never the project's own CLI.
+                    prefix = codex_argv_prefix(args.project_root)
+                    runtime_copy = str(runtime_copy_root(args.project_root))
+                except HostCommandError:
+                    # No install manifest: nothing to copy, so the rule is stale.
+                    prefix = runtime_copy = None
+                clone = None
+                if runtime_copy is not None:
+                    try:
+                        clone = Path(
+                            runtime_binding(Path(runtime_copy) / ".codex" / "orchestration")
+                            ["clone_root"]
+                        )
+                    except (HostCommandError, TypeError):
+                        clone = None  # no copy yet: nothing recorded to protect
+                report = {
+                    "ready": status == "installed",
+                    "argv_prefix": prefix,
+                    "codex_rule": status,
+                    "rule_file": str(codex_rule_path(args.project_root)),
+                    "runtime_copy": runtime_copy,
+                    # Whether this session would pass the guard the copy applies.
+                    "session_guard": session_guard_status(
+                        Path(runtime_copy) if runtime_copy is not None else None, clone
+                    ),
+                }
         elif args.command == "install-codex-rule":
             rule_file = str(codex_rule_path(args.project_root))
             if args.print_only:
@@ -2839,14 +3002,29 @@ def main() -> int:
                     "ready": True,
                     "rule_file": rule_file,
                     "rule_text": render_codex_rule(args.project_root),
+                    "runtime_copy": str(runtime_copy_root(args.project_root)),
                 }
             else:
-                outcome = write_codex_rule(args.project_root, replace=args.replace)
+                installed = install_codex_rule(
+                    args.project_root, replace=args.replace,
+                    clone_root=installer_root(ORCHESTRATION_ROOT),
+                )
                 report = {
-                    "ready": outcome != "differs",
-                    "codex_rule": outcome,
+                    "ready": installed["codex_rule"] != "differs",
+                    **installed,
                     "rule_file": rule_file,
                 }
+        elif args.command == "remove-codex-rule":
+            report = {"ready": True, "removed": remove_codex_rule(args.project_root)}
+        elif args.command == "codex-session-scan":
+            report = {
+                "ready": True,
+                "warnings": scan_recent_sessions(
+                    args.clone_root,
+                    configured_codex_home(),
+                    Path(os.environ.get("HOME") or Path.home()),
+                ),
+            }
         else:  # pragma: no cover - argparse restricts commands.
             raise ContractError("unsupported command")
     except OSError:

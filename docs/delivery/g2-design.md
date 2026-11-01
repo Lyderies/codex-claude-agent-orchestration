@@ -1,8 +1,9 @@
 # G2 design: cross-provider read-only routing
 
-- **Status:** revision 3. The first cross-provider review found eight blockers and proposed a
+- **Status:** revision 4. The first cross-provider review found eight blockers and proposed a
   simpler design, which is adopted. The second review confirmed seven fixed and raised three more,
   addressed below. Reviews are capped at two rounds; the S4 security review checks the result.
+  Two whole-release reviews of the v1 candidate returned NO-GO; S6 records the runtime fixes.
 - **Goal:** the G2 exit in [the plan](plan.md).
 - **Evidence:** the [routing table](../routing-table.md) and the dispatch spikes on `staging`.
 
@@ -252,7 +253,8 @@ build.
   - Identity window: the birth time is microseconds on macOS and 10 ms clock ticks on Linux, and
     a pid could change hands between the last record read and the signal. Both require the pid
     space to wrap around in that interval.
-  - Native Codex children share the primary's command rule (see S5b).
+  - Native Codex children shared the primary's command rule; since S6 every Codex child is
+    bridged, so none does.
 
 ### S4: security review, pilot install and exit
 
@@ -278,8 +280,9 @@ build.
 - **Rule.** With the owner's consent, the wizard's Commands step writes one Codex command
   rule per project: a `prefix_rule` with `decision = "allow"`, which runs a matching
   command outside the sandbox without a prompt. The pattern is the absolute base interpreter,
-  the isolation flags `-I -B -S`, the absolute `<root>/.codex/orchestration/cli.py`, then
-  one allowlisted subcommand. The file carries `match` and `not_match` examples that Codex
+  the isolation flags `-I -B -S`, the absolute `cli.py` (since S6, that of the owner-only
+  runtime copy, not `<root>/.codex/orchestration/cli.py`), then one allowlisted
+  subcommand. The file carries `match` and `not_match` examples that Codex
   checks when it loads it: an owner command, the relative forms and the form without the
   flags must not match. It is written with mode 0600 and symlinks are refused. A new rule is
   published with a hard link, which never overwrites, so a rule another setup wrote in the
@@ -367,8 +370,9 @@ build.
   its value. No flag turns the check off, and host markers play no part.
   - **Why keyed to the installed CLI.** It applies when an install manifest sits next to
     `cli.py`. A sandboxed Codex session cannot create or remove that file, because
-    `.codex/` is read-only there, and the rule only ever runs the installed `cli.py`. The
-    source tree has no manifest and keeps these options for development and tests.
+    `.codex/` is read-only there, and the rule only ever runs an installed `cli.py` (since
+    S6, the protected copy, whose project comes from its binding). The source tree has no
+    manifest and keeps these options for development and tests.
   - **Why the default state is safe to trust.** It follows `HOME` (or `XDG_STATE_HOME`
     on Linux) in the process environment. A command Codex runs through the rule is a
     fresh process with Codex's environment, and an environment-assignment prefix breaks
@@ -383,8 +387,9 @@ build.
     let `dispatch` start a bridged child without the owner's attestation. Both are
     unreachable now: every allowlisted command uses this project and the owner's state.
 - **Residual risks.**
-  - The project must be the Codex session's workspace root: Codex keeps `.codex` read-only
-    only at the top of a writable root, and the rule runs that `cli.py`.
+  - The project had to be the Codex session's workspace root: Codex keeps `.codex`
+    read-only only at the top of a writable root, and the rule ran the project's `cli.py`.
+    S6 moves the rule's target to an owner-only copy in the Codex home.
   - The interpreter check accepts admin-group-writable directories on macOS, and trusts
     the interpreter's standard library and dynamic libraries where they are installed.
   - A shared repository in a writable root other than the project and the temporary
@@ -399,12 +404,245 @@ build.
     attestation and the rule itself come from the owner's terminal. An owner who runs
     `scripts/attest.py --state-root` against an installed project is refused at
     `provider-observe`, because only the default state is accepted.
-  - Native Codex children that a Codex primary spawns share its session, so the rule applies
-    to them too: a native child could run the primary-host commands outside its own sandbox.
-    It is still held to this project's root and the owner's state by the own-root invariant,
-    and every run it could open or dispatch still needs ledger admission. The Codex skill
-    says never to ask a child to run them. Bridged Codex children load no rules (S4c).
+  - Native Codex children that a Codex primary spawned shared its session, so the rule
+    applied to them too. Since S6 a Codex primary spawns no native children.
   - The Claude primary's permission rules are a separate follow-up.
+
+### S6: v1 hardening
+
+Two independent whole-release reviews of the v1 candidate returned NO-GO, and focused
+reviews of the runtime boundary and of the bridge and ledger followed. This is the runtime
+half of the fixes; the owner-side half (setup, attestation, the installer) is separate.
+The owner's standing rule holds: the orchestrator runs without per-command approvals, and
+safety comes from redundant layers.
+
+- **Supported threat model.** The rule runs commands outside the sandbox for every Codex
+  session on the machine. It is safe only while no Codex session uses the home folder, its
+  parent or `/` as its workspace, and none adds `~` or `~/.codex` as a writable root with
+  `--add-dir`. Such a session could write `~/.codex` (the rule and its copy) and every
+  tool installed under the home folder (a Python under `~/.pyenv`, Claude Code under
+  `~/.local`), which the rule then runs. The wizard's consent screen, the README and the
+  Codex skill state it in those words. Sessions opened on a project, or on any other
+  folder, are supported, so a program the rule's commands run must not sit where such a
+  session could reach it.
+- **Session workspace guard.** The workspace rule above no longer rests on the owner
+  alone. Before every primary-host command, the protected copy identifies the calling
+  session from `CODEX_THREAD_ID` (strict UUID form; a command the rule runs is a fresh
+  process whose environment the model cannot set) and finds exactly one record for it in
+  the account's `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl` (account home
+  from the account database, every folder and the file opened without following symlinks
+  and owner-checked, newest day folders first, at most 400). It reads only two Codex 0.164
+  records, never conversation content: `session_meta` (the first line: `cwd`,
+  `runtime_workspace_roots`) and the last `turn_context` (read backwards in bounded steps,
+  at most 32 MiB from the end: `sandbox_policy.type` and
+  `file_system_sandbox_policy.entries`). It refuses, with plain messages:
+  - a session without its sandbox (`danger-full-access`) or of an unknown type;
+  - no record (`codex exec --ephemeral`), several, a missing or malformed `CODEX_THREAD_ID`,
+    or any record shape it does not know (the format is pinned to Codex 0.164 and fails
+    closed on change);
+  - any writable folder (every `path` entry with write access, `slash_tmp` as `/tmp`,
+    `tmpdir` as the command's `TMPDIR`, and, except in a read-only session, every runtime
+    workspace root) that is `/`, the account home or a folder above it, or that equals,
+    contains or lies inside `~/.codex` (and so the copy), the orchestrator clone that
+    installed the copy (recorded in its binding, format 2), a trusted installation folder
+    or any hidden top-level home folder; and a writable `special` root or home entry, or
+    one it cannot place.
+  - Containment is decided component by component, for each path both as written (no
+    symlink followed) and as it resolves now: two components are the same folder when
+    their file-system identities (device and inode) match, and a component that does not
+    exist is compared by name ignoring case. So a protected folder renamed and replaced by
+    a symlink still protects its recorded path (and its new target), and a different
+    spelling on a case-insensitive volume (`~/work` for `~/Work`) is the same folder; when
+    unsure, the guard refuses.
+  `host-command` reports the verdict as `session_guard` (`ok` or the reason) without
+  changing `ready` or `codex_rule`, and the Codex skill stops on anything but `ok`. The
+  wizard's first screen runs `codex-session-scan` from the clone, with the same parsing:
+  records changed in the last 14 days (at most 200) in the folder Codex uses (`CODEX_HOME`,
+  else `$HOME/.codex`), warning, with Continue or Quit, about a session that could write the
+  clone, `$HOME` or the account home, or a folder above them. The Claude primary's project
+  CLI is unaffected.
+- **Trusted installation folders.** The interpreter the rule names (and its standard
+  library), every provider client and git must resolve under one of
+  `host_paths.TRUSTED_INSTALL_ROOTS` (`/usr/bin`, `/bin`, `/usr/libexec`, `/usr/local`,
+  `/opt/homebrew`, Linuxbrew's default prefix, `/Library/Frameworks/Python.framework`,
+  `/Library/Developer/CommandLineTools`, `/Applications`, `/nix/store`) or in a hidden
+  top-level folder of the account's home folder (`~/.local`, `~/.pyenv`, `~/.codex`),
+  besides the existing checks (canonical, owned by the user or root, writable by no one
+  else, outside the project and temporary directories, never the macOS `/usr/bin/python3`
+  shim). A Linux system Python's prefix, `/usr` itself, is accepted. An allowlist rather
+  than "outside the home folder", because a sibling such as `~/Work/tools` or
+  `/srv/work/tools` could be part of a permitted session's workspace. The list is one
+  constant that the owner tools import too, so both sides apply the same rule.
+- **Protected rule target.** The S5b rule named `<project>/.codex/orchestration/cli.py`.
+  A session opened on a parent folder, or one where `.codex` is absent, can rewrite that
+  file, and the user-layer rule would then run it outside the sandbox.
+  - `install-codex-rule` (owner) now copies the runtime to
+    `~/.codex/agent-orchestration/<project digest>/<runtime digest>/`, mirroring the
+    project layout. The copy holds exactly this package's runtime files
+    (`codex_agents/runtime_files.py`: `cli.py`, every `codex_agents` module, the
+    configuration and the schemas), a manifest of exactly those files and a binding
+    (`.codex/orchestration/runtime-binding.json`: format, project root, runtime digest,
+    version). The file set is a constant of the code doing the install, never the
+    project's install manifest, which a parent-folder session could extend with a
+    planted module and its digest (a top-level `socket.py` would shadow the standard
+    library on the copy's import path).
+  - The runtime digest covers every file the copy holds, and it is also the collector's
+    runtime identity: `COLLECTOR_RUNTIME_DIGEST`, `validate_collector_runtime` and
+    `runtime-releases.json` use the same set. Signed release data
+    (`config/learning-releases.json`) is not code; the copy reads its project's.
+  - Before publishing, the project's runtime must pass its manifest digests and equal
+    this package's recorded runtime and version, and its `.codex/orchestration` may hold
+    nothing but the package's files and the project's own configuration: a planted module,
+    a package, bytecode or an extension module refuses. The learning hooks and the Claude
+    skill now launch Python with the isolation flags, so neither writes bytecode there.
+    A project without an install manifest gets neither copy nor rule.
+  - The copy is staged in an owner-only sibling created through no-follow descriptors
+    (`open_private_directories`), verified byte for byte against the project's files, and
+    renamed into place, so the rule never names a partial copy.
+  - The rule keeps the `[interpreter, isolation flags, cli]` shape and names the copy's
+    `cli.py`; its `not_match` examples include the project's own `cli.py` and the old
+    prefix. After the rule names a copy, the project's older copies are removed.
+  - **No bytecode read.** `-B` only stops Python writing bytecode; CPython 3.14 still
+    loaded a planted timestamp `.pyc` from `__pycache__` beside a module. The isolation
+    flags are now `-I -B -S -X pycache_prefix=/dev/null` for the rule, `argv_prefix`, the
+    collector, the deadline watchdog and the hooks. A rule without the new flag is `stale`.
+  - The copy's CLI first checks, before its directory goes on the import path, that the
+    tree holds exactly the files its manifest lists, so an extra module there is never
+    imported. It then reads its binding: the copy must sit at exactly the path the binding
+    implies. Its `BUNDLE_ROOT` is the bound project, so the own-root invariant pins
+    `--project-root` and `--root` to the project, never to the copy's location. It runs
+    only the primary-host commands (and `learning-serve`, the collector it starts), and
+    only while the project's runtime files are byte for byte the copy.
+  - `host-command` reports `installed` only when the rule file is a fresh render and the
+    copy exists, is bound to this project, holds nothing extra and equals the project's
+    runtime; `missing` without a rule file; `unsupported` (with a `reason`) for a Codex
+    home other than the real `~/.codex`; otherwise `stale`, including a rule naming the
+    project's `cli.py` and a project without a manifest. Its `argv_prefix` names the copy.
+  - `remove-codex-rule --project-root <root>` (owner) deletes the rule and every copy for
+    the project, without following symlinks, and prints
+    `{"ready": true, "removed": [<paths>]}` (empty when there was nothing). It needs only
+    the resolved project path, so it works for a temporary project and after the package
+    files are gone; it also removes a rule an earlier version wrote to another
+    `CODEX_HOME`. The installer's remove step calls it.
+  - **Only the real `~/.codex`.** A session opened at the home folder has `~/.codex` as
+    its workspace root's `.codex`, which Codex keeps read-only, and a session opened on a
+    project cannot write it at all; the rules directory sits there too, so the copy adds
+    no new exposure. The home folder is the account's, from the system account database
+    (`pwd`), never HOME alone: a HOME or `CODEX_HOME` that disagrees with it, a `~/.codex`
+    that is a symlink, a home folder reached through a symlink and a `~/.codex` another
+    user owns or can change are all refused with a plain reason.
+- **Real git, no xcrun shim.** On macOS `/usr/bin/git` is an xcrun shim that consults a
+  lookup cache under `$TMPDIR`, which the sandbox can write. `git_executable()` resolves a
+  real binary: the Command Line Tools git, then the active developer directory's (from
+  xcode-select's root-owned link), Xcode's, then Homebrew's; `/usr/bin/git` on Linux.
+  Each is pinned as its realpath and must pass `trusted_location_problem` with the
+  temporary roots and the repository being inspected untrusted; none passing refuses.
+  `xcrun_nocache=1` is set for git, provider clients and operational checks. `ps`,
+  `getconf`, `sandbox-exec` and `ssh-keygen` are real binaries; a darwin `/usr/bin`
+  interpreter (the `python3` shim) is refused for the rule.
+- **Trusted provider executables.** `resolve_client` followed the fixed search path
+  through symlinks but only hashed the target. Before anything executes, the resolved
+  client must now pass the same location and ancestor checks, with the temporary roots and
+  the registered project root untrusted (`client_unavailable` otherwise), so a link into
+  a writable checkout is never run.
+- **Worker-result retention.** S5 kept a verification-required result's raw JSON for its
+  verifier with the default 90-day retention. It now lives only while its orchestration is
+  open, and at most seven days after its outcome was recorded. Closing the orchestration
+  deletes it; every ledger start clamps each kept result's expiry to its outcome's
+  ingestion time plus seven days (which shortens results an earlier version kept for 90)
+  and deletes what is past it; the persistent collector runs the same sweep every minute;
+  and a read past the limit refuses even before a sweep. A registration is removed only
+  after its file is gone, so a failed deletion stays registered (and expired, so never
+  read) and is retried at the next sweep. Each collector request must arrive whole within
+  five seconds, so a slow sender cannot postpone a sweep. Project deletion removes it as
+  before. Only the outcome's digests and closed metadata stay.
+- **Codex children are bridged.** A native Codex child shares the Codex primary's session
+  and therefore its command rule. Routing now dispatches every Codex child through the
+  bridge (`codex exec`, read-only, `--ignore-rules`), from either primary; only a Claude
+  primary spawns natively, and only Claude children. Bridged Codex-from-Codex uses the
+  same `dispatch` path as a Claude primary, which already runs outside the sandbox
+  through the rule. Consequences: a Codex route that needs `workspace-write` is never
+  eligible until write containment exists, and the legacy GPT-5.6 Sol fallback, which
+  answers a native host's model rejection, is refused for a bridged route.
+- **Bridged children get the whole assignment.** A child's prompt carries the objective,
+  each required criterion's id and description (the template alone names only ids), and
+  the result template. A Codex child also gets the routed role's developer instructions as
+  `-c developer_instructions=...`, which codex-cli 0.164.0 renders as a developer message
+  (checked with `codex debug prompt-input`, which makes no model call). They are read from
+  the role's agent file (packaged or mapped) and refused unless the file and the
+  instructions hash to the run's recorded execution configuration, so a bridged child
+  runs the configuration the ledger binds.
+- **Bridged results are bound.** `dispatch` validates the child's result and fences one
+  that does not validate or would be too large to keep (`invalid_result`,
+  `result_too_large`). It then records a `dispatch_result` lifecycle record: a keyed
+  digest of the result it returns, never its text, with the fenced, reviewed and
+  terminal-state facts. `commit_host_result` for a bridged run requires exactly that
+  result and terminal state, so a primary cannot record a made-up verifier result or
+  drop or invent a fence.
+- **Options end before the prompt.** Both bridged launches and the billing probe pass
+  `--` before the prompt, which starts with the assignment's objective. Without it,
+  `codex exec` read an objective such as `-cfoo=bar` as a configuration override
+  (checked on codex-cli 0.164.0 with no credentials); Claude's option parser treats `--`
+  the same way (its operands after `--` are never options).
+- **Owner tools (setup, attestation, the installer).**
+  - Owner commands (registration, status, attestation, `host-command`,
+    `install-codex-rule`, `remove-codex-rule`) run this repository's own CLI with
+    `--project-root`, never the project's `.codex/orchestration` code; the clone must
+    therefore sit outside every folder opened in Codex (the wizard's first screen and the
+    README say so). Steps that depend on the install still require it to be this release,
+    byte for byte, with nothing extra in `.codex/orchestration`.
+  - A collector that setup starts through `learning-register` runs the clone's
+    `cli.py learning-serve`; authorization is by version and runtime digest, so a primary
+    that later restarts it runs its own (protected) copy of the same runtime.
+  - The interpreter is judged before it runs, against `host_paths.TRUSTED_INSTALL_ROOTS`
+    and `install_location_problem` (setup.sh keeps a bash copy of the list, kept equal by a
+    test), plus the temporary-folder, project, virtual-environment and xcrun-shim checks.
+  - Git on the project is plumbing only: state from `ls-files`/`ls-tree` and byte
+    comparison, commits through `hash-object -w --no-filters`, `update-index`, `write-tree`,
+    `commit-tree --no-gpg-sign` and `update-ref` with the old value, with
+    `GIT_ALLOW_PROTOCOL=""`, `GIT_NO_LAZY_FETCH=1` and `repository_layout_problem` refusing
+    partial clones; the repository-helper check stays as a second layer.
+  - The installer's record of the deny rules it added lives in the owner's learning state
+    (`installer/claude-settings-<project digest>.json`), never in the project; an entry not
+    recorded there is never removed. When an owner-only CLI subcommand is retired, add its
+    name to `scripts/install.py` `HISTORICAL_OWNER_ONLY` so its old deny rules are still
+    recognised as the installer's.
+  - Residual: the settings file is staged in that owner folder and renamed into place after
+    re-comparing the destination's bytes; an edit landing in the sub-millisecond window
+    between that comparison and the rename is overwritten (accepted). When the state folder
+    is on another file system, the file is staged beside the destination under a random
+    name instead.
+- **Native admission (accepted residual).** A Claude primary's native children run in the
+  primary's own session and allowance; admission for them is accounting and policy, not
+  a spend boundary, and the native tool consumes no admission capability. A primary that
+  ignores a denial spends only its own session's allowance. Codex children cannot be
+  routed natively any more.
+- **Residual risks.**
+  - The session guard checks the calling session's own record, which lives in
+    `~/.codex`: a session opened on `/` or `/Users` (or given `~/.codex` with `--add-dir`)
+    can write that record and forge its settings before running a command, as it can the
+    copy and the rules. The guard stops the ordinary mistake (Codex opened on the home
+    folder, a parent of the clone, or with `--add-dir ~/.local`), not a session that
+    already writes `~/.codex`. The record format is Codex 0.164's; a change fails closed. A session opened on a trusted installation folder itself (say
+    `/opt/homebrew` or `~/.pyenv`) could change the tools there too; nobody opens one
+    there, and no check can tell.
+  - A Codex primary can still spawn a native Codex child with its own collaboration tool,
+    ignoring the route; that child shares the primary's session and rule. Routing never
+    asks for one and the Codex skill forbids it, but nothing at the spawn boundary stops
+    it. Accepted: the primary already holds the rule's authority itself, and such a child
+    is still held to this project and the owner's state by the own-root invariant and
+    every run it opens to ledger admission.
+  - In a parent-folder session the project's configuration (provider routing,
+    operational checks, mapped agents and its `.git`) stays model-writable. The copy's
+    code never runs from there, git runs with every helper off, operational checks run in
+    their own sandbox, and every route is held to policy, but "committed and clean" is
+    then only as strong as that session's restraint.
+  - The copy is verified against the project and this package's recorded runtime, not
+    against an owner signature: an owner who installs a modified package gets that
+    package copied.
+  - Raw worker results stay on disk for the orchestration's life (at most seven days, and
+    up to a minute past that until the collector's sweep), owner-only but readable by any
+    sandboxed session, as all host files are.
 
 ## Deferred to G4
 

@@ -49,24 +49,16 @@ from .learning_contracts import (
     validate_execution_configuration,
 )
 from .learning_adapters import HOOK_EVENTS, empty_usage, load_client_capabilities, reconcile_run
+from .runtime_files import ORCHESTRATION_PREFIX, RUNTIME_FILES, runtime_digest
 
 
 def _collector_runtime_digest() -> str:
+    """The digest of every runtime file this process runs from (`RUNTIME_FILES`)."""
+
     orchestration_root = Path(__file__).resolve().parent.parent
-    paths = [
-        orchestration_root / "cli.py",
-        orchestration_root / "config" / "learning-clients.json",
-        *sorted((orchestration_root / "codex_agents").glob("*.py")),
-    ]
-    hasher = hashlib.sha256()
-    for path in paths:
-        relative = path.relative_to(orchestration_root).as_posix().encode("utf-8")
-        hasher.update(len(relative).to_bytes(4, "big"))
-        hasher.update(relative)
-        content = path.read_bytes()
-        hasher.update(len(content).to_bytes(8, "big"))
-        hasher.update(content)
-    return hasher.hexdigest()
+    return runtime_digest(
+        {relative: (orchestration_root / relative).read_bytes() for relative in RUNTIME_FILES}
+    )
 
 
 def _package_version() -> str:
@@ -103,7 +95,32 @@ COLLECTOR_PROTOCOL_VERSION = 1
 COLLECTOR_RUNTIME_DIGEST = _collector_runtime_digest()
 PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
+# The one line `install_owner_public_key` writes; the allowed-signers file holds nothing else.
+OWNER_SIGNER_LINE = re.compile(
+    rb"codex-agents-owner (?:ssh-ed25519|sk-ssh-ed25519@openssh\.com|ssh-rsa|"
+    rb"ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+\n"
+)
 DEFAULT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
+# A worker result kept for its verifier is raw child text, so it lives only while
+# its orchestration is open, and never longer than this; only digests stay.
+WORKER_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+# The persistent collector deletes expired worker results this often, so the
+# limit holds even while no lifecycle command opens the ledger.
+WORKER_RESULT_SWEEP_SECONDS = 60.0
+# A collector request must arrive whole within this, well inside the sweep
+# interval, so a slow or stalled sender can never postpone a sweep.
+COLLECTOR_REQUEST_DEADLINE_SECONDS = 5.0
+# Registered worker results: their raw text, kept for a verifier in the same
+# orchestration; the select yields project, path and orchestration status.
+_WORKER_RESULT_FILES = (
+    "SELECT s.project_id,s.relative_path,s.expires_at_ms,o.status FROM stored_files s "
+    "LEFT JOIN records r ON r.project_id=s.project_id AND r.record_id=s.source_record_id "
+    "LEFT JOIN host_run_bindings b ON b.project_id=r.project_id "
+    "AND b.run_id=json_extract(CAST(r.content AS TEXT),'$.run_id') "
+    "LEFT JOIN orchestrations o ON o.project_id=b.project_id "
+    "AND o.orchestration_id=b.orchestration_id "
+    "WHERE s.kind='artifact' AND substr(s.file_id,1,12)='host_result_'"
+)
 REPAIR_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000
 MAX_PENDING_REPAIR_RECEIPTS = 4096
 MAX_PENDING_HOST_RUNS = 4096
@@ -828,12 +845,21 @@ class LearningState:
         return self.allowed_signers_path
 
     def owner_allowed_signers(self) -> Path:
+        """The allowed-signers file, only while it names exactly one owner key.
+
+        It must be exactly the single canonical line `install_owner_public_key` writes:
+        `ssh-keygen -Y verify` accepts a signature from any key the file lists, so a second
+        line, options or a comment would let another key sign as the owner.
+        """
+
         if self.allowed_signers_path.is_symlink():
             raise StateError("owner allowed-signers path is unsafe")
         _check_owner_mode(self.allowed_signers_path, directory=False)
-        content = self.allowed_signers_path.read_text(encoding="ascii")
-        if not content.startswith("codex-agents-owner ") or len(content) > 16_384:
+        content = self.allowed_signers_path.read_bytes()
+        if not content:
             raise StateError("owner public key is not configured")
+        if OWNER_SIGNER_LINE.fullmatch(content) is None:
+            raise StateError("owner allowed-signers must name exactly one owner key")
         return self.allowed_signers_path
 
     def harden_database_files(self) -> None:
@@ -882,36 +908,20 @@ def validate_collector_runtime(cli_path: Path) -> dict[str, str | int]:
                 os.close(descriptor)
         if _version_tuple(version) is None:
             raise ContractError("package VERSION is invalid")
-        prefix = ".codex/orchestration/"
-        cli_relative = f"{prefix}cli.py"
-        clients_relative = f"{prefix}config/learning-clients.json"
-        module_paths = sorted(
-            path
-            for path in paths
-            if path.startswith(f"{prefix}codex_agents/") and path.endswith(".py")
-        )
-        runtime_paths = [cli_relative, clients_relative, *module_paths]
-        if (
-            cli_relative not in contents
-            or clients_relative not in contents
-            or f"{prefix}codex_agents/learning_store.py" not in module_paths
-        ):
+        # The runtime is this package's own file set, never whatever else the
+        # manifest lists: an extra module there is not runtime, and the digest
+        # covers every runtime file, configuration and schemas included.
+        if any(ORCHESTRATION_PREFIX + relative not in contents for relative in RUNTIME_FILES):
             raise ContractError("installed collector runtime is incomplete")
-        hasher = hashlib.sha256()
-        for path in runtime_paths:
-            relative = path.removeprefix(prefix).encode("utf-8")
-            content = contents[path]
-            hasher.update(len(relative).to_bytes(4, "big"))
-            hasher.update(relative)
-            hasher.update(len(content).to_bytes(8, "big"))
-            hasher.update(content)
-        runtime_digest = hasher.hexdigest()
-        if version != PACKAGE_VERSION or runtime_digest != COLLECTOR_RUNTIME_DIGEST:
+        digest = runtime_digest(
+            {relative: contents[ORCHESTRATION_PREFIX + relative] for relative in RUNTIME_FILES}
+        )
+        if version != PACKAGE_VERSION or digest != COLLECTOR_RUNTIME_DIGEST:
             raise ContractError("installed collector identity is inconsistent")
         return {
             "schema_version": COLLECTOR_AUTHORIZATION_SCHEMA_VERSION,
             "runtime_version": version,
-            "runtime_digest": runtime_digest,
+            "runtime_digest": digest,
         }
     except (
         ContractError,
@@ -1263,9 +1273,75 @@ class LearningLedger:
         self.state.harden_database_files()
         return connection
 
-    def _reconcile_managed_files(self) -> None:
-        """Reconcile crash-orphaned files and registrations before serving work."""
+    def _expire_worker_results_locked(self, now: int) -> list[tuple[str, str]]:
+        """Mark the worker results that may no longer be kept; return them.
 
+        Every kept result's expiry is first clamped to its outcome's ingestion
+        time plus the retention, which also shortens results an earlier
+        version kept for 90 days. A result whose orchestration has closed is
+        marked expired now. Registrations stay until the file is really gone
+        (`sweep_worker_results`), and an expired one is never read. Returns the
+        (project, relative path) pairs due for deletion.
+        """
+
+        self._connection.execute(
+            "UPDATE stored_files SET expires_at_ms=("
+            "SELECT MIN(COALESCE(stored_files.expires_at_ms, r.ingested_at_ms + ?),"
+            "r.ingested_at_ms + ?) FROM records r WHERE r.project_id=stored_files.project_id "
+            "AND r.record_id=stored_files.source_record_id) "
+            "WHERE kind='artifact' AND substr(file_id,1,12)='host_result_' AND EXISTS("
+            "SELECT 1 FROM records r WHERE r.project_id=stored_files.project_id "
+            "AND r.record_id=stored_files.source_record_id)",
+            (WORKER_RESULT_RETENTION_MS, WORKER_RESULT_RETENTION_MS),
+        )
+        due = []
+        for row in self._connection.execute(_WORKER_RESULT_FILES).fetchall():
+            if row["status"] in {"active", "paused"} and (
+                row["expires_at_ms"] is not None and int(row["expires_at_ms"]) > now
+            ):
+                continue
+            self._connection.execute(
+                "UPDATE stored_files SET expires_at_ms=MIN(COALESCE(expires_at_ms,?),?) "
+                "WHERE project_id=? AND relative_path=?",
+                (now, now, str(row["project_id"]), str(row["relative_path"])),
+            )
+            due.append((str(row["project_id"]), str(row["relative_path"])))
+        return due
+
+    def sweep_worker_results(self) -> int:
+        """Delete worker results past their retention or orchestration; return how many.
+
+        A registration is removed only after its file is gone, so a failed
+        deletion is retried at the next sweep instead of being forgotten.
+        """
+
+        removed = 0
+        with self._lock:
+            with self._connection:
+                due = self._expire_worker_results_locked(self._clock_ms())
+            for project_id, relative in due:
+                try:
+                    self._remove_registered_path(project_id, relative)
+                except (OSError, LedgerError):
+                    continue  # still registered and expired: retried, never read
+                with self._connection:
+                    self._connection.execute(
+                        "DELETE FROM stored_files WHERE project_id=? AND relative_path=?",
+                        (project_id, relative),
+                    )
+                removed += 1
+        return removed
+
+    def _reconcile_managed_files(self) -> None:
+        """Reconcile crash-orphaned files and registrations before serving work.
+
+        A worker result whose orchestration has closed, or that is past its
+        retention, is deleted first (`sweep_worker_results`); one whose file
+        cannot be deleted stays registered and expired, so it is retried and
+        never read.
+        """
+
+        self.sweep_worker_results()
         rows = self._connection.execute(
             "SELECT project_id,relative_path FROM stored_files"
         ).fetchall()
@@ -2202,7 +2278,8 @@ class LearningLedger:
             raise LedgerError("verification evidence requires controlled admission")
         if checked["record_type"] in PROVIDER_OBSERVATION_TYPES | {
             "admission_decision", "billing_attestation", "dispatch_intent",
-            "host_run_profile", "probe_admission", "verification_binding",
+            "dispatch_result", "host_run_profile", "probe_admission",
+            "verification_binding",
         }:
             raise LedgerError("provider evidence requires ledger-run observation")
         if (
@@ -2638,6 +2715,9 @@ class LearningLedger:
                 goal_time_used_seconds=resolved_goal_time,
                 observed_at_ms=timestamp,
             )
+        # The boundary's worker results were kept only for its verifiers; now
+        # that it is closed, the sweep deletes them (and retries what it cannot).
+        self.sweep_worker_results()
         self.state.harden_database_files()
         return self.orchestration_report(project_id, orchestration_id)
 
@@ -3736,6 +3816,7 @@ class LearningLedger:
             with self._lock:
                 run_id = self._open_run_for_provider_locked(project_id, run_handle, provider)
         timestamp = self._clock_ms()
+        untrusted = self._registered_roots(project_id)
         # The client's TMPDIR is a fresh owner-only directory under the learning
         # state, never the system temp directory a sandboxed primary can write.
         try:
@@ -3749,6 +3830,7 @@ class LearningLedger:
                     observed_at_ms=timestamp,
                     tmpdir=tmpdir,
                     environ=environ,
+                    untrusted=untrusted,
                 )
             else:
                 records = observe_codex(
@@ -3759,11 +3841,23 @@ class LearningLedger:
                     environ=environ,
                     run_id=run_id,
                     phase=phase,
+                    untrusted=untrusted,
                 )
         finally:
             remove_private_directory(tmpdir)
         self._store_provider_observations(project_id, records, timestamp=timestamp)
         return records
+
+    def _registered_roots(self, project_id: str) -> tuple[Path, ...]:
+        """The registered project's root, which no provider client may live in."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT canonical_root FROM projects WHERE project_id=?", (project_id,)
+            ).fetchone()
+        if row is None or row["canonical_root"] is None:
+            return ()
+        return (Path(str(row["canonical_root"])),)
 
     def _open_run_for_provider_locked(
         self, project_id: str, run_handle: str, provider: str
@@ -4075,7 +4169,10 @@ class LearningLedger:
             deny(decision["reason_code"], timestamp, decision)
             raise AdmissionDenied(decision["reason_code"])
         self.state.harden_database_files()
-        infos, failure = claude_billing_probe(environ, project_root=project_root)
+        infos, failure = claude_billing_probe(
+            environ, project_root=project_root,
+            untrusted=self._registered_roots(project_id),
+        )
         observed = self._clock_ms()
         headroom: list[dict[str, Any]] = []
         billing_records: list[dict[str, Any]] = []
@@ -4569,6 +4666,80 @@ class LearningLedger:
             "deadline_at_ms": record["deadline_at_ms"],
         }
 
+    def record_dispatch_result(
+        self,
+        project_id: str,
+        *,
+        run_handle: str,
+        bridge_run_id: str,
+        result: dict[str, Any],
+        fenced: bool,
+        reviewed: bool,
+        terminal_state: str | None,
+    ) -> dict[str, Any]:
+        """Bind what a dispatched child returned to its run, once.
+
+        The ledger keeps a keyed digest of the result, never its text, with the
+        bridge's fence, review and terminal-state facts. Recording the run's
+        result later requires exactly this result and terminal state, so a
+        primary can neither substitute a result nor drop a fence.
+        """
+
+        timestamp = self._clock_ms()
+        handle_digest = keyed_digest(self.state.digest_key(), run_handle)
+        with self._lock, self._connection:
+            binding = self._connection.execute(
+                "SELECT run_id,binding_state,consumed_at_ms FROM host_run_bindings "
+                "WHERE project_id=? AND handle_digest=?",
+                (project_id, handle_digest),
+            ).fetchone()
+            if (
+                binding is None
+                or binding["binding_state"] != "pending"
+                or binding["consumed_at_ms"] is not None
+            ):
+                raise LedgerError("host run is not pending")
+            run_id = str(binding["run_id"])
+            intents = self._connection.execute(
+                "SELECT content FROM records WHERE project_id=? "
+                "AND record_type='dispatch_intent' AND source='lifecycle' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchall()
+            if (
+                len(intents) != 1
+                or json.loads(bytes(intents[0]["content"]))["bridge_run_id"] != bridge_run_id
+            ):
+                raise LedgerError("only the dispatched run records its child's result")
+            if self._connection.execute(
+                "SELECT 1 FROM records WHERE project_id=? AND record_type='dispatch_result' "
+                "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                (project_id, run_id),
+            ).fetchone() is not None:
+                raise LedgerError("the dispatched child's result is already recorded")
+            material = {
+                "schema_version": 1,
+                "record_type": "dispatch_result",
+                "run_id": run_id,
+                "bridge_run_id": bridge_run_id,
+                "result_digest": keyed_digest(self.state.digest_key(), canonical_json(result)),
+                "fenced": fenced,
+                "reviewed": reviewed,
+                "terminal_state": terminal_state,
+                "observed_at_ms": timestamp,
+            }
+            try:
+                record = validate_learning_record(
+                    {**material, "record_id": f"dispatch_result:{content_digest(material)}"}
+                )
+            except ContractError as exc:
+                raise LedgerError("dispatch result is invalid") from exc
+            self._append_checked_locked(
+                project_id, record, producer="lifecycle", timestamp=timestamp
+            )
+        self.state.harden_database_files()
+        return {"run_id": run_id, "bridge_run_id": bridge_run_id}
+
     def host_owner(
         self,
         project_id: str,
@@ -4833,6 +5004,27 @@ class LearningLedger:
             ).fetchone() is None:
                 # A bridged run's result can only come from its dispatched child.
                 raise LedgerError("a bridged run must be dispatched before its result")
+            if client_version == BRIDGE_CLIENT_VERSION:
+                # ... and it must be exactly what that child returned, with the
+                # bridge's terminal state: neither may be made up or dropped.
+                dispatched = self._connection.execute(
+                    "SELECT content FROM records WHERE project_id=? "
+                    "AND record_type='dispatch_result' AND source='lifecycle' "
+                    "AND json_extract(CAST(content AS TEXT),'$.run_id')=?",
+                    (project_id, checked_observation["run_id"]),
+                ).fetchall()
+                if len(dispatched) != 1:
+                    raise LedgerError("a bridged run has no recorded child result")
+                recorded = json.loads(bytes(dispatched[0]["content"]))
+                if not secrets.compare_digest(
+                    keyed_digest(self.state.digest_key(), canonical_json(result)),
+                    recorded["result_digest"],
+                ):
+                    raise LedgerError("host result differs from the bridged child's result")
+                if terminal_state != recorded["terminal_state"]:
+                    raise LedgerError(
+                        "host terminal state differs from the bridged child's outcome"
+                    )
             if trusted_handle is not None and client_version == BRIDGE_CLIENT_VERSION:
                 # A bridged run's usage is what the bridge itself recorded for
                 # it in the ledger; the primary never supplies it.
@@ -5022,7 +5214,7 @@ class LearningLedger:
                             stored_result["relative_path"],
                             stored_result["result_digest"],
                             outcome["record_id"],
-                            timestamp + DEFAULT_RETENTION_MS,
+                            timestamp + WORKER_RESULT_RETENTION_MS,
                         ),
                     )
                 self._connection.execute("COMMIT")
@@ -5101,12 +5293,17 @@ class LearningLedger:
         self, project_id: str, outcome: dict[str, Any], outcome_digest: str
     ) -> dict[str, Any]:
         row = self._connection.execute(
-            "SELECT relative_path,content_digest,source_record_id FROM stored_files "
-            "WHERE project_id=? AND file_id=? AND kind='artifact'",
+            "SELECT relative_path,content_digest,source_record_id,expires_at_ms "
+            "FROM stored_files WHERE project_id=? AND file_id=? AND kind='artifact'",
             (project_id, f"host_result_{outcome_digest}"),
         ).fetchone()
         if row is None or row["source_record_id"] != outcome["record_id"]:
             raise LedgerError("the worker result for verification_for_outcome is unavailable")
+        if row["expires_at_ms"] is None or int(row["expires_at_ms"]) <= self._clock_ms():
+            # Past its retention it is never handed on, swept or not.
+            raise LedgerError(
+                "the worker result for verification_for_outcome is unavailable: it expired"
+            )
         path = self.state.root / str(row["relative_path"])
         try:
             _assert_no_symlink_components(path)
@@ -8578,16 +8775,24 @@ class CollectorServer:
         listener.settimeout(0.1)
         self._started_at_ms = time.time_ns() // 1_000_000
         self._ready.set()
+        next_sweep = time.monotonic() + WORKER_RESULT_SWEEP_SECONDS
         try:
             while not self._stop.is_set():
+                if time.monotonic() >= next_sweep:
+                    # Kept worker results expire on time even while the
+                    # collector is the only process holding the ledger.
+                    next_sweep = time.monotonic() + WORKER_RESULT_SWEEP_SECONDS
+                    with contextlib.suppress(LedgerError, OSError, sqlite3.Error):
+                        self.ledger.sweep_worker_results()
                 try:
                     connection, _ = listener.accept()
                 except TimeoutError:
                     continue
                 with connection:
-                    connection.settimeout(1)
                     response = self._handle(connection)
-                    connection.sendall(canonical_json(response) + b"\n")
+                    connection.settimeout(1)
+                    with contextlib.suppress(OSError):
+                        connection.sendall(canonical_json(response) + b"\n")
         finally:
             listener.close()
             self._socket = None
@@ -8596,8 +8801,17 @@ class CollectorServer:
 
     def _handle(self, connection: socket.socket) -> dict[str, Any]:
         raw = bytearray()
+        deadline = time.monotonic() + COLLECTOR_REQUEST_DEADLINE_SECONDS
         while b"\n" not in raw:
-            chunk = connection.recv(8192)
+            # One absolute deadline for the whole request, not per receive.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"ok": False, "code": "request_timeout"}
+            connection.settimeout(remaining)
+            try:
+                chunk = connection.recv(8192)
+            except TimeoutError:
+                return {"ok": False, "code": "request_timeout"}
             if not chunk:
                 break
             raw.extend(chunk)

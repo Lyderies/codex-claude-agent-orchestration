@@ -16,11 +16,13 @@ import shutil
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 from .contracts import ContractError
+from .git_plumbing import XCRUN_NO_CACHE
+from .host_paths import executable_location_problem, temp_roots
 from .learning_contracts import (
     CLAUDE_AUTH_METHODS,
     CLAUDE_OVERAGE_DISABLED_REASONS,
@@ -203,8 +205,16 @@ def trusted_search_path() -> str:
     )
 
 
-def resolve_client(name: str) -> tuple[str, str]:
-    """Find a provider client on the trusted path; return its real path and digest."""
+def resolve_client(name: str, *, untrusted: Iterable[Path] = ()) -> tuple[str, str]:
+    """Find a provider client on the trusted path; return its real path and digest.
+
+    A client runs outside the Codex sandbox, so before anything executes it its
+    resolved file must pass the same location checks as the interpreter: no
+    symlink left on its path, no component another user could change, not
+    inside a temporary directory or an `untrusted` root (the project), and not
+    in an ordinary folder under the home folder. A link on the search path that
+    points into a writable checkout is refused, never run and hashed.
+    """
 
     found = shutil.which(name, path=trusted_search_path())
     if found is None:
@@ -212,6 +222,10 @@ def resolve_client(name: str) -> tuple[str, str]:
             f"{name} client is unavailable on the trusted path", "client_unavailable"
         )
     real = os.path.realpath(found)
+    if executable_location_problem(Path(real), [*temp_roots(), *untrusted]) is not None:
+        raise ObservationError(
+            f"{name} client is not in a trusted location", "client_unavailable"
+        )
     digest = hashlib.sha256()
     try:
         with open(real, "rb") as handle:
@@ -240,6 +254,9 @@ def client_environment(environ: Mapping[str, str], tmpdir: Path) -> dict[str, st
         "PATH": trusted_search_path(),
         "LANG": environ.get("LANG") or "C.UTF-8",
         "TMPDIR": str(tmpdir),
+        # A client that runs git or another developer tool through a macOS xcrun
+        # shim on PATH must not read the shim's lookup cache.
+        **XCRUN_NO_CACHE,
     }
 
 
@@ -376,10 +393,11 @@ def observe_claude(
     environ: Mapping[str, str] | None = None,
     popen: Callable[..., Any] = subprocess.Popen,
     timeout: float = OBSERVATION_TIMEOUT_SECONDS,
+    untrusted: Iterable[Path] = (),
 ) -> list[dict[str, Any]]:
     caller = os.environ if environ is None else environ
     _require_no_api_keys(caller)
-    executable, client_sha256 = resolve_client("claude")
+    executable, client_sha256 = resolve_client("claude", untrusted=untrusted)
     output = _bounded_output(
         [executable, "auth", "status", "--json"],
         environment=client_environment(caller, tmpdir),
@@ -411,9 +429,10 @@ class AppServerSession:
         tmpdir: Path,
         popen: Callable[..., Any] = subprocess.Popen,
         timeout: float = OBSERVATION_TIMEOUT_SECONDS,
+        untrusted: Iterable[Path] = (),
     ) -> None:
         _require_no_api_keys(environ)
-        executable, self.client_sha256 = resolve_client("codex")
+        executable, self.client_sha256 = resolve_client("codex", untrusted=untrusted)
         self.client_path = executable
         environment = client_environment(environ, tmpdir)
         self._timeout = timeout
@@ -616,9 +635,12 @@ def observe_codex(
     popen: Callable[..., Any] = subprocess.Popen,
     run_id: str | None = None,
     phase: str | None = None,
+    untrusted: Iterable[Path] = (),
 ) -> list[dict[str, Any]]:
     caller = os.environ if environ is None else environ
-    session = AppServerSession(project_root, environ=caller, tmpdir=tmpdir, popen=popen)
+    session = AppServerSession(
+        project_root, environ=caller, tmpdir=tmpdir, popen=popen, untrusted=untrusted
+    )
     try:
         session.request(
             "initialize",

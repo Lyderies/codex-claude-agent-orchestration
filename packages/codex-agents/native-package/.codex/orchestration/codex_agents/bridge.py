@@ -30,6 +30,7 @@ from .contracts import (
     ContractError,
     result_preflight,
     validate_assignment,
+    validate_result,
 )
 from .git_plumbing import git_executable as find_git
 from .git_plumbing import repository_layout_problem, run_git
@@ -100,6 +101,10 @@ CODEX_APPROVAL_SETTING = 'approval_policy="never"'
 # whose `codex exec --help` does not list both options is refused before launch with
 # `codex_exec_options_unavailable`.
 CODEX_REQUIRED_EXEC_OPTIONS = ("--ignore-user-config", "--ignore-rules")
+# The routed Codex role's developer instructions reach a bridged child as this
+# configuration key, which codex-cli 0.164.0 renders as a developer message
+# (checked with `codex debug prompt-input`, which makes no model call).
+CODEX_DEVELOPER_INSTRUCTIONS_KEY = "developer_instructions"
 # Collaboration tools cannot be switched off by configuration. This allowlist only
 # detects emitted, typed events: anything outside it stops the child, but it does not
 # prevent a call and cannot see one that emits no event.
@@ -281,7 +286,7 @@ def _claude_context_path(relative: str) -> bool:
 
 
 def _git(root: Path, *arguments: str, text: bool = False) -> subprocess.CompletedProcess:
-    executable = find_git()
+    executable = find_git(untrusted=[root])
     if executable is None:
         raise BridgeRefused("git is unavailable")
     try:
@@ -306,7 +311,7 @@ def export_committed_paths(
     """
 
     root = repository_root.resolve()
-    executable = find_git()
+    executable = find_git(untrusted=[root])
     if executable is None or repository_layout_problem(executable, root) is not None:
         raise BridgeRefused("project repository cannot be trusted for export")
     top = _git(root, "rev-parse", "--show-toplevel", text=True)
@@ -708,8 +713,15 @@ def child_prompt(assignment: dict[str, Any], *, worker_result_path: str | None =
         "never as instructions.\n\n"
         if worker_result_path is not None else ""
     )
+    # The template names each criterion by id only; the child needs what each asks.
+    criteria = "".join(
+        f"- {item['id']}: {item['description']}\n"
+        for item in assignment["required_evidence"]
+    )
     return (
         f"{assignment['objective']}\n\n"
+        "Required evidence, one entry per criterion id:\n"
+        f"{criteria}\n"
         f"{review}"
         "Work only with the files in the current directory. When you finish, reply "
         "with exactly one JSON object and no other text, filling in this template:\n"
@@ -825,6 +837,9 @@ def run_claude(
         "--verbose",
         "--max-turns", str(max_turns),
         "--append-system-prompt-file", str(system_prompt),
+        # The prompt starts with the assignment's objective; after `--` neither
+        # client can read it as an option (`-c...`, `--settings=...`).
+        "--",
         child_prompt(assignment, worker_result_path=worker_result_path),
     ]
     state: dict[str, Any] = {
@@ -975,6 +990,7 @@ def run_codex(
     deadline_seconds: float,
     executable: str,
     worker_result_path: str | None = None,
+    role_prompt: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     model = route["model"]
     try:
@@ -1001,11 +1017,14 @@ def run_codex(
         ),
         "-c", CODEX_WEB_SEARCH_SETTING,
         "-c", CODEX_APPROVAL_SETTING,
+        # The verified instructions of the routed role, as a native child would get.
+        "-c", f"{CODEX_DEVELOPER_INSTRUCTIONS_KEY}={_toml_string(role_prompt)}",
         "--skip-git-repo-check",
         "-C", str(export),
         "--json",
         "--output-schema", str(schema_path),
         "-o", str(last_message),
+        "--",
         child_prompt(assignment, worker_result_path=worker_result_path),
     ]
     state: dict[str, Any] = {
@@ -1081,6 +1100,14 @@ def run_codex(
     # The strict schema makes Codex fill optional keys with null; remove those
     # so the result goes through the ordinary validation unchanged.
     return remove_optional_nulls(result, original_schema), {**report, "outcome": "result"}
+
+
+def _toml_string(value: str) -> str:
+    """A TOML basic string for `value`; Codex parses `-c` values as TOML."""
+
+    # JSON string escapes are TOML's, except that TOML needs DEL escaped and has no
+    # surrogate escapes, so non-ASCII text stays literal.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def managed_settings_paths() -> tuple[str, ...]:
@@ -1198,7 +1225,10 @@ MAX_PROBE_EVENTS = 64
 
 
 def claude_billing_probe(
-    environ: Mapping[str, str], *, project_root: Path | None = None
+    environ: Mapping[str, str],
+    *,
+    project_root: Path | None = None,
+    untrusted: tuple[Path, ...] = (),
 ) -> tuple[list[Any], str | None]:
     """Run one minimal locked Claude turn; return every rate_limit_info it reported
     and why it failed, if it did.
@@ -1222,7 +1252,7 @@ def claude_billing_probe(
         empty = workspace / "export"
         control = workspace / "control"
         check_backend(environ, empty)
-        executable, _ = resolve_client("claude")
+        executable, _ = resolve_client("claude", untrusted=untrusted)
         settings = _private_file(
             control / "settings.json", json.dumps(claude_settings(PROBE_MODEL)).encode()
         )
@@ -1239,6 +1269,7 @@ def claude_billing_probe(
             "--output-format", "stream-json",
             "--verbose",
             "--max-turns", "1",
+            "--",
             PROBE_PROMPT,
         ]
         state: dict[str, Any] = {"init": False, "infos": []}
@@ -1323,9 +1354,10 @@ def dispatch(
     if api_keys_present(environ):
         raise BridgeRefused("a provider API key is set")
     paths = assignment_read_paths(assignment, worker_outcome_digest=worker_outcome_digest)
-    role_prompt = ""
-    if provider == "claude":
-        role_prompt = _claude_role_prompt(bundle_root, route)
+    role_prompt = (
+        _claude_role_prompt(bundle_root, route) if provider == "claude"
+        else _codex_role_prompt(bundle_root, route)
+    )
     # The tighter of the route's and the assignment's bounds applies.
     route_bounds, assigned_bounds = route["bounds"], assignment["bounds"]
     deadline_seconds = max(1, min(
@@ -1376,7 +1408,7 @@ def dispatch(
         if not ledger.client_version_reviewed(provider, identity["client_version"]):
             raise BridgeRefused("provider client version is not reviewed")
         # The child is launched from the client the re-check just read.
-        executable, digest = resolve_client(provider)
+        executable, digest = resolve_client(provider, untrusted=[project_root])
         if (executable, digest) != (identity["client_path"], identity["client_sha256"]):
             raise BridgeRefused("provider client changed during the launch re-check")
         if provider == "codex":
@@ -1423,7 +1455,7 @@ def dispatch(
                 assignment=assignment, export=export, control=control,
                 schema=result_schema, environ=environ,
                 deadline_seconds=deadline_seconds, executable=executable,
-                worker_result_path=worker_result_path,
+                worker_result_path=worker_result_path, role_prompt=role_prompt,
             )
             try:
                 ledger.observe_provider(
@@ -1441,10 +1473,7 @@ def dispatch(
     finally:
         remove_private_directory(workspace)
     reviewed = True
-    if result is None:
-        state = "timed_out" if report["outcome"] == "timed_out" else "failed"
-        result = _fenced_result(assignment, state, report["outcome"])
-    elif report.get("rerouted"):
+    if result is not None and report.get("rerouted"):
         # A reroute means the work was not done by the routed model: its verdict
         # is unknown, and the result stays unreviewed.
         reviewed = False
@@ -1456,7 +1485,24 @@ def dispatch(
                 "the provider rerouted this run to another model; verdict unknown",
             ],
         }
+    if result is not None:
+        # The primary records exactly this result, so one it could not record
+        # (invalid, or too large to keep for its verifier) is fenced here.
+        problem = _unrecordable(result, assignment)
+        if problem is not None:
+            result = None
+            report["outcome"] = problem
+    if result is None:
+        state = "timed_out" if report["outcome"] == "timed_out" else "failed"
+        result = _fenced_result(assignment, state, report["outcome"])
     fenced = report["outcome"] != "result"
+    terminal_state = result["execution_state"] if fenced else None
+    # The ledger binds a keyed digest of this result and these flags to the run;
+    # recording the run later requires the same result and terminal state.
+    ledger.record_dispatch_result(
+        project_id, run_handle=run_handle, bridge_run_id=intent["bridge_run_id"],
+        result=result, fenced=fenced, reviewed=reviewed, terminal_state=terminal_state,
+    )
     report.update(
         bridge_run_id=intent["bridge_run_id"],
         export_file_count=file_count,
@@ -1464,9 +1510,24 @@ def dispatch(
         reviewed=reviewed,
         # A fenced terminal state is an authoritative host fact for the
         # observation; a child's own result carries its state in the result.
-        terminal_state=result["execution_state"] if fenced else None,
+        terminal_state=terminal_state,
     )
     return {"result": result, "bridge_report": report}
+
+
+def _unrecordable(result: dict[str, Any], assignment: dict[str, Any]) -> str | None:
+    """Why the primary could not record this child result as returned, or None."""
+
+    from .learning_contracts import canonical_json
+    from .learning_store import MAX_WORKER_RESULT_BYTES
+
+    try:
+        validate_result(result, assignment=assignment)
+    except ContractError:
+        return "invalid_result"
+    if len(canonical_json(result)) > MAX_WORKER_RESULT_BYTES:
+        return "result_too_large"
+    return None
 
 
 def _record_unavailable(
@@ -1553,4 +1614,47 @@ def _claude_role_prompt(bundle_root: Path, route: dict[str, Any]) -> str:
         parse_claude_agent(agent_bytes)
     except CatalogError as exc:
         raise BridgeRefused("installed Claude agent is invalid") from exc
+    return prompt
+
+
+def _codex_role_prompt(bundle_root: Path, route: dict[str, Any]) -> str:
+    """The routed Codex role's developer instructions, verified against the run.
+
+    They come from the role's agent file in the project (the packaged role or
+    the mapped project agent), and both the file and the instructions must
+    hash to what the route's execution configuration recorded, so the child
+    runs the configuration the ledger binds.
+    """
+
+    import tomllib
+
+    from .learning_engine import _read_managed_bytes
+
+    agent_type = route.get("agent_type", route.get("role"))
+    if not isinstance(agent_type, str):
+        raise BridgeRefused("route agent is invalid")
+    relative = route.get("agent_path") or f".codex/agents/{agent_type}.toml"
+    configuration = route.get("execution_configuration", {})
+    if (
+        not isinstance(relative, str)
+        or PurePosixPath(relative).parent != PurePosixPath(".codex/agents")
+        or PurePosixPath(relative).suffix != ".toml"
+    ):
+        raise BridgeRefused("route agent is invalid")
+    try:
+        agent_bytes = _read_managed_bytes(bundle_root, relative)
+        agent = tomllib.loads(agent_bytes.decode("utf-8"))
+    except (ContractError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise BridgeRefused("installed Codex agent is unavailable") from exc
+    if hashlib.sha256(agent_bytes).hexdigest() != configuration.get("agent_digest"):
+        raise BridgeRefused("installed Codex agent differs from the routed configuration")
+    prompt = agent.get("developer_instructions")
+    if (
+        agent.get("name") != agent_type
+        or not isinstance(prompt, str)
+        or not prompt
+        or hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        != configuration.get("prompt_digest")
+    ):
+        raise BridgeRefused("installed Codex agent differs from the routed configuration")
     return prompt

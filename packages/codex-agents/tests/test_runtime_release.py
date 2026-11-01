@@ -9,6 +9,11 @@ import tests.support  # noqa: F401
 from tests.support import BUNDLE_ROOT, REPOSITORY_ROOT
 
 from codex_agents.learning_store import COLLECTOR_RUNTIME_DIGEST
+from codex_agents.runtime_files import (
+    PACKAGE_DATA_FILES,
+    RUNTIME_FILES,
+    runtime_digest,
+)
 
 RELEASES = REPOSITORY_ROOT / "runtime-releases.json"
 
@@ -30,6 +35,26 @@ class RuntimeReleaseTests(unittest.TestCase):
         self.assertEqual(
             releases[version], COLLECTOR_RUNTIME_DIGEST,
             "the collector runtime changed: bump VERSION and record the new digest",
+        )
+
+    def test_the_runtime_file_set_is_exactly_the_package_orchestration_files(self) -> None:
+        # The protected copy and the runtime digest use this constant, never a
+        # project's manifest, so it must name every file the CLI may load.
+        orchestration = BUNDLE_ROOT / ".codex" / "orchestration"
+        bundled = {
+            path.relative_to(orchestration).as_posix()
+            for path in orchestration.rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+            and path.name != ".DS_Store"
+        }
+        self.assertEqual(bundled, {*RUNTIME_FILES, *PACKAGE_DATA_FILES})
+        self.assertEqual(list(RUNTIME_FILES), sorted(set(RUNTIME_FILES)))
+        self.assertEqual(
+            COLLECTOR_RUNTIME_DIGEST,
+            runtime_digest({
+                relative: (orchestration / relative).read_bytes()
+                for relative in RUNTIME_FILES
+            }),
         )
 
     def test_versions_increase_and_digests_are_unique(self) -> None:

@@ -385,6 +385,33 @@ class LearningStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(StateError, "key rotation"):
             self.state.install_owner_public_key(replacement)
 
+    def test_allowed_signers_must_name_exactly_one_owner_key(self) -> None:
+        signers = self.state.allowed_signers_path
+        line = signers.read_bytes()
+        self.assertEqual(signers, self.state.owner_allowed_signers())
+        other_root = Path(self.temporary.name) / "other-signer"
+        other_root.mkdir()
+        _, other = generate_test_owner_key(other_root)
+        second = ("codex-agents-owner " + " ".join(other.split()[:2]) + "\n").encode("ascii")
+        for content in (
+            line + second,  # a second signer would also verify as the owner
+            line.rstrip(b"\n"),
+            line + b"\n",
+            b'cert-authority,namespaces="x" ' + line,
+            line.replace(b"codex-agents-owner ", b"codex-agents-owner  "),
+            line.rstrip(b"\n") + b" comment\n",
+            b"# comment\n" + line,
+        ):
+            with self.subTest(content=content[:40]):
+                signers.write_bytes(content)
+                with self.assertRaisesRegex(StateError, "exactly one owner key"):
+                    self.state.owner_allowed_signers()
+        signers.write_bytes(b"")
+        with self.assertRaisesRegex(StateError, "not configured"):
+            self.state.owner_allowed_signers()
+        signers.write_bytes(line)
+        self.assertEqual(signers, self.state.owner_allowed_signers())
+
     def test_symlinked_state_component_is_rejected(self) -> None:
         link = Path(self.temporary.name) / "link"
         link.symlink_to(self.state.root, target_is_directory=True)

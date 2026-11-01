@@ -2,6 +2,157 @@
 
 ## 0.2.0: cross-provider read-only routing (G2)
 
+- **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
+  - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
+    which a session opened on a parent folder could rewrite. `install-codex-rule` copies
+    exactly this package's runtime files (a constant of the installing code, never the
+    project's manifest), verified byte for byte and against this package's recorded
+    runtime, to an owner-only `~/.codex/agent-orchestration/<project>/<runtime>/` copy
+    bound to its project, and the rule names that copy. The runtime digest, also the
+    collector's identity in `runtime-releases.json`, now covers every file the copy holds
+    (configuration and schemas included). Setup refuses a project whose
+    `.codex/orchestration` holds anything else (a planted `socket.py`, a package, bytecode,
+    an extension module), and the copy refuses an extra entry of its own before its folder
+    is importable. Only the account's real `~/.codex` is supported (the home folder comes
+    from the system account database): a HOME or `CODEX_HOME` that disagrees with it or a
+    symlinked `~/.codex` is refused, and `host-command` reports it as `unsupported`.
+  - **Session workspace guard.** Before every primary-host command the protected copy runs,
+    it finds the calling Codex session's record from `CODEX_THREAD_ID`
+    (`~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl` under the account's home, no
+    symlinks, owner-checked), reads only its `session_meta` and its last `turn_context`
+    (backwards, bounded), and refuses a session without its sandbox (`danger-full-access`),
+    without a record (`--ephemeral`), with several or a shape it does not know, or able to
+    write `/`, the home folder or a folder above it, `~/.codex`, the copy, the clone that
+    installed it (now recorded in the copy's binding) or a trusted installation folder.
+    Paths are compared by file-system identity and case-folded name, as recorded and as
+    they resolve, so a symlink swap or a case variant cannot hide a protected folder; a
+    read-only session's workspace roots are not counted as writable.
+    `host-command` reports the verdict as `session_guard`, and the wizard's first screen warns
+    about a recent session that could write the clone or the home folder.
+  - The interpreter the rule names, provider clients and git must come from a trusted
+    installation folder (`host_paths.TRUSTED_INSTALL_ROOTS`: system folders, Homebrew,
+    python.org, Xcode and its Command Line Tools, Nix) or a hidden top-level folder of the
+    home folder such as `~/.local` or `~/.pyenv`; a sibling install such as `~/Work/tools`
+    is refused. The copy serves only its bound project, only
+    the primary-host commands, and only while the project's installed files still match
+    it. A project without an install manifest gets no rule. `host-command` reports
+    `installed` only when rule, copy and project all match (earlier rules are `stale`),
+    and its `argv_prefix` names the copy. New owner command `remove-codex-rule
+    --project-root <root>` removes the rule and the copy and prints
+    `{"ready": true, "removed": [...]}` (an empty list when there is nothing, for any
+    project, including one in a temporary folder).
+  - The supported threat model is stated plainly in the wizard, README, design and Codex
+    skill: while the rule exists, no Codex session may use the home folder, its parent or
+    `/` as its workspace, or add `~` or `~/.codex` with `--add-dir`; home-installed tools
+    such as Claude Code stay supported under that rule.
+  - Every Python launched outside the sandbox (the rule's prefix, the collector, the
+    deadline watchdog, the learning hooks and the Claude skill's commands) adds
+    `-X pycache_prefix=/dev/null`: `-B` only stops writing
+    bytecode, and CPython still loaded a planted `.pyc` from `__pycache__`. Rules without
+    it are `stale`, and a copy holding any file its manifest does not list, bytecode
+    included, fails verification.
+  - Git runs from a real binary (Command Line Tools, Xcode or Homebrew on macOS, never
+    the `/usr/bin/git` xcrun shim whose cache sits in `$TMPDIR`) outside the inspected
+    repository, with `xcrun_nocache=1` for git, provider clients and operational checks.
+  - A provider client is refused unless its resolved file passes the same location checks
+    as the interpreter, outside the project and every temporary directory, before it
+    runs.
+  - A worker result kept for its verifier is deleted when its orchestration closes, and
+    seven days after its outcome at most: each ledger start clamps older expiries (90 days
+    before) and sweeps, the collector sweeps every minute, and an expired result is never
+    read. A failed deletion stays registered and is retried, and a collector request must
+    arrive within five seconds, so a slow sender cannot hold off the sweep. Only digests
+    stay.
+  - Every Codex child is bridged (`codex exec --ignore-rules`, read-only), from a Codex
+    primary too, so no child shares the primary's command rule. Codex routes that need
+    write access are not eligible, and the native-only legacy fallback is refused for
+    bridged routes.
+  - `dispatch` fences a child result that does not validate and binds a keyed digest of
+    the result it returns, with its terminal state, to the run; recording any other
+    result, or dropping or inventing the fence, is refused.
+  - Both bridged launches pass `--` before the prompt, so an objective can never be read
+    as a client option.
+  - Bridged children receive each required criterion's description, not only its id, and
+    a bridged Codex child receives its routed role's developer instructions (as
+    `-c developer_instructions=...`), refused unless they match the run's recorded
+    execution configuration.
+- **Owner-side round 2 (0.8.9).**
+  - Setup and the installer no longer run `status`, `add` or `commit` on the project: state
+    comes from `ls-files`/`ls-tree` and byte comparison, and commits from
+    `hash-object -w --no-filters`, `update-index`, `write-tree`, `commit-tree --no-gpg-sign`
+    and `update-ref` with the old value. Every owner Git process sets `GIT_ALLOW_PROTOCOL=""`
+    and `GIT_NO_LAZY_FETCH=1`, and partial clones and promisor remotes are refused.
+  - The interpreter rule is the runtime's (`host_paths.TRUSTED_INSTALL_ROOTS` and
+    `install_location_problem`), replacing the home tool-folder list.
+  - The deny-rule ownership record moved to the owner's learning state; an in-project record
+    from an earlier version is used once, only without an owner record and only for generated
+    rules, then deleted. Settings are staged in that owner folder and renamed into place after
+    re-comparing the destination.
+- **Owner-side review fixes (0.8.9).** Two further reviews of setup, attestation and the
+  installer, under the narrowed threat model (sessions may be opened on a project's parent
+  folder, never on the home folder, its parent or `/`; this repository must sit outside every
+  folder opened in Codex, as the wizard's first screen and the README now say).
+  - Owner commands (registration, status, attestation, `host-command`, `install-codex-rule`,
+    `remove-codex-rule`) run this repository's own orchestrator CLI with `--project-root`,
+    never the project's `.codex/orchestration` code. Steps that depend on the install first
+    require it to be this release byte for byte, and the check now refuses any extra entry in
+    `.codex/orchestration`: a symlink of any name (an extensionless `hashlib` link to a
+    package passed before), a package, bytecode or another file. `install-codex-rule` from this
+    repository copies bytes equal to this repository's runtime; uninstall runs this
+    repository's `remove-codex-rule` whatever version the project has.
+  - `attest.py` signs in memory: the approved bytes go to `ssh-keygen -Y sign` on stdin and the
+    signature comes back on stdout; the enrolled key and the signature reach the CLI through
+    pipes (`/dev/fd`), and `check-novalidate` verifies the in-memory bytes. No key, statement or
+    signature file exists.
+  - Exactly one owner signer: `attest.py` and the runtime's `owner_allowed_signers()` refuse
+    an allowed-signers file that is not exactly one canonical `codex-agents-owner <type> <key>`
+    line (0.8.9's recorded runtime digest updated).
+  - Git runs from a trusted real binary (the runtime's `git_executable` rules: never macOS's
+    `/usr/bin` shim or a PATH lookup) with hooks, the file-system monitor, commit and tag
+    signing and automatic maintenance off. Before any status, staging or commit, setup and the
+    installer read the repository's own settings with `git config --get-regexp` plumbing and
+    refuse when they name a helper program (filters, diff and merge drivers, `core.sshCommand`,
+    `gpg.program`, credential helpers, pagers, editors, trailer commands or any include).
+  - The interpreter is trusted before it first runs: refused in a temporary folder, the project
+    (the starting folder's project, then the chosen one), a virtual environment, macOS's
+    `/usr/bin/python3` shim, or a folder under home other than an interpreter manager's. Every
+    owner Python launch and every command shown to the owner adds `-X pycache_prefix=/dev/null`.
+  - The chosen operational-checks file is snapshot into private scratch at once, and the preview
+    and the install read that snapshot. A scratch base under the home folder is refused.
+  - The permissions record counts an entry as the installer's only when the current or an
+    earlier release generated it, so a planted record cannot delete a user's rule. Settings are
+    replanned just before writing and refused if either file changed since it was read; the
+    record is written before the settings on install and removed after them on uninstall, so an
+    interruption leaves a state the next run repairs.
+  - On Linux only the operational-check sandbox failure is reported as the known limitation;
+    every other verify failure is shown. The Commands step explains `codex_rule: unsupported`
+    with its reason and the fix (the real `~/.codex`, no `CODEX_HOME` elsewhere, no symlink).
+- **Owner-side hardening (v1 security review).**
+  - `setup.sh` and `scripts/attest.py` keep every working file in a fresh owner-only folder in
+    the per-user cache folder (macOS) or `$XDG_RUNTIME_DIR` (Linux, refused when unset), created
+    through no-follow, ownership-checked descriptors; nothing goes to `/tmp` or `$TMPDIR`, where
+    a sandboxed agent could swap the enrolled key, the statement or the install plan.
+  - `attest.py` passes the billing grant on stdin, rebuilds the signing payload from the approved
+    statement (the runtime's `authenticated_owner_record` construction) and refuses any other
+    bytes, checks with `ssh-keygen -Y check-novalidate` that the signature covers them, and after
+    enrolment refuses unless the configured owner key is the one it showed.
+  - Every Python the wizard starts, `attest.py` included, is the real file behind `python3` on
+    `PATH` (refused in a temporary folder, the project or a virtual environment) and runs with
+    `-I -B -S`; `attest.py` imports only the standard library. The project's CLI runs only after
+    its runtime files match this repository's copy byte for byte (same version, no extra
+    modules), with `-X pycache_prefix=/dev/null` so a planted `__pycache__` file is never loaded.
+  - Git on the project runs with `-c core.hooksPath=/dev/null -c core.fsmonitor=false`
+    (`--no-optional-locks` for status); the wizard says its commit skips the project's hooks.
+  - `scripts/install.py remove` first removes the Codex commands rule and its protected runtime
+    copy through the project's `remove-codex-rule`; an installed CLI without that command makes
+    it stop and name the rule file to delete. The Commands step now says every Codex session
+    loads the rule, which runs a protected copy, and never to use the home folder's parent or `/`
+    as a Codex workspace.
+  - The installer merges Claude Code permission deny rules into `.claude/settings.json` for every
+    owner-only CLI subcommand (the parser's commands minus the 23 primary-host ones) and `Edit`
+    rules for `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`, keeping user
+    entries; `verify` reports missing rules and `remove` takes out only what install added. These
+    rules are a policy layer, not a sandbox.
 - **Bridged child containment (0.8.8).**
   - Bridged Codex children run with `--ignore-rules`: `--ignore-user-config` skips only
     `config.toml`, so a child still loaded the owner's execpolicy rules, and the setup-written

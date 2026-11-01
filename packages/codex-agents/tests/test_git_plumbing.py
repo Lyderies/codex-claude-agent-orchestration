@@ -17,7 +17,7 @@ from unittest import mock
 from tests.support import BUNDLE_ROOT, TEMP_ROOT
 from tests.learning_support import assignment, routing_fields
 
-from codex_agents import git_plumbing
+from codex_agents import git_plumbing, host_paths
 from codex_agents.bridge import BridgeRefused, export_committed_paths
 from codex_agents.contracts import ContractError
 from codex_agents.host_commands import PYTHON_FLAGS
@@ -351,6 +351,98 @@ class RepositoryLayoutTests(unittest.TestCase):
         self.assertTrue(calls)
         self.assertLessEqual(set(calls), {"rev-parse", "ls-tree", "cat-file", "config"})
         self.assertNotIn('"git", "-C"', source)
+
+
+class GitExecutableTests(unittest.TestCase):
+    """The git that trust checks run is a real binary at a fixed, trusted location."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        # The stand-in binaries' folder counts as an installation folder here.
+        roots = mock.patch.object(
+            host_paths, "TRUSTED_INSTALL_ROOTS",
+            (*host_paths.TRUSTED_INSTALL_ROOTS, os.path.realpath(self.base)),
+        )
+        roots.start()
+        self.addCleanup(roots.stop)
+
+    def fake_git(self, name: str) -> str:
+        path = self.base / name / "git"
+        path.parent.mkdir()
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_the_resolved_git_is_real_and_trusted(self) -> None:
+        executable = git_plumbing.git_executable()
+        if executable is None:
+            self.skipTest("no trusted git binary on this machine")
+        self.assertEqual(os.path.realpath(executable), executable)
+        self.assertIsNone(host_paths.executable_location_problem(
+            Path(executable), list(git_plumbing.temp_roots())
+        ))
+        if sys.platform == "darwin":
+            # /usr/bin/git is an xcrun shim whose lookup cache sits in $TMPDIR.
+            self.assertNotEqual("/usr/bin", os.path.dirname(executable))
+            self.assertNotIn("/usr/bin/git", git_plumbing.git_candidates())
+        else:
+            self.assertEqual(("/usr/bin/git",), git_plumbing.git_candidates())
+
+    def test_candidates_in_temporary_or_shim_locations_are_refused(self) -> None:
+        temporary = self.fake_git("temporary")
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (temporary,)):
+            self.assertIsNone(git_plumbing.git_executable())
+        trusted = self.fake_git("trusted")
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (temporary, trusted)), \
+                mock.patch.object(
+                    git_plumbing, "temp_roots", lambda: {Path(temporary).parent}
+                ):
+            self.assertEqual(trusted, git_plumbing.git_executable())
+        # A symlink to a trusted binary is pinned as the binary itself.
+        link = self.base / "link-git"
+        link.symlink_to(trusted)
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (str(link),)), \
+                mock.patch.object(git_plumbing, "temp_roots", lambda: set()):
+            self.assertEqual(trusted, git_plumbing.git_executable())
+        if sys.platform == "darwin":
+            with mock.patch.object(git_plumbing, "git_candidates", lambda: ("/usr/bin/git",)):
+                self.assertIsNone(git_plumbing.git_executable())
+        # Outside every trusted installation folder (a sibling of a workspace), never.
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (trusted,)), \
+                mock.patch.object(git_plumbing, "temp_roots", lambda: set()), \
+                mock.patch.object(host_paths, "TRUSTED_INSTALL_ROOTS", ("/usr/bin",)):
+            self.assertIsNone(git_plumbing.git_executable())
+        # A git inside the repository it would inspect is never run.
+        with mock.patch.object(git_plumbing, "git_candidates", lambda: (trusted,)), \
+                mock.patch.object(git_plumbing, "temp_roots", lambda: set()):
+            self.assertEqual(trusted, git_plumbing.git_executable())
+            self.assertIsNone(
+                git_plumbing.git_executable(untrusted=[Path(trusted).parent.parent])
+            )
+
+    def test_the_developer_directory_comes_from_the_root_owned_link(self) -> None:
+        with mock.patch.object(git_plumbing, "sys") as fake_sys, \
+                mock.patch.object(git_plumbing, "_developer_directory", lambda: "/opt/dev"):
+            fake_sys.platform = "darwin"
+            candidates = git_plumbing.git_candidates()
+        self.assertEqual("/Library/Developer/CommandLineTools/usr/bin/git", candidates[0])
+        self.assertEqual("/opt/dev/usr/bin/git", candidates[1])
+        with mock.patch.object(git_plumbing, "sys") as fake_sys, \
+                mock.patch.object(git_plumbing, "_developer_directory", lambda: None):
+            fake_sys.platform = "darwin"
+            self.assertFalse(
+                any("{" in item for item in git_plumbing.git_candidates())
+            )
+        link = self.base / "xcode_select_link"
+        link.symlink_to("/opt/dev")
+        # A link this user owns is not xcode-select's.
+        with mock.patch.object(git_plumbing, "XCODE_SELECT_LINK", str(link)):
+            self.assertIsNone(git_plumbing._developer_directory())
+
+    def test_xcrun_shims_skip_their_cache(self) -> None:
+        self.assertEqual("1", git_plumbing.GIT_ENVIRONMENT["xcrun_nocache"])
 
 
 if __name__ == "__main__":

@@ -1096,11 +1096,16 @@ class LearningCliTests(unittest.TestCase):
         opened = self._run(*open_arguments)
         self.assertRegex(opened["run_handle"], r"^hrn_[0-9a-f]{48}$")
         self.assertEqual("admitted", opened["admission"])
-        self._run(
+        # A Codex child is bridged: only its own dispatch binds it, and only that
+        # child's recorded result can finish the run (see test_bridge).
+        self.assertEqual("bridge", route["dispatch"])
+        refused = self._run(
             "learning-bind-host-agent",
             "--run-handle", opened["run_handle"],
             "--agent-id", "native-child-1",
+            expected=2,
         )
+        self.assertIn("binds only its dispatched child", refused["error"])
         observation = {
             "run_handle": opened["run_handle"],
             "result_attempts": [
@@ -1114,14 +1119,8 @@ class LearningCliTests(unittest.TestCase):
             "--result", str(self._write("trusted-result.json", result())),
             "--observation", str(self._write("trusted-observation.json", observation)),
         )
-        recorded = self._run("learning-record-host-result", *arguments)
-        self.assertEqual(assigned["assignment_id"], recorded["outcome"]["assignment_id"])
-        self.assertEqual(assigned["role"], recorded["outcome"]["role"])
-        self.assertEqual(assigned["model"], recorded["outcome"]["model"])
-        self.assertEqual(assigned["effort"], recorded["outcome"]["effort"])
-        self.assertTrue(all(value is None for value in recorded["outcome"]["usage"].values()))
-        replay = self._run("learning-record-host-result", *arguments, expected=2)
-        self.assertIn("host run handle", replay["error"])
+        recorded = self._run("learning-record-host-result", *arguments, expected=2)
+        self.assertIn("must be dispatched", recorded["error"])
         self.assertNotIn(
             opened["run_handle"].encode(),
             self.state_root.joinpath("learning.sqlite3").read_bytes(),
@@ -1181,7 +1180,9 @@ class LearningCliTests(unittest.TestCase):
         self.assertEqual(1, committed["runs"]["abandoned"])
         self.assertEqual(0, committed["runs"]["pending"])
 
-    def test_legacy_fallback_requires_one_abandoned_primary_host_run(self) -> None:
+    def test_legacy_fallback_is_refused_for_bridged_children(self) -> None:
+        # The fallback answers a native host's model rejection. Every Codex
+        # child is bridged, so a recovery-unavailable run gets no receipt.
         task = {
             "id": "task-1", "objective": "Read one fixture", "family": "research",
             "complexity": "medium", "risk": "low", "meaningful": True,
@@ -1211,13 +1212,7 @@ class LearningCliTests(unittest.TestCase):
             "--parent-grant", str(parent_path),
             "--orchestration-handle", orchestration["orchestration_handle"],
         )
-        naked = self._run(
-            "learning-route",
-            "--task", str(task_path),
-            "--fallback-from-run-handle", primary_run["run_handle"],
-            expected=2,
-        )
-        self.assertIn("paused orchestration", naked["error"])
+        self.assertEqual("bridge", primary_route["dispatch"])
         self._run(
             "learning-pause-orchestration",
             "--orchestration-handle", orchestration["orchestration_handle"],
@@ -1227,84 +1222,14 @@ class LearningCliTests(unittest.TestCase):
             "--run-handle", primary_run["run_handle"],
             "--reason", "recovery_unavailable",
         )
-        fallback_route = self._run(
-            "learning-route",
-            "--task", str(task_path),
-            "--fallback-from-run-handle", primary_run["run_handle"],
-        )
-        self.assertEqual(
-            ("gpt-5.6-sol", "high"),
-            (fallback_route["model"], fallback_route["effort"]),
-        )
-        self.assertEqual(
-            "selected_model_unavailable_fallback", fallback_route["reason"]
-        )
-        receipt = fallback_route["fallback"]["receipt_id"]
-        self.assertRegex(receipt, r"^fbr_[0-9a-f]{48}$")
-        replay = self._run(
+        refused = self._run(
             "learning-route",
             "--task", str(task_path),
             "--fallback-from-run-handle", primary_run["run_handle"],
             expected=2,
         )
-        self.assertIn("unbound recovery-unavailable run", replay["error"])
-        self._run(
-            "learning-resume-orchestration",
-            "--orchestration-handle", orchestration["orchestration_handle"],
-        )
-        fallback_assignment = dict(primary_assignment)
-        fallback_assignment.update(
-            assignment_id="fallback-assignment-1",
-            model="gpt-5.6-sol",
-            effort="high",
-        )
-        fallback_assignment_path = self._write(
-            "fallback-assignment.json", fallback_assignment
-        )
-        fallback_route_path = self._write("fallback-route.json", fallback_route)
-        fallback_run = self._run(
-            "learning-open-host-run",
-            "--task", str(task_path),
-            "--route", str(fallback_route_path),
-            "--assignment", str(fallback_assignment_path),
-            "--parent-grant", str(parent_path),
-            "--fallback-receipt", receipt,
-            "--orchestration-handle", orchestration["orchestration_handle"],
-        )
-        receipt_replay = self._run(
-            "learning-open-host-run",
-            "--task", str(task_path),
-            "--route", str(fallback_route_path),
-            "--assignment", str(fallback_assignment_path),
-            "--parent-grant", str(parent_path),
-            "--fallback-receipt", receipt,
-            "--orchestration-handle", orchestration["orchestration_handle"],
-            expected=2,
-        )
-        self.assertIn("fallback receipt", receipt_replay["error"])
-        self._run(
-            "learning-bind-host-agent",
-            "--run-handle", fallback_run["run_handle"],
-            "--agent-id", "native-fallback-child-1",
-        )
-        fallback_result = result()
-        fallback_result["assignment_id"] = fallback_assignment["assignment_id"]
-        observation = {
-            "run_handle": fallback_run["run_handle"],
-            "result_attempts": [
-                {"status": "accepted", "reason_code": None, "receipt_id": None}
-            ],
-        }
-        recorded = self._run(
-            "learning-record-host-result",
-            "--task", str(task_path),
-            "--assignment", str(fallback_assignment_path),
-            "--parent-grant", str(parent_path),
-            "--result", str(self._write("fallback-result.json", fallback_result)),
-            "--observation", str(self._write("fallback-observation.json", observation)),
-            "--fallback-receipt", receipt,
-        )
-        self.assertEqual("gpt-5.6-sol", recorded["outcome"]["model"])
+        self.assertEqual("input validation failed", refused["error"])
+        self.assertNotIn("fallback", refused)
 
     def test_runtime_rejects_test_fixture_client_identity(self) -> None:
         clients = json.loads(
