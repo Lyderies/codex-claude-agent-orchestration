@@ -77,26 +77,44 @@ def _host_paths():
 HOST_PATHS = _host_paths()
 
 
-def trusted_interpreter() -> str | None:
+def _rule_may_name(python: str) -> bool:
+    """Whether the runtime's interpreter_path accepts `python` (what host-command checks)."""
+
+    completed = subprocess.run(
+        [python, "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null", "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from codex_agents.host_commands import interpreter_path; interpreter_path()",
+         str(ORCHESTRATION)],
+        capture_output=True, stdin=subprocess.DEVNULL, check=False)
+    return completed.returncode == 0
+
+
+def trusted_interpreter() -> tuple[str | None, bool]:
     """A Python 3.11+ the wizard will run: in one of the runtime's trusted installation folders
-    and not macOS's /usr/bin shim. CI's toolcache Python is not, so another is looked for."""
+    and not macOS's /usr/bin shim. CI's toolcache Python is not, so another is looked for. One
+    the Codex rule may also name is preferred; the second value says whether it can."""
 
     candidates = [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
                   "/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/usr/bin/python3"]
+    usable = []
     for candidate in candidates:
         real = os.path.realpath(candidate)
-        if not os.path.isfile(real) or (sys.platform == "darwin" and os.path.dirname(real) == "/usr/bin"):
+        if real in usable or not os.path.isfile(real) or (
+                sys.platform == "darwin" and os.path.dirname(real) == "/usr/bin"):
             continue
         if HOST_PATHS.install_location_problem(Path(real)) is not None:
             continue
         version = subprocess.run([real, "-I", "-c", "import sys; sys.exit(sys.version_info < (3, 11))"],
                                  capture_output=True, check=False)
         if version.returncode == 0:
-            return real
-    return None
+            usable.append(real)
+    for real in usable:
+        if _rule_may_name(real):
+            return real, True
+    return (usable[0], False) if usable else (None, False)
 
 
-TRUSTED_PY = trusted_interpreter()
+TRUSTED_PY, RULE_MAY_NAME_TRUSTED_PY = trusted_interpreter()
 if TRUSTED_PY and TRUSTED_PY != os.path.realpath(sys.executable):
     # Every setup.sh this process starts finds that interpreter first on PATH.
     _SHIM = Path(tempfile.mkdtemp(prefix="setup-tests-python-"))
@@ -1133,6 +1151,7 @@ class WizardTerminalTests(unittest.TestCase):
     def make_project(self, name: str = "project", base: Path | None = None) -> tuple[Path, Path]:
         project = (base or self.base) / name
         project.mkdir()
+        project.chmod(0o755)  # never group-writable, whatever the runner's umask
         subprocess.run(["git", "init", "-q", str(project)], check=True, env=self.env)
         (project / "qa-check").write_text("#!/usr/bin/python3\nprint(1)\n")
         (project / "qa-check").chmod(0o700)
@@ -1193,8 +1212,11 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertIn("never on your home folder", plain)
         self.send("\r")  # Continue: it is a warning, not a stop
         self.expect("Project path")
-        self.send("\x03")  # Ctrl-C ends the wizard here
-        self.finish()
+        # Quit through the wizard: bash 5 runs the INT trap only once `read -e` returns.
+        self.send("q\r")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
         self.assertEqual(list((self.home / ".codex").iterdir()), [self.home / ".codex" / "sessions"])
 
     def test_a_project_codex_session_is_not_warned_about(self) -> None:
@@ -1951,8 +1973,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Start the attestation")
         self.send("\r")
         self.expect("does not match this setup")
-        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
-        self.assertIn(".codex/orchestration/cli.py differs", plain.replace("\r\n", " "))
+        self.expect(".codex/orchestration/cli.py differs")  # the reason line may arrive later
         self.assertFalse((self.base / "attest.count").exists(), "attest.py ran")
         self.send("\r")
         self.expect("Back to the main menu")
@@ -2044,6 +2065,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertNotIn("to undo only the rule, delete:", final)
         self.assertFalse((self.home / ".codex").exists())
 
+    @unittest.skipUnless(RULE_MAY_NAME_TRUSTED_PY,
+                         "host-command checks the interpreter before the Codex home; none here passes")
     def test_an_unsupported_codex_home_is_explained_with_its_fix(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())

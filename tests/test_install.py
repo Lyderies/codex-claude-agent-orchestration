@@ -105,7 +105,10 @@ def isolate_home(test: unittest.TestCase, home: Path) -> None:
 
     home.mkdir(mode=0o700, exist_ok=True)
     environment = {key: value for key, value in os.environ.items() if key not in ("CODEX_HOME", "XDG_STATE_HOME")}
-    patcher = mock.patch.dict(os.environ, {**environment, "HOME": str(home)}, clear=True)
+    # The installer's plumbing commit needs an identity; CI runners have no Git identity.
+    identity = {"GIT_AUTHOR_NAME": "Tests", "GIT_AUTHOR_EMAIL": "tests@example.invalid",
+                "GIT_COMMITTER_NAME": "Tests", "GIT_COMMITTER_EMAIL": "tests@example.invalid"}
+    patcher = mock.patch.dict(os.environ, {**environment, **identity, "HOME": str(home)}, clear=True)
     patcher.start()
     test.addCleanup(patcher.stop)
     # A CI toolcache Python sits outside the trusted installation folders; the rule itself is
