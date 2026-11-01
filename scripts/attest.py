@@ -566,22 +566,19 @@ def client_status(name: str, project: Path | None = None) -> tuple[int, bytes]:
                 start_new_session=True)
         except OSError:
             return CLIENT_FAILED, b""
+        # Read as it arrives, never more than the cap: a client that keeps writing is stopped
+        # (its whole process group) the moment it passes the cap or the deadline.
+        deadline = time.monotonic() + CLIENT_TIMEOUT_SECONDS
         try:
-            output, _ = process.communicate(timeout=CLIENT_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                process.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                pass
+            output = providers.read_bounded(process.stdout, limit=CLIENT_OUTPUT_LIMIT, deadline=deadline)
+            process.wait(timeout=max(deadline - time.monotonic(), 0.1))
+        except (providers.BoundedReadError, subprocess.TimeoutExpired, OSError):
+            providers.stop_process_group(process)
             return CLIENT_FAILED, b""
+        finally:
+            process.stdout.close()
     finally:
         remove_scratch(scratch)
-    if len(output) > CLIENT_OUTPUT_LIMIT:
-        return CLIENT_FAILED, b""
     return (0 if process.returncode == 0 else CLIENT_SIGNED_OUT), output
 
 
@@ -830,6 +827,10 @@ def check_path_safe(path: Path) -> None:
             raise AttestError("a key path directory is writable by other users")
 
 
+KEY_HAS_LINK = (
+    "This key file has another link elsewhere; make a fresh copy in ~/.ssh (cp, not mv) and remove "
+    "the old one"
+)
 OUTSIDE_SSH = (
     "the owner key must be a file in your own ~/.ssh folder (such as ~/.ssh/codex-agents-owner). "
     "A key anywhere else could be swapped by another program between the checks and the "
@@ -849,7 +850,8 @@ def check_key_location(key: Path, *, exists: bool = True) -> None:
     Enrolment, signing and the passphrase change take a private key only from ~/.ssh (or a
     folder in it), a folder no agent sandbox can write, so the file checked is the file
     ssh-keygen opens. No component of the path, from / to the key, may be a symbolic link;
-    ~/.ssh and everything below it must be yours and writable by no one else; the folders
+    ~/.ssh and everything below it must be yours and writable by no one else, and the key file
+    may have no other hard link (KEY_HAS_LINK); the folders
     above it must belong to you or root and be writable by no one else (a root-owned sticky
     folder excepted). With `exists` false (a key about to be created) the key and ~/.ssh may
     be missing; the home folder may not. A refusal never names the path: a mistyped
@@ -873,6 +875,10 @@ def check_key_location(key: Path, *, exists: bool = True) -> None:
             raise AttestError("a key path component could not be checked") from exc
         if stat.S_ISLNK(info.st_mode):
             raise AttestError("the owner key's path may not pass through symbolic links, so it is not used")
+        if current == key and not stat.S_ISDIR(info.st_mode) and info.st_nlink != 1:
+            # A hard link elsewhere (a folder an agent can write, kept when the key was moved
+            # into ~/.ssh) would let that agent rewrite this same file after the checks.
+            raise AttestError(KEY_HAS_LINK)
         writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         if within(current, folder):
             if info.st_uid != uid:
@@ -916,10 +922,20 @@ def validate_private_key(key: Path) -> None:
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise AttestError("the private key must be owned by you with mode 0600 or stricter")
     try:
-        with key.open("rb") as handle:
-            head = handle.read(64)
+        descriptor = os.open(key, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise AttestError("that private key file could not be read") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise AttestError("that path is not a regular file")
+        if opened.st_nlink != 1:  # checked on the file actually opened, too
+            raise AttestError(KEY_HAS_LINK)
+        head = os.read(descriptor, 64)
+    except OSError as exc:
+        raise AttestError("that private key file could not be read") from exc
+    finally:
+        os.close(descriptor)
     if b"PRIVATE KEY-----" not in head:
         raise AttestError("that path is not a private key (a public key file cannot sign)")
     unlocked = ssh(["-y", "-P", "", "-f", str(key)], capture_output=True, text=True,

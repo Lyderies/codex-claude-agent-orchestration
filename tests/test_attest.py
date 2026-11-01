@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -851,6 +852,52 @@ class AttestTests(AttestHarness):
                         call()
         self.no_keygen_ran()
 
+    def test_a_key_with_another_hard_link_is_refused_at_every_use(self) -> None:
+        # A key moved (not copied) into ~/.ssh from a folder an agent can write keeps that
+        # folder's link: the agent could rewrite this same file after the checks.
+        key = self.configure_key()
+        writable = self.root / "project-keys"
+        writable.mkdir(mode=0o700)
+        os.link(key, writable / "owner")
+        for name, call in (("validate", lambda: attest.validate_private_key(key)),
+                           ("derive", lambda: attest.derive_public(key)),
+                           ("sign", lambda: attest.sign_in_memory(key, b"payload")),
+                           ("location", lambda: attest.check_key_location(key))):
+            with self.subTest(call=name), \
+                    mock.patch.object(attest.subprocess, "run", self.world.run), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(attest.AttestError) as caught:
+                    call()
+                self.assertEqual(str(caught.exception), attest.KEY_HAS_LINK)
+        # The passphrase change refuses it as well, before ssh-keygen ever opens the key.
+        with mock.patch.object(attest, "configured_public_key", return_value=("ssh-ed25519", "AAAAkey")), \
+                mock.patch.object(attest, "locate_key_file", return_value=key), \
+                mock.patch.object(attest, "describe_key", return_value="ssh-ed25519 SHA256:x"):
+            self.assertEqual(self.run_main([], change=True), 1)
+        self.assertIn("another link elsewhere", self.output)
+        self.no_keygen_ran(key)
+        # Also on the descriptor validation opens: a link made after the path check is caught.
+        (writable / "owner").unlink()
+        real = os.lstat
+
+        def one_link(path):
+            info = real(path)
+            if Path(path) == key:
+                fields = list(info)
+                fields[3] = 1
+                return os.stat_result(fields)
+            return info
+
+        os.link(key, writable / "owner")
+        with mock.patch.object(attest, "_lstat", one_link), mock.patch.object(attest.Path, "lstat",
+                                                                               lambda path: one_link(path)):
+            with self.assertRaisesRegex(attest.AttestError, "another link elsewhere"):
+                attest.validate_private_key(key)
+        # A fresh copy (one link) is accepted again.
+        (writable / "owner").unlink()
+        with mock.patch.object(attest.subprocess, "run", self.world.run):
+            attest.check_key_location(key)
+
     def test_enrolling_a_typed_key_location_outside_ssh_is_refused_without_echo(self) -> None:
         self.set_providers(codex=True)
         other = self.root / "mykey"
@@ -1407,6 +1454,27 @@ class ClientStatusTests(unittest.TestCase):
         self.client("codex", extra="exec /bin/sleep 30\n")
         with mock.patch.object(attest, "CLIENT_TIMEOUT_SECONDS", 1):
             self.assertEqual(attest.client_status("codex"), (attest.CLIENT_FAILED, b""))
+
+    def test_a_client_that_floods_its_output_is_stopped_at_the_cap(self) -> None:
+        # Writes without end and leaves a child in its process group; reading stops at the cap,
+        # long before the deadline, and the whole group is killed.
+        pidfile = self.temp / "child.pid"
+        self.client("codex", extra=f'/bin/sleep 60 & echo $! > "{pidfile}"\n'
+                                   "exec /usr/bin/yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n")
+        started = time.monotonic()
+        with mock.patch.object(attest, "CLIENT_TIMEOUT_SECONDS", 20):
+            self.assertEqual(attest.client_status("codex"), (attest.CLIENT_FAILED, b""))
+        self.assertLess(time.monotonic() - started, 10)
+        child = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the client's process group was not stopped")
 
     def test_owner_tool_prints_only_claudes_json(self) -> None:
         for name, printed in (("codex", b""), ("claude", self.recorded_output())):

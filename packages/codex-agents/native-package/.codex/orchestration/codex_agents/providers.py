@@ -260,7 +260,9 @@ def client_environment(environ: Mapping[str, str], tmpdir: Path) -> dict[str, st
     }
 
 
-def _stop_process_group(process: Any) -> None:
+def stop_process_group(process: Any) -> None:
+    """Kill a child started with `start_new_session` and its whole group, then reap it."""
+
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -269,6 +271,39 @@ def _stop_process_group(process: Any) -> None:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         pass
+
+
+_stop_process_group = stop_process_group
+
+
+class BoundedReadError(Exception):
+    """A child's output passed its size cap (`too_large`) or its deadline (`timeout`)."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def read_bounded(stream: Any, *, limit: int, deadline: float) -> bytes:
+    """Read `stream` to its end, never holding more than `limit` bytes or reading past
+    `deadline` (a `time.monotonic()` value); BoundedReadError the moment either is passed,
+    so the caller can stop the process at once."""
+
+    chunks: list[bytes] = []
+    received = 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise BoundedReadError("timeout")
+            chunk = os.read(stream.fileno(), 65_536)
+            if not chunk:
+                return b"".join(chunks)
+            received += len(chunk)
+            if received > limit:
+                raise BoundedReadError("too_large")
+            chunks.append(chunk)
 
 
 def _bounded_output(
@@ -293,25 +328,16 @@ def _bounded_output(
         raise ObservationError(
             "provider observation is unavailable", "client_unavailable"
         ) from exc
-    chunks: list[bytes] = []
-    received = 0
     deadline = time.monotonic() + timeout
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
-                    raise ObservationError(
-                        "provider observation timed out", "observation_timed_out"
-                    )
-                chunk = os.read(process.stdout.fileno(), 65_536)
-                if not chunk:
-                    break
-                received += len(chunk)
-                if received > MAX_OBSERVATION_BYTES:
-                    raise ContractError("provider observation output is too large")
-                chunks.append(chunk)
+        try:
+            output = read_bounded(process.stdout, limit=MAX_OBSERVATION_BYTES, deadline=deadline)
+        except BoundedReadError as exc:
+            if exc.kind == "too_large":
+                raise ContractError("provider observation output is too large") from None
+            raise ObservationError(
+                "provider observation timed out", "observation_timed_out"
+            ) from None
         try:
             returncode = process.wait(timeout=max(deadline - time.monotonic(), 0.1))
         except subprocess.TimeoutExpired as exc:
@@ -325,7 +351,7 @@ def _bounded_output(
         process.stdout.close()
     if returncode != 0:
         raise ContractError("provider observation failed")
-    return b"".join(chunks)
+    return output
 
 
 def read_client_version(

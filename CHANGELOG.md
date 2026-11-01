@@ -68,6 +68,14 @@
     used for Codex routes"), and a route denied for that reason says so.
   - The 0.8.9 runtime digest is recomputed.
 
+- **Owner key links and client output (owner review).** `attest.py` refuses an owner private
+  key whose file has another hard link ("This key file has another link elsewhere; make a fresh
+  copy in ~/.ssh (cp, not mv) and remove the old one"), at every use and again on the file it
+  opens itself: a key moved into `~/.ssh` from a folder an agent can write kept that link, through
+  which the agent could rewrite it after the checks. `client-status` reads a client's output with
+  the runtime's bounded reader (`providers.read_bounded`) and stops the client's process group the
+  moment it passes 256 KiB, instead of buffering it all first.
+
 - **Owner tools follow the state rules.** `scripts/attest.py` and `scripts/install.py` show the
   runtime's plain refusal when the learning state location is unusable (an `XDG_STATE_HOME`
   outside a hidden home folder or not canonical, or an unsafe `~/.local`), and the wizard maps
