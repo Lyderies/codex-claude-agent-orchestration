@@ -786,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
     learning_register.add_argument("--project-root", required=True, type=Path)
     learning_register.add_argument(
         "--move-legacy-state",
-        help="approve moving the pre-0.8.9 macOS state: the SHA-256 of its "
+        help="approve moving the pre-0.8.10 macOS state: the SHA-256 of its "
         "owner-allowed-signers file as reviewed, or 'none'",
     )
 
@@ -1523,7 +1523,7 @@ def main() -> int:
             report = validate_learning_record(_bounded_json_input(args.record))
         elif args.command == "learning-register":
             validate_collector_runtime(ORCHESTRATION_ROOT / "cli.py")
-            # The owner's registration copies a pre-0.8.9 macOS state folder to the
+            # The owner's registration copies a pre-0.8.10 macOS state folder to the
             # default location first (once) and renames the old one aside; nothing
             # else does. `state_moved` names the old copy, which the owner may delete.
             moved_aside = (

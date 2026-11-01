@@ -690,7 +690,7 @@ def _prepare_default_state_root() -> Path:
         raise StateError(str(exc)) from None
 
 
-# The pre-0.8.9 macOS folder (host_paths.legacy_state_root) is moved once, by the
+# The pre-0.8.10 macOS folder (host_paths.legacy_state_root) is moved once, by the
 # owner's `learning-register`; every other use of the default state refuses while
 # only the old folder exists, so nothing starts a second, empty state beside it.
 UNMOVED_STATE = (
@@ -744,7 +744,7 @@ UNIX_SOCKET_PATH_MAX = 103 if sys.platform == "darwin" else 107
 
 
 def _unmoved_legacy_state() -> bool:
-    """Whether only the pre-0.8.9 macOS state folder exists."""
+    """Whether only the pre-0.8.10 macOS state folder exists."""
 
     if os.name == "nt":
         return False
@@ -916,7 +916,7 @@ def legacy_signers_digest(root: Path) -> str:
 def migrate_legacy_state(
     cli_path: Path, project_root: Path, approved_signers: str | None = None
 ) -> Path | None:
-    """Copy the pre-0.8.9 macOS learning state to the default folder, once (owner).
+    """Copy the pre-0.8.10 macOS learning state to the default folder, once (owner).
 
     Only the owner's `learning-register` calls this, and only while the old
     folder is the only one. With the collector stopped and its maintenance

@@ -1,7 +1,7 @@
 # Delivery plan: cross-provider agent orchestration
 
 - **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
-  0.1.0). G2 is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.9);
+  0.1.0). G2 is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10);
   the tag follows the G2 exit. Next: v1.1 child liveness, then v1.2 Codex plan loop, then G3. Scope changes are listed under
   "Decisions and open questions".
 - **Updated:** 2026-11-01.

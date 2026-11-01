@@ -73,7 +73,7 @@
         "native-package/.codex/orchestration/schemas/project-agent-routing.schema.json": "1c8a33df057b014471cf1638e65af0a2f85598b07736e4b0768e95c4575144e5",
         "native-package/.codex/orchestration/schemas/result.schema.json": "ca99176345bca9d9dccd463e6d6e15d0c1308c38e6d39d9c052749e4e217cf49",
         "native-package/.codex/orchestration/schemas/task.schema.json": "db210a583a239cef03a9560e0ae7c994a8ae238413b1a05ed9c2c815496b68c1",
-        "native-package/VERSION": "d0176718bd214ce8474c06ed61c395ca113fdfc2acdd86d9aa9933b40d9b561e",
+        "native-package/VERSION": "d0176718bd214ce8474c06ed61c395ca113fdfc2acdd86d9aa9933b40d9b561e; 0.8.10 for the final v1 fixes, since a collector had already authorized the earlier 0.8.9 build",
         "scripts/backup_installed_project.py": "58d9f3b765e7573d1acef03625d0778b1cf68c8c30127bc584c7171b67430e6c",
         "scripts/benchmark_learning.py": "43ad441d2e2b7f1b1380e5e11cd27b0f449fbc4d0e97e3aa4f2a0c5de21fbfa6",
         "scripts/check_app_server.py": "d19c118c4c2e61448bccf8f04a72bce3509245e4a1753b4b8d8a9da8f4924884",

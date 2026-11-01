@@ -154,7 +154,7 @@ class DefaultStateRootTests(unittest.TestCase):
 
     def test_only_macos_has_an_old_state_folder(self) -> None:
         _default, legacy = self.resolve("darwin")
-        # Where the pre-0.8.9 code put it: HOME's Library/Application Support.
+        # Where the pre-0.8.10 code put it: HOME's Library/Application Support.
         self.assertEqual(self.other / "Library" / "Application Support" / "codex-agents", legacy)
         self.assertIsNone(self.resolve("linux")[1])
 
@@ -214,7 +214,7 @@ class OversizedSignerTests(unittest.TestCase):
 
 
 class LegacyStateMoveTests(unittest.TestCase):
-    """The one-time, owner-driven copy of the pre-0.8.9 macOS state folder."""
+    """The one-time, owner-driven copy of the pre-0.8.10 macOS state folder."""
 
     def setUp(self) -> None:
         # Short: the collector's socket path is limited to about 100 bytes.
