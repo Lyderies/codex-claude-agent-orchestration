@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -60,6 +61,58 @@ def interpreter_trusted() -> bool:
 
 TRUSTED_PYTHON = interpreter_trusted()
 SCRATCH_CONTAINER = "agent-orchestration-owner"
+FAKE_RULE = '"""A stand-in for the CLI\'s host-command and install-codex-rule replies (FAKE_RULE)."""\nimport hashlib, json, os, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nwith open(os.environ["FAKE_RULE_LOG"], "a") as log:\n    log.write(" ".join(args) + "\\n")\ncommand = next(item for item in args if item in ("host-command", "install-codex-rule"))\nroot = Path(os.path.realpath(args[args.index("--project-root") + 1]))\ndigest = hashlib.sha256(str(root).encode()).hexdigest()[:12]\nhome = Path(os.environ["HOME"]) / ".codex"\nrule = str(home / "rules" / f"agent-orchestration-{digest}.rules")\ncopy = str(home / "agent-orchestration" / digest / ("0" * 64))\nstatus = os.environ["FAKE_RULE"]\nif command == "host-command":\n    report = {"ready": status == "installed", "codex_rule": status, "rule_file": rule, "runtime_copy": copy}\nelif "--print" in args:\n    report = {"ready": True, "rule_file": rule, "runtime_copy": copy,\n              "rule_text": \'prefix_rule(pattern = ["python3"], decision = "allow")\\n\'}\nelse:\n    report = {"ready": True, "codex_rule": "replaced" if "--replace" in args else "created",\n              "rule_file": rule, "runtime_copy": copy, "runtime_copy_status": "created"}\nprint(json.dumps(report))\n'
+ACCOUNT_HOME = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+
+
+def _host_paths():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("setup_tests_host_paths",
+                                                  ORCHESTRATION / "codex_agents" / "host_paths.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+HOST_PATHS = _host_paths()
+
+
+def trusted_interpreter() -> str | None:
+    """A Python 3.11+ the wizard will run: in one of the runtime's trusted installation folders
+    and not macOS's /usr/bin shim. CI's toolcache Python is not, so another is looked for."""
+
+    candidates = [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                  "/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/usr/bin/python3"]
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if not os.path.isfile(real) or (sys.platform == "darwin" and os.path.dirname(real) == "/usr/bin"):
+            continue
+        if HOST_PATHS.install_location_problem(Path(real)) is not None:
+            continue
+        version = subprocess.run([real, "-I", "-c", "import sys; sys.exit(sys.version_info < (3, 11))"],
+                                 capture_output=True, check=False)
+        if version.returncode == 0:
+            return real
+    return None
+
+
+TRUSTED_PY = trusted_interpreter()
+if TRUSTED_PY and TRUSTED_PY != os.path.realpath(sys.executable):
+    # Every setup.sh this process starts finds that interpreter first on PATH.
+    _SHIM = Path(tempfile.mkdtemp(prefix="setup-tests-python-"))
+    (_SHIM / "python3").symlink_to(TRUSTED_PY)
+    os.environ["PATH"] = f"{_SHIM}{os.pathsep}{os.environ['PATH']}"
+
+
+def account_home_folder(test: unittest.TestCase) -> Path:
+    """A fresh folder inside a hidden top-level folder of the account's home, which the
+    runtime's rule trusts for installed programs; removed after the test."""
+
+    parent = ACCOUNT_HOME / ".cache" / "agent-orch-tests"
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    test.addCleanup(shutil.rmtree, folder, True)
+    return folder
 
 
 def trusted_git() -> str:
@@ -298,9 +351,8 @@ class SetupScriptTests(unittest.TestCase):
                                     capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
-        self.assertIn(".codex/new name.txt (from .codex/old name .txt)", lines)
-        self.assertIn(".codex/extra", lines)
-        self.assertEqual(len(lines), 2, lines)
+        # Found with plumbing: a rename is its new and its old name, each kept whole.
+        self.assertEqual(lines, [".codex/extra", ".codex/new name.txt", ".codex/old name .txt"])
 
     def helper(self, *args: str, stdin: bytes = b"", env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(SETUP), "--helper", *args], input=stdin, capture_output=True,
@@ -404,12 +456,15 @@ class SetupScriptTests(unittest.TestCase):
             stripped = line.strip()
             if re.search(r'(^|[;&|]\s*|run_cmd "[^"]*" |\$\()git\s', stripped):
                 self.fail(f"git run from PATH: {stripped}")
-        self.assertIn('xcrun_nocache=1 "$GIT" -C "$project" "${GIT_SAFE[@]}" "$@"', text)
+        self.assertIn("xcrun_nocache=1 GIT_ALLOW_PROTOCOL='' GIT_NO_LAZY_FETCH=1 "
+                      '"$GIT" -C "$project" "${GIT_SAFE[@]}" "$@"', text)
         uses = [line for line in code if re.search(r'\bg "\$', line)]
-        self.assertGreaterEqual(len(uses), 8)
+        self.assertGreaterEqual(len(uses), 4)
+        # No porcelain: status, add and commit go through the installer's plumbing.
         for line in uses:
-            if " status " in line:
-                self.assertIn("--no-optional-locks", line.split(" status ")[0], line)
+            self.assertIsNone(re.search(r'\bg "\$[^"]*"( --?[a-z-]+)* (status|add|commit|diff)\b', line), line)
+        self.assertIn('owner_git commit "$PROJECT"', text)
+        self.assertIn('owner_git changes "$1" .codex .agents .claude', text)
         safe = re.search(r"^GIT_SAFE=\((.*)\)$", text, re.M).group(1).split()
         self.assertEqual(safe, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                                 "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
@@ -523,21 +578,24 @@ class SetupScriptTests(unittest.TestCase):
                                 cwd=cwd)
         return result.stdout.strip()
 
-    def test_python_under_home_must_be_in_an_interpreter_managers_folder(self) -> None:
+    def test_python_must_be_in_a_trusted_installation_folder(self) -> None:
         outside = outside_temporary_folders()
         if outside is None:
             self.skipTest("no folder outside the temporary roots is available")
-        home = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
-        self.addCleanup(shutil.rmtree, home, True)
-        for relative, expected in ((".pyenv/versions/3.12/bin", None), (".local/bin", None),
-                                   ("Code/tools/bin", "refused: home"), ("bin", "refused: home")):
-            with self.subTest(folder=relative):
-                folder = home / relative
+        sibling = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside)) / "tools"
+        self.addCleanup(shutil.rmtree, sibling.parent, True)
+        hidden = account_home_folder(self) / "bin"
+        for folder, expected in ((sibling, "refused: install"), (hidden, None)):
+            with self.subTest(folder=str(folder)):
                 folder.mkdir(parents=True)
                 (folder / "python3").write_text("#!/bin/sh\nexit 99\n")  # never run
                 (folder / "python3").chmod(0o755)
-                found = self.python_for(folder, home=str(home))
-                self.assertEqual(found, expected or str(folder.resolve() / "python3"))
+                self.assertEqual(self.python_for(folder), expected or str(folder.resolve() / "python3"))
+
+    def test_the_trusted_installation_folders_match_the_runtime(self) -> None:
+        printed = subprocess.run(["bash", str(SETUP), "--print-trusted-roots"], capture_output=True,
+                                 text=True, check=True).stdout.split()
+        self.assertEqual(tuple(printed), HOST_PATHS.TRUSTED_INSTALL_ROOTS)
 
     def test_python_inside_the_starting_project_is_refused_before_it_runs(self) -> None:
         outside = outside_temporary_folders()
@@ -568,7 +626,9 @@ class SetupScriptTests(unittest.TestCase):
             self.skipTest("no folder outside the temporary roots is available")
         base = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
         self.addCleanup(shutil.rmtree, base, True)
-        real = os.path.realpath(sys.executable)
+        if TRUSTED_PY is None:
+            self.skipTest("no Python in a trusted installation folder")
+        real = TRUSTED_PY
         linked = base / "linked"
         linked.mkdir()
         (linked / "python3").symlink_to(real)
@@ -747,9 +807,9 @@ class SetupScriptTests(unittest.TestCase):
                       "project cannot change. Never open Codex on your home folder, its parent or / while "
                       "the rule exists.", text)
         self.assertNotIn("It applies to Codex sessions started in this project's root folder", text)
-        self.assertIn("Git runs with the project's hooks, file-system monitor, commit signing and "
-                      "background maintenance turned off, and only after setup has checked that the "
-                      "project's own Git settings name no program (such as a filter) for Git to start.", text)
+        self.assertIn("Setup commits with Git's plumbing commands only (hash-object, update-index, write-tree, "
+                      "commit-tree, update-ref), which start no hook, filter, signing program, pager or "
+                      "maintenance whatever the project's Git settings say", text)
         self.assertNotIn("no script in the project runs as you", text)
         self.assertNotIn("or a commit hook stopped it", text)
         self.assertIn("Keep this setup folder outside every folder you open in Codex", text)
@@ -859,6 +919,8 @@ class SetupScriptTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform != "win32", "needs a pseudo-terminal")
 class WizardTerminalTests(unittest.TestCase):
     def setUp(self) -> None:
+        if TRUSTED_PY is None:
+            self.skipTest("no Python in a trusted installation folder")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(os.path.realpath(self._tmp.name))
@@ -868,8 +930,12 @@ class WizardTerminalTests(unittest.TestCase):
             self.skipTest("no folder outside the temporary roots is available")
         self.outside = Path(tempfile.mkdtemp(prefix="agent-orch-test-", dir=outside))
         self.addCleanup(shutil.rmtree, self.outside, True)
-        self.fakes = self.outside / "bin"
+        # The fake python3 must sit in a trusted installation folder: a hidden folder of the
+        # account's home, by the runtime's rule.
+        self.fakes = account_home_folder(self) / "bin"
         self.fakes.mkdir()
+        (self.fakes / "fake_rule.py").write_text(FAKE_RULE)
+        self.rule_log = self.base / "rule.log"
         self.home = self.base / "home"
         self.home.mkdir()
         self.tmpdir = self.base / "tmp"
@@ -900,8 +966,10 @@ class WizardTerminalTests(unittest.TestCase):
             'if [ -n "$FAKE_UNTRUSTED" ]; then case "$*" in *host-command*)'
             ' echo \'{"ready": false, "error": "the Python interpreter cannot be trusted: x"}\';'
             ' exit 2;; esac; fi\n'
-            f'exec "{sys.executable}" "$@"\n')
-        (self.fakes / "python3.real").symlink_to(os.path.realpath(sys.executable))
+            'if [ -n "$FAKE_RULE" ]; then case "$*" in *"cli.py host-command"*|*"cli.py install-codex-rule"*)'
+            f' exec "{TRUSTED_PY}" "{self.fakes / "fake_rule.py"}" "$@";; esac; fi\n'
+            f'exec "{TRUSTED_PY}" "$@"\n')
+        (self.fakes / "python3.real").symlink_to(TRUSTED_PY)
         for fake in self.fakes.iterdir():
             if not fake.is_symlink():
                 fake.chmod(0o755)
@@ -911,6 +979,7 @@ class WizardTerminalTests(unittest.TestCase):
                                  "PYTHONDONTWRITEBYTECODE", "CODEX_HOME")}
         self.env.update(
             PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
+            FAKE_RULE_LOG=str(self.rule_log),
             TMPDIR=str(self.tmpdir), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
             GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
             GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
@@ -1130,14 +1199,11 @@ class WizardTerminalTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
-    @NEEDS_TRUSTED_PYTHON
     def test_full_run_leaves_no_bytecode_quotes_commands_and_cleans_up(self) -> None:
-        base = self.non_temporary_base()
-        project, checks = self.make_project("my proj;x", base)
-        # The rule's protected copy refuses a temporary home, so this run's HOME is outside them too.
-        self.home = base / "home"
-        self.home.mkdir(mode=0o700)
-        self.env["HOME"] = str(self.home)
+        # The Codex rule's replies come from the fake CLI (the runtime's account-home check
+        # refuses a test HOME); test_install drives the real rule lifecycle in process.
+        project, checks = self.make_project("my proj;x", self.non_temporary_base())
+        self.env["FAKE_RULE"] = "missing"
         self.to_project_prompt(project)
         self.send("\r")
         self.expect("Path to operational-checks.json")
@@ -1187,22 +1253,13 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertRegex(final, r"and its copy:\n\s+\S*/\.codex/agent-orchestration/")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
-        rules = list((self.home / ".codex" / "rules").iterdir())
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(oct(rules[0].stat().st_mode & 0o777), "0o600")
         cli = project / ".codex" / "orchestration" / "cli.py"
-        expected = subprocess.run(
-            [sys.executable, str(cli), "install-codex-rule", "--project-root", str(project), "--print"],
-            capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1"), check=True)
-        import json
-        self.assertEqual(rules[0].read_text(), json.loads(expected.stdout)["rule_text"])
-        status = json.loads(subprocess.run(
-            [sys.executable, str(cli), "host-command", "--project-root", str(project)],
-            capture_output=True, text=True, env=dict(self.env, PYTHONDONTWRITEBYTECODE="1")).stdout)
-        self.assertEqual(status["codex_rule"], "installed")
-        copy_cli = status["argv_prefix"][-1]
-        self.assertTrue(copy_cli.startswith(str(self.home / ".codex" / "agent-orchestration")), copy_cli)
-        self.assertIn(json.dumps(copy_cli), rules[0].read_text())
+        # The rule was written by this checkout's own CLI, for this project.
+        clone = str(ORCHESTRATION / "cli.py")
+        rule_calls = self.rule_log.read_text().splitlines()
+        self.assertEqual([call.split(clone + " ", 1)[1] for call in rule_calls if "install-codex-rule" in call],
+                         [f"install-codex-rule --project-root {project} --print",
+                          f"install-codex-rule --project-root {project}"])
         runs = self.py_log.read_text().split()
         self.assertTrue(runs and set(runs) == {"1"}, runs)
         self.assert_python_isolated()
@@ -1332,7 +1389,7 @@ class WizardTerminalTests(unittest.TestCase):
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
@@ -1529,17 +1586,16 @@ class WizardTerminalTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
-    @NEEDS_TRUSTED_PYTHON
     def test_verify_retry_back_and_the_summary_return_to_the_menu(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)  # left uncommitted: verification fails
-        self.start(project)
+        self.start(project, {"FAKE_RULE": "missing"})
         self.expect("Everything looks good")
         self.send("\r")
         self.expect("Project path")
@@ -1760,7 +1816,7 @@ class WizardTerminalTests(unittest.TestCase):
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         (project / ".codex" / "local*").write_text("local\n")
@@ -1807,8 +1863,7 @@ class WizardTerminalTests(unittest.TestCase):
                        check=True, env=self.env)
         self.drive_to_commit_menu(project, checks)
         plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen)
-        self.assertIn("Git runs with the project's hooks, file-system monitor, commit signing and background "
-                      "maintenance turned off", re.sub(r"\s+", " ", plain))
+        self.assertIn("Setup commits with Git's plumbing commands only", re.sub(r"\s+", " ", plain))
         self.send("\r")
         final = self.finish_after_install()
         self.assertIn("; committed", final)
@@ -1876,17 +1931,11 @@ class WizardTerminalTests(unittest.TestCase):
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(status, "")
 
-    @NEEDS_TRUSTED_PYTHON
     def test_a_stale_rule_left_unchanged_keeps_its_undo_instruction(self) -> None:
         import hashlib
         project, checks = self.make_project(base=self.non_temporary_base())
         digest = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:12]
-        rules = self.home / ".codex" / "rules"
-        rules.mkdir(parents=True, mode=0o700)
-        stale = rules / f"agent-orchestration-{digest}.rules"
-        stale.write_text("# an older rule for this project\n")
-        stale.chmod(0o600)
-        self.drive_to_commit_menu(project, checks)
+        self.drive_to_commit_menu(project, checks, {"FAKE_RULE": "stale"})
         self.send("\r")
         self.expect("Continue")
         self.send("\r")
@@ -1910,21 +1959,20 @@ class WizardTerminalTests(unittest.TestCase):
         self.assertNotIn("until the Codex commands rule exists", final)
         self.assertRegex(final, r"to undo only the rule, delete:\n\s+\S*/\.codex/rules/agent-orchestration-"
                          + digest + r"\.rules")
-        self.assertEqual("# an older rule for this project\n", stale.read_text())
+        self.assertNotIn("install-codex-rule", self.rule_log.read_text())  # left unchanged
 
-    @NEEDS_TRUSTED_PYTHON
     def test_verify_reports_the_codex_commands_rule_without_writing_it(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
-        self.start(project)
+        self.start(project, {"FAKE_RULE": "missing"})
         self.expect("Everything looks good")
         self.send("\r")
         self.expect("Project path")
@@ -1951,14 +1999,13 @@ class WizardTerminalTests(unittest.TestCase):
         routing_in = self.base / "par.json"
         routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
         subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
              "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
             check=True, capture_output=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "add", "-A"], check=True, env=self.env)
         subprocess.run(["git", "-C", str(project), "commit", "-qm", "install"], check=True, env=self.env)
-        elsewhere = self.base / "codex-elsewhere"
-        elsewhere.mkdir()
-        self.start(project, {"CODEX_HOME": str(elsewhere)})
+        # The real CLI, with HOME pointed at a test folder: not the account's home folder.
+        self.start(project)
         self.expect("Everything looks good")
         self.send("\r")
         self.expect("Project path")
@@ -1968,14 +2015,14 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("cannot be used with this Codex setup")
         self.expect("Continue")
         plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
-        self.assertIn("CODEX_HOME points somewhere other than ~/.codex", plain)
-        self.assertIn("unset CODEX_HOME", plain)
+        self.assertIn("HOME is not this account's home folder", plain)
+        self.assertIn("run setup with HOME set to your own home folder", plain)
         self.assertNotIn("may be older", plain)
         self.send("\r")
         self.expect("Back to the main menu")
         self.send("\r")
         self.assertEqual(self.finish(), 0)
-        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertFalse((self.home / ".codex").exists())
 
     def test_an_untrusted_python_is_explained_and_nothing_is_written(self) -> None:
         project, checks = self.make_project(base=self.non_temporary_base())

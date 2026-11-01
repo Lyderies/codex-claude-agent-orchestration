@@ -63,6 +63,18 @@
     a bridged Codex child receives its routed role's developer instructions (as
     `-c developer_instructions=...`), refused unless they match the run's recorded
     execution configuration.
+- **Owner-side round 2 (0.8.9).**
+  - Setup and the installer no longer run `status`, `add` or `commit` on the project: state
+    comes from `ls-files`/`ls-tree` and byte comparison, and commits from
+    `hash-object -w --no-filters`, `update-index`, `write-tree`, `commit-tree --no-gpg-sign`
+    and `update-ref` with the old value. Every owner Git process sets `GIT_ALLOW_PROTOCOL=""`
+    and `GIT_NO_LAZY_FETCH=1`, and partial clones and promisor remotes are refused.
+  - The interpreter rule is the runtime's (`host_paths.TRUSTED_INSTALL_ROOTS` and
+    `install_location_problem`), replacing the home tool-folder list.
+  - The deny-rule ownership record moved to the owner's learning state; an in-project record
+    from an earlier version is used once, only without an owner record and only for generated
+    rules, then deleted. Settings are staged in that owner folder and renamed into place after
+    re-comparing the destination.
 - **Owner-side review fixes (0.8.9).** Two further reviews of setup, attestation and the
   installer, under the narrowed threat model (sessions may be opened on a project's parent
   folder, never on the home folder, its parent or `/`; this repository must sit outside every

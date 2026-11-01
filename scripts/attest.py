@@ -27,6 +27,7 @@ import argparse
 import base64
 import getpass
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -259,27 +260,28 @@ def remove_scratch(path: Path) -> bool:
 # --- the trusted interpreter and the project's runtime ----------------------------------
 
 
-# Folders under the home folder where interpreter managers install Python. A Codex session
-# is never opened on the home folder (the supported threat model), so these stay out of its
-# reach, while any other folder under home may be a project or a project's parent folder,
-# which a session can be opened on.
-HOME_TOOL_ROOTS = (
-    ".pyenv", ".local", ".asdf", ".rye", ".conda", ".mise", ".nix-profile", ".uv",
-    ".homebrew", "homebrew", "miniconda3", "anaconda3", "miniforge3", "mambaforge",
-)
+# The runtime's own rule for where a trusted program may be installed
+# (host_paths.TRUSTED_INSTALL_ROOTS and install_location_problem), loaded by file from this
+# repository's package so owner tools and the runtime decide alike. It imports only the
+# standard library.
+_HOST_PATHS_FILE = (Path(__file__).resolve().parents[1] / "packages" / "codex-agents" / "native-package"
+                    / ".codex" / "orchestration" / "codex_agents" / "host_paths.py")
+_HOST_PATHS_SPEC = importlib.util.spec_from_file_location("agent_orchestration_host_paths", _HOST_PATHS_FILE)
+host_paths = importlib.util.module_from_spec(_HOST_PATHS_SPEC)
+_HOST_PATHS_SPEC.loader.exec_module(host_paths)
 UNTRUSTED_PYTHON_ADVICE = "Put a system Python, such as Homebrew's or python.org's, first on PATH"
 
 
-def python_location_problem(executable: Path, project: Path | None = None,
-                            home: Path | None = None) -> str | None:
+def python_location_problem(executable: Path, project: Path | None = None) -> str | None:
     """Why an interpreter's real file may not run owner code, or None; decided without running it.
 
     Refused: a temporary folder or the project (an AI agent can write both); a virtual
     environment's copy (its pyvenv.cfg can point it at other code); macOS's /usr/bin xcrun
-    shim (it reads a lookup cache under $TMPDIR); and any folder under the home folder other
-    than an interpreter manager's (HOME_TOOL_ROOTS), since a Codex session may be opened on a
-    project's parent folder there. ./setup.sh applies the same rules in bash before it
-    starts any Python.
+    shim (it reads a lookup cache under $TMPDIR); and anything outside the runtime's trusted
+    installation folders (host_paths.install_location_problem: system folders, Homebrew,
+    python.org, Xcode, Nix, or a hidden top-level folder of the account's home folder). A
+    sibling install such as /srv/work/tools, which a session opened on /srv/work could
+    change, is refused. ./setup.sh applies the same rules in bash before it starts any Python.
     """
 
     if not executable.is_absolute() or Path(os.path.realpath(executable)) != executable:
@@ -292,13 +294,7 @@ def python_location_problem(executable: Path, project: Path | None = None,
         return "it belongs to a virtual environment, whose settings an AI agent could change"
     if sys.platform == "darwin" and executable.parent == Path("/usr/bin"):
         return "it is macOS's /usr/bin/python3, a shim that reads a cache an AI agent can write"
-    home = Path(os.path.realpath(home if home is not None else Path.home()))
-    if within(executable, home) and executable != home:
-        first = executable.relative_to(home).parts[0]
-        if first not in HOME_TOOL_ROOTS:
-            return ("it is in a folder under your home folder that a Codex session could be "
-                    "opened on")
-    return None
+    return host_paths.install_location_problem(executable)
 
 
 def trusted_python(project: Path | None = None) -> str:

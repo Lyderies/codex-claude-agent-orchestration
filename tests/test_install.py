@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -99,13 +100,20 @@ def make_target(base: Path) -> tuple[Path, list[str]]:
 
 
 def isolate_home(test: unittest.TestCase, home: Path) -> None:
-    """Point HOME at a test folder (remove runs remove-codex-rule, which reads ~/.codex)."""
+    """Point HOME at a test folder (remove runs remove-codex-rule, which reads ~/.codex; the
+    ownership record lives in the learning state under it)."""
 
     home.mkdir(mode=0o700, exist_ok=True)
-    environment = {key: value for key, value in os.environ.items() if key != "CODEX_HOME"}
+    environment = {key: value for key, value in os.environ.items() if key not in ("CODEX_HOME", "XDG_STATE_HOME")}
     patcher = mock.patch.dict(os.environ, {**environment, "HOME": str(home)}, clear=True)
     patcher.start()
     test.addCleanup(patcher.stop)
+    # A CI toolcache Python sits outside the trusted installation folders; the rule itself is
+    # tested in test_attest, so here this test's own interpreter counts as installed.
+    if installer.attest.python_location_problem(Path(os.path.realpath(sys.executable))) is not None:
+        trusted = mock.patch.object(installer.attest.host_paths, "install_location_problem", return_value=None)
+        trusted.start()
+        test.addCleanup(trusted.stop)
 
 
 class UmbrellaInstallTests(unittest.TestCase):
@@ -274,7 +282,8 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assertTrue(gits)
         for command in gits:
             self.assertEqual(command[0], trusted, command)  # never a PATH lookup
-            self.assertEqual(command[3:3 + len(installer.GIT_SAFE)], list(installer.GIT_SAFE), command)
+            if command[1] == "-C":  # the installer's own calls; git_plumbing's carry its options
+                self.assertEqual(command[3:3 + len(installer.GIT_SAFE)], list(installer.GIT_SAFE), command)
         for option in ("core.hooksPath=/dev/null", "core.fsmonitor=false", "commit.gpgSign=false",
                        "tag.gpgSign=false", "gc.auto=0", "maintenance.auto=false"):
             self.assertIn(option, installer.GIT_SAFE)
@@ -310,6 +319,103 @@ class UmbrellaInstallTests(unittest.TestCase):
         with self.assertRaises(installer.InstallRefused):
             self.install(apply=True)
         self.assertFalse(marker.exists())
+
+    def test_every_owner_git_process_has_no_transport_and_no_lazy_fetch(self) -> None:
+        seen: list[tuple[list[str], dict]] = []
+        real_run = subprocess.run
+
+        def spy(command, *args, **kwargs):
+            seen.append(([str(part) for part in command], kwargs.get("env") or {}))
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(installer.subprocess, "run", spy):
+            self.assertTrue(self.install(apply=True)["ok"])
+            git(self.target, "add", ".")
+            git(self.target, "commit", "-qm", "install packages")
+            installer.project_changes(self.target, list(installer.MANAGED_PATHS))
+        trusted = installer.git_executable([self.target])
+        gits = [(command, env) for command, env in seen if command[0] == trusted]  # not this test's own git
+        self.assertTrue(gits)
+        for command, env in gits:
+            self.assertEqual(env.get("GIT_ALLOW_PROTOCOL"), "", command)
+            self.assertEqual(env.get("GIT_NO_LAZY_FETCH"), "1", command)
+            for porcelain in ("status", "add", "commit", "diff", "checkout"):
+                self.assertNotIn(porcelain, command[3 + len(installer.GIT_SAFE):][:2], command)
+
+    def test_partial_clones_and_promisor_remotes_are_refused(self) -> None:
+        for key, value in (("extensions.partialClone", "origin"), ("remote.origin.promisor", "true"),
+                           ("remote.origin.partialclonefilter", "blob:none")):
+            with self.subTest(key=key):
+                git(self.target, "config", key, value)
+                with self.assertRaisesRegex(installer.InstallRefused, "partial clone or names a promisor"):
+                    self.install(apply=True)
+                with self.assertRaisesRegex(installer.InstallRefused, "partial clone"):
+                    installer.commit_paths(self.target, "m", "d", ["README.md"])
+                git(self.target, "config", "--unset", key)
+
+    def test_changes_are_found_with_plumbing_as_status_reports_them(self) -> None:
+        codex = self.target / ".codex"
+        codex.mkdir()
+        for name in ("kept", "edited", "gone", "staged", "renamed", "mode"):
+            (codex / name).write_text(f"{name}\n")
+        (self.target / ".gitignore").write_text(".codex/ignored\n")
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "files")
+        self.assertEqual(installer.project_changes(self.target, [".codex"]), [])
+        (codex / "edited").write_text("changed\n")
+        (codex / "gone").unlink()
+        (codex / "staged").write_text("staged change\n")
+        git(self.target, "add", ".codex/staged")
+        git(self.target, "mv", ".codex/renamed", ".codex/moved")
+        (codex / "mode").chmod(0o755)
+        (codex / "untracked").write_text("new\n")
+        (codex / "ignored").write_text("ignored\n")
+        (codex / "kept").touch()  # a newer time alone is no change
+        self.assertEqual(installer.project_changes(self.target, [".codex"]),
+                         [".codex/edited", ".codex/gone", ".codex/mode", ".codex/moved", ".codex/renamed",
+                          ".codex/staged", ".codex/untracked"])
+        reported = git(self.target, "status", "--porcelain", "--untracked-files=all", "--", ".codex").stdout
+        self.assertEqual(len(reported.splitlines()), 6)  # status shows the rename as one line
+
+    def test_a_plumbing_commit_takes_only_its_paths_and_runs_no_project_program(self) -> None:
+        ran = self.base / "ran"
+        hooks = self.base / "githooks"
+        hooks.mkdir()
+        for name in ("pre-commit", "commit-msg", "post-commit", "reference-transaction", "post-index-change"):
+            (hooks / name).write_text(f"#!/bin/sh\necho {name} >> '{ran}'\n")
+            (hooks / name).chmod(0o755)
+        (self.target / "README.md").write_text("# Staged by the user\n")
+        git(self.target, "add", "README.md")
+        (self.target / ".codex").mkdir()
+        (self.target / ".codex" / "a").write_text("a\n")
+        head = git(self.target, "rev-parse", "HEAD").stdout.strip()
+        git(self.target, "config", "core.hooksPath", str(hooks))
+        git(self.target, "config", "commit.gpgSign", "true")  # never honoured: commits are never signed
+        self.assertEqual(installer.commit_paths(self.target, "Install", "Details", [".codex/a"]), "committed")
+        self.assertFalse(ran.exists(), "a project hook ran")
+        git(self.target, "config", "--unset", "core.hooksPath")
+        self.assertEqual(git(self.target, "rev-parse", "HEAD^").stdout.strip(), head)
+        self.assertEqual(git(self.target, "show", "--name-only", "--format=%s", "HEAD").stdout.split(),
+                         ["Install", ".codex/a"])
+        self.assertNotIn("gpgsig", git(self.target, "cat-file", "commit", "HEAD").stdout)
+        # The user's own staged change is still staged, and the committed path is clean.
+        self.assertEqual(git(self.target, "status", "--porcelain").stdout.splitlines(), ["M  README.md"])
+        self.assertEqual(installer.commit_paths(self.target, "Again", "x", [".codex/a"]), "nothing")
+
+    def test_a_plumbing_commit_refuses_when_the_branch_moved(self) -> None:
+        (self.target / ".codex").mkdir()
+        (self.target / ".codex" / "a").write_text("a\n")
+        real = installer._git_run
+
+        def move_branch_first(target, *args, **kwargs):
+            if args and args[0] == "update-ref":
+                git(self.target, "commit", "-q", "--allow-empty", "-m", "moved meanwhile")
+            return real(target, *args, **kwargs)
+
+        with mock.patch.object(installer, "_git_run", move_branch_first):
+            with self.assertRaisesRegex(installer.InstallRefused, "branch moved"):
+                installer.commit_paths(self.target, "Install", "Details", [".codex/a"])
+        self.assertEqual(git(self.target, "log", "-1", "--format=%s").stdout.strip(), "moved meanwhile")
 
     def test_git_never_runs_a_planted_fsmonitor(self) -> None:
         marker = self.base / "fsmonitor-ran"
@@ -352,14 +458,27 @@ class UmbrellaInstallTests(unittest.TestCase):
     def settings(self) -> dict:
         return json.loads((self.target / ".claude" / "settings.json").read_text(encoding="utf-8"))
 
+    def owner_record_path(self) -> Path:
+        return installer.attest.default_state_root() / "installer" / installer.OwnerState.record_name(self.target)
+
+    def owner_record(self) -> dict:
+        return json.loads(self.owner_record_path().read_text())
+
     def test_install_creates_settings_and_remove_takes_them_away(self) -> None:
         preview = self.install()
         self.assertEqual(preview["claude_settings"]["action"], "create")
-        self.assertEqual(preview["claude_settings"]["changed_paths"],
-                         [installer.PERMISSIONS_RECORD, installer.CLAUDE_SETTINGS])
+        self.assertEqual(preview["claude_settings"]["changed_paths"], [installer.CLAUDE_SETTINGS])
         self.assertFalse((self.target / ".claude" / "settings.json").exists())
+        self.assertFalse(self.owner_record_path().exists())
         self.assertTrue(self.install(apply=True)["ok"])
         self.assertEqual(self.settings(), {"permissions": {"deny": installer.deny_rules()}})
+        # The record of what install added lives in the owner's state, never in the project.
+        self.assertEqual(self.owner_record()["deny"], installer.deny_rules())
+        self.assertEqual(oct(self.owner_record_path().stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct(self.owner_record_path().parent.stat().st_mode & 0o777), "0o700")
+        self.assertFalse((self.target / installer.LEGACY_RECORD).exists())
+        self.assertEqual([path.name for path in self.owner_record_path().parent.iterdir()],
+                         [self.owner_record_path().name])  # no staging folder left
         git(self.target, "add", ".")
         git(self.target, "commit", "-qm", "install packages")
         verified = installer.operate("verify", self.target)
@@ -368,7 +487,7 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assertTrue(removed["ok"], removed)
         self.assertEqual(removed["claude_settings"]["action"], "remove")
         self.assertFalse((self.target / ".claude" / "settings.json").exists())
-        self.assertFalse((self.target / installer.PERMISSIONS_RECORD).exists())
+        self.assertFalse(self.owner_record_path().exists())
 
     def test_user_settings_are_kept_and_only_added_entries_are_removed(self) -> None:
         mine = installer.deny_rules()[0]
@@ -393,8 +512,7 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assertEqual(merged["permissions"]["ask"], ["Bash(git push *)"])
         self.assertEqual(merged["permissions"]["deny"][:3], ["Read(./.env)", mine, 7])
         self.assertEqual(set(merged["permissions"]["deny"][3:]) | {mine}, set(installer.deny_rules()))
-        record = json.loads((self.target / installer.PERMISSIONS_RECORD).read_text())
-        self.assertNotIn(mine, record["deny"])  # the user had it first, so it stays theirs
+        self.assertNotIn(mine, self.owner_record()["deny"])  # the user had it first, so it stays theirs
         git(self.target, "add", ".")
         git(self.target, "commit", "-qm", "install packages")
         again = self.install(apply=True)  # an update with nothing new changes nothing
@@ -405,10 +523,9 @@ class UmbrellaInstallTests(unittest.TestCase):
 
     def test_an_entry_install_added_and_no_longer_wants_is_removed_on_update(self) -> None:
         self.assertTrue(self.install(apply=True)["ok"])
-        record_path = self.target / installer.PERMISSIONS_RECORD
-        record = json.loads(record_path.read_text())
+        record = self.owner_record()
         record["deny"].append("Bash(*.codex/orchestration/cli.py retired-command)")
-        record_path.write_text(json.dumps(record))
+        self.owner_record_path().write_text(json.dumps(record))
         data = self.settings()
         data["permissions"]["deny"].append("Bash(*.codex/orchestration/cli.py retired-command)")
         (self.target / ".claude" / "settings.json").write_text(json.dumps(data))
@@ -420,32 +537,64 @@ class UmbrellaInstallTests(unittest.TestCase):
             self.assertTrue(self.install(apply=True)["ok"])
         self.assertEqual(self.settings()["permissions"]["deny"], installer.deny_rules())
 
-    def test_a_forged_record_never_deletes_a_users_rule(self) -> None:
-        settings = self.target / ".claude" / "settings.json"
-        settings.parent.mkdir()
-        settings.write_text(json.dumps({"permissions": {"deny": ["Bash(curl *)"]}}), encoding="utf-8")
-        record = self.target / installer.PERMISSIONS_RECORD
+    def legacy_record(self, deny: list[str]) -> Path:
+        record = self.target / installer.LEGACY_RECORD
+        record.parent.mkdir(exist_ok=True)
         record.write_text(json.dumps({"format": 1, "created_settings_file": False, "created_permissions": False,
-                                      "created_deny": False, "deny": ["Bash(curl *)", "Edit(/src/**)"]}))
-        git(self.target, "add", ".")
-        git(self.target, "commit", "-qm", "planted record")
+                                      "created_deny": False, "deny": deny}))
+        return record
+
+    def test_a_record_planted_in_the_project_never_deletes_a_users_rule(self) -> None:
+        settings = self.target / ".claude" / "settings.json"
         self.assertTrue(self.install(apply=True)["ok"])
-        deny = self.settings()["permissions"]["deny"]
-        self.assertEqual(deny[0], "Bash(curl *)")
-        owned = json.loads(record.read_text())["deny"]
-        self.assertNotIn("Bash(curl *)", owned)
-        self.assertNotIn("Edit(/src/**)", owned)
         git(self.target, "add", ".")
         git(self.target, "commit", "-qm", "install packages")
+        # The user also wants a generated rule of their own, and an agent plants a record
+        # claiming it for the installer (and an unrelated rule).
+        data = self.settings()
+        data["permissions"]["deny"] = ["Bash(curl *)", *data["permissions"]["deny"]]
+        settings.write_text(json.dumps(data), encoding="utf-8")
+        owned = self.owner_record()
+        owned["deny"].remove("Edit(/.git/**)")
+        owned["created_settings_file"] = False
+        self.owner_record_path().write_text(json.dumps(owned))  # the user's own Edit(/.git/**)
+        self.legacy_record(["Bash(curl *)", "Edit(/.git/**)"])
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "planted record")
+        removed = installer.operate("remove", self.target, apply=True)
+        self.assertTrue(removed["ok"], removed)
+        self.assertNotIn("Edit(/.git/**)", removed["claude_settings"]["removed"])
+        self.assertEqual(self.settings()["permissions"]["deny"], ["Bash(curl *)", "Edit(/.git/**)"])
+        self.assertFalse((self.target / installer.LEGACY_RECORD).exists())
+
+    def test_an_earlier_versions_project_record_is_migrated_once(self) -> None:
+        self.assertTrue(self.install(apply=True)["ok"])
+        # Make the install look like an earlier version's: its record in the project only.
+        record = self.owner_record()
+        self.owner_record_path().unlink()
+        legacy = self.legacy_record([*record["deny"], "Bash(curl *)"])
+        legacy_data = json.loads(legacy.read_text())
+        legacy_data.update(created_settings_file=True, created_permissions=True, created_deny=True)
+        legacy.write_text(json.dumps(legacy_data))
+        git(self.target, "add", ".")
+        git(self.target, "commit", "-qm", "an earlier version's install")
+        preview = self.install()
+        self.assertIn(installer.LEGACY_RECORD, preview["claude_settings"]["changed_paths"])  # a deletion to commit
+        self.assertTrue(self.install(apply=True)["ok"])
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.owner_record()["deny"], installer.deny_rules())  # Bash(curl *) never owned
+        git(self.target, "add", "-A")
+        git(self.target, "commit", "-qm", "migrated")
         self.assertTrue(installer.operate("remove", self.target, apply=True)["ok"])
-        self.assertEqual(json.loads(settings.read_text(encoding="utf-8")),
-                         {"permissions": {"deny": ["Bash(curl *)"]}})
+        self.assertFalse((self.target / ".claude" / "settings.json").exists())
 
     def test_historical_generated_rules_count_as_the_installers(self) -> None:
         generated = installer.generated_rules()
         self.assertTrue(set(installer.deny_rules()) <= generated)
         for name in installer.HISTORICAL_OWNER_ONLY:
             self.assertIn(f"Bash(*.codex/orchestration/cli.py {name} *)", generated)
+        self.assertIn("Edit(/.claude/agent-orchestration-permissions.json)", generated)
+        self.assertNotIn("Edit(/.claude/agent-orchestration-permissions.json)", installer.deny_rules())
         self.assertNotIn("Bash(curl *)", generated)
 
     def test_settings_changed_after_planning_are_never_overwritten(self) -> None:
@@ -456,34 +605,73 @@ class UmbrellaInstallTests(unittest.TestCase):
         with self.assertRaisesRegex(installer.InstallRefused, "changed while setup ran"):
             installer.apply_settings(self.target, plan)
         self.assertEqual(json.loads(settings.read_text()), {"permissions": {"deny": ["Bash(rm *)"]}})
-        self.assertFalse((self.target / installer.PERMISSIONS_RECORD).exists())
+        self.assertFalse(self.owner_record_path().exists())
         # Applying replans from the current files, so the edit is kept.
         installer.apply_settings(self.target, installer.plan_settings(self.target, "install"))
         self.assertEqual(self.settings()["permissions"]["deny"][0], "Bash(rm *)")
 
+    def test_the_destination_is_compared_again_right_before_the_rename(self) -> None:
+        settings = self.target / ".claude" / "settings.json"
+        plan = installer.plan_settings(self.target, "install")
+        real_write_new = installer._write_new
+
+        def edit_while_staging(directory, name, content, mode):
+            real_write_new(directory, name, content, mode)
+            if name.startswith(".settings.json."):  # the staged copy now exists; the user edits
+                settings.parent.mkdir(exist_ok=True)
+                settings.write_text('{"edited": true}', encoding="utf-8")
+
+        with mock.patch.object(installer, "_write_new", edit_while_staging):
+            with self.assertRaisesRegex(installer.InstallRefused, "changed while setup ran"):
+                installer.apply_settings(self.target, plan)
+        self.assertEqual(json.loads(settings.read_text()), {"edited": True})
+        self.assertEqual([path.name for path in settings.parent.iterdir()], ["settings.json"])
+
+    def test_settings_are_staged_outside_the_project_and_renamed_into_place(self) -> None:
+        renames: list[tuple[int, int]] = []
+        real_rename = installer.os.rename
+
+        def spy(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+            renames.append((src_dir_fd, dst_dir_fd))
+            return real_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with mock.patch.object(installer.os, "rename", spy):
+            installer.apply_settings(self.target, installer.plan_settings(self.target, "install"))
+        self.assertEqual(self.settings(), {"permissions": {"deny": installer.deny_rules()}})
+        # One rename publishes the settings from a different (owner) folder; one stores the record.
+        self.assertEqual(len(renames), 2)
+        self.assertEqual(sum(1 for source, destination in renames if source != destination), 1)
+        self.assertEqual([path.name for path in (self.target / ".claude").iterdir()], ["settings.json"])
+
+    def test_another_file_system_falls_back_to_a_random_name_beside_the_settings(self) -> None:
+        real_rename = installer.os.rename
+
+        def cross_device(source, destination, *, src_dir_fd=None, dst_dir_fd=None):
+            if src_dir_fd != dst_dir_fd:
+                raise OSError(errno.EXDEV, "simulated other file system")
+            return real_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with mock.patch.object(installer.os, "rename", cross_device):
+            installer.apply_settings(self.target, installer.plan_settings(self.target, "install"))
+        self.assertEqual(self.settings(), {"permissions": {"deny": installer.deny_rules()}})
+        self.assertEqual([path.name for path in (self.target / ".claude").iterdir()], ["settings.json"])
+
     def test_an_interrupted_paired_write_recovers(self) -> None:
         plan = installer.plan_settings(self.target, "install")
-        self.assertEqual(plan["order"], [installer.PERMISSIONS_RECORD, installer.CLAUDE_SETTINGS])
-        real_write = installer._Project.write
-
-        def fail_on_settings(project, relative, content):
-            if relative == installer.CLAUDE_SETTINGS:
-                raise OSError("simulated failure")
-            return real_write(project, relative, content)
-
-        with mock.patch.object(installer._Project, "write", fail_on_settings):
+        self.assertEqual(plan["order"], [installer.OWNER_RECORD, installer.CLAUDE_SETTINGS])
+        with mock.patch.object(installer._Project, "publish", side_effect=OSError("simulated failure")):
             with self.assertRaises(OSError):
                 installer.apply_settings(self.target, plan)
-        # The record already claims the entries; the next install adds and owns them.
-        self.assertTrue((self.target / installer.PERMISSIONS_RECORD).exists())
+        # The owner record already claims the entries; the next install adds and owns them.
+        self.assertTrue(self.owner_record_path().exists())
         self.assertFalse((self.target / ".claude" / "settings.json").exists())
         installer.apply_settings(self.target, installer.plan_settings(self.target, "install"))
         self.assertEqual(self.settings()["permissions"]["deny"], installer.deny_rules())
         removal = installer.plan_settings(self.target, "remove")
-        self.assertEqual(removal["order"], [installer.CLAUDE_SETTINGS, installer.PERMISSIONS_RECORD])
+        self.assertEqual(removal["order"], [installer.CLAUDE_SETTINGS, installer.OWNER_RECORD])
         installer.apply_settings(self.target, removal)
         self.assertFalse((self.target / ".claude" / "settings.json").exists())
-        self.assertFalse((self.target / installer.PERMISSIONS_RECORD).exists())
+        self.assertFalse(self.owner_record_path().exists())
 
     def test_unmergeable_settings_refuse_before_any_write(self) -> None:
         settings = self.target / ".claude" / "settings.json"
@@ -643,35 +831,34 @@ class OwnerCommandsFromThisCheckoutTests(unittest.TestCase):
                                    capture_output=True, text=True, stdin=subprocess.DEVNULL)
         return json.loads(completed.stdout)
 
-    def test_host_command_and_the_rule_lifecycle_match_and_copy_this_checkout(self) -> None:
+    def test_host_command_matches_and_the_rule_lifecycle_copies_this_checkout(self) -> None:
         clone = installer.attest.clone_cli()
         root = ["--project-root", str(self.target)]
+        # Under a test HOME both copies answer alike: the runtime's account-home check refuses it.
         before = self.run_cli(clone, "host-command", *root)
         self.assertEqual(before, self.run_cli(self.installed_cli, "host-command", *root))
-        self.assertEqual(before["codex_rule"], "missing")
-        printed = self.run_cli(clone, "install-codex-rule", *root, "--print")
-        self.assertEqual(printed, self.run_cli(self.installed_cli, "install-codex-rule", *root, "--print"))
-        written = self.run_cli(clone, "install-codex-rule", *root)
-        self.assertEqual(written["codex_rule"], "created", written)
-        copy = Path(written["runtime_copy"])
-        self.assertTrue(str(copy).startswith(str(self.home / ".codex" / "agent-orchestration")))
-        sys.path.insert(0, str(installer.ORCHESTRATION))
-        try:
-            from codex_agents.runtime_files import RUNTIME_FILES
-        finally:
-            sys.path.remove(str(installer.ORCHESTRATION))
-        for relative in RUNTIME_FILES:
-            self.assertEqual((copy / ".codex/orchestration" / relative).read_bytes(),
-                             (installer.ORCHESTRATION / relative).read_bytes(), relative)
-        after = self.run_cli(clone, "host-command", *root)
-        self.assertEqual(after, self.run_cli(self.installed_cli, "host-command", *root))
-        self.assertEqual(after["codex_rule"], "installed")
-        self.assertEqual(after["argv_prefix"][-1], str(copy / ".codex" / "orchestration" / "cli.py"))
-        removed = self.run_cli(clone, "remove-codex-rule", *root)
-        self.assertTrue(removed["ready"])
-        self.assertIn(written["rule_file"], removed["removed"])
-        self.assertFalse(copy.exists())
-        self.assertEqual(self.run_cli(clone, "host-command", *root)["codex_rule"], "missing")
+        self.assertEqual(before["codex_rule"], "unsupported")
+        self.assertIn("HOME is not this account's home folder", before["reason"])
+        # The real rule lifecycle, in process, with the account's home pointed at the test home.
+        from codex_agents import host_commands
+        from codex_agents.runtime_files import RUNTIME_FILES
+        environ = {"HOME": str(self.home)}
+        with mock.patch.object(host_commands, "account_home", return_value=self.home):
+            self.assertEqual(host_commands.rule_status(self.target, environ), "missing")
+            written = host_commands.install_rule(self.target, environ)
+            self.assertEqual(written["codex_rule"], "created", written)
+            copy = Path(written["runtime_copy"])
+            self.assertTrue(str(copy).startswith(str(self.home / ".codex" / "agent-orchestration")))
+            for relative in RUNTIME_FILES:  # the copy is exactly this checkout's runtime
+                self.assertEqual((copy / ".codex/orchestration" / relative).read_bytes(),
+                                 (installer.ORCHESTRATION / relative).read_bytes(), relative)
+            self.assertEqual(host_commands.rule_status(self.target, environ), "installed")
+            self.assertEqual(host_commands.argv_prefix(self.target, environ=environ)[-1],
+                             str(copy / ".codex" / "orchestration" / "cli.py"))
+            removed = host_commands.remove_rule(self.target, environ)
+            self.assertIn(str(host_commands.rule_path(self.target, environ)), removed)
+            self.assertFalse(copy.exists())
+            self.assertEqual(host_commands.rule_status(self.target, environ), "missing")
 
     def test_configure_owner_key_writes_the_same_record_from_either_copy(self) -> None:
         key = self.base / "throwaway"

@@ -548,6 +548,34 @@ safety comes from redundant layers.
   `codex exec` read an objective such as `-cfoo=bar` as a configuration override
   (checked on codex-cli 0.164.0 with no credentials); Claude's option parser treats `--`
   the same way (its operands after `--` are never options).
+- **Owner tools (setup, attestation, the installer).**
+  - Owner commands (registration, status, attestation, `host-command`,
+    `install-codex-rule`, `remove-codex-rule`) run this repository's own CLI with
+    `--project-root`, never the project's `.codex/orchestration` code; the clone must
+    therefore sit outside every folder opened in Codex (the wizard's first screen and the
+    README say so). Steps that depend on the install still require it to be this release,
+    byte for byte, with nothing extra in `.codex/orchestration`.
+  - A collector that setup starts through `learning-register` runs the clone's
+    `cli.py learning-serve`; authorization is by version and runtime digest, so a primary
+    that later restarts it runs its own (protected) copy of the same runtime.
+  - The interpreter is judged before it runs, against `host_paths.TRUSTED_INSTALL_ROOTS`
+    and `install_location_problem` (setup.sh keeps a bash copy of the list, kept equal by a
+    test), plus the temporary-folder, project, virtual-environment and xcrun-shim checks.
+  - Git on the project is plumbing only: state from `ls-files`/`ls-tree` and byte
+    comparison, commits through `hash-object -w --no-filters`, `update-index`, `write-tree`,
+    `commit-tree --no-gpg-sign` and `update-ref` with the old value, with
+    `GIT_ALLOW_PROTOCOL=""`, `GIT_NO_LAZY_FETCH=1` and `repository_layout_problem` refusing
+    partial clones; the repository-helper check stays as a second layer.
+  - The installer's record of the deny rules it added lives in the owner's learning state
+    (`installer/claude-settings-<project digest>.json`), never in the project; an entry not
+    recorded there is never removed. When an owner-only CLI subcommand is retired, add its
+    name to `scripts/install.py` `HISTORICAL_OWNER_ONLY` so its old deny rules are still
+    recognised as the installer's.
+  - Residual: the settings file is staged in that owner folder and renamed into place after
+    re-comparing the destination's bytes; an edit landing in the sub-millisecond window
+    between that comparison and the rename is overwritten (accepted). When the state folder
+    is on another file system, the file is staged beside the destination under a random
+    name instead.
 - **Native admission (accepted residual).** A Claude primary's native children run in the
   primary's own session and allowance; admission for them is accounting and policy, not
   a spend boundary, and the native tool consumes no admission capability. A primary that

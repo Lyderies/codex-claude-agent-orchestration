@@ -70,6 +70,17 @@ def private_base(test: unittest.TestCase) -> Path:
 
 
 PROJECT_ID = "prj_" + "0123456789abcdef" * 2
+# A CI toolcache Python lies outside the runtime's trusted installation folders. The rule is
+# tested on its own (IsolationTests); elsewhere this interpreter is treated as installed.
+SELF_TRUSTED = attest.python_location_problem(Path(os.path.realpath(sys.executable))) is None
+TRUST = "" if SELF_TRUSTED else "+trust"
+
+
+def trust_this_interpreter(test: unittest.TestCase) -> None:
+    if not SELF_TRUSTED:
+        patcher = mock.patch.object(attest.host_paths, "install_location_problem", return_value=None)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 # Runs attest.py the way setup.sh does (isolated), pointed at a test bundle and scratch base:
 #   python -I -B -S -c RUNNER attest.py BUNDLE SCRATCH MODE ARGS...
@@ -81,7 +92,9 @@ RUNNER = (
     "spec.loader.exec_module(attest)\n"
     "attest.NATIVE_PACKAGE = Path(sys.argv[2])\n"
     "attest.SCRATCH_BASE = sys.argv[3]\n"
-    "if sys.argv[4] == 'break-echo':\n"
+    "if sys.argv[4].endswith('+trust'):\n"
+    "    attest.host_paths.install_location_problem = lambda path: None\n"
+    "if sys.argv[4].startswith('break-echo'):\n"
     "    import termios\n"
     "    def broken(*a, **k):\n"
     "        raise termios.error('simulated')\n"
@@ -293,6 +306,7 @@ class AttestHarness(unittest.TestCase):
         attest._CLEANUP_FAILURES.clear()
         attest._TEMP_DIRS.clear()
         self.scratch_base = private_base(self)
+        trust_this_interpreter(self)
         for patcher in (mock.patch.object(attest, "check_ssh_keygen"),
                         mock.patch.object(attest, "check_project_runtime"),
                         mock.patch.object(attest, "SCRATCH_BASE", str(self.scratch_base))):
@@ -1344,30 +1358,43 @@ class IsolationTests(unittest.TestCase):
         with mock.patch.object(attest.sys, "executable", str(venv / "bin" / "python3")):
             with self.assertRaisesRegex(attest.AttestError, "virtual environment"):
                 attest.trusted_python()
-        project = outside / "project"
-        (project / "bin").mkdir(parents=True)
-        (project / "bin" / "python3").write_text("")
-        with mock.patch.object(attest.sys, "executable", str(project / "bin" / "python3")):
-            self.assertEqual(attest.trusted_python(), str(project / "bin" / "python3"))
-            with self.assertRaisesRegex(attest.AttestError, "inside the project"):
-                attest.trusted_python(project)
+        # A hidden folder of the account's home is a trusted installation folder; a project
+        # inside it still is not.
+        with mock.patch.object(attest.host_paths, "account_home", return_value=outside):
+            project = outside / ".tools" / "project"
+            (project / "bin").mkdir(parents=True)
+            (project / "bin" / "python3").write_text("")
+            with mock.patch.object(attest.sys, "executable", str(project / "bin" / "python3")):
+                self.assertEqual(attest.trusted_python(), str(project / "bin" / "python3"))
+                with self.assertRaisesRegex(attest.AttestError, "inside the project"):
+                    attest.trusted_python(project)
 
-    def test_interpreters_under_home_are_trusted_only_in_a_tool_folder(self) -> None:
+    def test_only_the_runtimes_trusted_installation_folders_are_accepted(self) -> None:
         home = private_base(self) / "home"
-        for relative, expected in ((".pyenv/versions/3.12.4/bin/python3.12", None),
-                                   (".local/share/uv/python/cpython-3.12/bin/python3.12", None),
-                                   ("miniforge3/bin/python3", None),
-                                   ("Code/tools/bin/python3", "under your home folder"),
-                                   ("projects/app/.venv-copies/bin/python3", "under your home folder")):
-            with self.subTest(path=relative):
-                executable = home / relative
-                executable.parent.mkdir(parents=True, exist_ok=True)
-                executable.write_text("")
-                problem = attest.python_location_problem(executable, home=home)
-                if expected is None:
-                    self.assertIsNone(problem)
-                else:
-                    self.assertIn(expected, problem)
+        with mock.patch.object(attest.host_paths, "account_home", return_value=home):
+            for relative, trusted in ((".pyenv/versions/3.12.4/bin/python3.12", True),
+                                      (".local/share/uv/python/cpython-3.12/bin/python3.12", True),
+                                      ("miniforge3/bin/python3", False),
+                                      ("Code/tools/bin/python3", False),
+                                      ("Work/tools/python3", False)):
+                with self.subTest(path=relative):
+                    executable = home / relative
+                    executable.parent.mkdir(parents=True, exist_ok=True)
+                    executable.write_text("")
+                    problem = attest.python_location_problem(executable)
+                    if trusted:
+                        self.assertIsNone(problem)
+                    else:
+                        self.assertIn("not in a trusted installation folder", problem)
+            # A sibling install outside the home folder, as /srv/work/tools next to /srv/work/app.
+            sibling = home.parent / "srv-work" / "tools" / "python3"
+            sibling.parent.mkdir(parents=True)
+            sibling.write_text("")
+            self.assertIn("not in a trusted installation folder", attest.python_location_problem(sibling))
+        # The list is the runtime's own.
+        self.assertIs(attest.host_paths.TRUSTED_INSTALL_ROOTS, attest.host_paths.TRUSTED_INSTALL_ROOTS)
+        self.assertIn("/opt/homebrew", attest.host_paths.TRUSTED_INSTALL_ROOTS)
+        self.assertEqual(attest.host_paths.__file__, str(_ORCHESTRATION / "codex_agents" / "host_paths.py"))
 
     @unittest.skipUnless(sys.platform == "darwin", "the xcrun shim is macOS's")
     def test_the_macos_xcrun_shim_is_refused(self) -> None:
@@ -1393,6 +1420,7 @@ class IsolationTests(unittest.TestCase):
             attest.copy_input(big, base / "from-big.json")
 
     def test_a_symlinked_interpreter_is_launched_as_its_real_file(self) -> None:
+        trust_this_interpreter(self)
         outside = private_base(self)
         link = outside / "python3"
         link.symlink_to(os.path.realpath(sys.executable))
@@ -1425,7 +1453,7 @@ class RealTerminalTests(unittest.TestCase):
         env.pop("SSH_AUTH_SOCK", None)
         args = ["--target", str(project), "--state-root", str(state)]
         command = [sys.executable, "-I", "-B", "-S", "-c", RUNNER, str(_SCRIPT), str(bundle),
-                   str(private_base(self)), "break-echo" if break_echo else "normal", *args]
+                   str(private_base(self)), ("break-echo" if break_echo else "normal") + TRUST, *args]
         pid, fd = pty.fork()
         if pid == 0:
             os.execve(sys.executable, command, env)
@@ -1527,7 +1555,7 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         pid, fd = pty.fork()
         if pid == 0:
             os.execve(sys.executable, [sys.executable, "-I", "-B", "-S", "-c", RUNNER, str(_SCRIPT),
-                                       str(self.bundle), str(self.scratch), "normal",
+                                       str(self.bundle), str(self.scratch), "normal" + TRUST,
                                        "--target", str(self.project), "--state-root", str(self.state)], env)
         finish = _child_finisher(pid, fd)
         self.addCleanup(finish)

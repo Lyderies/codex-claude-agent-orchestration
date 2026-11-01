@@ -14,14 +14,15 @@
 # Owner authority stays out of reach of the AI agents this sets up. Every Python it starts
 # is the real python3 file found on PATH, trusted before it ever runs (never a symlink, a
 # virtual environment's copy, macOS's /usr/bin shim, or one in a temporary folder, the
-# project, or a folder under home a Codex session could be opened on), run with
+# project, or outside the runtime's trusted installation folders), run with
 # -I -B -S -X pycache_prefix=/dev/null so nothing from the working folder, the environment,
 # site-packages or a bytecode cache loads. Its working files live in a host-private folder
 # no agent sandbox can write. Owner commands run this repository's own orchestrator CLI
 # with --project-root, never the project's copy, and only once the installed copy is this
-# release byte for byte. Git is a trusted real binary with hooks, the file-system monitor,
-# signing and maintenance off, and porcelain commands run only while the project's own Git
-# settings name no helper program. This folder must sit outside every folder opened in Codex.
+# release byte for byte. Git is a trusted real binary run with plumbing only (no status,
+# add or commit), every helper and transport off, and not at all on a partial clone or
+# while the project's own Git settings name a helper program. This folder must sit outside
+# every folder opened in Codex.
 #
 # Test hook (no terminal needed):
 #   ./setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE
@@ -34,6 +35,7 @@
 #   ./setup.sh --print-ignored-paths PROJECT PATH...  NUL-delimited PATHs ignored by .gitignore
 #   ./setup.sh --print-python                  prints the trusted Python, or "refused: REASON"
 #   ./setup.sh --print-git                     prints the trusted git binary, or "none"
+#   ./setup.sh --print-trusted-roots           prints the trusted installation folders, one per line
 #   ./setup.sh --print-git-helpers PROJECT     prints helper programs the project's Git settings name, or "none"
 
 # Never let Python write bytecode into the project (it would dirty managed paths).
@@ -51,9 +53,11 @@ GIT_SAFE=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgSign=
 # pattern): filters, diff and merge drivers, transports, pagers, editors, signing and
 # credential helpers, trailer commands, and includes, whose files cannot be vetted here.
 GIT_HELPER_KEYS='^(filter\..+\.(clean|smudge|process)|diff\.external|diff\..+\.(command|textconv)|merge\..+\.driver|core\.(sshcommand|pager|editor|askpass|gitproxy|alternaterefscommand)|gpg\.(.+\.)?program|gpg\.ssh\.defaultkeycommand|credential\.(.+\.)?helper|pager\..+|sequence\.editor|include\.path|includeif\..+\.path|trailer\..+\.(command|cmd))$'
-# Folders under the home folder where interpreter managers install Python (as in attest.py):
-# a Codex session is never opened on the home folder itself, so these stay out of its reach.
-HOME_TOOL_ROOTS=".pyenv .local .asdf .rye .conda .mise .nix-profile .uv .homebrew homebrew miniconda3 anaconda3 miniforge3 mambaforge"
+# Where a trusted program may be installed: the runtime's host_paths.TRUSTED_INSTALL_ROOTS
+# (a test keeps this copy equal; the Linuxbrew prefix is split as there), plus a hidden
+# top-level folder of the account's home folder. The interpreter is judged against it before
+# it ever runs, so the check is in bash.
+TRUSTED_INSTALL_ROOTS="/usr/bin /bin /usr/libexec /usr/local /opt/homebrew /home""/linuxbrew/.linuxbrew /Library/Frameworks/Python.framework /Library/Developer/CommandLineTools /Applications /nix/store"
 SETUP_VERSION=1
 CLAUDE_MODELS_ALL="claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5"
 STEP_NAMES=("Checks" "Project" "Providers" "Install" "Collector" "Billing" "Profile" "Commands" "Done")
@@ -203,23 +207,42 @@ work_tree_top() {
   done
 }
 
+# account_home : this account's home folder from the system account database (bash expands
+# ~user through it), never from HOME, as the runtime's host_paths.account_home.
+account_home() {
+  local user home
+  user=$(id -un 2>/dev/null) || return 1
+  case "$user" in ''|*[!A-Za-z0-9._-]*) return 1;; esac
+  home=$(eval "printf '%s' ~$user")
+  case "$home" in /*) ;; *) return 1;; esac
+  CDPATH='' cd -- "$home" 2>/dev/null && pwd -P
+}
+
+# install_location_trusted FILE : succeeds when FILE lies under a trusted installation folder
+# or in a hidden top-level folder of the account's home folder (host_paths's rule).
+install_location_trusted() {
+  local root home rel
+  for root in $TRUSTED_INSTALL_ROOTS; do inside_dir "$1" "$root" && return 0; done
+  home=$(account_home) || return 1
+  if [ "$home" != / ] && inside_dir "$1" "$home" && [ "$1" != "$home" ]; then
+    rel=${1#"$home"/}
+    case "$rel" in .*) return 0;; esac
+  fi
+  return 1
+}
+
 # python_location_problem FILE [PROJECT] : why an interpreter's real file may not run owner
-# code (temporary, project, venv, shim or home), or nothing. It is decided before the file
+# code (temporary, project, venv, shim or install), or nothing. It is decided before the file
 # ever runs, with the same rules as attest.py's python_location_problem.
 python_location_problem() {
-  local py=$1 project=${2:-} home rel first root
+  local py=$1 project=${2:-}
   if inside_temp "$py"; then echo temporary; return 0; fi
   if [ -n "$project" ] && inside_dir "$py" "$project"; then echo project; return 0; fi
   if [ -e "$(dirname -- "$py")/pyvenv.cfg" ] || [ -e "$(dirname -- "$(dirname -- "$py")")/pyvenv.cfg" ]; then
     echo venv; return 0
   fi
   if [ "$(uname -s)" = Darwin ] && [ "$(dirname -- "$py")" = /usr/bin ]; then echo shim; return 0; fi
-  home=$(CDPATH='' cd -- "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || home=""
-  if [ -n "$home" ] && [ "$home" != / ] && inside_dir "$py" "$home" && [ "$py" != "$home" ]; then
-    rel=${py#"$home"/}; first=${rel%%/*}
-    for root in $HOME_TOOL_ROOTS; do [ "$first" = "$root" ] && return 0; done
-    echo home
-  fi
+  install_location_trusted "$py" || echo install
   return 0
 }
 
@@ -248,7 +271,7 @@ python_problem_text() {
     venv) echo "The python3 on your PATH belongs to a virtual environment, whose settings an AI agent could change.";;
     project) echo "The python3 on your PATH is inside this project, where an AI agent could change it.";;
     shim) echo "The python3 on your PATH is macOS's /usr/bin/python3, a shim that reads a cache an AI agent can write.";;
-    home) echo "The python3 on your PATH is in a folder under your home folder that a Codex session could be opened on.";;
+    install) echo "The python3 on your PATH is not in a trusted installation folder (a system folder, Homebrew, python.org, Xcode, Nix, or a hidden folder in your home folder), so a Codex session opened on a folder above it could change it.";;
     *) echo "python3 was not found.";;
   esac
 }
@@ -274,7 +297,19 @@ print(git_executable([Path(item) for item in sys.argv[2:]]) or "")' "$ORCH_DIR" 
 g() {
   local project=$1
   shift
-  xcrun_nocache=1 "$GIT" -C "$project" "${GIT_SAFE[@]}" "$@"
+  xcrun_nocache=1 GIT_ALLOW_PROTOCOL='' GIT_NO_LAZY_FETCH=1 "$GIT" -C "$project" "${GIT_SAFE[@]}" "$@"
+}
+
+# owner_git ARGS... : the installer's plumbing-only git (scripts/install.py git_tool), in the
+# trusted Python: `changes PROJECT PATH...` prints the paths with uncommitted changes,
+# NUL-delimited; `commit PROJECT MESSAGE DETAIL PATH...` commits exactly those paths. Neither
+# runs status, add or commit, so no filter, hook, signing program or pager can run.
+owner_git() {
+  "$PY" "${PYF[@]}" -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("agent_orchestration_install", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.exit(module.git_tool(sys.argv[2:]))' "$ROOT_DIR/scripts/install.py" "$@"
 }
 
 # git_helpers PROJECT : prints the project's own Git settings that name a program Git could
@@ -450,7 +485,8 @@ elif op in ("plan", "planpaths", "paths"):
             result = subprocess.run(
                 [git, "-C", project, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                  "--literal-pathspecs", "ls-files", "-z", "--", rel],
-                capture_output=True, env=dict(os.environ, xcrun_nocache="1"))
+                capture_output=True,
+                env=dict(os.environ, xcrun_nocache="1", GIT_ALLOW_PROTOCOL="", GIT_NO_LAZY_FETCH="1"))
             if result.returncode != 0:
                 sys.exit(4)
             if os.path.lexists(os.path.join(project, rel)) or result.stdout:
@@ -596,55 +632,42 @@ sys.exit(module.owner_tool(sys.argv[2:]))' "$ROOT_DIR/scripts/attest.py" "$@"
 # `XY new` followed by a bare `old` field; both names are kept whole. Only control characters
 # are removed, so a name cannot drive the terminal.
 uncommitted_managed() {
-  local rec st name src out=""
+  local name out=""
   if ! git_porcelain_ok "$1"; then
     printf '%s' "(not checked: the project's Git settings name programs that Git would run)"
     return 0
   fi
-  while IFS= read -r -d '' rec; do
-    st=${rec:0:2}; name=${rec:3}
+  while IFS= read -r -d '' name; do
+    if [ "$name" = '!' ]; then out="(not checked: Git could not read the project)"; break; fi
     name=${name//[[:cntrl:]]/}
-    case "$st" in
-      *R*|*C*)
-        IFS= read -r -d '' src
-        src=${src//[[:cntrl:]]/}
-        name="$name (from $src)";;
-    esac
     if [ -z "$out" ]; then out=$name; else out="$out
 $name"; fi
-  done < <(g "$1" --no-optional-locks status --porcelain -z --untracked-files=all -- .agents .claude .codex 2>/dev/null)
+  done < <(owner_git changes "$1" .agents .claude .codex 2>/dev/null || printf '!\0')
   printf '%s' "$out"
 }
 
 # changed_paths PROJECT PATH... : prints, NUL-delimited, the PATHs that really have changes
-# (modified, staged, deleted or untracked) according to `git status -z` with literal pathspecs.
-# If Git cannot answer, every PATH is printed, so a failure never hides a needed commit.
+# (modified, staged, deleted or untracked), found with plumbing only (owner_git changes):
+# a renamed file's old and new names both count. If Git cannot answer, every PATH is
+# printed, so a failure never hides a needed commit.
 changed_paths() {
-  local project=$1 rec st name src bad=0 cand
+  local project=$1 name bad=0 cand
   shift
   [ "$#" -gt 0 ] || return 0
-  while IFS= read -r -d '' rec; do
-    if [ "$rec" = '!' ]; then bad=1; continue; fi
-    st=${rec:0:2}; name=${rec:3}; src=""
-    case "$st" in
-      *R*|*C*) IFS= read -r -d '' src;;
-    esac
-    # A rename's source is kept when it is also a candidate, so the commit includes the
-    # deletion. A copy's source is unchanged, so it is never kept.
-    case "$st" in *R*) ;; *) src="";; esac
+  while IFS= read -r -d '' name; do
+    if [ "$name" = '!' ]; then bad=1; continue; fi
     for cand in "$@"; do
-      if [ "$cand" = "$name" ]; then printf '%s\0' "$name"; fi
-      if [ -n "$src" ] && [ "$cand" = "$src" ]; then printf '%s\0' "$src"; fi
+      if [ "$cand" = "$name" ]; then printf '%s\0' "$name"; break; fi
     done
-  done < <({ git_porcelain_ok "$project" && g "$project" --no-optional-locks --literal-pathspecs status --porcelain -z --untracked-files=all -- "$@" 2>/dev/null; } || printf '!\0')
+  done < <({ git_porcelain_ok "$project" && owner_git changes "$project" "$@" 2>/dev/null; } || printf '!\0')
   if [ "$bad" -eq 1 ]; then
     for cand in "$@"; do printf '%s\0' "$cand"; done
   fi
 }
 
 # ignored_paths PROJECT PATH... : prints, NUL-delimited, the PATHs that exist untracked but
-# are ignored by the project's .gitignore, which `git status` never lists and `git add`
-# would refuse. If Git cannot answer it prints a single `!` record instead, so a failed query
+# are ignored by the project's .gitignore (ls-files, a plumbing query), which a commit made
+# by hand with `git add` would refuse. If Git cannot answer it prints a single `!` record instead, so a failed query
 # is never read as "nothing is ignored".
 ignored_paths() {
   local project=$1 rec cand
@@ -748,6 +771,8 @@ case "${1:-}" in
     if [ -n "$PY" ]; then printf '%s\n' "$PY"; else printf 'refused: %s\n' "$PY_PROBLEM"; fi; exit 0;;
   --print-git)
     printf '%s\n' "${GIT:-none}"; exit 0;;
+  --print-trusted-roots)
+    printf '%s\n' $TRUSTED_INSTALL_ROOTS; exit 0;;
   --print-git-helpers)
     if [ "$#" -ne 2 ]; then echo "usage: setup.sh --print-git-helpers PROJECT" >&2; exit 2; fi
     if git_porcelain_ok "$2"; then echo none; else printf '%s\n' "$GIT_HELPERS_FOUND"; fi; exit 0;;
@@ -1383,7 +1408,10 @@ managed_problem() {
     echo "$(git_helpers_text) Remove those settings from .git/config, or install and commit by hand (README, Advanced)."
     return 1
   fi
-  dirty=$(g "$1" --no-optional-locks status --porcelain --untracked-files=all -- .codex .agents .claude 2>/dev/null | head -n 3)
+  if ! dirty=$(owner_git changes "$1" .codex .agents .claude 2>"$LOGDIR/changes.err" | tr '\0' '\n'; exit "${PIPESTATUS[0]}"); then
+    echo "Git could not read the project, so setup cannot tell whether its managed paths are clean: $(head -c 200 "$LOGDIR/changes.err" | tr -d '[:cntrl:]')"
+    return 1
+  fi
   if [ -n "$dirty" ]; then
     echo "Uncommitted changes exist in managed paths (.codex, .agents, .claude). Commit or discard them first."
     return 1
@@ -1849,9 +1877,9 @@ step_install() {
     fi
     COMMIT_STATE=failed
   else
-    body "Next: commit the installed files in the project. Only these $n_paths paths are staged and committed, nothing is pushed. Git runs with the project's hooks, file-system monitor, commit signing and background maintenance turned off, and only after setup has checked that the project's own Git settings name no program (such as a filter) for Git to start. The exact commands are below; choose 'Show every path' for the full list."
-    list_cmd "$(printf '%q' "$GIT") -C $q_project ${GIT_SAFE[*]} --literal-pathspecs add -A -- <the $n_paths paths below>"
-    list_cmd "$(printf '%q' "$GIT") -C $q_project ${GIT_SAFE[*]} --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
+    body "Next: commit the installed files in the project. Only these $n_paths paths are committed, nothing is pushed. Setup commits with Git's plumbing commands only (hash-object, update-index, write-tree, commit-tree, update-ref), which start no hook, filter, signing program, pager or maintenance whatever the project's Git settings say, and with every network transport off. To commit them yourself instead, these are the commands; choose 'Show every path' for the full list."
+    list_cmd "git -C $q_project --literal-pathspecs add -A -- <the $n_paths paths below>"
+    list_cmd "git -C $q_project --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
     shown=0
     for path in "${COMMIT_PATHS[@]}"; do
       [ "$shown" -ge 10 ] && break
@@ -1862,7 +1890,7 @@ step_install() {
     while :; do
       menu 0 "Commit now (recommended)" "I will commit myself" "Show every path"
       [ "$MENU_IDX" -eq 2 ] || break
-      view_plan "$(printf 'git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgSign=false --literal-pathspecs add -A -- %s\n' "${COMMIT_PATHS[@]}")"
+      view_plan "$(printf '%s\n' "${COMMIT_PATHS[@]}")" "Paths to commit"
     done
     screen_reset; begin_step 4
     list_add ok "Packages installed"
@@ -1875,8 +1903,7 @@ step_install() {
         RUN_QUIET=0
         LAST_RC=1
         failure_detail "Not committed" "$(git_helpers_text) Commit the files yourself, then run ./setup.sh again and choose Verify."
-      elif run_cmd "Staging" g "$PROJECT" --literal-pathspecs add -A -- "${COMMIT_PATHS[@]}" &&
-         run_cmd "Committing" g "$PROJECT" --literal-pathspecs commit -m "$COMMIT_MSG_1" -m "$COMMIT_MSG_2" -- "${COMMIT_PATHS[@]}"; then
+      elif run_cmd "Committing" owner_git commit "$PROJECT" "$COMMIT_MSG_1" "$COMMIT_MSG_2" "${COMMIT_PATHS[@]}"; then
         RUN_QUIET=0
         commit_done=1
         COMMIT_STATE=committed
@@ -2223,7 +2250,7 @@ check_rule() { # check_rule -> RULE_STATUS (installed, missing, stale, unsupport
 unsupported_home() {
   list_add fail "The Codex commands rule cannot be used with this Codex setup"
   list_sub "Reason: ${RULE_REASON:0:200}"
-  list_sub "The rule and its protected copy of the orchestrator work only in the real ~/.codex folder. Fix: unset CODEX_HOME (or point it at ~/.codex), replace a symbolic link at ~/.codex with a real folder, then run ./setup.sh again."
+  list_sub "The rule and its protected copy of the orchestrator work only in your account's own ~/.codex folder. Fix: run setup with HOME set to your own home folder, unset CODEX_HOME (or point it at ~/.codex), replace a symbolic link at ~/.codex with a real folder, then run ./setup.sh again."
   record_failure "The Codex commands rule cannot be used with this Codex setup" "use the real ~/.codex folder (unset CODEX_HOME, no symlink), then run setup again"
 }
 

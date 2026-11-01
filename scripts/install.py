@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
+import hashlib
 import importlib.util
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -40,14 +43,21 @@ ORCHESTRATION = ROOT / "packages" / "codex-agents" / "native-package" / ".codex"
 MANAGED_PATHS = (".codex", ".agents", ".claude")
 CODEX_MANIFEST = Path(".codex") / "orchestration" / "install-manifest.json"
 CLAUDE_SETTINGS = ".claude/settings.json"
-PERMISSIONS_RECORD = ".claude/agent-orchestration-permissions.json"
-# Git on the project never runs repository hooks, a file-system monitor, a signing program
-# or automatic maintenance. A Codex session opened on a parent folder can write the
-# project's .git, so porcelain commands also run only while the repository's own settings
-# name no program for Git to start (repository_helpers).
+# Where an earlier version kept its ownership record, inside the project. The record now
+# lives in the owner's learning state (OwnerState); the old file is read once to migrate.
+LEGACY_RECORD = ".claude/agent-orchestration-permissions.json"
+OWNER_RECORD = "owner-record"  # the plan's key for the record in the owner's state
+# Git on the project runs only plumbing (ls-files, ls-tree, rev-parse, hash-object,
+# update-index, write-tree, commit-tree, update-ref): no status, add or commit, so no clean
+# or smudge filter, textconv, hook, signing program, pager or maintenance can run whatever
+# the project's configuration says. These options switch the helpers off as well, every
+# transport is refused and lazy fetching is off, and a partial clone or promisor remote is
+# refused (git_plumbing.repository_layout_problem) before any object is read.
 GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
             "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
             "-c", "gc.auto=0", "-c", "maintenance.auto=false")
+GIT_ENVIRONMENT = {"xcrun_nocache": "1", "GIT_ALLOW_PROTOCOL": "", "GIT_NO_LAZY_FETCH": "1",
+                   "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 # Repository settings that name a program Git may start (setup.sh uses the same pattern):
 # filters, diff and merge drivers, transports, pagers, editors, signing and credential
 # helpers, trailer commands, and includes, whose files cannot be vetted here.
@@ -72,8 +82,7 @@ REVERSE = {"install": "remove", "remove": "install"}
 # Owner commands a Claude primary may never run, whatever this checkout's parser lists.
 ALWAYS_OWNER_ONLY = ("install-codex-rule", "remove-codex-rule")
 # Paths a Claude primary may never edit with its file tools or recognised shell writes.
-PROTECTED_EDITS = ("/.codex/**", "/.agents/**", "/.claude/settings*.json",
-                   "/" + PERMISSIONS_RECORD, "/.git/**")
+PROTECTED_EDITS = ("/.codex/**", "/.agents/**", "/.claude/settings*.json", "/.git/**")
 CLI_PATTERN = "*.codex/orchestration/cli.py"
 MAX_SETTINGS_BYTES = 1024 * 1024
 # Every owner-only command an earlier release's installer denied (0.8.8 and 0.8.9). A recorded
@@ -93,7 +102,7 @@ HISTORICAL_OWNER_ONLY = (
     "learning-rollback", "learning-configure-owner-key", "learning-create-grant-request",
     "learning-attach-grant-signature", "host-command", "install-codex-rule", "remove-codex-rule",
 )
-HISTORICAL_PROTECTED_EDITS = PROTECTED_EDITS
+HISTORICAL_PROTECTED_EDITS = (*PROTECTED_EDITS, "/" + LEGACY_RECORD)
 
 _ATTEST_SPEC = importlib.util.spec_from_file_location("agent_orchestration_attest",
                                                       ROOT / "scripts" / "attest.py")
@@ -101,7 +110,7 @@ attest = importlib.util.module_from_spec(_ATTEST_SPEC)
 _ATTEST_SPEC.loader.exec_module(attest)
 # This repository's own runtime decides which git binary is real and trusted.
 sys.path.insert(0, str(ORCHESTRATION))
-from codex_agents.git_plumbing import git_executable  # noqa: E402 - this checkout's package
+from codex_agents.git_plumbing import git_executable, repository_layout_problem  # noqa: E402
 
 
 class InstallRefused(RuntimeError):
@@ -119,9 +128,17 @@ def _git_binary(target: Path) -> str:
     return found
 
 
-def _git_run(target: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([_git_binary(target), "-C", str(target), *GIT_SAFE, *args], capture_output=True,
-                          text=True, stdin=subprocess.DEVNULL, env={**os.environ, "xcrun_nocache": "1"})
+def _git_run(target: Path, *args: str, input: bytes | None = None, index: Path | None = None,
+             text: bool = True) -> subprocess.CompletedProcess:
+    """Run plumbing git on the project with every helper, transport and lazy fetch off."""
+
+    env = {**os.environ, **GIT_ENVIRONMENT}
+    if index is not None:
+        env["GIT_INDEX_FILE"] = str(index)
+    return subprocess.run(
+        [_git_binary(target), "-C", str(target), *GIT_SAFE, "--literal-pathspecs", *args],
+        capture_output=True, text=text, input=input,
+        stdin=subprocess.DEVNULL if input is None else None, env=env)
 
 
 def _git(target: Path, *args: str) -> str:
@@ -129,6 +146,196 @@ def _git(target: Path, *args: str) -> str:
     if result.returncode != 0:
         raise InstallRefused(f"target is not a usable Git working tree: {target}")
     return result.stdout.strip()
+
+
+def _require_plain_repository(target: Path) -> None:
+    """Refuse a repository Git could fetch into (a partial clone or promisor remote) or whose
+    git directory lies inside its own working tree, before any object is read."""
+
+    problem = repository_layout_problem(_git_binary(target), Path(os.path.realpath(target)))
+    if problem is not None:
+        raise InstallRefused(f"{problem}; setup does not run Git on it")
+
+
+def _records(output: bytes) -> list[str]:
+    return [item.decode("utf-8", "surrogateescape") for item in output.split(b"\0") if item]
+
+
+def _blob_id(data: bytes, object_format: str) -> str:
+    digest = hashlib.sha256 if object_format == "sha256" else hashlib.sha1
+    return digest(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _worktree_entry(root_fd: int, relative: str) -> tuple[str, bytes] | None:
+    """The working-tree file at `relative` as (mode, bytes), read without following any
+    symlink and without any Git filter; None when it is absent, ("", b"") when it is not a
+    file Git could hold (a folder, a device, a path through a symlinked folder)."""
+
+    parts = relative.split("/")
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            except FileNotFoundError:
+                return None
+            except OSError:
+                return "", b""
+            os.close(descriptor)
+            descriptor = child
+        try:
+            info = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return "120000", os.fsencode(os.readlink(parts[-1], dir_fd=descriptor))
+        if not stat.S_ISREG(info.st_mode):
+            return "", b""
+        handle = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        try:
+            chunks = []
+            while chunk := os.read(handle, 1 << 20):
+                chunks.append(chunk)
+        finally:
+            os.close(handle)
+        return ("100755" if info.st_mode & stat.S_IXUSR else "100644"), b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _head(target: Path) -> str | None:
+    result = _git_run(target, "rev-parse", "-q", "--verify", "HEAD^{commit}")
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+
+def project_changes(target: Path, paths: list[str] | tuple[str, ...]) -> list[str]:
+    """The paths under `paths` with uncommitted changes, found with plumbing only.
+
+    A path counts when the index differs from HEAD (staged or conflicted), when the working
+    tree's bytes or mode differ from the index (hashed here, never through a filter), when it
+    is gone from the working tree, or when it is untracked and not ignored. This is what
+    `git status` reports, without running anything the repository's settings name.
+    """
+
+    _require_plain_repository(target)
+    object_format = _git(target, "rev-parse", "--show-object-format") or "sha1"
+    filemode = _git_run(target, "config", "--bool", "core.fileMode").stdout.strip() != "false"
+    head = _head(target)
+    tracked: dict[str, tuple[str, str]] = {}
+    if head is not None:
+        listing = _git_run(target, "ls-tree", "-r", "-z", "--full-tree", head, "--", *paths, text=False)
+        if listing.returncode != 0:
+            raise InstallRefused("Git could not read the project's last commit")
+        for record in _records(listing.stdout):
+            meta, path = record.split("\t", 1)
+            mode, _kind, oid = meta.split(" ")
+            tracked[path] = (mode, oid)
+    staged = _git_run(target, "ls-files", "-s", "-z", "--", *paths, text=False)
+    untracked = _git_run(target, "ls-files", "-z", "--others", "--exclude-standard", "--", *paths, text=False)
+    if staged.returncode != 0 or untracked.returncode != 0:
+        raise InstallRefused("Git could not read the project's index")
+    changed: set[str] = set(_records(untracked.stdout))
+    index: dict[str, tuple[str, str]] = {}
+    for record in _records(staged.stdout):
+        meta, path = record.split("\t", 1)
+        mode, oid, stage = meta.split(" ")
+        if stage != "0":
+            changed.add(path)
+        else:
+            index[path] = (mode, oid)
+    changed.update(path for path in tracked if path not in index)
+    root_fd = os.open(os.path.realpath(target), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for path, (mode, oid) in index.items():
+            if tracked.get(path) != (mode, oid):
+                changed.add(path)
+            if mode == "160000":  # a submodule: only its recorded commit is compared
+                continue
+            entry = _worktree_entry(root_fd, path)
+            if entry is None or not entry[0]:
+                changed.add(path)
+                continue
+            same_mode = entry[0] == mode or (not filemode and "120000" not in (mode, entry[0]))
+            if not same_mode or _blob_id(entry[1], object_format) != oid:
+                changed.add(path)
+    finally:
+        os.close(root_fd)
+    return sorted(changed)
+
+
+def commit_paths(target: Path, message: str, detail: str, paths: list[str]) -> str:
+    """Commit exactly `paths` as they are in the working tree, with plumbing only.
+
+    Blobs are written with ``hash-object -w --no-filters``, a private index built from HEAD
+    gets them with ``update-index --index-info``, then ``write-tree``, ``commit-tree``
+    (never signed) and ``update-ref`` with the old value, so a branch that moved meanwhile
+    refuses. The project's own index then records the same entries for those paths and
+    keeps everything else it had staged. Returns "committed" or "nothing".
+    """
+
+    if not paths:
+        raise InstallRefused("there is nothing to commit")
+    _require_plain_repository(target)
+    helpers = repository_helpers(target)  # defence in depth: none of these commands would run them
+    if helpers:
+        raise InstallRefused(helpers_refusal(helpers))
+    object_format = _git(target, "rev-parse", "--show-object-format") or "sha1"
+    zero = "0" * (64 if object_format == "sha256" else 40)
+    head = _head(target)
+    branch = _git_run(target, "symbolic-ref", "-q", "HEAD")
+    reference = branch.stdout.strip() if branch.returncode == 0 else None
+    try:
+        scratch = attest.make_scratch("index-")
+    except attest.AttestError as exc:
+        raise InstallRefused(str(exc)) from None
+    try:
+        private_index = scratch / "index"
+        seeded = _git_run(target, "read-tree", *((head,) if head else ("--empty",)), index=private_index)
+        if seeded.returncode != 0:
+            raise InstallRefused("Git could not read the project's last commit")
+        records = []
+        root_fd = os.open(os.path.realpath(target), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for path in paths:
+                entry = _worktree_entry(root_fd, path)
+                if entry is None:
+                    records.append(f"0 {zero}\t{path}\0")
+                    continue
+                if not entry[0]:
+                    raise InstallRefused(f"{path} is not a file Git can commit")
+                written = _git_run(target, "hash-object", "-w", "--no-filters", "--stdin",
+                                   input=entry[1], text=False)
+                if written.returncode != 0:
+                    raise InstallRefused("Git could not store a file")
+                records.append(f"{entry[0]} {written.stdout.decode().strip()}\t{path}\0")
+        finally:
+            os.close(root_fd)
+        info = "".join(records).encode("utf-8", "surrogateescape")
+        if _git_run(target, "update-index", "-z", "--index-info", input=info, index=private_index,
+                    text=False).returncode != 0:
+            raise InstallRefused("Git could not stage the files")
+        tree = _git_run(target, "write-tree", index=private_index)
+        if tree.returncode != 0:
+            raise InstallRefused("Git could not write the commit's tree")
+        tree_id = tree.stdout.strip()
+        if head and _git(target, "rev-parse", f"{head}^{{tree}}") == tree_id:
+            return "nothing"
+        created = _git_run(target, "commit-tree", tree_id, *(("-p", head) if head else ()), "--no-gpg-sign",
+                           "-m", message, "-m", detail)
+        if created.returncode != 0:
+            raise InstallRefused("Git refused the commit; the usual cause is that your Git identity "
+                                 "(user.name and user.email) is not set")
+        commit = created.stdout.strip()
+        moved = _git_run(target, "update-ref", "-m", message, *(("--no-deref",) if reference is None else ()),
+                         reference or "HEAD", commit, head or zero)
+        if moved.returncode != 0:
+            raise InstallRefused("the branch moved while setup ran, so nothing was committed")
+        if _git_run(target, "update-index", "-z", "--index-info", input=info, text=False).returncode != 0:
+            raise InstallRefused("the commit was made, but Git could not update the project's index; "
+                                 "run git status and stage the committed files yourself")
+        return "committed"
+    finally:
+        attest.remove_scratch(scratch)
 
 
 def repository_helpers(target: Path) -> list[str]:
@@ -180,8 +387,7 @@ def check_target(target: Path, *, mutating: bool) -> None:
     helpers = repository_helpers(target)
     if helpers:
         raise InstallRefused(helpers_refusal(helpers))
-    if _git(target, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all",
-            "--", *MANAGED_PATHS):
+    if project_changes(target, MANAGED_PATHS):
         raise InstallRefused("managed paths (.codex, .agents, .claude) have uncommitted changes")
 
 
@@ -340,38 +546,176 @@ class _Project:
         finally:
             os.close(parent)
 
-    def write(self, relative: str, content: bytes) -> None:
-        parent, name = self._parent(relative, create=True)
-        temporary = f".{name}.{os.getpid()}.tmp"
+    def _current(self, parent: int, name: str) -> bytes | None:
         try:
-            handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
-                             dir_fd=parent)
-            try:
-                os.write(handle, content)
-                os.fchmod(handle, 0o644)
-            finally:
-                os.close(handle)
-            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
-        except BaseException:
-            try:
-                os.unlink(temporary, dir_fd=parent)
-            except OSError:
-                pass
-            raise
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return b"\0not a regular file"
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            return os.read(handle, MAX_SETTINGS_BYTES + 1)
         finally:
+            os.close(handle)
+
+    def publish(self, relative: str, content: bytes, before: bytes | None, staging: int | None) -> None:
+        """Replace `relative` with `content`, unless it no longer holds `before`.
+
+        The new file is written in the owner's staging folder (`staging`, a pinned descriptor
+        outside the project) and renamed into place from there, so no agent can swap it
+        between writing and publishing; the destination is compared with `before` right
+        before the rename. Only when the staging folder is on another file system does the
+        file go through a fresh, randomly named temporary file beside the destination.
+        """
+
+        parent, name = self._parent(relative, create=True)
+        temporary = f".{name}.{secrets.token_hex(8)}.tmp"
+        source = None
+        try:
+            if staging is not None:
+                _write_new(staging, temporary, content, 0o644)
+                source = staging
+            if self._current(parent, name) != before:
+                raise InstallRefused(f"{relative} changed while setup ran, so it was not overwritten; "
+                                     "run setup again")
+            if source is not None:
+                try:
+                    os.rename(temporary, name, src_dir_fd=source, dst_dir_fd=parent)
+                    return
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    os.unlink(temporary, dir_fd=source)
+                    source = None
+            _write_new(parent, temporary, content, 0o644)
+            source = parent
+            if self._current(parent, name) != before:
+                raise InstallRefused(f"{relative} changed while setup ran, so it was not overwritten; "
+                                     "run setup again")
+            os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            source = None
+        finally:
+            if source is not None:
+                try:
+                    os.unlink(temporary, dir_fd=source)
+                except OSError:
+                    pass
             os.close(parent)
 
-    def remove(self, relative: str) -> None:
+    def remove(self, relative: str, before: bytes | None) -> None:
         try:
             parent, name = self._parent(relative, create=False)
         except FileNotFoundError:
             return
         try:
+            current = self._current(parent, name)
+            if current is None:
+                return
+            if current != before:
+                raise InstallRefused(f"{relative} changed while setup ran, so it was not removed; "
+                                     "run setup again")
             os.unlink(name, dir_fd=parent)
-        except FileNotFoundError:
-            pass
         finally:
             os.close(parent)
+
+
+def _write_new(directory: int, name: str, content: bytes, mode: int) -> None:
+    handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=directory)
+    try:
+        os.write(handle, content)
+        os.fchmod(handle, mode)
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
+class OwnerState:
+    """The installer's owner-only folder in the owner's learning state, opened by verified
+    descriptors. It holds each project's ownership record (which deny rules the installer
+    added) and stages settings files before they are published, outside every project."""
+
+    FOLDER = "installer"
+
+    def __init__(self, *, create: bool) -> None:
+        self.fd: int | None = None
+        base = attest.default_state_root()
+        try:
+            if create:
+                base.mkdir(mode=0o700, parents=True, exist_ok=True)
+            elif not base.is_dir():
+                return
+            base_fd, _canonical = attest._open_verified_directory(base)
+        except (OSError, attest.AttestError) as exc:
+            raise InstallRefused(f"the owner's learning state folder cannot be used safely: {exc}") from None
+        try:
+            self.fd = attest._private_child(base_fd, self.FOLDER, create=create)
+        except FileNotFoundError:
+            self.fd = None
+        except (OSError, attest.AttestError) as exc:
+            raise InstallRefused(f"the installer's folder in the learning state cannot be used: {exc}") from None
+        finally:
+            os.close(base_fd)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+
+    @staticmethod
+    def record_name(target: Path) -> str:
+        digest = hashlib.sha256(os.path.realpath(target).encode("utf-8", "surrogateescape")).hexdigest()
+        return f"claude-settings-{digest[:32]}.json"
+
+    def read(self, name: str) -> bytes | None:
+        if self.fd is None:
+            return None
+        try:
+            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+        except FileNotFoundError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(handle).st_mode):
+                raise InstallRefused("the installer's ownership record is not a regular file")
+            return os.read(handle, MAX_SETTINGS_BYTES + 1)
+        finally:
+            os.close(handle)
+
+    def write(self, name: str, content: bytes) -> None:
+        temporary = f".{name}.{secrets.token_hex(8)}.tmp"
+        _write_new(self.fd, temporary, content, 0o600)
+        try:
+            os.rename(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            os.unlink(temporary, dir_fd=self.fd)
+            raise
+
+    def remove(self, name: str) -> None:
+        if self.fd is None:
+            return
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+
+    def staging(self) -> int | None:
+        """An owner-only staging folder's descriptor; the caller removes it with `unstage`."""
+
+        if self.fd is None:
+            return None
+        name = f"staging-{secrets.token_hex(8)}"
+        os.mkdir(name, 0o700, dir_fd=self.fd)
+        self._staging = name
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+
+    def unstage(self, descriptor: int | None) -> None:
+        if descriptor is None:
+            return
+        try:
+            for leftover in os.listdir(descriptor):
+                os.unlink(leftover, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+            os.rmdir(self._staging, dir_fd=self.fd)
 
 
 def _dump(value: dict) -> bytes:
@@ -396,11 +740,10 @@ def _load_settings(project: _Project) -> tuple[dict | None, bytes | None]:
     return data, raw
 
 
-def _load_record(project: _Project, raw: bytes | None, generated: set[str]) -> dict | None:
-    """The installer's record of the entries it added, keeping only generated rules.
+def _load_record(raw: bytes | None, generated: set[str], where: str) -> dict | None:
+    """An ownership record of the entries the installer added, keeping only generated rules.
 
-    An entry outside every set this installer generates is never treated as the installer's,
-    so a planted record cannot make an update or a removal delete a user's own rule.
+    An entry outside every set this installer generates is never treated as the installer's.
     """
 
     if raw is None:
@@ -414,7 +757,7 @@ def _load_record(project: _Project, raw: bytes | None, generated: set[str]) -> d
             or not all(isinstance(record.get(flag), bool) for flag in flags)
             or not isinstance(record.get("deny"), list)
             or not all(isinstance(item, str) for item in record["deny"])):
-        raise InstallRefused(f"{PERMISSIONS_RECORD} is unreadable; restore it from Git before continuing")
+        raise InstallRefused(f"{where} is unreadable; restore or delete it before continuing")
     return {**record, "deny": [entry for entry in record["deny"] if entry in generated]}
 
 
@@ -425,29 +768,41 @@ def _record_bytes(record: dict) -> bytes:
 def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHESTRATION) -> dict:
     """What install or remove does to .claude/settings.json, with the bytes to write.
 
-    Install adds every missing deny rule and records which ones it added; user entries are
-    never dropped or reordered. Remove takes out only the recorded entries, then the
-    permissions and deny keys and the file itself when install created them and they are
-    now empty. Returns {"action", "changed_paths", "writes": {path: bytes | None}}.
+    Install adds every missing deny rule and records which ones it added in the owner's
+    learning state (OwnerState), outside the project, so nothing in the project can claim a
+    rule for the installer; user entries are never dropped or reordered. Remove takes out
+    only the entries recorded there, then the permissions and deny keys and the file itself
+    when install created them and they are now empty. An entry not recorded is never
+    removed. A record an earlier version kept in the project (LEGACY_RECORD) is used once,
+    only while no owner record exists and only for generated rules, then deleted.
+    Returns {"action", "changed_paths", "writes", "original", "order"}.
     """
 
+    generated = generated_rules(orchestration)
     project = _Project(target)
     try:
         data, raw = _load_settings(project)
-        record_raw = project.read(PERMISSIONS_RECORD)
-        record = _load_record(project, record_raw, generated_rules(orchestration))
+        legacy_raw = project.read(LEGACY_RECORD)
     finally:
         project.close()
-    # The bytes this plan was made from: apply_settings writes nothing if either changed.
-    original = {CLAUDE_SETTINGS: raw, PERMISSIONS_RECORD: record_raw}
+    owner = OwnerState(create=False)
+    try:
+        owner_raw = owner.read(OwnerState.record_name(target))
+    finally:
+        owner.close()
+    if owner_raw is not None:
+        record = _load_record(owner_raw, generated, "the installer's ownership record")
+    else:
+        record = _load_record(legacy_raw, generated, LEGACY_RECORD)
+    # The bytes this plan was made from: apply_settings writes nothing if any of them changed.
+    original = {CLAUDE_SETTINGS: raw, LEGACY_RECORD: legacy_raw, OWNER_RECORD: owner_raw}
     writes: dict[str, bytes | None] = {}
+    if legacy_raw is not None:
+        writes[LEGACY_RECORD] = None
     if operation == "remove":
-        if record is None:
-            return {"action": "none", "changed_paths": [], "writes": writes, "removed": [],
-                    "original": original, "order": []}
-        ours = set(record["deny"])
         removed: list[str] = []
-        if data is not None:
+        if record is not None and data is not None:
+            ours = set(record["deny"])
             updated = json.loads(json.dumps(data))
             permissions = updated.get("permissions")
             if isinstance(permissions, dict) and isinstance(permissions.get("deny"), list):
@@ -466,12 +821,14 @@ def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHEST
                 writes[CLAUDE_SETTINGS] = None
             elif updated != data:
                 writes[CLAUDE_SETTINGS] = _dump(updated)
-        writes[PERMISSIONS_RECORD] = None
-        # Settings first, then the record: a failure in between leaves a record naming entries
+        if owner_raw is not None:
+            writes[OWNER_RECORD] = None
+        # Settings first, then the records: a failure in between leaves a record naming entries
         # already gone, which the next install or removal handles.
-        order = [path for path in (CLAUDE_SETTINGS, PERMISSIONS_RECORD) if path in writes]
-        return {"action": "remove", "changed_paths": sorted(writes), "writes": writes, "removed": removed,
-                "original": original, "order": order}
+        order = [key for key in (CLAUDE_SETTINGS, OWNER_RECORD, LEGACY_RECORD) if key in writes]
+        action = "remove" if writes else "none"
+        return {"action": action, "changed_paths": sorted(set(writes) - {OWNER_RECORD}), "writes": writes,
+                "removed": removed, "original": original, "order": order}
     desired = deny_rules(orchestration)
     previous = set(record["deny"]) if record else set()
     updated = json.loads(json.dumps(data)) if data is not None else {}
@@ -485,6 +842,7 @@ def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHEST
     deny.extend(added)
     new_record = {
         "format": 1,
+        "project": os.path.realpath(target),
         "created_settings_file": record["created_settings_file"] if record else data is None,
         "created_permissions": (record["created_permissions"] if record else False)
         or data is None or "permissions" not in data,
@@ -494,32 +852,50 @@ def plan_settings(target: Path, operation: str, *, orchestration: Path = ORCHEST
     }
     if data is None or updated != data:
         writes[CLAUDE_SETTINGS] = _dump(updated)
-    if record is None or _record_bytes(new_record) != _record_bytes(record):
-        writes[PERMISSIONS_RECORD] = _record_bytes(new_record)
-    action = "unchanged" if not writes else ("create" if data is None else "merge")
-    # The record first, then the settings: a failure in between leaves a record that claims
-    # entries not yet in the settings, which the next install adds and owns and a removal skips.
-    order = [path for path in (PERMISSIONS_RECORD, CLAUDE_SETTINGS) if path in writes]
-    return {"action": action, "changed_paths": sorted(writes), "writes": writes, "added": added,
-            "original": original, "order": order}
+    if owner_raw is None or _record_bytes(new_record) != owner_raw:
+        writes[OWNER_RECORD] = _record_bytes(new_record)
+    action = "unchanged" if not set(writes) - {OWNER_RECORD} else ("create" if data is None else "merge")
+    # The owner record first, then the settings: a failure in between leaves a record that
+    # claims entries not yet in the settings, which the next install adds and owns and a
+    # removal skips. The project's old record goes last, once the owner record exists.
+    order = [key for key in (OWNER_RECORD, CLAUDE_SETTINGS, LEGACY_RECORD) if key in writes]
+    return {"action": action, "changed_paths": sorted(set(writes) - {OWNER_RECORD}), "writes": writes,
+            "added": added, "original": original, "order": order}
 
 
 def apply_settings(target: Path, plan: dict) -> None:
-    """Write a plan made moments before; refuse if either file changed since it was read."""
+    """Write a plan made moments before; refuse if anything it read has changed.
 
+    Every file is compared with the bytes the plan read; the settings file again right
+    before its rename (Project.publish). The ownership record lives in the owner's state.
+    """
+
+    name = OwnerState.record_name(target)
     project = _Project(target)
+    owner = OwnerState(create=OWNER_RECORD in plan["writes"] and plan["writes"][OWNER_RECORD] is not None
+                       or CLAUDE_SETTINGS in plan["writes"])
+    staging = None
     try:
-        for relative, before in plan["original"].items():
-            if project.read(relative) != before:
-                raise InstallRefused(f"{relative} changed while setup ran, so it was not overwritten; "
-                                     "run setup again")
-        for relative in plan["order"]:
-            content = plan["writes"][relative]
-            if content is None:
-                project.remove(relative)
+        for key in (CLAUDE_SETTINGS, LEGACY_RECORD):
+            if project.read(key) != plan["original"][key]:
+                raise InstallRefused(f"{key} changed while setup ran, so it was not overwritten; run setup again")
+        if owner.read(name) != plan["original"][OWNER_RECORD]:
+            raise InstallRefused("the installer's ownership record changed while setup ran; run setup again")
+        for key in plan["order"]:
+            content = plan["writes"][key]
+            if key == OWNER_RECORD:
+                owner.remove(name) if content is None else owner.write(name, content)
+            elif content is None:
+                project.remove(key, plan["original"][key])
             else:
-                project.write(relative, content)
+                staging = owner.staging()
+                try:
+                    project.publish(key, content, plan["original"][key], staging)
+                finally:
+                    owner.unstage(staging)
+                    staging = None
     finally:
+        owner.close()
         project.close()
 
 
@@ -700,6 +1076,31 @@ def operate(operation: str, target: Path, *, apply: bool = False, codex_options:
     summary["applied"] = True
     summary["ok"] = True
     return summary
+
+
+def git_tool(argv: list[str]) -> int:
+    """Plumbing-only git for ./setup.sh, which loads this file and calls it.
+
+    ``changes PROJECT [PATH...]`` prints, NUL-delimited, the paths with uncommitted changes
+    (project_changes); ``commit PROJECT MESSAGE DETAIL PATH...`` commits exactly those paths
+    (commit_paths) and exits 3 when there was nothing to commit. A refusal exits 2 with its
+    reason on stderr; any other failure exits 1.
+    """
+
+    try:
+        if len(argv) >= 2 and argv[0] == "changes":
+            found = project_changes(Path(argv[1]), argv[2:] or list(MANAGED_PATHS))
+            sys.stdout.buffer.write(b"".join(item.encode("utf-8", "surrogateescape") + b"\0" for item in found))
+            return 0
+        if len(argv) >= 5 and argv[0] == "commit":
+            return 0 if commit_paths(Path(argv[1]), argv[2], argv[3], argv[4:]) == "committed" else 3
+    except InstallRefused as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 1
+    print("unknown git tool", file=sys.stderr)
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -90,8 +90,10 @@ change the code that runs with your authority.
 - **Trusted Python, decided before it runs.** Every Python the wizard starts is the real file
   behind the `python3` on your `PATH`, checked before it ever runs: never a symlink, a virtual
   environment's copy, macOS's `/usr/bin/python3` shim, one in a temporary folder or the
-  project, or one in a folder under your home folder other than an interpreter manager's
-  (`~/.pyenv`, `~/.local`, `~/.asdf`, conda and the like). It runs with
+  project, or one outside the runtime's trusted installation folders (system folders,
+  Homebrew, python.org, the Command Line Tools, `/Applications`, Nix, or a hidden top-level
+  folder of your account's home folder such as `~/.pyenv` or `~/.local`), so a sibling install
+  like `/srv/work/tools` is refused. Owner tools and the runtime use one list. It runs with
   `-I -B -S -X pycache_prefix=/dev/null`, so nothing in the working folder, the environment,
   site-packages or a bytecode cache loads. Use a system Python such as Homebrew's or
   python.org's.
@@ -109,23 +111,32 @@ change the code that runs with your authority.
   signature comes back on standard output and is checked against those bytes, and the key being
   enrolled and the signature reach the orchestrator through pipes: nothing touches disk. After
   enrolling, the owner key record must hold exactly one key, the one it showed you.
-- **Git without project programs.** Git is a real binary at a fixed location (never macOS's
-  `/usr/bin/git` shim, never one on a search path an agent could change), run with
+- **Git plumbing only.** Git is a real binary at a fixed location (never macOS's
+  `/usr/bin/git` shim, never one on a search path an agent could change). Setup and the
+  installer never run `status`, `add` or `commit` on the project: they read its state with
+  `ls-files` and `ls-tree` and compare file bytes themselves, and commit with
+  `hash-object -w --no-filters`, `update-index`, `write-tree`, `commit-tree` (never signed)
+  and `update-ref` with the old value, so no filter, textconv, hook, signing program, pager or
+  maintenance can run whatever the project's settings say. Every Git process also runs with
   `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgSign=false
-  -c tag.gpgSign=false -c gc.auto=0 -c maintenance.auto=false`. Before any status, staging or
-  commit, setup reads the project's own Git settings and stops if they name a program Git would
-  start (a filter, diff or merge driver, pager, editor, SSH, signing or credential helper, or an
-  include); commit by hand in that case.
+  -c tag.gpgSign=false -c gc.auto=0 -c maintenance.auto=false`, no network transport
+  (`GIT_ALLOW_PROTOCOL=""`) and no lazy fetching (`GIT_NO_LAZY_FETCH=1`); a partial clone or a
+  promisor remote is refused. As a second layer, setup still stops when the project's own
+  settings name a program Git would start (a filter, diff or merge driver, pager, editor, SSH,
+  signing or credential helper, or an include); commit by hand in that case.
 - **Claude primaries cannot run owner commands.** The installer merges Claude Code permission
-  deny rules into the project's `.claude/settings.json` (and records what it added in
-  `.claude/agent-orchestration-permissions.json`): two `Bash` rules for each owner-only CLI
+  deny rules into the project's `.claude/settings.json` (and records which ones it added in
+  your learning state folder, outside the project, so nothing in the project can claim a rule
+  for it): two `Bash` rules for each owner-only CLI
   subcommand (registration, billing attestation, owner keys and grants, backups and deletion,
   canaries, promotion and rollback, upgrade reconciliation, the Codex rule commands and every
   other command that is not one of the 23 primary-host commands), in the forms
   `Bash(*.codex/orchestration/cli.py <command>)` and `Bash(*.codex/orchestration/cli.py <command> *)`,
   plus `Edit` rules for `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`.
   Existing settings are kept; `verify` reports missing rules and `remove` takes out only the
-  entries install added. These rules are a policy layer on Claude Code's tools, not a sandbox: a
+  entries that record says install added (an entry it did not record is never removed). The
+  new settings file is written in that owner-only state folder and renamed into place, after
+  checking that the project's copy has not changed since it was read. These rules are a policy layer on Claude Code's tools, not a sandbox: a
   command spelled another way (for example through `bash -c` or a script that starts the CLI
   itself) is not matched, so do not give a Claude primary more trust because of them.
 
@@ -167,8 +178,9 @@ Pass `../operational-checks.json` to the wizard when it asks, or to the installe
    python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py verify --target /path/to/project
    ```
 
-   Commit the installed files in the project, including `.claude/settings.json` and
-   `.claude/agent-orchestration-permissions.json`. To uninstall, run
+   Commit the installed files in the project, including `.claude/settings.json` (an earlier
+   version's `.claude/agent-orchestration-permissions.json` is migrated to your learning state
+   and deleted). To uninstall, run
    `python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py remove --target /path/to/project --apply`:
    it first removes the Codex commands rule and its protected copy with this repository's own
    `remove-codex-rule` (whatever version the project has installed), then the permission
