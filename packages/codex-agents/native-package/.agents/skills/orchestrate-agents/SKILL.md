@@ -1,6 +1,6 @@
 ---
 name: orchestrate-agents
-description: Route and supervise Codex subagents for multi-step research, planning, coding, security, or verification work when delegation may improve quality or time; keep simple sequential work in one agent.
+description: Route and supervise read-only Codex and Claude children (bridged, through the orchestrator CLI) for multi-step research, planning, security, or verification work when delegation may improve quality or time; keep simple sequential work in one agent.
 ---
 
 # Orchestrate agents
@@ -167,10 +167,7 @@ says `dispatch: native`, stop and report it.
    references, never raw prompts, output, secrets, or unrestricted tool data. Take the
    provider, model and effort from the route `learning-route` returns; the policy's
    ordered provider candidates per family decide them, not this text. Risk never raises
-   model or effort. Otherwise Astra is valid only for an evidenced `end_to_end`
-   operation with
-   extreme complexity, high ambiguity, and cross-system context; its initial effort is
-   medium. No claimed failure history causes model escalation. Project-bound
+   model or effort. No claimed failure history causes model escalation. Project-bound
    escalation from verifier history remains unavailable until the router can resolve
    the references to actual independent verifier records. Eligible alternatives are
    evaluation candidates, not permission to substitute them during live work. Each
