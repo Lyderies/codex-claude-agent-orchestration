@@ -215,7 +215,7 @@ def default_state_root(home: Path | None = None) -> Path:
     A hidden top-level home folder is where no supported Codex session is
     opened, and the session guard also protects this folder. Every existing
     folder between the home folder and the state (`~/.local`, `~/.local/state`)
-    must be a real folder, the owner's, writable by no one else. Until 0.8.9
+    must be a real folder, the owner's, writable by no one else. Until 0.8.10
     macOS used `~/Library/Application Support/codex-agents`, a non-hidden home
     folder that a session opened on `~/Library` could write; see
     legacy_state_root. Raises HostPathError with a plain message.
@@ -261,7 +261,7 @@ def prepare_default_state_root() -> Path:
 
 
 def legacy_state_root() -> Path | None:
-    """Where macOS kept the learning state before 0.8.9, else None.
+    """Where macOS kept the learning state before 0.8.10, else None.
 
     Found where that code put it (HOME's `Library/Application Support`), so it is
     only ever moved by the owner's `learning-register` and otherwise refuses.
@@ -277,7 +277,7 @@ def legacy_state_root() -> Path | None:
 def owner_state_root() -> Path:
     """The folder that holds the owner's state now, for the owner tools.
 
-    The pre-0.8.9 macOS folder while it is the only one (the wizard's collector
+    The pre-0.8.10 macOS folder while it is the only one (the wizard's collector
     step moves it), else the default; so an earlier wizard step never creates
     the new folder beside the old one.
     """

@@ -645,7 +645,7 @@ def scan_recent_sessions(
     skipped; this is a warning, not the guard, so it follows the folders Codex
     itself uses in this environment. The set-up projects are `projects` and
     those the runtime-copy bindings name; the learning state is the default
-    folder and, while it exists, the pre-0.8.9 macOS one. Each finding has a
+    folder and, while it exists, the pre-0.8.10 macOS one. Each finding has a
     plain `message`.
     """
 

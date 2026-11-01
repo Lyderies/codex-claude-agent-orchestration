@@ -617,7 +617,7 @@ def _shown_key(fields: list[str]) -> tuple[tuple[str, str] | None, str | None]:
 
 
 def legacy_state_report() -> dict:
-    """What the wizard shows before the one-time move of the pre-0.8.9 macOS state.
+    """What the wizard shows before the one-time move of the pre-0.8.10 macOS state.
 
     The old folder sits where a Codex session opened on ~/Library could have created it, so
     the owner sees when it was created, the owner key its signer file names and whether that
@@ -772,7 +772,7 @@ def default_state_root() -> Path:
     """The folder that holds your orchestrator records (the learning state) now, decided by
     this repository's own package, never a path of its own: host_paths.owner_state_root.
 
-    That is the pre-0.8.9 macOS folder while it is the only one (the collector step's
+    That is the pre-0.8.10 macOS folder while it is the only one (the collector step's
     learning-register moves it once), else the default ($XDG_STATE_HOME/codex-agents or the
     account's ~/.local/state/codex-agents). The install step runs before the collector step,
     so the installer's ownership record never creates the new folder beside the old one,

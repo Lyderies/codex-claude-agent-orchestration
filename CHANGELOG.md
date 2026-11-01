@@ -1,8 +1,11 @@
 # Changelog
 
-## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.9)
+## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.10)
 
-- **G2 v1 final hooks (0.8.9).** Codex runs the learning hooks outside its sandbox, and the
+- **Codex package 0.8.10.** The final v1 fixes below get their own package version: a collector
+  authorizes exactly one build per version, and the earlier 0.8.9 build (recorded again in
+  `runtime-releases.json`) was already authorized on the pilot machine.
+- **G2 v1 final hooks (0.8.10).** Codex runs the learning hooks outside its sandbox, and the
   static `.codex/hooks.json` ran `python3` from `PATH` (on macOS the `/usr/bin` xcrun shim,
   which reads a cache a session can write) and found the hook through `git rev-parse`
   (which follows `.git` and `core.worktree`).
@@ -29,9 +32,9 @@
   - Codex trusts hooks by hash: after an install or update, open `/hooks` in Codex and trust
     the orchestrator's learning hooks (the wizard says so; the installer never writes trust).
   - The hook's collector start gets `xcrun_nocache=1`; an unusable state location is a
-    silent no-op like an unregistered project. The 0.8.9 runtime digest is recomputed.
+    silent no-op like an unregistered project. The 0.8.10 runtime digest is recomputed.
 
-- **G2 v1 final runtime fixes (0.8.9).** From the final whole-release review.
+- **G2 v1 final runtime fixes (0.8.10).** From the final whole-release review.
   - **Learning state location.** On macOS the default learning state was
     `~/Library/Application Support/codex-agents`, which a Codex session opened on `~/Library`
     could write (ledger, digest key, collector authorization, `owner-allowed-signers`). The
@@ -72,9 +75,9 @@
     verifier) no longer fails install verification; validation warns instead ("<agent> is
     workspace-write; Codex children are bridged read-only in this release, so it is not
     used for Codex routes"), and a route denied for that reason says so.
-  - The 0.8.9 runtime digest is recomputed.
+  - The 0.8.10 runtime digest is recomputed.
 
-- **Final review (0.8.9).**
+- **Final review (0.8.10).**
   - The package installer refuses, before writing anything, when the project's
     `.codex/orchestration` holds files it does not install (a `socket.py` planted by a
     session that ran before the install, bytecode, a package), and verify reports it. The
@@ -88,7 +91,7 @@
     `~/.ssh/codex-agents-owner.pub`, asks, and the runtime checks the digest on its fresh copy.
   - Verify warns when `.claude/settings.json` defines hooks; the README, SECURITY.md and S6
     list the residuals (sessions running during an install; Claude settings and skills a
-    Codex session can rewrite). The 0.8.9 runtime digest is recomputed.
+    Codex session can rewrite). The 0.8.10 runtime digest is recomputed.
 
 - **Owner key links and client output (owner review).** `attest.py` refuses an owner private
   key whose file has another hard link ("This key file has another link elsewhere; make a fresh
