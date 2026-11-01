@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0: cross-provider read-only routing (G2; release candidate for dogfood toolchain v1, Codex package 0.8.10)
+## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1, Codex package 0.8.10)
 
 - **Codex package 0.8.10.** The final v1 fixes below get their own package version: a collector
   authorizes exactly one build per version, and the earlier 0.8.9 build (recorded again in

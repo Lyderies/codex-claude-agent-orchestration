@@ -4,7 +4,7 @@
   proposed a simpler design, which is adopted. The second review confirmed seven fixed and raised
   three more, addressed below. Reviews are capped at two rounds; the S4 security review checks the
   result. Two whole-release reviews of the v1 candidate returned NO-GO; S6 records the fixes, and the
-  result is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10).
+  result is dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10).
 - **Goal:** the G2 exit in [the plan](plan.md).
 - **Evidence:** the [routing table](../routing-table.md) and the dispatch spikes on `staging`.
 

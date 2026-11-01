@@ -10,7 +10,7 @@ and what an attacker gains.
 
 ## Current status
 
-The current release is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex
+The current release is dogfood toolchain v1 (release 0.2.0, Codex
 package 0.8.10): read-only children, macOS first, Linux partly untested. Fixes go into the next
 release; there are no maintained older releases. Changes to authority, containment or billing
 logic get an independent security review before release, recorded in the CHANGELOG.

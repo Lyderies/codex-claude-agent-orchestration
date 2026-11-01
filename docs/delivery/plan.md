@@ -1,8 +1,8 @@
 # Delivery plan: cross-provider agent orchestration
 
 - **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
-  0.1.0). G2 is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10);
-  the tag follows the G2 exit. Next: v1.1 child liveness, then v1.2 Codex plan loop, then G3. Scope changes are listed under
+  0.1.0). G2 is delivered as dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10),
+  tagged at the G2 exit. Next: v1.1 child liveness, then v1.2 Codex plan loop, then G3. Scope changes are listed under
   "Decisions and open questions".
 - **Updated:** 2026-11-01.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
@@ -102,7 +102,7 @@ Effort is an estimate in focused working sessions.
 | Goal | Feature set | Dogfooding | Exit | Effort | Status |
 |---|---|---|---|---|---|
 | G1 | Import and one-command install | Manual, logged by hand | Imported tests pass here; installer reproduces the pilot's current install | 1–2 | Done (0.1.0) |
-| G2 | **MVP:** cross-provider read-only routing | Starts at exit | Both primaries reach both providers read-only through recorded, replayable routes | 2–4 | Release candidate for toolchain v1 (0.2.0) |
+| G2 | **MVP:** cross-provider read-only routing | Starts at exit | Both primaries reach both providers read-only through recorded, replayable routes | 2–4 | Done: toolchain v1 (0.2.0) |
 | v1.1 | Child liveness from real client events | Read-only sub-tasks | Not yet defined | Not yet estimated | Planned |
 | v1.2 | Codex plan loop | Read-only sub-tasks | Not yet defined | Not yet estimated | Planned |
 | G3 | Write-capable children | Read and write sub-tasks | Contained write children, verified by the other provider | 2–3 | Planned |
