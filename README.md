@@ -5,7 +5,7 @@ Let a Claude Code or Codex session hand bounded sub-tasks to Codex or Claude chi
 **Status:** release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10). Children are
 read-only. macOS first, Linux partly untested, no Windows. Subscription logins only, never metered APIs.
 
-[Safety model](#safety-model) · [Quick start](#quick-start) · [Plan](docs/delivery/plan.md) · [Design](docs/delivery/g2-design.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
+[Safety model](#safety-model) · [Quick start](#quick-start) · [Troubleshooting](docs/troubleshooting.md) · [Plan](docs/delivery/plan.md) · [Design](docs/delivery/g2-design.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
 
 ```mermaid
 flowchart LR
@@ -98,7 +98,7 @@ What v1 enforces:
 
 ```mermaid
 flowchart TB
-    G["Codex primary: session guard, then the protected copy"] --> R["Route held to policy and config"]
+    G["Codex primary: the rule runs the protected copy, its session guard first"] --> R["Route held to policy and config"]
     R --> A["Admission, re-checked at launch"]
     A --> C["Read-only child in a private export"]
     C --> D["Result validated, fenced and bound by digest"]
@@ -127,6 +127,9 @@ In words: a request meets these layers in order, and a failure at any layer stop
   install, when `.codex` did not exist yet, can still rewrite that code.
 - **Claude settings and skills.** A Codex session in the project can rewrite `.claude/settings*.json` (hooks,
   deny rules) and `.claude/skills/`, which Claude Code loads on the host; verify warns about hooks there.
+- **The old macOS records.** A session that could write `~/Library` could have changed them before the
+  move; you check their creation date and owner key before approving it. The old copy, with the digest
+  key, stays readable until you delete it.
 
 > [!WARNING]
 > The attestation is your own statement about your billing settings. Admission also checks what the clients
@@ -153,7 +156,7 @@ Codex CLI 0.164.0 or both, signed in with their subscriptions, with no API key i
 | 2. Project | Picks the project (top of a Git working tree) and previews the install; changes nothing |
 | 3. Providers | Codex children, Claude children and models, and whether Codex sessions may start Claude children |
 | 4. Install | Installs, writes `provider-routing.json`, offers to commit only the changed files (never pushed), verifies |
-| 5. Collector | Registers the project with the local learning collector and starts it; on macOS it first moves your records to `~/.local/state/codex-agents`, once |
+| 5. Collector | Registers the project with the local learning collector and starts it; on macOS it first asks to move your records to `~/.local/state/codex-agents`, once |
 | 6. Billing | Hands the terminal to `attest.py`, which only you can complete |
 | 7. Profile | Only if Codex sessions may start Claude children: the `codex -p orchestrator` profile, network on |
 | 8. Commands | Only if Codex sessions orchestrate the project: the Codex commands rule and its protected copy |
@@ -183,8 +186,8 @@ plant them.
 
 > [!CAUTION]
 > Never add `~`, `~/.codex` or `~/.local` with `--add-dir` either. Setup warns about recent Codex sessions
-> that could write those folders, your records in `~/.local/state/codex-agents`, this repository or a tool
-> folder, and the orchestrator refuses their commands.
+> that could write your home folder, your records in `~/.local/state/codex-agents` or this repository, or
+> that were opened on a folder containing a set-up project; the orchestrator refuses their commands.
 
 ## Using it
 
@@ -195,6 +198,8 @@ dispatches a Codex child, verifies, runs operational QA and reports. A denial co
 **From Codex**, start a session in the project's own folder with `codex -p orchestrator` if step 7 created
 the profile, otherwise `codex`, and ask for the `orchestrate-agents` skill. It first runs `host-command`
 and stops, with the reason, unless the commands rule is `installed` and the session guard says `ok`.
+
+Your only command is `./setup.sh`; the orchestrator CLI is for the agent, which runs it through the skill.
 
 ## Configuration
 
@@ -207,38 +212,8 @@ and stops, with the reason, unless the commands rule is `installed` and the sess
 
 ## Troubleshooting
 
-<details><summary>"That passphrase did not unlock the key."</summary>
-
-`attest.py` asks `Try again or Exit? [T/e]`; press Enter to try again.
-</details>
-<details><summary>"the owner key must be a file in your own ~/.ssh folder"</summary>
-
-Move the key into `~/.ssh` (mode 0600, no symbolic link, the folder writable only by you) and run again.
-</details>
-<details><summary>I lost my owner key passphrase</summary>
-
-Signed attestations stay valid (admission uses the latest per account), but you cannot sign new ones: owner
-key rotation is not available yet. To stop a provider's children, disable it in `provider-routing.json`.
-</details>
-<details><summary>Codex reports the collector unreachable or "filesystem operation failed"</summary>
-
-The command ran inside Codex's sandbox. Run `./setup.sh`, choose "Update the install and walk through every
-step", allow the rule in step 8 (Commands), then start a new Codex session in the project's folder.
-</details>
-<details><summary>The Codex rule is "stale" after a Python or package upgrade</summary>
-
-The rule names the exact Python build and runtime copy. Run `./setup.sh` again and choose "Replace it".
-</details>
-<details><summary>"This Codex session can write to ..."</summary>
-
-The session guard refused the command. Quit that session and start Codex in the project's own folder.
-"Run Codex without --ephemeral" means the session left no record to check.
-</details>
-<details><summary>The Codex rule is "unsupported"</summary>
-
-It works only in your account's real `~/.codex`: set `HOME` to your own home folder, unset `CODEX_HOME`
-(or point it at `~/.codex`), replace a symlinked `~/.codex` with a real folder, and run `./setup.sh` again.
-</details>
+Common messages and their fixes, including "the Codex rule is stale", "This Codex session can write to
+..." and `host_client_unknown`, are in [troubleshooting](docs/troubleshooting.md).
 
 ## Status and roadmap
 

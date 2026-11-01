@@ -70,7 +70,9 @@ checkout and to the Python that ran the installer) and `.codex/orchestration/loc
 commit them: the installed `.codex/.gitignore` ignores both, and each clone gets its own when you install
 there. An update from 0.8.x replaces the old committed hooks file; take it out of Git with
 `git rm --cached .codex/hooks.json` before you commit. Codex trusts hooks by their hash, so after every
-install or update open `/hooks` in Codex and trust the orchestrator's learning hooks.
+install or update, once `install.py verify` passes, open `/hooks` in Codex and trust the orchestrator's
+learning hooks. Only a main checkout needs this: Codex loads a linked worktree's hooks from its main
+checkout. Close every Codex session in the project before installing or updating.
 
 ## 2. Enable providers
 
@@ -103,12 +105,14 @@ python3 -I -B -S -X pycache_prefix=/dev/null "$CLI" learning-status --project-ro
 ```
 
 One collector is shared by every project on the machine. Your orchestrator records (the learning state)
-live in `~/.local/state/codex-agents`, or `$XDG_STATE_HOME/codex-agents`; on macOS, the first
+live in `~/.local/state/codex-agents`, or `$XDG_STATE_HOME/codex-agents` when `XDG_STATE_HOME` is inside a
+hidden folder of your home such as `~/.local/state` (any other value is refused); on macOS, the first
 `learning-register` after this update moves them there from `~/Library/Application Support/codex-agents`
-and reports the old copy's path as `"state_moved"` (null otherwise); delete that old copy once you are
-happy. Because a session opened on `~/Library` could have created that old folder, it moves only with
-`--move-legacy-state <sha256 of its owner-allowed-signers file, or none>` after you have checked that the
-owner key it names is yours; the wizard shows it and asks first.
+and reports the old copy's path (`codex-agents.moved-<time>` beside the old folder) as `"state_moved"`
+(null otherwise); delete that old copy once you are happy. Because a session opened on `~/Library` could
+have created that old folder, it moves only with `--move-legacy-state <sha256 of its owner-allowed-signers
+file, or none>` after you have checked that the owner key it names is yours; the wizard shows its creation
+date and key fingerprints and asks first.
 
 ## 4. Attest billing
 

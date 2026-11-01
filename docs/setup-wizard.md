@@ -14,7 +14,8 @@ private log, shown only if something fails. `NO_COLOR=1` gives plain output. Pat
    runs it (from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` or `~/.local/bin`, its file
    checked first); one elsewhere on your `PATH` is reported, never run. It also scans Codex's session
    records from the last 14 days and warns, with Continue or Quit, about a session that could write this
-   repository, your orchestrator records, your home folder or a folder above them.
+   repository (the orchestrator clone), your orchestrator records or your home folder, or that was opened
+   on a folder containing a set-up project. The warnings end with the rule for where to open Codex.
 2. **Project.** The top folder of a Git working tree. Nothing changes; it previews the install. A project
    that has never been set up needs a prepared `operational-checks.json` (see the
    [recipe](manual-setup.md#operational-checks)); the wizard asks for its path and works from a private
@@ -23,28 +24,43 @@ private log, shown only if something fails. `NO_COLOR=1` gives plain output. Pat
    path, or quit.
 3. **Providers.** Codex children, Claude children and which Claude models, and "Let Codex sessions
    orchestrate Claude children". An existing `provider-routing.json` can be kept.
-4. **Install.** Installs, writes `provider-routing.json`, and offers to commit exactly the files the
-   installer reported plus `provider-routing.json`, listing only files that really changed (with none it
-   says "Nothing to commit" and skips the question). The commit uses Git plumbing only and is never
+4. **Install.** The screen starts with "Close every Codex session in this project first": the learning
+   hooks run the project's installed code outside Codex's sandbox, and a session started before the
+   install could still rewrite it. It then installs, writes `provider-routing.json`, and offers to commit
+   exactly the files the installer reported plus `provider-routing.json`, listing only files that really
+   changed (with none it says "Nothing to commit" and skips the question). The commit uses Git plumbing only and is never
    pushed. The summary says `committed`, `nothing to commit`, `not committed (you chose to commit
    yourself)` or `commit failed`, and lists anything left uncommitted, including files `.gitignore` hides.
    The learning hooks (`.codex/hooks.json`, which Codex runs outside its sandbox) are rendered for this
    checkout with the trusted Python and absolute paths, and are never committed; an older committed copy
-   is taken out of Git. The step says "In Codex, open /hooks and trust the orchestrator's learning hooks",
-   because Codex trusts hooks by hash and setup never writes that trust. Then it verifies the install.
+   is taken out of Git. Only after the runtime check passes (the installed orchestrator is this release,
+   byte for byte, with nothing extra) does the step say "In Codex, open /hooks and trust the
+   orchestrator's learning hooks", because Codex trusts hooks by hash and setup never writes that trust;
+   otherwise it says not to trust them yet, and why. This matters only on a main checkout: Codex loads a
+   linked worktree's hooks from its main checkout, and the hooks ignore events from a worktree. Then it
+   verifies the install.
 5. **Collector.** Registers the project with the one local learning collector shared by every project on
    the machine, and starts it. Your orchestrator records (the ledger, the owner key record and the
-   collector's files) live in `~/.local/state/codex-agents` (or `$XDG_STATE_HOME/codex-agents`); on macOS
-   the first registration after this update moves them there from
-   `~/Library/Application Support/codex-agents` and says so once.
+   collector's files) live in `~/.local/state/codex-agents`. `XDG_STATE_HOME` moves them only when it
+   points inside a hidden folder of your home, such as `~/.local/state`; any other value is refused.
+   - **One-time move on macOS.** Earlier releases kept the records in
+     `~/Library/Application Support/codex-agents`, which a Codex session opened on `~/Library` could
+     write. If that folder is still there, the step shows when it was created, the owner key fingerprint
+     it names and the fingerprint of your `~/.ssh/codex-agents-owner.pub`, says whether they match, and
+     asks "Move these records to the protected folder?". "No" leaves them and skips registration; every
+     orchestrator command refuses until they are moved.
+   - After the move it says once where the old copy went, `codex-agents.moved-<time>` beside the old
+     folder, and that you can delete it once you're happy. Until you do, it stays readable, digest key
+     included.
 6. **Billing.** Hands the terminal to `scripts/attest.py`; the wizard never touches its screens.
 7. **Profile.** Only when Codex sessions may orchestrate Claude children: creates
    `~/.codex/orchestrator.config.toml` with network on, for sessions started with `codex -p orchestrator`.
    An existing profile is compared by its effective settings and never overwritten.
 8. **Commands.** Only when Codex sessions orchestrate the project (Codex children, or bridging to Claude):
-   offers the Codex commands rule ("Yes, allow these commands"). Every Codex session on the machine loads
-   it, and it runs a protected copy of the orchestrator in `~/.codex`. A stale rule is left unchanged
-   unless you choose "Replace it". A Codex home other than the real `~/.codex` is reported as
+   offers the Codex commands rule. The default is "No, not now", so press Down once to "Yes, allow these
+   commands" before Enter. Every Codex session on the machine loads the rule, and it runs a protected
+   copy of the orchestrator in `~/.codex`. A rule that already matches is kept; a stale rule is left
+   unchanged unless you choose "Replace it". A Codex home other than the real `~/.codex` is reported as
    unsupported, with its reason and the fix.
 9. **Done.** A status line per step, how to start in each client, and the remove command.
 
@@ -52,6 +68,20 @@ After a step that did not finish, the choices are Try again, Skip for now (in a 
 main menu or Quit. The final screen offers Exit or Back to the main menu, and saving a summary of what
 failed when something did; the summary defaults to your home folder and the wizard asks before saving it
 inside a Git working tree. Only Exit or Quit ends the wizard.
+
+## Using it
+
+Your only command is `./setup.sh`. The orchestrator CLI is for the agent: you ask the primary session for
+the skill, and it routes the work, opens each run through admission, starts the child, has the result
+verified, runs operational QA and reports back, or stops with a `reason_code`.
+
+- **Claude Code:** open the project and ask for the `agent-orchestration` skill.
+- **Codex:** from your own terminal, start `codex -p orchestrator` (if step 7 created the profile) or
+  `codex` in the project's folder, and ask for the `orchestrate-agents` skill. Do not start Codex from
+  inside a Claude Code session: it inherits Claude Code's environment markers, and the host check then
+  refuses with `host_client_unknown`.
+
+Common messages and their fixes are in [troubleshooting](troubleshooting.md).
 
 ## Where to open Codex
 

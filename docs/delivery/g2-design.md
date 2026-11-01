@@ -846,7 +846,7 @@ safety comes from redundant layers.
     warns when `.claude/settings.json` defines hooks, which the installer never writes.
   - The old copy (`codex-agents.moved-<time>`, including the old digest key, which is the
     one the new state keeps using) stays readable where it was until the owner deletes
-    it; the wizard should say so.
+    it; the wizard's collector step names it and says it can be deleted.
   - The XDG_STATE_HOME check trusts HOME, the owner's environment, as the anchor.
   - The scan is a warning: it follows only records from the last 14 days, and the set-up
     projects it knows are the runtime bindings and the ledger's registrations.

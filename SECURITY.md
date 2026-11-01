@@ -38,13 +38,19 @@ Areas of particular interest:
 
 Accepted limits are listed in the README under "Does not protect against" and in the residual
 risks of [the G2 design](docs/delivery/g2-design.md) (S4c, S5b and S6). The supported setup
-assumes no Codex session is opened on the home folder, a folder above it or `/`, and that this
-repository sits outside every folder opened in Codex. The learning hooks name a fixed trusted
-interpreter and an absolute path, but they run the project's installed hook code, not a separate
-copy. Once installed, that code is protected like `.codex/hooks.json` itself (Codex keeps
-`<project>/.codex` read-only for a session opened on the project, and the session guard refuses
-sessions that can write it from above), but not from a process that was already writing the
-project before the install, when `.codex` did not exist: close every Codex session in the project
-before installing or updating. A Codex session in the project can also rewrite
-`.claude/settings*.json` and `.claude/skills/**`, which Claude Code runs on the host. A report that
-shows one of these limits is worse than documented is welcome.
+assumes every Codex session is opened on a project itself: never on a folder that contains a
+set-up project, the home folder, a folder above it or `/`, and that this repository sits outside
+every folder opened in Codex. A session that already writes `~/.codex` can forge its own session
+record, the rule and the protected copy; the session guard stops the ordinary mistake, not that.
+The learning hooks name a fixed trusted interpreter and an absolute path, but they run the
+project's installed hook code, not a separate copy. Once installed, that code is protected like
+`.codex/hooks.json` itself (Codex keeps `<project>/.codex` read-only for a session opened on the
+project, and the session guard refuses sessions that can write it from above), but not from a
+process that was already writing the project before the install, when `.codex` did not exist:
+close every Codex session in the project before installing or updating. A Codex session in the
+project can also rewrite `.claude/settings*.json` and `.claude/skills/**`, which Claude Code
+runs on the host. On macOS, a session that could write `~/Library` could have changed the old
+records folder before the owner approved its one-time move, and the old copy
+(`codex-agents.moved-<time>`, with the digest key) stays readable until the owner deletes it.
+Codex children can still read outside their export until G3. A report that shows one of these
+limits is worse than documented is welcome.

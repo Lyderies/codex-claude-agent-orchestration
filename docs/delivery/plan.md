@@ -215,6 +215,11 @@ however long it stays silent. v1.1 judges liveness from the client's real events
 - **Abort after a long silence,** by rule, without waiting for the deadline.
 - **Hard deadline as backstop:** the existing deadline and watchdog stay.
 
+Also a v1.1 candidate, from the G2 v1 hardening ([G2 design](g2-design.md), S6): run the learning
+hooks from a guard-protected owner copy, as the Codex rule already runs the CLI, rather than from the
+project's installed code. That would close the residual for a session that was already writing the
+project before the install.
+
 ## v1.2: Codex plan loop
 
 Planned (owner decision, 2026-11-01), not yet designed or estimated. It depends on v1.1. A Claude
