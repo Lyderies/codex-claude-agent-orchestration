@@ -1515,10 +1515,13 @@ def main() -> int:
             report = validate_learning_record(_bounded_json_input(args.record))
         elif args.command == "learning-register":
             validate_collector_runtime(ORCHESTRATION_ROOT / "cli.py")
-            # The owner's registration moves a pre-0.8.9 macOS state folder to the
-            # default location first (once); nothing else does.
-            state_moved = args.state_root is None and migrate_legacy_state(
-                ORCHESTRATION_ROOT / "cli.py", args.project_root
+            # The owner's registration copies a pre-0.8.9 macOS state folder to the
+            # default location first (once) and renames the old one aside; nothing
+            # else does. `state_moved` names the old copy, which the owner may delete.
+            moved_aside = (
+                migrate_legacy_state(ORCHESTRATION_ROOT / "cli.py", args.project_root)
+                if args.state_root is None
+                else None
             )
             state = LearningState(args.state_root)
             maintenance = CollectorMaintenance.acquire(
@@ -1561,7 +1564,7 @@ def main() -> int:
                 "collector_schema_version": health["schema_version"],
                 "collector_runtime_version": health["runtime_version"],
                 "collector_runtime_digest": health["runtime_digest"],
-                "state_moved": state_moved,
+                "state_moved": str(moved_aside) if moved_aside is not None else None,
             }
         elif args.command == "learning-serve":
             state = LearningState(args.state_root, create=False)

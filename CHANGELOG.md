@@ -6,16 +6,25 @@
   - **Learning state location.** On macOS the default learning state was
     `~/Library/Application Support/codex-agents`, which a Codex session opened on `~/Library`
     could write (ledger, digest key, collector authorization, `owner-allowed-signers`). The
-    default is now `$XDG_STATE_HOME/codex-agents`, else `~/.local/state/codex-agents`, on
-    every platform, with the home folder from the account database, never HOME.
+    default is now `~/.local/state/codex-agents` on every platform, with the home folder
+    from the account database, never HOME. `XDG_STATE_HOME` moves it only when it is
+    canonical and strictly inside a hidden folder of HOME (such as `~/.local/state`); any
+    other value refuses ("XDG_STATE_HOME must be inside a hidden folder in your home, such
+    as ~/.local/state; unset it or move it"). The folders above the state must be the
+    owner's, writable by no one else and not symbolic links; missing ones are created 0700.
+  - **No second hard link.** State files, including the owner's allowed signer and the
+    digest key, refuse a link count other than one.
   - **One-time move.** The owner's `learning-register` (the wizard's collector step) moves
-    the old macOS folder: it checks it, stops the collector and holds its maintenance lock,
-    renames the folder in one step on the same volume, checks it again and continues; it
-    refuses when both folders exist, when the move cannot happen in one step, or when the
-    new socket path would be too long. The report says `state_moved`. Every other use of
-    the default state refuses while only the old folder exists, telling the owner to run
-    `./setup.sh` (collector step). `host_paths.owner_state_root()` gives the owner tools the
-    folder in use until then.
+    the old macOS folder by copying, not renaming: with the collector stopped and the
+    ledger locked, it refuses a hard-linked, symbolic or special file, copies every file
+    into fresh inodes in an owner-only staging folder (the ledger through SQLite's backup
+    API), checks the copy, renames it into place and renames the old folder to
+    `codex-agents.moved-<UTC time>`, which `state_moved` names. On any failure the staging
+    folder is removed and the old folder is untouched; both folders present, or a socket
+    path that would be too long, refuse. Every other use of the default state refuses while
+    only the old folder exists, telling the owner to run `./setup.sh` (collector step).
+    `host_paths.owner_state_root()` gives the owner tools the folder in use until then. The
+    old copy, with the digest key, stays readable until the owner deletes it.
   - **Session guard coverage.** The guard also refuses a session that can write the learning
     state (with its `scratch`), the bridge's or the owner tools' host-private scratch
     container, a folder that strictly contains the copy's bound project, or the project's

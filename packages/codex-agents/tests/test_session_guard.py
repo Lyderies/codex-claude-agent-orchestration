@@ -360,25 +360,35 @@ class SessionScanTests(GuardTestCase):
         self.assertEqual([], scan_recent_sessions(self.clone, self.home / ".codex", self.home))
 
     def test_sessions_covering_the_learning_state_are_listed(self) -> None:
-        state = self.home / "State"
+        environment_home = self.base / "environment-home"
+        state = environment_home / ".local" / "state"
+        state.mkdir(parents=True)
         legacy = self.home / "Library" / "Application Support" / "codex-agents"
-        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+        with mock.patch.dict(os.environ, {
+            "HOME": str(environment_home), "XDG_STATE_HOME": str(state),
+        }):
             self.sessions.write(state)
             self.assertEqual(
                 [{"date": "2026-11-01", "folder": str(state), "holds": "state",
                   "message": SCAN_MESSAGES["state"]}],
                 scan_recent_sessions(self.clone, self.home / ".codex", self.home),
             )
-            # Before the owner's collector step moves it, the old macOS folder holds
-            # the state, so a session on ~/Library is listed while it exists.
-            self.sessions.write(self.home / "Library")
-            with mock.patch.object(session_guard, "legacy_state_root", lambda: legacy):
-                self.assertEqual(
-                    [], scan_recent_sessions(self.clone, self.home / ".codex", self.home)
-                )
-                legacy.mkdir(parents=True)
-                findings = scan_recent_sessions(self.clone, self.home / ".codex", self.home)
-            self.assertEqual(["state"], [item["holds"] for item in findings])
+        # Before the owner's collector step copies it, the old macOS folder holds
+        # the state, so a session on ~/Library is listed while it exists.
+        self.sessions.write(self.home / "Library")
+        with mock.patch.object(session_guard, "legacy_state_root", lambda: legacy):
+            self.assertEqual(
+                [], scan_recent_sessions(self.clone, self.home / ".codex", self.home)
+            )
+            legacy.mkdir(parents=True)
+            findings = scan_recent_sessions(self.clone, self.home / ".codex", self.home)
+        self.assertEqual(["state"], [item["holds"] for item in findings])
+        # An XDG_STATE_HOME the commands refuse is no state to warn about.
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.home / "State")}):
+            self.sessions.write(self.home / "State")
+            self.assertEqual(
+                [], scan_recent_sessions(self.clone, self.home / ".codex", self.home)
+            )
 
     def test_sessions_on_a_folder_containing_a_set_up_project_are_listed(self) -> None:
         # Projects come from the runtime copies' bindings and from the caller (the
@@ -436,12 +446,18 @@ class StateScratchAndProjectGuardTests(GuardTestCase):
             with self.subTest(folder=folder):
                 self.add_dir(folder)
                 self.assert_refused("trusted tools are installed")
-        # Wherever XDG_STATE_HOME puts it, the state, its scratch and the folders
-        # around it are protected.
-        state = self.home / "State"
-        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+        # An XDG_STATE_HOME inside a hidden folder of HOME (here a HOME other than
+        # the account's, as the tests isolate one) is protected wherever it is:
+        # the state, its scratch and the folders around it.
+        environment_home = self.base / "environment-home"
+        state = environment_home / ".local" / "state"
+        state.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {
+            "HOME": str(environment_home), "XDG_STATE_HOME": str(state),
+        }):
             for folder in (
-                state, state / "codex-agents", state / "codex-agents" / "scratch",
+                environment_home, state, state / "codex-agents",
+                state / "codex-agents" / "scratch",
                 state / "codex-agents" / "scratch" / "client-1",
             ):
                 with self.subTest(folder=folder):
@@ -449,8 +465,12 @@ class StateScratchAndProjectGuardTests(GuardTestCase):
                     self.assert_refused("orchestrator's learning state")
                     self.sessions.write(folder)
                     self.assert_refused("orchestrator's learning state")
-            self.add_dir(self.home / "StateBeside")
+            self.add_dir(environment_home / "Beside")
             self.check()
+        # Any other XDG_STATE_HOME refuses every command, the guard included.
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.home / "State")}):
+            self.sessions.write(self.project)
+            self.assert_refused("XDG_STATE_HOME must be inside a hidden folder in your home")
 
     def test_the_old_macos_state_folder_is_no_longer_special(self) -> None:
         # After the owner's collector step moved it, nothing trusted lives there.
