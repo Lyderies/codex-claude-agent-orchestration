@@ -179,6 +179,37 @@ class HardLinkTests(unittest.TestCase):
             self.state.digest_key()
 
 
+class OversizedSignerTests(unittest.TestCase):
+    """The allowed-signers file is checked whole: ssh-keygen reads every line."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(os.path.realpath(self.temporary.name))
+        _key, public = generate_test_owner_key(self.base)
+        self.content = self.oversized(public)
+
+    @staticmethod
+    def oversized(public: str) -> bytes:
+        # A first line that matches the canonical form and is exactly 4097 bytes,
+        # then a second, real key line.
+        prefix = b"codex-agents-owner ssh-ed25519 "
+        first = prefix + b"A" * (4096 - len(prefix)) + b"\n"
+        assert len(first) == 4097
+        kind, key = public.split()[:2]
+        return first + f"codex-agents-owner {kind} {key}\n".encode("ascii")
+
+    def test_an_over_long_first_line_hiding_a_second_key_is_refused(self) -> None:
+        state = LearningState(self.base / "state")
+        state.allowed_signers_path.write_bytes(self.content)
+        with self.assertRaisesRegex(StateError, "exactly one owner key"):
+            state.owner_allowed_signers()
+        # The old check passed on the first 4097 bytes alone.
+        self.assertIsNotNone(
+            learning_store.OWNER_SIGNER_LINE.fullmatch(self.content[:4097])
+        )
+
+
 class LegacyStateMoveTests(unittest.TestCase):
     """The one-time, owner-driven copy of the pre-0.8.9 macOS state folder."""
 
@@ -347,6 +378,18 @@ class LegacyStateMoveTests(unittest.TestCase):
         with self.assertRaisesRegex(StateError, "second hard link, a symbolic link"):
             migrate_legacy_state(CLI, self.project)
         self.assert_nothing_staged()
+
+    def test_an_old_signer_with_an_over_long_first_line_is_not_copied(self) -> None:
+        state = self.old_state(register=False)
+        attacker = self.base / "attacker"
+        attacker.mkdir()
+        _key, public = generate_test_owner_key(attacker)
+        state.allowed_signers_path.write_bytes(OversizedSignerTests.oversized(public))
+        with self.assertRaisesRegex(StateError, "did not pass its checks"):
+            migrate_legacy_state(CLI, self.project)
+        self.assert_nothing_staged()
+        self.assertTrue(os.path.lexists(self.legacy))
+        self.assertEqual([], self.moved_aside())
 
     def test_a_failed_copy_removes_the_staging_folder_and_keeps_the_old_one(self) -> None:
         self.old_state()

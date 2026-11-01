@@ -522,7 +522,10 @@ safety comes from redundant layers.
   - **No second hard link.** Every state file the store checks (database and journals,
     digest key, owner allowed-signers) refuses a link count other than one, and the signer
     and digest key are also checked on the descriptor they are read from: a hard link in a
-    project would otherwise keep write access to the file.
+    project would otherwise keep write access to the file. The allowed-signers file must be
+    exactly one canonical line of at most 4096 bytes, read whole (normal use, the staged
+    copy and the move): `ssh-keygen` reads the whole file, so a valid-looking over-long
+    first line must not hide a second key behind the part that was checked.
   - **One-time move.** Only the owner's `learning-register` (the wizard's collector step,
     run from the clone) moves the old folder, and only while it is the only one. It checks
     it (owner-only, no symlink, outside Git), refuses if the new socket path would exceed

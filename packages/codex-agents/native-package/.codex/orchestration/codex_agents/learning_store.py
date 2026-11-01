@@ -96,6 +96,8 @@ COLLECTOR_RUNTIME_DIGEST = _collector_runtime_digest()
 PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
 # The one line `install_owner_public_key` writes; the allowed-signers file holds nothing else.
+# The owner's allowed-signers file is read whole up to this size; anything longer refuses.
+OWNER_SIGNERS_MAX_BYTES = 4096
 OWNER_SIGNER_LINE = re.compile(
     rb"codex-agents-owner (?:ssh-ed25519|sk-ssh-ed25519@openssh\.com|ssh-rsa|"
     rb"ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+\n"
@@ -1183,10 +1185,12 @@ class LearningState:
         with os.fdopen(descriptor, "rb") as handle:
             if os.fstat(handle.fileno()).st_nlink != 1:
                 raise StateError("owner allowed-signers path is unsafe")
-            content = handle.read(4097)
+            content = handle.read(OWNER_SIGNERS_MAX_BYTES + 1)
         if not content:
             raise StateError("owner public key is not configured")
-        if OWNER_SIGNER_LINE.fullmatch(content) is None:
+        # The whole file must be the one line: ssh-keygen reads all of it, and a
+        # key after an over-long first line would otherwise go unchecked.
+        if len(content) > OWNER_SIGNERS_MAX_BYTES or OWNER_SIGNER_LINE.fullmatch(content) is None:
             raise StateError("owner allowed-signers must name exactly one owner key")
         return self.allowed_signers_path
 

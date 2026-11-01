@@ -13,7 +13,8 @@
     as ~/.local/state; unset it or move it"). The folders above the state must be the
     owner's, writable by no one else and not symbolic links; missing ones are created 0700.
   - **No second hard link.** State files, including the owner's allowed signer and the
-    digest key, refuse a link count other than one.
+    digest key, refuse a link count other than one. The allowed-signers file is validated
+    whole: anything over 4096 bytes refuses, since `ssh-keygen` reads every line.
   - **One-time move.** The owner's `learning-register` (the wizard's collector step) moves
     the old macOS folder by copying, not renaming: with the collector stopped and the
     ledger locked, it refuses a hard-linked, symbolic or special file, copies every file
