@@ -1242,6 +1242,42 @@ class SignOnlyWhatWasApprovedTests(AttestHarness):
         self.assertEqual(self.world.grants, {})
 
 
+class StateRootTests(unittest.TestCase):
+    """The owner tools follow the runtime's learning state folder, never a path of their own."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix="attest-state-")).resolve()
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def test_the_state_root_is_the_runtimes_owner_state_root(self) -> None:
+        with mock.patch.dict(os.environ, {"HOME": str(self.home),
+                                          "XDG_STATE_HOME": str(self.home / ".local" / "state")}):
+            self.assertEqual(attest.default_state_root(), attest.host_paths.owner_state_root())
+            self.assertEqual(attest.default_state_root(), self.home / ".local" / "state" / "codex-agents")
+        # Without XDG_STATE_HOME it is the account database's home, whatever HOME says: every
+        # test that resolves the default state must set XDG_STATE_HOME (test_install does).
+        import pwd
+        environ = {key: value for key, value in os.environ.items() if key != "XDG_STATE_HOME"}
+        with mock.patch.dict(os.environ, {**environ, "HOME": str(self.home)}, clear=True):
+            account = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+            self.assertEqual(attest.host_paths.default_state_root(), account / ".local" / "state" / "codex-agents")
+        self.assertNotIn("Application Support", _SCRIPT.read_text())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the old folder was macOS's")
+    def test_the_old_macos_folder_is_used_until_the_collector_step_moves_it(self) -> None:
+        old = self.home / "Library" / "Application Support" / "codex-agents"
+        old.mkdir(parents=True, mode=0o700)
+        new = self.home / ".local" / "state" / "codex-agents"
+        with mock.patch.dict(os.environ, {"HOME": str(self.home),
+                                          "XDG_STATE_HOME": str(self.home / ".local" / "state")}):
+            self.assertEqual(attest.default_state_root(), old)
+            new.mkdir(parents=True, mode=0o700)
+            self.assertEqual(attest.default_state_root(), new)
+
+    def test_the_scratch_container_is_the_one_the_guard_protects(self) -> None:
+        self.assertEqual(attest.SCRATCH_CONTAINER, attest.host_paths.OWNER_SCRATCH_CONTAINER)
+
+
 class ClientStatusTests(unittest.TestCase):
     """setup.sh's sign-in checks find and run a client only as the runtime would."""
 

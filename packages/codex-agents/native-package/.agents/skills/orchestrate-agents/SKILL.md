@@ -10,16 +10,19 @@ Keep the primary agent as the decision owner and final synthesizer.
 Codex's sandbox blocks the learning collector, so lifecycle commands run outside it only
 through the owner's Codex command rule. Every Codex session on this machine loads that
 rule, and it runs a protected copy of the orchestrator in `~/.codex` that a session
-opened on a project cannot change. It is safe only while no Codex session uses the home
-folder, its parent or `/` as its workspace (or adds `~` or `~/.codex` with `--add-dir`):
-if this session's workspace is one of those, stop and tell the owner. Before any other
+opened on a project cannot change. It is safe only while every Codex session is opened on
+a project itself: never on a folder that contains a set-up project, the orchestrator's
+setup folder, the home folder, its parent or `/` (nor adds `~` or `~/.codex` with
+`--add-dir`): if this session's workspace is one of those, stop and tell the owner. Before any other
 CLI call, run `python3 -I -B -S -X pycache_prefix=/dev/null .codex/orchestration/cli.py
 host-command --project-root <exact-root>`. If its `codex_rule` is not `installed`, stop
 and tell the owner to run `./setup.sh` (Codex commands step), with its `reason` when it
 says `unsupported`; do not retry or work around it. If its `session_guard` is not `ok`,
 stop and report that reason to the owner word for word: the orchestrator refuses every
 command from a session that can write the home folder, a folder above it, `~/.codex`, the
-orchestrator's setup folder or a tool folder, or that runs without its sandbox or with
+orchestrator's setup folder, a tool folder, the learning state, the orchestrator's private
+working folders, a folder that contains this project, or this project's `.codex`,
+`.agents` or `.git` as a folder of its own, or that runs without its sandbox or with
 `--ephemeral`, and only reopening Codex on the project folder fixes it. Otherwise run every later CLI command
 as exactly its `argv_prefix` (the absolute base interpreter, the isolation flags
 `-I -B -S -X pycache_prefix=/dev/null`, then the absolute `cli.py` of the protected copy

@@ -75,7 +75,6 @@ MANIFEST_RELATIVE = RUNTIME_RELATIVE / "install-manifest.json"
 # cache prefix points below /dev/null, where no folder can exist).
 PYTHON_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
 GETCONF = "/usr/bin/getconf"
-SCRATCH_CONTAINER = "agent-orchestration-owner"
 SCRATCH_BASE: str | None = None  # tests only; the platform's private folder otherwise
 ACCOUNT_HOME: str | None = None  # tests only; the system account database's home otherwise
 MACOS_ADMIN_GROUP = 80
@@ -277,6 +276,9 @@ _HOST_PATHS_SPEC = importlib.util.spec_from_file_location("agent_orchestration_h
 host_paths = importlib.util.module_from_spec(_HOST_PATHS_SPEC)
 _HOST_PATHS_SPEC.loader.exec_module(host_paths)
 UNTRUSTED_PYTHON_ADVICE = "Put a system Python, such as Homebrew's or python.org's, first on PATH"
+# The owner tools' scratch container, by the runtime's name for it: the session guard refuses a
+# Codex session that can write it.
+SCRATCH_CONTAINER = host_paths.OWNER_SCRATCH_CONTAINER
 
 
 def clone_module(name: str):
@@ -690,21 +692,17 @@ def ssh(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 def default_state_root() -> Path:
     """The folder that holds your orchestrator records (the learning state) now, decided by
-    this repository's own package, never a path of its own.
+    this repository's own package, never a path of its own: host_paths.owner_state_root.
 
-    host_paths.owner_state_root, where the package has it: the pre-0.8.9 macOS folder while
-    it is the only one (the collector step's learning-register moves it once), else the
-    default, so an earlier step (the installer's ownership record) never creates the new
-    folder beside the old one. Otherwise learning_store.default_state_root.
+    That is the pre-0.8.9 macOS folder while it is the only one (the collector step's
+    learning-register moves it once), else the default ($XDG_STATE_HOME/codex-agents or the
+    account's ~/.local/state/codex-agents). The install step runs before the collector step,
+    so the installer's ownership record never creates the new folder beside the old one,
+    which would make the move refuse.
     """
 
     try:
-        owner_state_root = getattr(host_paths, "owner_state_root", None)
-        if owner_state_root is not None:
-            return Path(owner_state_root())
-        return Path(clone_module("learning_store").default_state_root())
-    except AttestError:
-        raise
+        return Path(host_paths.owner_state_root())
     except Exception as exc:
         raise AttestError("the learning state folder cannot be found") from exc
 

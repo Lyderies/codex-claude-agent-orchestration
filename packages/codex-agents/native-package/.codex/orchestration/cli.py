@@ -130,6 +130,8 @@ from codex_agents.learning_store import (  # noqa: E402
     default_state_root,
     empty_ingestion_snapshot,
     ensure_collector,
+    migrate_legacy_state,
+    registered_project_roots,
     require_authorized_collector_runtime,
     validate_collector_runtime,
 )
@@ -394,11 +396,14 @@ def _require_protected_runtime(args: argparse.Namespace) -> None:
             "owner to run ./setup.sh (Codex commands step)"
         )
     # The calling Codex session may not be able to write anything the rule
-    # depends on: its home folder, ~/.codex, this copy, the clone, tool folders.
+    # depends on: its home folder, ~/.codex, this copy, the clone, tool folders,
+    # the learning state, the private scratch, or a folder that contains the
+    # project (or the project's .codex, .agents or .git as a folder of its own).
     try:
         check_current_session(
             ORCHESTRATION_ROOT.parent.parent,
             Path(_BINDING["clone_root"]) if _BINDING is not None else None,
+            BUNDLE_ROOT,
         )
     except SessionRefused as exc:
         raise HostCommandError(str(exc)) from None
@@ -1256,10 +1261,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remove_codex_rule_parser.add_argument("--project-root", required=True, type=Path)
 
-    # Read-only: which recent Codex sessions could write this clone or the home folder.
+    # Read-only: which recent Codex sessions could write this clone, the home folder,
+    # the learning state, or a folder that contains a set-up project.
     session_scan = subparsers.add_parser(
         "codex-session-scan",
-        help="setup: list recent Codex sessions that could write this clone or the home folder",
+        help="setup: list recent Codex sessions that could write this clone, the home "
+        "folder, the learning state or a folder containing a set-up project",
     )
     session_scan.add_argument("--clone-root", required=True, type=Path)
 
@@ -1507,8 +1514,13 @@ def main() -> int:
         elif args.command == "learning-validate":
             report = validate_learning_record(_bounded_json_input(args.record))
         elif args.command == "learning-register":
-            state = LearningState(args.state_root)
             validate_collector_runtime(ORCHESTRATION_ROOT / "cli.py")
+            # The owner's registration moves a pre-0.8.9 macOS state folder to the
+            # default location first (once); nothing else does.
+            state_moved = args.state_root is None and migrate_legacy_state(
+                ORCHESTRATION_ROOT / "cli.py", args.project_root
+            )
+            state = LearningState(args.state_root)
             maintenance = CollectorMaintenance.acquire(
                 state,
                 ORCHESTRATION_ROOT / "cli.py",
@@ -1549,6 +1561,7 @@ def main() -> int:
                 "collector_schema_version": health["schema_version"],
                 "collector_runtime_version": health["runtime_version"],
                 "collector_runtime_digest": health["runtime_digest"],
+                "state_moved": state_moved,
             }
         elif args.command == "learning-serve":
             state = LearningState(args.state_root, create=False)
@@ -2992,7 +3005,8 @@ def main() -> int:
                     "runtime_copy": runtime_copy,
                     # Whether this session would pass the guard the copy applies.
                     "session_guard": session_guard_status(
-                        Path(runtime_copy) if runtime_copy is not None else None, clone
+                        Path(runtime_copy) if runtime_copy is not None else None, clone,
+                        Path(os.path.abspath(args.project_root)),
                     ),
                 }
         elif args.command == "install-codex-rule":
@@ -3023,6 +3037,7 @@ def main() -> int:
                     args.clone_root,
                     configured_codex_home(),
                     Path(os.environ.get("HOME") or Path.home()),
+                    projects=registered_project_roots(),
                 ),
             }
         else:  # pragma: no cover - argparse restricts commands.

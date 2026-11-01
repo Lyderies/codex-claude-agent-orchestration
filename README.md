@@ -88,8 +88,9 @@ What v1 enforces:
   returns. QA accepts only the verifier opened for that outcome and runs only the project's hashed commands.
 - **Protected command rule and session guard.** The optional Codex rule lets only the 23 everyday
   orchestrator commands run outside Codex's sandbox, through an owner-only, byte-verified runtime copy in
-  `~/.codex`. Before each command the copy refuses a session that can write `/`, your home folder or a
-  folder above it, `~/.codex`, your records, this repository or a tool folder, or runs without its sandbox.
+  `~/.codex`. Before each command the copy refuses a session opened above the project, one that can write
+  `/`, your home folder or a folder above it, `~/.codex`, your records, this repository or a tool folder,
+  and one without its sandbox.
 - **Owner authority stays with you.** `setup.sh`, `attest.py` and the installer run this repository's own
   CLI, never the project's copy; Git on the project is plumbing only; the interpreter, Git and provider
   clients must come from trusted install folders, and setup never runs a client or basic tool from an
@@ -113,7 +114,8 @@ In words: a request meets these layers in order, and a failure at any layer stop
   A native Claude child has the primary's permissions, so its reads are advisory.
 - **A session that already writes `~/.codex`** (opened on `/`, or given it with `--add-dir`) can forge its
   own session record, the rule and the copy. The guard stops the ordinary mistake, not that.
-- **Parent-folder sessions.** A session opened above the project can change its configuration and `.git`.
+- **Parent-folder sessions.** A session opened above the project can still change its configuration and
+  `.git`; the orchestrator refuses that session's commands, but cannot undo what it wrote.
 - **A primary that ignores its route.** A Codex primary can still spawn a native Codex child that shares
   its rule; a Claude primary's native children spend its own allowance whatever admission says.
 - **Other spellings and detached processes.** The installer's Claude Code deny rules are a policy layer,
@@ -158,18 +160,21 @@ re-attest or change the owner key passphrase. Details: [setup wizard](docs/setup
 
 ### Where to open Codex
 
-Open Codex on your project folders, not on a folder that holds them all.
+Open Codex on the project itself. This repository (the orchestrator clone) is only for running
+`./setup.sh`; never open Codex on it.
 
 ```mermaid
 flowchart TB
-    H["Home folder, a folder above it, or /: never"] --> F["A folder holding several projects: avoid"]
-    H --> S["This repository: outside every Codex workspace"]
+    H["Home folder, a folder above it, or /: never"] --> F["A folder holding several projects: never"]
+    H --> S["This repository: only for ./setup.sh, outside every Codex workspace"]
     F --> A["Project A: open Codex here"]
     F --> B["Project B: open Codex here"]
 ```
 
-In words: open Codex on each project folder; never on the home folder, a folder above it or `/`; avoid a
-folder that holds several projects; and keep this repository outside every folder you open in Codex.
+In words: open Codex on each project itself; never on a folder that contains a set-up project, this
+repository, the home folder, a folder above it or `/`. A folder above a project is never safe: Codex runs
+a nested trusted project's `.codex/config.toml` and hooks outside the sandbox, so a session there could
+plant them.
 
 > [!CAUTION]
 > Never add `~`, `~/.codex` or `~/.local` with `--add-dir` either. Setup warns about recent Codex sessions

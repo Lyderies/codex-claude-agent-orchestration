@@ -52,18 +52,18 @@ inside a Git working tree. Only Exit or Quit ends the wizard.
 
 ## Where to open Codex
 
-Open Codex on your project folders, not on a folder that holds them all. While the Codex commands rule
-exists, never open Codex on your home folder, a folder above it or `/`, never add `~`, `~/.codex` or
-`~/.local` with `--add-dir`, and keep this repository outside every folder you open in Codex. Before each
-command the rule runs, the orchestrator reads the calling session's own Codex record (only its settings,
-never the conversation) and refuses a session that runs without its sandbox, left no record
-(`--ephemeral`), or can write your home folder, a folder above it, `~/.codex`, this repository, your
-records in `~/.local/state/codex-agents` or a tool folder (`~/.local`, `/opt/homebrew` and the like,
-including one added with `--add-dir`). In a Codex session, `host-command` prints that verdict as
-`session_guard`.
-
-A session opened on a folder that holds several projects, and none of the folders above, is not refused,
-but every project's configuration and `.git` in it are then writable by that session's model.
+Open Codex on the project itself; this repository is only for running `./setup.sh`. Never open Codex on
+a folder that contains a set-up project, this repository, your home folder, a folder above it or `/`, and
+never add `~`, `~/.codex` or `~/.local` with `--add-dir`. A folder above a project is never safe: Codex
+runs a nested trusted project's `.codex/config.toml` and hooks outside the sandbox, and keeps a project's
+`.codex`, `.agents` and `.git` read-only only when the project is the top of the session's folder, so a
+session opened above it could plant them. Before each command the rule runs, the orchestrator reads the
+calling session's own Codex record (only its settings, never the conversation) and refuses a session that
+runs without its sandbox, left no record (`--ephemeral`), was opened on a folder that contains the
+project, or can write your home folder, a folder above it, `~/.codex`, this repository, your records in
+`~/.local/state/codex-agents`, the private working folders or a tool folder (`~/.local`, `/opt/homebrew`
+and the like, including one added with `--add-dir`). In a Codex session, `host-command` prints that verdict
+as `session_guard`. A refused session's commands stop, but what it already wrote stays.
 
 ## How setup keeps your authority away from the agents
 

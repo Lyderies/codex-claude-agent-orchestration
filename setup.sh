@@ -413,14 +413,15 @@ op = sys.argv[1]
 if op == "get":
     print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
 elif op == "sessions":
-    # codex-session-scan's warnings, one per line: date, what it holds, folder. Control
-    # characters are dropped, so a folder name cannot drive the terminal.
+    # codex-session-scan's warnings, one per line: date, what it holds, folder and its plain
+    # message, separated by \x1f. Control characters are dropped, so a folder or project name
+    # cannot drive the terminal (or split a line).
     data = load(sys.argv[2])
     for item in (data.get("warnings") if isinstance(data, dict) else None) or []:
         if isinstance(item, dict):
             fields = [re.sub(r"[\x00-\x1f\x7f]", "", str(item.get(key, "")))
-                      for key in ("date", "holds", "folder")]
-            print("\t".join(fields))
+                      for key in ("date", "holds", "folder", "message")]
+            print("\x1f".join(fields))
 elif op == "claude":
     data = load("-")
     if isinstance(data, dict) and data.get("loggedIn") is True:
@@ -1443,26 +1444,30 @@ step_checks() {
 
 # session_warnings : warn about recent Codex sessions (records changed in the last 14 days)
 # that could write this setup folder, your orchestrator records (the learning state), the home
-# folder or a folder above it. This clone's CLI
+# folder or a folder above it, or that were opened on a folder containing a set-up project,
+# each with the runtime's plain message. This clone's CLI
 # reads only each record's session settings, never the conversation, with the same parsing
 # as the guard the Codex commands rule applies. A scan that fails warns about nothing.
 session_warnings() {
-  local scan date holds folder what
+  local scan date holds folder message
   # Step 1 runs before the private working folder exists, so the report stays in memory.
   scan=$("$PY" "${PYF[@]}" "$CLONE_CLI" codex-session-scan --clone-root "$ROOT_DIR" 2>/dev/null) || return 0
-  while IFS=$'\t' read -r date holds folder; do
+  while IFS=$'\x1f' read -r date holds folder message; do
     [ -n "$folder" ] || continue
-    case "$holds" in
-      clone) what="this setup folder";;
-      state) what="your orchestrator records";;
-      project) what="a project set up with this orchestrator";;
-      *) what="your home folder";;
-    esac
-    list_add warn "A Codex session on $date could write to $folder, which holds $what."
+    # The runtime's plain message for what the folder holds (home, clone, state or project).
+    if [ -z "$message" ]; then
+      case "$holds" in
+        clone) message="Codex was opened on a folder that holds this setup folder";;
+        state) message="Codex was opened on a folder that holds the orchestrator's learning state";;
+        project) message="Codex was opened on a folder that contains a set-up project";;
+        *) message="Codex was opened on a folder that holds your home folder";;
+      esac
+    fi
+    list_add warn "A Codex session on $date could write to $folder. $message."
     SESSION_WARNING=1
   done < <(printf '%s' "$scan" | pj sessions -)
   if [ "$SESSION_WARNING" -eq 1 ]; then
-    list_sub "While the Codex commands rule exists, open Codex on a project folder only: never on your home folder, a folder above it, or a folder holding this setup folder, your orchestrator records or a set-up project. The orchestrator refuses commands from such a session."
+    list_sub "Open Codex on the project itself: never on a folder that contains a set-up project, this setup folder, your home folder, a folder above it or /."
   fi
 }
 
@@ -2090,7 +2095,7 @@ version_hint() {
 }
 
 step_collector() {
-  local cli ready moved from
+  local cli ready
   begin_step 5
   cli="$PROJECT/.codex/orchestration/cli.py"
   if [ ! -f "$cli" ]; then
@@ -2120,12 +2125,9 @@ step_collector() {
     pause; return 1
   fi
   list_add ok "Collector registered"
-  # learning-register reports state_moved (true) when it has just moved the learning state
-  # from its old macOS folder, once; migrated_state_from (a path) is read the same way. Only
-  # a fixed sentence is shown, never a reported path.
-  moved=$(pj get "$LAST_OUT" state_moved)
-  from=$(pj get "$LAST_OUT" migrated_state_from)
-  if [ "$moved" = true ] || { [ -n "$from" ] && [ "$from" != false ]; }; then
+  # learning-register reports "state_moved": true when it has just moved the learning state
+  # from its old macOS folder (once); one fixed sentence says so.
+  if [ "$(pj get "$LAST_OUT" state_moved)" = true ]; then
     list_add info "Moved your orchestrator records once to a protected folder, ~/.local/state/codex-agents."
   fi
   render

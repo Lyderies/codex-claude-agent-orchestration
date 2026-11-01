@@ -710,13 +710,22 @@ def validate_package(root: Path) -> dict[str, Any]:
             "failure_events": [],
         },
     ]
-    # The smoke routes check the package policy, so a project that enables
-    # another provider does not change what they expect.
-    smoke_policy = {
-        key: value
-        for key, value in effective_policy.items()
-        if key not in {"provider_routing", "provider_config_digest"}
-    }
+    # Every Codex child is bridged read-only in this release, so a mapped Codex
+    # agent that needs workspace-write is never used for a Codex route.
+    for roles_key, sandboxes_key in (
+        ("project_agent_roles", "project_agent_role_sandboxes"),
+        ("project_agent_verifiers", "project_agent_verifier_sandboxes"),
+    ):
+        for family, sandbox in effective_policy.get(sandboxes_key, {}).items():
+            agent = effective_policy.get(roles_key, {}).get(family)
+            if agent is not None and sandbox != "read-only":
+                warnings.append(
+                    f"{agent} is {sandbox}; Codex children are bridged read-only in this "
+                    "release, so it is not used for Codex routes"
+                )
+    # The smoke routes check the package policy alone: neither a project's
+    # provider configuration nor its agent mapping changes what they expect.
+    smoke_policy = policy
     try:
         routes = [
             route_task(smoke_tasks[0], smoke_policy),

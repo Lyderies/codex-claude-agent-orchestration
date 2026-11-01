@@ -164,10 +164,12 @@ differing one. It refuses:
   system account database, or a symlinked `~/.codex`.
 
 Run it again after a Python upgrade or a package update; `host-command` then reports `stale`. Before each
-command, the copy's session guard refuses a Codex session that can write `/`, your home folder or a folder
-above it, `~/.codex`, the copy, this repository or a tool folder, or that runs without its sandbox or
-leaves no record. Open Codex on the project folder: never on your home folder, a folder above it or `/`,
-and never add `~` or `~/.codex` with `--add-dir`.
+command, the copy's session guard refuses a Codex session that was opened on a folder that contains the
+project, that can write `/`, your home folder or a folder above it, `~/.codex`, the copy, this repository,
+your records or a tool folder, or that runs without its sandbox or leaves no record. Open Codex on the
+project itself: never on a folder that contains a set-up project, this repository, your home folder, a
+folder above it or `/` (Codex runs a nested trusted project's `.codex/config.toml` and hooks outside the
+sandbox), and never add `~`, `~/.codex` or `~/.local` with `--add-dir`.
 
 To undo only the rule and its copy:
 

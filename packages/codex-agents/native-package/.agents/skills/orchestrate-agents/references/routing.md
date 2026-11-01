@@ -140,14 +140,19 @@ collector. It prints `argv_prefix` (naming the copy), `runtime_copy` and `codex_
 `missing` without a rule file; `unsupported` for a Codex home other than the real
 `~/.codex`; `stale` otherwise, as after a Python or package change, for a rule that names
 the project's own `cli.py`, without an install manifest, or for a symlink. The rule is
-safe only while no Codex session uses the home folder, its parent or `/` as its workspace,
-or adds `~` or `~/.codex` with `--add-dir`: such a session could write `~/.codex` and
-home-installed tools. The copy checks that itself before every command: it finds the
-calling session's Codex record from `CODEX_THREAD_ID` (only `session_meta` and the last
-`turn_context`, never conversation content) and refuses a session that runs without its
-sandbox, has no record (`--ephemeral`), or can write `/`, the home folder or a folder
-above it, `~/.codex`, the copy, the orchestrator clone that installed it, or a trusted
-installation folder; `host-command` reports the verdict as `session_guard`. The rule leaves every argument after the subcommand to the CLI, so
+safe only while every Codex session is opened on a project itself: never on a folder that
+contains a set-up project, the orchestrator clone, the home folder, its parent or `/`, and
+never with `~` or `~/.codex` added by `--add-dir`. Such a session could write `~/.codex`
+and home-installed tools, or plant a nested project's `.codex/config.toml` and hooks,
+which Codex runs outside the sandbox. The copy checks that itself before every command:
+it finds the calling session's Codex record from `CODEX_THREAD_ID` (only `session_meta`
+and the last `turn_context`, never conversation content) and refuses a session that runs
+without its sandbox, has no record (`--ephemeral`), or can write `/`, the home folder or a
+folder above it, `~/.codex`, the copy, the orchestrator clone that installed it, a trusted
+installation folder, the learning state (`$XDG_STATE_HOME/codex-agents` or
+`~/.local/state/codex-agents`), the bridge's or the owner tools' private scratch, a
+folder that contains the bound project, or the project's `.codex`, `.agents` or `.git`
+as a folder of its own; `host-command` reports the verdict as `session_guard`. The rule leaves every argument after the subcommand to the CLI, so
 for these commands the copy refuses a `--project-root` or `--root` other than its bound
 project, a `--state-root` other than the default learning state, and any `--policy`, before doing any other work. Commands it runs outside the sandbox never use a
 sandbox-writable location: trust checks read the repository with git plumbing only (no

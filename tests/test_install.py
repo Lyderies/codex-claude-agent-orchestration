@@ -99,6 +99,18 @@ def make_target(base: Path) -> tuple[Path, list[str]]:
     return target, ["--project-agent-routing", str(routing), "--operational-checks", str(checks)]
 
 
+def assert_state_inside(test: unittest.TestCase, home: Path) -> None:
+    """Guard: the learning state the owner tools would use lies inside this test's home.
+
+    The runtime places it by the account database's home unless XDG_STATE_HOME names a
+    folder, so a test that forgot to set XDG_STATE_HOME would write the real
+    ~/.local/state/codex-agents; this stops the test first.
+    """
+
+    state = Path(os.path.realpath(installer.attest.default_state_root()))
+    test.assertTrue(state.is_relative_to(os.path.realpath(home)), "the learning state is outside the test home")
+
+
 def isolate_home(test: unittest.TestCase, home: Path) -> None:
     """Point HOME at a test folder (remove runs remove-codex-rule, which reads ~/.codex), and
     XDG_STATE_HOME below it: the ownership record lives in the learning state, which the
@@ -113,6 +125,7 @@ def isolate_home(test: unittest.TestCase, home: Path) -> None:
                                            "XDG_STATE_HOME": str(home / ".local" / "state")}, clear=True)
     patcher.start()
     test.addCleanup(patcher.stop)
+    assert_state_inside(test, home)
     # A CI toolcache Python sits outside the trusted installation folders; the rule itself is
     # tested in test_attest, so here this test's own interpreter counts as installed.
     if installer.attest.python_location_problem(Path(os.path.realpath(sys.executable))) is not None:
@@ -498,21 +511,13 @@ class UmbrellaInstallTests(unittest.TestCase):
         # The owner tools never name the learning state's folder themselves.
         for script in ("attest.py", "install.py"):
             self.assertNotIn("Application Support", (installer.ROOT / "scripts" / script).read_text(encoding="utf-8"))
-        sys.path.insert(0, str(installer.ORCHESTRATION))
-        try:
-            from codex_agents.learning_store import default_state_root
-        finally:
-            sys.path.remove(str(installer.ORCHESTRATION))
-        if hasattr(installer.attest.host_paths, "owner_state_root"):
-            self.assertEqual(installer.attest.default_state_root(), installer.attest.host_paths.owner_state_root())
-        else:
-            self.assertEqual(installer.attest.default_state_root(), default_state_root())
+        self.assertEqual(installer.attest.default_state_root(), installer.attest.host_paths.owner_state_root())
         # Where the runtime says the owner's state is now (the old macOS folder until the
         # collector step moves it), the record goes; the new folder is never created beside it.
         old = self.base / "home" / "old-state" / "codex-agents"
         old.mkdir(parents=True, mode=0o700)
         new = Path(os.environ["XDG_STATE_HOME"]) / "codex-agents"
-        with mock.patch.object(installer.attest.host_paths, "owner_state_root", lambda: old, create=True):
+        with mock.patch.object(installer.attest.host_paths, "owner_state_root", lambda: old):
             self.assertEqual(installer.attest.default_state_root(), old)
             self.assertTrue(self.install(apply=True)["ok"])
             name = installer.OwnerState.record_name(self.target)

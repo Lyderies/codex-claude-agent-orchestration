@@ -143,6 +143,78 @@ def account_home() -> Path:
     return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
 
 
+# The owner's learning state (ledger, digest key, collector authorization, the
+# owner's allowed signer, installer records, `scratch`) lives in this folder.
+STATE_FOLDER = "codex-agents"
+# Host-private scratch: the bridge's container and the owner tools' container
+# (scripts/attest.py SCRATCH_CONTAINER), both under host_scratch_base().
+BRIDGE_SCRATCH_CONTAINER = "codex-agents-scratch"
+OWNER_SCRATCH_CONTAINER = "agent-orchestration-owner"
+
+
+def default_state_root(home: Path | None = None) -> Path:
+    """The owner's learning state: `$XDG_STATE_HOME/codex-agents`, else
+    `~/.local/state/codex-agents`, on every platform.
+
+    The home folder is the account's (from the account database), never HOME. A
+    hidden top-level home folder is where no supported Codex session is opened;
+    the session guard also protects this folder wherever it resolves. Until
+    0.8.9 macOS used `~/Library/Application Support/codex-agents`, a non-hidden
+    home folder that a session opened on `~/Library` could write; see
+    legacy_state_root. A relative XDG_STATE_HOME is ignored, as the XDG
+    specification says.
+    """
+
+    base = os.environ.get("XDG_STATE_HOME")
+    if base and os.path.isabs(base):
+        return Path(base) / STATE_FOLDER
+    return (home if home is not None else account_home()) / ".local" / "state" / STATE_FOLDER
+
+
+def legacy_state_root() -> Path | None:
+    """Where macOS kept the learning state before 0.8.9, else None.
+
+    Found where that code put it (HOME's `Library/Application Support`), so it is
+    only ever moved by the owner's `learning-register` and otherwise refuses.
+    """
+
+    if sys.platform != "darwin":
+        return None
+    home = os.environ.get("HOME")
+    base = Path(home) if home and os.path.isabs(home) else account_home()
+    return base / "Library" / "Application Support" / STATE_FOLDER
+
+
+def owner_state_root() -> Path:
+    """The folder that holds the owner's state now, for the owner tools.
+
+    The pre-0.8.9 macOS folder while it is the only one (the wizard's collector
+    step moves it), else the default; so an earlier wizard step never creates
+    the new folder beside the old one.
+    """
+
+    legacy = legacy_state_root()
+    default = default_state_root()
+    if legacy is not None and os.path.lexists(legacy) and not os.path.lexists(default):
+        return legacy
+    return default
+
+
+def host_scratch_base() -> str | None:
+    """The per-user cache folder on macOS, `$XDG_RUNTIME_DIR` elsewhere, or None.
+
+    Neither is writable from Codex's workspace-write sandbox; host-private
+    scratch (bridge exports and control files, the owner tools' working files)
+    lives in a container there.
+    """
+
+    if sys.platform == "darwin":
+        value = darwin_directory("DARWIN_USER_CACHE_DIR")
+    else:
+        value = os.environ.get("XDG_RUNTIME_DIR")
+    return value if value and os.path.isabs(value) else None
+
+
 def install_location_problem(path: Path) -> str | None:
     """Why a program at `path` is not in a trusted installation folder, or None.
 

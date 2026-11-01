@@ -16,6 +16,7 @@ from codex_agents import session_guard
 from codex_agents.session_guard import (
     NO_RECORD,
     NO_THREAD,
+    SCAN_MESSAGES,
     SessionRefused,
     check_current_session,
     scan_recent_sessions,
@@ -111,18 +112,26 @@ class GuardTestCase(unittest.TestCase):
         self.copy = self.home / ".codex" / "agent-orchestration" / "abc" / ("0" * 64)
         self.sessions = SessionFiles(self.home)
         # The scratch home sits in the system temp folder, so the sandbox's /tmp
-        # and TMPDIR stand-ins are folders beside it.
+        # and TMPDIR stand-ins are folders beside it; so is the per-user cache
+        # folder that holds the host-private scratch containers.
         (self.base / "tmp").mkdir()
         (self.base / "tmpdir").mkdir()
+        self.cache = self.base / "cache"
+        self.cache.mkdir()
         for patcher in (
             mock.patch.object(session_guard, "account_home", lambda: self.home),
             mock.patch.object(session_guard, "SLASH_TMP", str(self.base / "tmp")),
+            mock.patch.object(session_guard, "host_scratch_base", lambda: str(self.cache)),
             mock.patch.dict(os.environ, {
                 "CODEX_THREAD_ID": THREAD, "TMPDIR": str(self.base / "tmpdir"),
+                "HOME": str(self.home),
             }),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        # The learning state follows XDG_STATE_HOME when it is set; by default it is
+        # the account's ~/.local/state/codex-agents.
+        os.environ.pop("XDG_STATE_HOME", None)
 
     def check(self) -> None:
         check_current_session(self.copy, self.clone)
@@ -333,8 +342,10 @@ class SessionScanTests(GuardTestCase):
         self.sessions.write(self.home, thread=third, day=("2026", "10", "30"))
         findings = scan_recent_sessions(self.clone, self.home / ".codex", self.home)
         self.assertEqual(
-            [{"date": "2026-11-01", "folder": str(self.home / "Tools"), "holds": "clone"},
-             {"date": "2026-10-30", "folder": str(self.home), "holds": "home"}],
+            [{"date": "2026-11-01", "folder": str(self.home / "Tools"), "holds": "clone",
+              "message": SCAN_MESSAGES["clone"]},
+             {"date": "2026-10-30", "folder": str(self.home), "holds": "home",
+              "message": SCAN_MESSAGES["home"]}],
             findings,
         )
         # Records not changed for more than two weeks are not read.
@@ -347,6 +358,154 @@ class SessionScanTests(GuardTestCase):
         path = self.sessions.write(self.home)
         path.write_text("not json\n")
         self.assertEqual([], scan_recent_sessions(self.clone, self.home / ".codex", self.home))
+
+    def test_sessions_covering_the_learning_state_are_listed(self) -> None:
+        state = self.home / "State"
+        legacy = self.home / "Library" / "Application Support" / "codex-agents"
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+            self.sessions.write(state)
+            self.assertEqual(
+                [{"date": "2026-11-01", "folder": str(state), "holds": "state",
+                  "message": SCAN_MESSAGES["state"]}],
+                scan_recent_sessions(self.clone, self.home / ".codex", self.home),
+            )
+            # Before the owner's collector step moves it, the old macOS folder holds
+            # the state, so a session on ~/Library is listed while it exists.
+            self.sessions.write(self.home / "Library")
+            with mock.patch.object(session_guard, "legacy_state_root", lambda: legacy):
+                self.assertEqual(
+                    [], scan_recent_sessions(self.clone, self.home / ".codex", self.home)
+                )
+                legacy.mkdir(parents=True)
+                findings = scan_recent_sessions(self.clone, self.home / ".codex", self.home)
+            self.assertEqual(["state"], [item["holds"] for item in findings])
+
+    def test_sessions_on_a_folder_containing_a_set_up_project_are_listed(self) -> None:
+        # Projects come from the runtime copies' bindings and from the caller (the
+        # ledger's registered projects).
+        binding = self.copy / ".codex" / "orchestration" / "runtime-binding.json"
+        binding.parent.mkdir(parents=True)
+        binding.write_text(json.dumps({"format": 2, "project_root": str(self.project)}))
+        other = self.home / "Elsewhere" / "registered"
+        other.mkdir(parents=True)
+        self.sessions.write(self.home / "Work")
+        third = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5d"
+        self.sessions.write(self.home / "Elsewhere", thread=third, day=("2026", "10", "31"))
+        findings = scan_recent_sessions(
+            self.clone, self.home / ".codex", self.home, projects=[other]
+        )
+        self.assertEqual(
+            [{"date": "2026-11-01", "folder": str(self.home / "Work"), "holds": "project",
+              "message": "Codex was opened on a folder that contains a set-up project "
+                         "(project); open Codex on the project itself"},
+             {"date": "2026-10-31", "folder": str(self.home / "Elsewhere"), "holds": "project",
+              "message": "Codex was opened on a folder that contains a set-up project "
+                         "(registered); open Codex on the project itself"}],
+            findings,
+        )
+        # A session on the project itself is not listed.
+        self.sessions.write(self.project)
+        self.sessions.write(other, thread=third, day=("2026", "10", "31"))
+        self.assertEqual(
+            [], scan_recent_sessions(self.clone, self.home / ".codex", self.home, projects=[other])
+        )
+
+
+class StateScratchAndProjectGuardTests(GuardTestCase):
+    def check_project(self) -> None:
+        check_current_session(self.copy, self.clone, self.project)
+
+    def assert_project_refused(self, text: str) -> None:
+        with self.assertRaises(SessionRefused) as caught:
+            self.check_project()
+        self.assertIn(text, str(caught.exception))
+        self.assertNotIn(str(self.base), str(caught.exception))
+
+    def add_dir(self, folder: Path) -> None:
+        """A session on the project with `folder` added as a writable root."""
+
+        self.sessions.write(
+            self.project, entries=workspace_entries(self.project, path_entry(folder)),
+            roots=[str(self.project), str(folder)],
+        )
+
+    def test_sessions_that_can_write_the_learning_state_are_refused(self) -> None:
+        # By default the state is ~/.local/state/codex-agents, a hidden home folder.
+        default = self.home / ".local" / "state" / "codex-agents"
+        for folder in (default, default / "scratch" / "qa-1", self.home / ".local" / "state"):
+            with self.subTest(folder=folder):
+                self.add_dir(folder)
+                self.assert_refused("trusted tools are installed")
+        # Wherever XDG_STATE_HOME puts it, the state, its scratch and the folders
+        # around it are protected.
+        state = self.home / "State"
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+            for folder in (
+                state, state / "codex-agents", state / "codex-agents" / "scratch",
+                state / "codex-agents" / "scratch" / "client-1",
+            ):
+                with self.subTest(folder=folder):
+                    self.add_dir(folder)
+                    self.assert_refused("orchestrator's learning state")
+                    self.sessions.write(folder)
+                    self.assert_refused("orchestrator's learning state")
+            self.add_dir(self.home / "StateBeside")
+            self.check()
+
+    def test_the_old_macos_state_folder_is_no_longer_special(self) -> None:
+        # After the owner's collector step moved it, nothing trusted lives there.
+        legacy = self.home / "Library" / "Application Support" / "codex-agents"
+        legacy.mkdir(parents=True)
+        self.add_dir(legacy)
+        self.check_project()
+        self.sessions.write(self.home / "Library")
+        self.check_project()
+
+    def test_sessions_that_can_write_a_scratch_container_are_refused(self) -> None:
+        bridge = self.cache / "codex-agents-scratch"
+        owner = self.cache / "agent-orchestration-owner"
+        for folder in (self.cache, bridge, bridge / "dispatch-1" / "control", owner):
+            with self.subTest(folder=folder):
+                self.add_dir(folder)
+                self.assert_refused("orchestrator's private working folder")
+        self.add_dir(self.cache / "unrelated")
+        self.check()
+        # Without a per-user cache folder (Linux without XDG_RUNTIME_DIR) dispatch
+        # refuses anyway, and there is nothing to protect.
+        with mock.patch.object(session_guard, "host_scratch_base", lambda: None):
+            self.add_dir(self.cache)
+            self.check()
+
+    def test_a_session_on_a_folder_containing_the_project_is_refused(self) -> None:
+        self.sessions.write(self.project)
+        self.check_project()
+        self.sessions.write(self.project / "src")
+        self.check_project()
+        self.sessions.write(self.home / "Work")
+        self.assert_project_refused("contains this project")
+        # Also through another spelling, or added as a writable root.
+        self.sessions.write(self.home / "work")
+        self.assert_project_refused("contains this project")
+        self.add_dir(self.home / "Work")
+        self.assert_project_refused("contains this project")
+        # A project renamed and replaced by a symlink is still protected at its
+        # recorded path and at the folder it resolves to.
+        moved = self.home / "Work" / "moved"
+        self.project.rename(moved)
+        self.project.symlink_to(moved)
+        self.sessions.write(self.home / "Work")
+        self.assert_project_refused("contains this project")
+
+    def test_the_project_control_folders_as_writable_roots_are_refused(self) -> None:
+        # The record lists <workspace>/.git, .agents and .codex as read entries:
+        # Codex keeps them read-only at the top of the project. Added as writable
+        # roots of their own, they would not be.
+        for name in (".codex", ".agents", ".git", ".git/hooks", ".CODEX/rules"):
+            with self.subTest(name=name):
+                self.add_dir(self.project / name)
+                self.assert_project_refused("this project's .codex, .agents or .git")
+        self.add_dir(self.project / "docs")
+        self.check_project()
 
 
 if __name__ == "__main__":
