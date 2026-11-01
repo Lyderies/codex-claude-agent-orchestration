@@ -1,0 +1,29 @@
+name: Bug report
+description: Something in setup or orchestration did not work as documented.
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Report security problems privately (see SECURITY.md), not here. Remove names, emails,
+        hostnames and home paths from anything you paste.
+  - type: input
+    id: release
+    attributes:
+      label: Release and Codex package version
+      description: From CHANGELOG.md and packages/codex-agents/runtime-releases.json.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System and client versions
+      description: macOS or Linux version, Claude Code and Codex CLI versions.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The steps, what you expected, and the message or `reason_code` you saw.
+    validations:
+      required: true
