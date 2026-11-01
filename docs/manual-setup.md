@@ -1,7 +1,7 @@
 # Manual setup
 
 `./setup.sh` runs these steps for you and is the supported path. Use this page to understand what it does,
-or to repair one step by hand.
+or to repair one step by hand. Every file these steps write is listed in [configuration](configuration.md).
 
 Run every command from the root of this repository, with a trusted `python3` first on `PATH`: a system,
 Homebrew or python.org Python 3.11 or later, not a virtual environment's and not macOS's

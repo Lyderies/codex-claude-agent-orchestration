@@ -44,7 +44,8 @@ Usage figures are estimates:
 | Verification and code review | Deterministic checks first, then the other vendor: GPT-6.1 Sol (high) for Claude-written work, Opus 5.5 (high) for Codex-written work | Same vendor, a different model | Astra (xhigh) for high-risk Claude-written diffs | 1–5% Plus or under 2% Max 5x | 2–12 | Low–medium |
 | Hard end-to-end | Opus 5.5 (high; xhigh on retry), with a checklist and budget | GPT-6 Astra (high) on Pro plans; GPT-6.1 Sol (high) on Plus | Fable (high) last, from a reserved budget | 2.5–7% Max 5x | 45–90 | Low–medium |
 
-The evidence behind these rows comes from two research reports kept on the `staging` branch,
+The evidence behind these rows comes from two research reports kept in `research/reports/` on the
+[`planning` branch](https://github.com/Lyderies/codex-claude-agent-orchestration/tree/planning/research/reports),
 "Codex and Claude model routing" and "Model routing cost and preferences". Community preference
 enters only as a small prior worth a few paired runs.
 

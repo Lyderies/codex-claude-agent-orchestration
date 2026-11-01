@@ -1,32 +1,33 @@
 # Codex–Claude agent orchestration
 
+[![CI](https://github.com/Lyderies/codex-claude-agent-orchestration/actions/workflows/ci.yml/badge.svg)](https://github.com/Lyderies/codex-claude-agent-orchestration/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Let a Claude Code or Codex session hand bounded sub-tasks to Codex or Claude child agents, on subscription logins only.
 
-**Status:** dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10). Children are
-read-only. macOS first, Linux partly untested, no Windows. Subscription logins only, never metered APIs.
-
-[Safety model](#safety-model) · [Quick start](#quick-start) · [Troubleshooting](docs/troubleshooting.md) · [Plan](docs/delivery/plan.md) · [Design](docs/delivery/g2-design.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
+**Status:** dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10). Children are read-only.
+macOS first, Linux partly untested, no Windows. Subscription logins only, never metered APIs.
 
 ```mermaid
 flowchart LR
-    P["Primary session: Claude Code or Codex"] --> R["Route from policy and committed config"]
-    R --> A{"Admission, fails closed"}
-    A -- "denied" --> X["Stop with a reason code"]
-    A -- "native, Claude primary only" --> N["Native Claude child"]
-    A -- "bridge" --> B["Bridged Codex or Claude child, read-only"]
-    N --> V["Verifier, other provider when eligible"]
-    B --> V
-    V --> L[("Local ledger and operational QA")]
+    P["Your session<br/>Claude Code or Codex"] -->|"task"| R["Router<br/>fixed rules"]
+    R --> G{"Guard and<br/>admission checks"}
+    G -->|"denied"| S["Stop with<br/>a reason"]
+    G -->|"admitted"| C["Read-only child<br/>Codex or Claude"]
+    C -->|"result"| P
+    G -.-> L[("Local route record<br/>replayable")]
+    C -.-> L
 ```
 
-In words: the primary asks for a route, admission either stops the run or admits one read-only child, and
-the result goes to a verifier (from the other provider when one is eligible), then to the ledger and QA.
+In words: your session hands a task to the router. Guard and admission checks either stop it with a
+reason or start one read-only Codex or Claude child. The route and the outcome are recorded locally and
+can be replayed.
 
 ## Why
 
-- **Code picks the child, not a model.** A route is a pure function of the installed policy, the task
-  contract and committed project configuration, in the [routing table](docs/routing-table.md)'s fixed
-  order: quality first, then expected usage cost. Model output never grants tools, paths or spend.
+- **Code picks the child, not a model.** A route comes from the installed policy, the task and your
+  project's committed configuration, in the [routing table](docs/routing-table.md)'s fixed order:
+  quality first, then expected usage cost. Model output never grants tools, paths or spend.
 - **Subscription logins only.** API keys, usage credits and paid fallback are never eligible, and no child
   runs until you have signed a billing attestation for that account.
 - **Independent checking.** Each meaningful result goes to a verifier from the other provider when one is
@@ -34,220 +35,93 @@ the result goes to a verifier (from the other provider when one is eligible), th
 - **Evidence stays on your machine.** Routes, admission decisions and outcomes go to a local ledger in
   `~/.local/state/codex-agents` that is never committed, and every recorded route replays exactly.
 
-It does not yet run write-capable children, and it never changes its own routing without you.
-
-## How it works
-
-The **primary** is the session you work in; a **child** is an agent it delegates one bounded assignment
-to. **Admission** is the deterministic gate that decides whether a child may start, and the **ledger** is
-the local record that binds each run to its route, admission decision and result.
-
-```mermaid
-sequenceDiagram
-    participant P as Primary
-    participant O as Orchestrator CLI
-    participant C as Child
-    participant V as Verifier
-    participant L as Local ledger
-    P->>O: learning-route with the task contract
-    O-->>P: Provider, model, effort, dispatch path and verifier
-    P->>O: learning-open-host-run
-    O->>L: Admission decision bound to the run
-    P->>O: dispatch with the run handle
-    O->>C: Start read-only in a private export of committed files
-    C-->>O: Result
-    O->>L: Keyed digest of the result and its terminal state
-    O-->>P: The validated or fenced result
-    P->>V: Verification bound to the worker outcome, same lifecycle
-    V-->>P: Verdict
-    P->>O: Operational checks, then the QA record
-```
-
-In words: route, open (admission), dispatch one child, record exactly the result it returned, verify it
-through the same lifecycle, then run operational QA. A Claude primary spawns a Claude child natively with
-the Agent tool instead, using spawn parameters the CLI computes ([G2 design](docs/delivery/g2-design.md)).
-
-| Primary | Codex child | Claude child |
-|---|---|---|
-| Claude Code | Bridged: `codex exec`, read-only | Native subagent through the Agent tool |
-| Codex | Bridged: `codex exec`, read-only | Bridged: `claude -p`, read-only, only if the project allows it |
-
-## Safety model
-
-What v1 enforces:
-
-- **Subscription only.** Admission fails closed on an API key in the environment, an unreviewed client
-  version, an identity reading over 30 minutes old, a non-subscription plan, a missing attestation,
-  unknown or paid-usage billing, exhausted headroom (90% of a window) or a run cap, and re-checks at launch.
-- **Owner-signed attestation.** Per account, you sign that extra usage and credit purchases are off, with
-  your one passphrase-protected owner key; `attest.py` signs only the bytes it rebuilt from your answers.
-- **Read-only children in a private export.** A bridged child sees only the committed bytes of its granted
-  paths, under a hard deadline. Claude children get `Read`, `Glob` and `Grep` only; Codex children run
-  `codex exec` read-only and ephemeral, without user config, execpolicy rules, approvals or connectors.
-- **Results bound in the ledger.** `dispatch` fences an invalid result and binds a digest of the one it
-  returns. QA accepts only the verifier opened for that outcome and runs only the project's hashed commands.
-- **Protected command rule and session guard.** The optional Codex rule lets only the 23 everyday
-  orchestrator commands run outside Codex's sandbox, through an owner-only, byte-verified runtime copy in
-  `~/.codex`. Before each command the copy refuses a session opened above the project, one that can write
-  `/`, your home folder or a folder above it, `~/.codex`, your records, this repository or a tool folder,
-  and one without its sandbox.
-- **Owner authority stays with you.** `setup.sh`, `attest.py` and the installer run this repository's own
-  CLI, never the project's copy; Git on the project is plumbing only; the interpreter, Git and provider
-  clients must come from trusted install folders, and setup never runs a client or basic tool from an
-  earlier `PATH` entry; and the owner key is used only from your own `~/.ssh`.
-
-```mermaid
-flowchart TB
-    G["Codex primary: the rule runs the protected copy, its session guard first"] --> R["Route held to policy and config"]
-    R --> A["Admission, re-checked at launch"]
-    A --> C["Read-only child in a private export"]
-    C --> D["Result validated, fenced and bound by digest"]
-    D --> V["Other-provider verifier, then operational QA"]
-```
-
-In words: a request meets these layers in order, and a failure at any layer stops the run.
-
-**Does not protect against** (full list: the residual risks in S4c, S5b and S6 of the
-[G2 design](docs/delivery/g2-design.md)):
-
-- **Codex reads.** Codex's read-only sandbox can read outside the export (enforced read roots come in G3).
-  A native Claude child has the primary's permissions, so its reads are advisory.
-- **A session that already writes `~/.codex`** (opened on `/`, or given it with `--add-dir`) can forge its
-  own session record, the rule and the copy. The guard stops the ordinary mistake, not that.
-- **Parent-folder sessions.** A session opened above the project can still change its configuration and
-  `.git`; the orchestrator refuses that session's commands, but cannot undo what it wrote.
-- **A primary that ignores its route.** A Codex primary can still spawn a native Codex child that shares
-  its rule; a Claude primary's native children spend its own allowance whatever admission says.
-- **Other spellings and detached processes.** The installer's Claude Code deny rules are a policy layer,
-  so `bash -c` is not matched; a process that double-forks between snapshots can outlive cleanup.
-- **Prompt content and a modified package.** Repository text reaches every child's prompt as instructions;
-  the protected copy is checked against this package, not against a signature.
-- **Sessions running during an install.** The learning hooks run the project's installed code outside the
-  sandbox. Close every Codex session in the project before installing or updating: one started before the
-  install, when `.codex` did not exist yet, can still rewrite that code.
-- **Claude settings and skills.** A Codex session in the project can rewrite `.claude/settings*.json` (hooks,
-  deny rules) and `.claude/skills/`, which Claude Code loads on the host; verify warns about hooks there.
-- **The old macOS records.** A session that could write `~/Library` could have changed them before the
-  move; you check their creation date and owner key before approving it. The old copy, with the digest
-  key, stays readable until you delete it.
-
-> [!WARNING]
-> The attestation is your own statement about your billing settings. Admission also checks what the clients
-> report, but relies on extra usage and Codex credit purchases being off; re-attest whenever they change.
+It does not yet run children that can edit files, and it never changes its own routing without you.
 
 ## Quick start
 
-You need macOS, or Linux (WSL counts) without operational QA yet; Git from the Command Line Tools, Xcode
-or Homebrew (`/usr/bin/git` on Linux); Python 3.11+ from a trusted install such as Homebrew or python.org
-first on `PATH` (not a virtual environment or macOS's `/usr/bin/python3` shim); and Claude Code 2.1.x,
-Codex CLI 0.164.0 or both, signed in with their subscriptions, with no API key in the environment.
+You need:
 
-> [!NOTE]
-> A new project needs a prepared `operational-checks.json` naming its exact, hashed test and security
-> commands. The wizard asks for its path; see the [recipe](docs/manual-setup.md#operational-checks).
+- macOS, or Linux (WSL counts) without operational QA yet, with Git from the Command Line Tools, Xcode
+  or Homebrew and Python 3.11 or later from a trusted install such as Homebrew or python.org;
+- Claude Code 2.1.x, Codex CLI 0.164.0 or both, signed in with their subscriptions, and no API key in
+  the environment;
+- for a new project, an `operational-checks.json` naming its exact test and security commands
+  ([recipe](docs/manual-setup.md#operational-checks)).
+
+From the root of this repository:
 
 ```sh
-./setup.sh /path/to/project    # from the root of this repository
+./setup.sh /path/to/project
 ```
 
-| Step | What it does |
-|---|---|
-| 1. Checks | The OS, Git, a trusted Python, both sign-ins, no API key, and recent Codex sessions that could write too much |
-| 2. Project | Picks the project (top of a Git working tree) and previews the install; changes nothing |
-| 3. Providers | Codex children, Claude children and models, and whether Codex sessions may start Claude children |
-| 4. Install | Installs, writes `provider-routing.json`, offers to commit only the changed files (never pushed), verifies |
-| 5. Collector | Registers the project with the local learning collector and starts it; on macOS it first asks to move your records to `~/.local/state/codex-agents`, once |
-| 6. Billing | Hands the terminal to `attest.py`, which only you can complete |
-| 7. Profile | Only if Codex sessions may start Claude children: the `codex -p orchestrator` profile, network on |
-| 8. Commands | Only if Codex sessions orchestrate the project: the Codex commands rule and its protected copy |
-| 9. Done | A line per step, how to start in each client, and the remove command |
-
-Keys: arrows, Enter, Space, `q` to quit; `NO_COLOR=1` for plain output. Run it again to update, verify,
-re-attest or change the owner key passphrase. Details: [setup wizard](docs/setup-wizard.md) and
-[manual setup](docs/manual-setup.md).
-
-### Where to open Codex
-
-Open Codex on the project itself. This repository (the orchestrator clone) is only for running
-`./setup.sh`; never open Codex on it.
-
-```mermaid
-flowchart TB
-    H["Home folder, a folder above it, or /: never"] --> F["A folder holding several projects: never"]
-    H --> S["This repository: only for ./setup.sh, outside every Codex workspace"]
-    F --> A["Project A: open Codex here"]
-    F --> B["Project B: open Codex here"]
-```
-
-In words: open Codex on each project itself; never on a folder that contains a set-up project, this
-repository, the home folder, a folder above it or `/`. A folder above a project is never safe: Codex runs
-a nested trusted project's `.codex/config.toml` and hooks outside the sandbox, so a session there could
-plant them.
+The wizard checks your machine, asks which providers children may use, installs into the project,
+registers the local collector and hands you the billing attestation to sign. Run it again to update,
+verify or re-attest. The [getting started](docs/getting-started.md) guide walks through a first run.
 
 > [!CAUTION]
-> Never add `~`, `~/.codex` or `~/.local` with `--add-dir` either. Setup warns about recent Codex sessions
-> that could write your home folder, your records in `~/.local/state/codex-agents` or this repository, or
-> that were opened on a folder containing a set-up project; the orchestrator refuses their commands.
+> Open Codex on the project itself. Never open it on a folder that contains a set-up project, on this
+> repository, on your home folder, on a folder above it or on `/`. A session opened above a project
+> could plant files that Codex runs outside its sandbox. [Why](docs/security-model.md#where-to-open-codex)
 
 ## Using it
 
-**From Claude Code**, open the project and ask, for example: "Use the agent-orchestration skill to have the
-routed reviewer check the error handling in `src/`." It routes, opens the run, spawns a Claude child or
-dispatches a Codex child, verifies, runs operational QA and reports. A denial comes back as a `reason_code`.
+**From Claude Code**, open the project and ask, for example: "Use the `agent-orchestration` skill to
+have the routed reviewer check the error handling in `src/`." It routes the task, starts the child,
+has the result verified, runs your checks and reports back.
 
-**From Codex**, start a session in the project's own folder with `codex -p orchestrator` if step 7 created
-the profile, otherwise `codex`, and ask for the `orchestrate-agents` skill. It first runs `host-command`
-and stops, with the reason, unless the commands rule is `installed` and the session guard says `ok`.
+**From Codex**, start `codex` (or `codex -p orchestrator`, if setup created that profile) in the
+project's own folder from your own terminal, and ask for the `orchestrate-agents` skill.
 
-Your only command is `./setup.sh`; the orchestrator CLI is for the agent, which runs it through the skill.
+A denied task comes back with a `reason_code` saying why. Your only command is `./setup.sh`; the
+orchestrator CLI is for the agent, which runs it through the skill. More in
+[using it](docs/using-it.md).
 
-## Configuration
+## Safety at a glance
 
-| File (in the project) | Purpose |
-|---|---|
-| `.codex/orchestration/provider-routing.json` | Enabled providers, allowed Claude models, and `codex_primary_may_bridge_to_claude`. Committed and clean; without it only Codex children are allowed |
-| `.codex/orchestration/operational-checks.json` | The exact, hashed test and security commands operational QA may run |
-| `.codex/orchestration/project-agent-routing.json` | Optional mapping of project agents to task families; setup writes an empty one if missing |
-| [`docs/routing-table.md`](docs/routing-table.md) (this repository) | The starting table; the policy mirrors it, and a test holds the policy to its order |
+- **Subscription only.** Admission fails closed on an API key in the environment, an unreviewed client
+  version, unknown or paid-usage billing, a missing attestation or exhausted headroom, and checks
+  again at launch.
+- **Read-only children.** Every child is read-only. A bridged child sees only the committed files it was
+  granted, in a private copy, under a hard deadline.
+- **Results are bound.** A bridged child's result is validated and recorded by digest in the ledger,
+  and only the verifier opened for that result counts.
+- **Protected Codex commands.** The optional Codex rule runs a byte-verified, owner-only copy of the
+  orchestrator, and its session guard refuses sessions that can write too much.
+- **Your authority stays yours.** Setup and attestation run this repository's own code, never the
+  project's, and only you can sign with your owner key.
 
-## Troubleshooting
+Known limits include: Codex children can still read outside their export until G3, and a session that
+can already write `~/.codex` can forge what the guard checks. The full list and the threat model are in
+the [security model](docs/security-model.md).
 
-Common messages and their fixes, including "the Codex rule is stale", "This Codex session can write to
-..." and `host_client_unknown`, are in [troubleshooting](docs/troubleshooting.md).
+> [!WARNING]
+> The attestation is your own statement about your billing settings. Admission also checks what the
+> clients report, but relies on extra usage and Codex credit purchases being off; re-attest whenever
+> they change.
 
-## Status and roadmap
+## Documentation
 
-Toolchain v1 is G1 plus G2; native Windows support and operational QA on Linux are parked. See the
-[delivery plan](docs/delivery/plan.md).
+- [Getting started](docs/getting-started.md): from a fresh clone to a first routed review
+- [Using it](docs/using-it.md): orchestrating from Claude Code and from Codex
+- [Setup wizard](docs/setup-wizard.md) and [manual setup](docs/manual-setup.md)
+- [Configuration](docs/configuration.md): project files, machine files and options
+- [How it works](docs/how-it-works.md): routes, admission, children, verification and the ledger
+- [Security model](docs/security-model.md): what v1 protects and what it does not
+- [Troubleshooting](docs/troubleshooting.md) and [FAQ](docs/faq.md)
+- [All documentation](docs/README.md)
 
-| Goal | Scope | Status |
-|---|---|---|
-| G1 | Import both packages; one-command install, verify and remove | Shipped (0.1.0) |
-| G2 | Cross-provider read-only routing, admission, bridge, both primaries | Shipped as toolchain v1 (0.2.0) |
-| v1.1 | Child liveness from real client events: reasoning summaries on, a silent child graded stale, the primary decides, abort after a long silence, the hard deadline as backstop | Planned |
-| v1.2 | Codex plan loop: a supervisor the orchestrator owns keeps a Codex primary working through a plan; code decides every stop | Planned |
-| G3 | Write-capable children in their own worktrees, verified by the other provider; enforced Codex read roots | Planned |
-| G4 | Evidence-driven routing: paired runs, a frozen evaluation set, a usage-cost model, headroom tie-breaking | Planned |
+## Roadmap
 
-## Development
+- **v1.1:** child liveness from real client events, so a silent child is noticed and stopped.
+- **v1.2:** a Codex plan loop that keeps a Codex session working through a plan; code decides every stop.
+- **Then G3 and G4:** children that can edit files in their own worktrees, then evidence-driven routing.
 
-```sh
-git config core.hooksPath .githooks          # identifier guard on every commit
-python3 scripts/check_identifiers.py         # scan tracked files
-ruff check .
-python3 -m unittest discover -s tests -v
-(cd packages/codex-agents && python3 -m unittest discover -s tests)
-(cd packages/claude-agents && PYTHONPATH=src python3 -m unittest discover -s tests)
-```
-
-CI runs the identifier guard, Ruff and all three suites on Linux and macOS. Every runtime change needs a
-Codex package version bump and an entry in `packages/codex-agents/runtime-releases.json`.
+What changed in each release is in the [CHANGELOG](CHANGELOG.md).
 
 ## Contributing
 
-There is no contributing guide yet; open an issue before sending a pull request. Changes to authority,
-containment or billing logic need an independent security review; everything else needs tests, Ruff and a
-clean identifier scan.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch model and the checks. Changes to authority,
+containment or billing logic need an independent security review.
 
 ## Security
 

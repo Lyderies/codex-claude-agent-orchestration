@@ -5,6 +5,12 @@
 - **Codex package 0.8.10.** The final v1 fixes below get their own package version: a collector
   authorizes exactly one build per version, and the earlier 0.8.9 build (recorded again in
   `runtime-releases.json`) was already authorized on the pilot machine.
+- **Documentation layout.** The README is now a short overview; the detail moved into `docs/`, indexed by
+  `docs/README.md`: getting started, using it, configuration, how it works, the security model (which
+  replaces the README's safety section and the design document's residual-risk lists as the place
+  accepted limits are listed) and an FAQ. CONTRIBUTING.md, a pull request template and a bug report form
+  were added. The delivery plan and the G2 design moved, with the research, to the separate `planning`
+  branch, so release branches carry only user and contributor documentation.
 - **Final documentation pass.** Troubleshooting moved to `docs/troubleshooting.md`, with new entries
   for `host_client_unknown` (a Codex session started from inside Claude Code), the unmoved macOS
   records and an unusable `XDG_STATE_HOME`. The setup wizard reference covers the install step's

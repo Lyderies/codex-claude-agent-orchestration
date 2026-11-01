@@ -69,19 +69,11 @@ main menu or Quit. The final screen offers Exit or Back to the main menu, and sa
 failed when something did; the summary defaults to your home folder and the wizard asks before saving it
 inside a Git working tree. Only Exit or Quit ends the wizard.
 
-## Using it
+## After setup
 
-Your only command is `./setup.sh`. The orchestrator CLI is for the agent: you ask the primary session for
-the skill, and it routes the work, opens each run through admission, starts the child, has the result
-verified, runs operational QA and reports back, or stops with a `reason_code`.
-
-- **Claude Code:** open the project and ask for the `agent-orchestration` skill.
-- **Codex:** from your own terminal, start `codex -p orchestrator` (if step 7 created the profile) or
-  `codex` in the project's folder, and ask for the `orchestrate-agents` skill. Do not start Codex from
-  inside a Claude Code session: it inherits Claude Code's environment markers, and the host check then
-  refuses with `host_client_unknown`.
-
-Common messages and their fixes are in [troubleshooting](troubleshooting.md).
+Your only command is `./setup.sh`. How to orchestrate from Claude Code and from Codex is in
+[using it](using-it.md); common messages and their fixes are in [troubleshooting](troubleshooting.md).
+Every file and option the wizard writes is listed in [configuration](configuration.md).
 
 ## Where to open Codex
 
@@ -96,7 +88,8 @@ runs without its sandbox, left no record (`--ephemeral`), was opened on a folder
 project, or can write your home folder, a folder above it, `~/.codex`, this repository, your records in
 `~/.local/state/codex-agents`, the private working folders or a tool folder (`~/.local`, `/opt/homebrew`
 and the like, including one added with `--add-dir`). In a Codex session, `host-command` prints that verdict
-as `session_guard`. A refused session's commands stop, but what it already wrote stays.
+as `session_guard`. A refused session's commands stop, but what it already wrote stays. The
+[security model](security-model.md) covers the guard and its limits.
 
 ## How setup keeps your authority away from the agents
 

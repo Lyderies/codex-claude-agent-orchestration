@@ -36,8 +36,8 @@ Areas of particular interest:
 
 ## Known limits
 
-Accepted limits are listed in the README under "Does not protect against" and in the residual
-risks of [the G2 design](docs/delivery/g2-design.md) (S4c, S5b and S6). The supported setup
+Accepted limits, with the threat model behind them, are listed in
+[the security model](docs/security-model.md#what-it-does-not-protect-against). The supported setup
 assumes every Codex session is opened on a project itself: never on a folder that contains a
 set-up project, the home folder, a folder above it or `/`, and that this repository sits outside
 every folder opened in Codex. A session that already writes `~/.codex` can forge its own session
