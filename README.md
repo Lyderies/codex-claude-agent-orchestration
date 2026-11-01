@@ -245,6 +245,7 @@ Toolchain v1 is G1 plus G2; native Windows support and operational QA on Linux a
 | G1 | Import both packages; one-command install, verify and remove | Shipped (0.1.0) |
 | G2 | Cross-provider read-only routing, admission, bridge, both primaries | Release candidate for toolchain v1 (0.2.0) |
 | v1.1 | Child liveness from real client events: reasoning summaries on, a silent child graded stale, the primary decides, abort after a long silence, the hard deadline as backstop | Planned |
+| v1.2 | Codex plan loop: a supervisor the orchestrator owns keeps a Codex primary working through a plan; code decides every stop | Planned |
 | G3 | Write-capable children in their own worktrees, verified by the other provider; enforced Codex read roots | Planned |
 | G4 | Evidence-driven routing: paired runs, a frozen evaluation set, a usage-cost model, headroom tie-breaking | Planned |
 
