@@ -391,6 +391,15 @@ def safe(value):
 op = sys.argv[1]
 if op == "get":
     print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
+elif op == "sessions":
+    # codex-session-scan's warnings, one per line: date, what it holds, folder. Control
+    # characters are dropped, so a folder name cannot drive the terminal.
+    data = load(sys.argv[2])
+    for item in (data.get("warnings") if isinstance(data, dict) else None) or []:
+        if isinstance(item, dict):
+            fields = [re.sub(r"[\x00-\x1f\x7f]", "", str(item.get(key, "")))
+                      for key in ("date", "holds", "folder")]
+            print("\t".join(fields))
 elif op == "claude":
     data = load("-")
     if isinstance(data, dict) and data.get("loggedIn") is True:
@@ -1349,6 +1358,8 @@ step_checks() {
     else
       list_add ok "No ANTHROPIC_API_KEY or OPENAI_API_KEY set"
     fi
+    SESSION_WARNING=0
+    [ "$hard" -eq 0 ] && session_warnings
     if [ "$hard" -eq 1 ]; then
       body "Fix the failures above, then re-check. Setup cannot continue without them."
       menu 0 "Re-check" "Quit"
@@ -1363,6 +1374,11 @@ step_checks() {
         2) echo "Stopped."; exit 1;;
       esac
       mark_step 1 ok "checks done with warnings"
+    elif [ "$SESSION_WARNING" -eq 1 ]; then
+      body "Read the warning above, then continue."
+      menu 0 "Continue" "Quit"
+      [ "$MENU_IDX" -eq 1 ] && { echo "Stopped."; exit 0; }
+      mark_step 1 ok "checks passed with a Codex session warning"
     else
       body "Everything looks good."
       menu 0 "Continue" "Quit"
@@ -1371,6 +1387,28 @@ step_checks() {
     fi
     return 0
   done
+}
+
+# session_warnings : warn about recent Codex sessions (records changed in the last 14 days)
+# that could write this setup folder, the home folder or a folder above it. This clone's CLI
+# reads only each record's session settings, never the conversation, with the same parsing
+# as the guard the Codex commands rule applies. A scan that fails warns about nothing.
+session_warnings() {
+  local scan date holds folder what
+  # Step 1 runs before the private working folder exists, so the report stays in memory.
+  scan=$("$PY" "${PYF[@]}" "$CLONE_CLI" codex-session-scan --clone-root "$ROOT_DIR" 2>/dev/null) || return 0
+  while IFS=$'\t' read -r date holds folder; do
+    [ -n "$folder" ] || continue
+    case "$holds" in
+      clone) what="this setup folder";;
+      *) what="your home folder";;
+    esac
+    list_add warn "A Codex session on $date could write to $folder, which holds $what."
+    SESSION_WARNING=1
+  done < <(printf '%s' "$scan" | pj sessions -)
+  if [ "$SESSION_WARNING" -eq 1 ]; then
+    list_sub "While the Codex commands rule exists, open Codex on a project folder only: never on your home folder, a folder above it, or a folder holding this setup folder. The orchestrator refuses commands from such a session."
+  fi
 }
 
 # ---------------------------------------------------------------------------

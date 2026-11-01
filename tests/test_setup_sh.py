@@ -974,9 +974,10 @@ class WizardTerminalTests(unittest.TestCase):
             if not fake.is_symlink():
                 fake.chmod(0o755)
         # CODEX_HOME is dropped so the commands step can only write under the test's HOME.
+        # CODEX_THREAD_ID is dropped too, so nothing reads real Codex session records.
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NO_COLOR",
-                                 "PYTHONDONTWRITEBYTECODE", "CODEX_HOME")}
+                                 "PYTHONDONTWRITEBYTECODE", "CODEX_HOME", "CODEX_THREAD_ID")}
         self.env.update(
             PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
             FAKE_RULE_LOG=str(self.rule_log),
@@ -1158,6 +1159,56 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Everything looks good")
         self.send("\r")
         self.expect("Project path")
+
+    def write_codex_session(self, workspace: Path, thread: str) -> None:
+        """A synthetic Codex 0.164 session record for a session opened on `workspace`."""
+
+        import json
+        folder = self.home / ".codex" / "sessions" / "2026" / "11" / "01"
+        folder.mkdir(parents=True, exist_ok=True)
+        # No /tmp entry: this checkout sits in a temporary folder, which every real
+        # session can write, so the warning would always name it.
+        entries = [
+            {"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
+            {"path": {"type": "path", "path": str(workspace)}, "access": "write"},
+        ]
+        lines = [
+            {"timestamp": "2026-11-01T10:00:00Z", "type": "session_meta", "payload": {
+                "id": thread, "cwd": str(workspace), "runtime_workspace_roots": [str(workspace)]}},
+            {"timestamp": "2026-11-01T10:00:01Z", "type": "turn_context", "payload": {
+                "cwd": str(workspace), "sandbox_policy": {"type": "workspace-write"},
+                "file_system_sandbox_policy": {"entries": entries}}},
+        ]
+        (folder / f"rollout-2026-11-01T10-00-00-{thread}.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in lines))
+
+    def test_a_codex_session_able_to_write_this_clone_is_warned_about(self) -> None:
+        self.write_codex_session(ROOT.parent, "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b")
+        self.start(self.base)
+        self.expect("Read the warning above")
+        self.expect("Up/Down move")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn(f"A Codex session on 2026-11-01 could write to {ROOT.parent}, which holds "
+                      "this setup folder", plain)
+        self.assertIn("never on your home folder", plain)
+        self.send("\r")  # Continue: it is a warning, not a stop
+        self.expect("Project path")
+        self.send("\x03")  # Ctrl-C ends the wizard here
+        self.finish()
+        self.assertEqual(list((self.home / ".codex").iterdir()), [self.home / ".codex" / "sessions"])
+
+    def test_a_project_codex_session_is_not_warned_about(self) -> None:
+        project = self.base / "some-project"
+        project.mkdir()
+        self.write_codex_session(project, "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5c")
+        self.start(self.base)
+        self.expect("Everything looks good")
+        self.expect("Up/Down move")
+        self.assertNotIn("A Codex session on", self.screen)
+        self.send("q")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
 
     def test_quit_on_the_first_screen_changes_nothing(self) -> None:
         self.start(self.base)

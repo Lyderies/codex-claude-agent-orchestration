@@ -826,9 +826,13 @@ class OwnerCommandsFromThisCheckoutTests(unittest.TestCase):
         self.installed_cli = self.target / ".codex" / "orchestration" / "cli.py"
 
     def run_cli(self, cli: Path, *args: str) -> dict:
+        # Without CODEX_THREAD_ID, so host-command never reads real Codex session records
+        # when the tests themselves run inside a Codex session.
+        environment = {key: value for key, value in os.environ.items() if key != "CODEX_THREAD_ID"}
         completed = subprocess.run([os.path.realpath(sys.executable), "-I", "-B", "-S", "-X",
                                     "pycache_prefix=/dev/null", str(cli), *args],
-                                   capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                   env=environment)
         return json.loads(completed.stdout)
 
     def test_host_command_matches_and_the_rule_lifecycle_copies_this_checkout(self) -> None:

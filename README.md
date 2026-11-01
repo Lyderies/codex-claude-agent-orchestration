@@ -85,7 +85,10 @@ changed anything it can write: the temporary folders, and any folder a Codex ses
 opened on, which may be a project or a folder above it (a nested project's tree, `.git` and
 `.claude` included). Sessions are never opened on your home folder, its parent or `/`.
 **Keep this repository's folder outside every folder you open in Codex**, so no session can
-change the code that runs with your authority.
+change the code that runs with your authority. The wizard's first screen warns when a recent
+Codex session (the last 14 days) could write this folder, your home folder or a folder above
+it, and the orchestrator refuses commands from such a session (see the troubleshooting note
+below).
 
 - **Trusted Python, decided before it runs.** Every Python the wizard starts is the real file
   behind the `python3` on your `PATH`, checked before it ever runs: never a symlink, a virtual
@@ -139,6 +142,17 @@ change the code that runs with your authority.
   checking that the project's copy has not changed since it was read. These rules are a policy layer on Claude Code's tools, not a sandbox: a
   command spelled another way (for example through `bash -c` or a script that starts the CLI
   itself) is not matched, so do not give a Claude primary more trust because of them.
+
+### Troubleshooting: "This Codex session can write to ..."
+
+Before every orchestrator command a Codex primary runs through the commands rule, the
+orchestrator reads that session's own Codex record (`~/.codex/sessions/.../rollout-*.jsonl`,
+only its settings, never the conversation) and refuses when the session runs without its
+sandbox, or can write your home folder, a folder above it, `~/.codex`, this repository's
+folder or a tool folder (`~/.local`, `/opt/homebrew` and the like, including one added with
+`--add-dir`). Quit that session and start Codex in the project's own folder. "Run Codex
+without --ephemeral" means the session left no record to check. In a Codex session,
+`host-command` prints the same verdict as `session_guard`.
 
 ### Advanced: manual setup
 

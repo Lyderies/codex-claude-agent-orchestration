@@ -425,6 +425,34 @@ safety comes from redundant layers.
   Codex skill state it in those words. Sessions opened on a project, or on any other
   folder, are supported, so a program the rule's commands run must not sit where such a
   session could reach it.
+- **Session workspace guard.** The workspace rule above no longer rests on the owner
+  alone. Before every primary-host command, the protected copy identifies the calling
+  session from `CODEX_THREAD_ID` (strict UUID form; a command the rule runs is a fresh
+  process whose environment the model cannot set) and finds exactly one record for it in
+  the account's `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl` (account home
+  from the account database, every folder and the file opened without following symlinks
+  and owner-checked, newest day folders first, at most 400). It reads only two Codex 0.164
+  records, never conversation content: `session_meta` (the first line: `cwd`,
+  `runtime_workspace_roots`) and the last `turn_context` (read backwards in bounded steps,
+  at most 32 MiB from the end: `sandbox_policy.type` and
+  `file_system_sandbox_policy.entries`). It refuses, with plain messages:
+  - a session without its sandbox (`danger-full-access`) or of an unknown type;
+  - no record (`codex exec --ephemeral`), several, a missing or malformed `CODEX_THREAD_ID`,
+    or any record shape it does not know (the format is pinned to Codex 0.164 and fails
+    closed on change);
+  - any writable folder (every `path` entry with write access, `slash_tmp` as `/tmp`,
+    `tmpdir` as the command's `TMPDIR`, every runtime workspace root) whose real path is
+    `/`, the account home or a folder above it, or that equals, contains or lies inside
+    `~/.codex` (and so the copy), the orchestrator clone that installed the copy (recorded
+    in its binding, format 2), a trusted installation folder or any hidden top-level home
+    folder; and a writable `special` root or home entry, or one it cannot place.
+  `host-command` reports the verdict as `session_guard` (`ok` or the reason) without
+  changing `ready` or `codex_rule`, and the Codex skill stops on anything but `ok`. The
+  wizard's first screen runs `codex-session-scan` from the clone, with the same parsing:
+  records changed in the last 14 days (at most 200) in the folder Codex uses (`CODEX_HOME`,
+  else `$HOME/.codex`), warning, with Continue or Quit, about a session that could write the
+  clone, `$HOME` or the account home, or a folder above them. The Claude primary's project
+  CLI is unaffected.
 - **Trusted installation folders.** The interpreter the rule names (and its standard
   library), every provider client and git must resolve under one of
   `host_paths.TRUSTED_INSTALL_ROOTS` (`/usr/bin`, `/bin`, `/usr/libexec`, `/usr/local`,
@@ -582,10 +610,12 @@ safety comes from redundant layers.
   ignores a denial spends only its own session's allowance. Codex children cannot be
   routed natively any more.
 - **Residual risks.**
-  - The threat model above is an instruction to the owner, not something the runtime can
-    detect: a session opened on the home folder, its parent or `/`, or one given `~` or
-    `~/.codex` with `--add-dir`, can change the copy, the rules and home-installed tools
-    that the rule runs. A session opened on a trusted installation folder itself (say
+  - The session guard checks the calling session's own record, which lives in
+    `~/.codex`: a session opened on `/` or `/Users` (or given `~/.codex` with `--add-dir`)
+    can write that record and forge its settings before running a command, as it can the
+    copy and the rules. The guard stops the ordinary mistake (Codex opened on the home
+    folder, a parent of the clone, or with `--add-dir ~/.local`), not a session that
+    already writes `~/.codex`. The record format is Codex 0.164's; a change fails closed. A session opened on a trusted installation folder itself (say
     `/opt/homebrew` or `~/.pyenv`) could change the tools there too; nobody opens one
     there, and no check can tell.
   - A Codex primary can still spawn a native Codex child with its own collaboration tool,

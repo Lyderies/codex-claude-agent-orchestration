@@ -16,6 +16,16 @@
     is importable. Only the account's real `~/.codex` is supported (the home folder comes
     from the system account database): a HOME or `CODEX_HOME` that disagrees with it or a
     symlinked `~/.codex` is refused, and `host-command` reports it as `unsupported`.
+  - **Session workspace guard.** Before every primary-host command the protected copy runs,
+    it finds the calling Codex session's record from `CODEX_THREAD_ID`
+    (`~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl` under the account's home, no
+    symlinks, owner-checked), reads only its `session_meta` and its last `turn_context`
+    (backwards, bounded), and refuses a session without its sandbox (`danger-full-access`),
+    without a record (`--ephemeral`), with several or a shape it does not know, or able to
+    write `/`, the home folder or a folder above it, `~/.codex`, the copy, the clone that
+    installed it (now recorded in the copy's binding) or a trusted installation folder.
+    `host-command` reports the verdict as `session_guard`, and the wizard's first screen warns
+    about a recent session that could write the clone or the home folder.
   - The interpreter the rule names, provider clients and git must come from a trusted
     installation folder (`host_paths.TRUSTED_INSTALL_ROOTS`: system folders, Homebrew,
     python.org, Xcode and its Command Line Tools, Nix) or a hidden top-level folder of the
