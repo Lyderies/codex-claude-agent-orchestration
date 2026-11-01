@@ -61,9 +61,16 @@ python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py verify --target 
 
 Commit the installed files in the project, including `.claude/settings.json`, which now holds Claude Code
 deny rules for the owner-only commands (an earlier version's `.claude/agent-orchestration-permissions.json`
-is migrated to your learning state and deleted). If you commit by hand, skip the project's hooks:
+is migrated to your orchestrator records and deleted). If you commit by hand, skip the project's hooks:
 `git -c core.hooksPath=/dev/null -c core.fsmonitor=false commit ...`. The wizard itself commits with Git
 plumbing only, and stops when the project's settings name a program Git would start.
+
+The installer also writes `.codex/hooks.json` (the learning hooks, rendered with absolute paths to this
+checkout and to the Python that ran the installer) and `.codex/orchestration/local-install.json`. Never
+commit them: the installed `.codex/.gitignore` ignores both, and each clone gets its own when you install
+there. An update from 0.8.x replaces the old committed hooks file; take it out of Git with
+`git rm --cached .codex/hooks.json` before you commit. Codex trusts hooks by their hash, so after every
+install or update open `/hooks` in Codex and trust the orchestrator's learning hooks.
 
 ## 2. Enable providers
 
@@ -95,7 +102,13 @@ python3 -I -B -S -X pycache_prefix=/dev/null "$CLI" learning-register --project-
 python3 -I -B -S -X pycache_prefix=/dev/null "$CLI" learning-status --project-root /path/to/project
 ```
 
-One collector is shared by every project on the machine.
+One collector is shared by every project on the machine. Your orchestrator records (the learning state)
+live in `~/.local/state/codex-agents`, or `$XDG_STATE_HOME/codex-agents`; on macOS, the first
+`learning-register` after this update moves them there from `~/Library/Application Support/codex-agents`
+and reports the old copy's path as `"state_moved"` (null otherwise); delete that old copy once you are
+happy. Because a session opened on `~/Library` could have created that old folder, it moves only with
+`--move-legacy-state <sha256 of its owner-allowed-signers file, or none>` after you have checked that the
+owner key it names is yours; the wizard shows it and asks first.
 
 ## 4. Attest billing
 
@@ -107,9 +120,11 @@ python3 -I -B -S -X pycache_prefix=/dev/null scripts/attest.py --target /path/to
 
 No child runs until you confirm that each account cannot be charged beyond its subscription.
 
-- It creates the owner key at `~/.ssh/codex-agents-owner` if you have none. Keys without a passphrase are
-  refused, and signing runs without `ssh-agent`, so no program, including an AI agent, can sign in your
-  name. The owner key record must hold exactly one key.
+- It creates the owner key at `~/.ssh/codex-agents-owner` if you have none. Any owner key must be a file in
+  your own `~/.ssh` (no symbolic link on its path, the folder writable only by you), checked again before
+  every use; a key anywhere else is refused. Keys without a passphrase are refused, and signing runs
+  without `ssh-agent`, so no program, including an AI agent, can sign in your name. The owner key record
+  must hold exactly one key.
 - It asks whether pay-as-you-go extra usage and Codex credit spending are turned off, and has you sign each
   answer. It signs in memory, only the bytes it rebuilt from your answers, and checks the signature.
 - A wrong passphrase offers Try again or Exit. To change the passphrase, choose "Change the owner key
@@ -159,10 +174,12 @@ differing one. It refuses:
   system account database, or a symlinked `~/.codex`.
 
 Run it again after a Python upgrade or a package update; `host-command` then reports `stale`. Before each
-command, the copy's session guard refuses a Codex session that can write `/`, your home folder or a folder
-above it, `~/.codex`, the copy, this repository or a tool folder, or that runs without its sandbox or
-leaves no record. Open Codex on the project folder: never on your home folder, a folder above it or `/`,
-and never add `~` or `~/.codex` with `--add-dir`.
+command, the copy's session guard refuses a Codex session that was opened on a folder that contains the
+project, that can write `/`, your home folder or a folder above it, `~/.codex`, the copy, this repository,
+your records or a tool folder, or that runs without its sandbox or leaves no record. Open Codex on the
+project itself: never on a folder that contains a set-up project, this repository, your home folder, a
+folder above it or `/` (Codex runs a nested trusted project's `.codex/config.toml` and hooks outside the
+sandbox), and never add `~`, `~/.codex` or `~/.local` with `--add-dir`.
 
 To undo only the rule and its copy:
 

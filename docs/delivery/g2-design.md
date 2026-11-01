@@ -378,11 +378,13 @@ build.
     `.codex/` is read-only there, and the rule only ever runs an installed `cli.py` (since
     S6, the protected copy, whose project comes from its binding). The source tree has no
     manifest and keeps these options for development and tests.
-  - **Why the default state is safe to trust.** It follows `HOME` (or `XDG_STATE_HOME`
-    on Linux) in the process environment. A command Codex runs through the rule is a
-    fresh process with Codex's environment, and an environment-assignment prefix breaks
-    the rule's argument match, so the model cannot move it. Tests that drive an
-    installed CLI point `HOME` at a temporary directory instead of using an opt-out.
+  - **Why the default state is safe to trust.** It followed `HOME` (or `XDG_STATE_HOME`
+    on Linux) in the process environment; since S6 it is `XDG_STATE_HOME` or the account
+    database's home folder, on macOS too (S6, learning state location). A command Codex
+    runs through the rule is a fresh process with Codex's environment, and an
+    environment-assignment prefix breaks the rule's argument match, so the model cannot
+    move it. Tests that drive an installed CLI point `XDG_STATE_HOME` (and `HOME`) at a
+    temporary directory instead of using an opt-out.
   - **What it closes.** Before it, `validate --root`, `route --root`, `learning-route`
     and the assignment and result checks ran git in a caller-chosen directory before
     any registration check (provider-routing and operational-check trust both read the
@@ -431,9 +433,16 @@ safety comes from redundant layers.
   `--add-dir`. Such a session could write `~/.codex` (the rule and its copy) and every
   tool installed under the home folder (a Python under `~/.pyenv`, Claude Code under
   `~/.local`), which the rule then runs. The wizard's consent screen, the README and the
-  Codex skill state it in those words. Sessions opened on a project, or on any other
-  folder, are supported, so a program the rule's commands run must not sit where such a
-  session could reach it.
+  Codex skill state it in those words. Open Codex on the project itself; never on a
+  folder that contains a set-up project, the clone, your home folder, its parent or `/`.
+  The reason for the first: Codex runs a nested trusted project's `.codex/config.toml`
+  and `.codex/hooks.json` outside the sandbox, and keeps a project's `.codex`, `.agents`
+  and `.git` read-only only when the project is the top of a writable root, so a session
+  opened on a folder above the project can plant those files (and edit
+  `.codex/orchestration/**` or `.git/config`), and no package code can stop that. Sessions
+  opened on any other folder (one that holds none of these) are supported, so a program
+  the rule's commands run, and anything they trust, must not sit where such a session
+  could reach it.
 - **Session workspace guard.** The workspace rule above no longer rests on the owner
   alone. Before every primary-host command, the protected copy identifies the calling
   session from `CODEX_THREAD_ID` (strict UUID form; a command the rule runs is a fresh
@@ -453,9 +462,21 @@ safety comes from redundant layers.
     `tmpdir` as the command's `TMPDIR`, and, except in a read-only session, every runtime
     workspace root) that is `/`, the account home or a folder above it, or that equals,
     contains or lies inside `~/.codex` (and so the copy), the orchestrator clone that
-    installed the copy (recorded in its binding, format 2), a trusted installation folder
-    or any hidden top-level home folder; and a writable `special` root or home entry, or
-    one it cannot place.
+    installed the copy (recorded in its binding, format 2), a trusted installation folder,
+    any hidden top-level home folder, the learning state as the commands use it
+    (`$XDG_STATE_HOME/codex-agents`, only inside a hidden folder of HOME, or the account's
+    `~/.local/state/codex-agents`, with its `scratch`), or a host-private scratch container (the bridge's
+    `codex-agents-scratch` and the owner tools' `agent-orchestration-owner`, in the
+    per-user cache folder on macOS or `$XDG_RUNTIME_DIR` on Linux); and a writable
+    `special` root or home entry, or one it cannot place.
+  - a writable folder that strictly contains the copy's bound project, or that is (or
+    lies inside) the project's `.codex`, `.agents` or `.git`. The project itself stays
+    allowed: the record lists `<root>/.git`, `.agents` and `.codex` as read entries for
+    a workspace-write session, which Codex keeps read-only at the top of every writable
+    root (on the synthetic Codex 0.164 fixtures; the real record was not re-read for this
+    change). Because the guard runs before every rule-matched command, `dispatch`
+    included, a session that could write the bridge's control files or exports never
+    starts a bridged child.
   - Containment is decided component by component, for each path both as written (no
     symlink followed) and as it resolves now: two components are the same folder when
     their file-system identities (device and inode) match, and a component that does not
@@ -468,8 +489,85 @@ safety comes from redundant layers.
   wizard's first screen runs `codex-session-scan` from the clone, with the same parsing:
   records changed in the last 14 days (at most 200) in the folder Codex uses (`CODEX_HOME`,
   else `$HOME/.codex`), warning, with Continue or Quit, about a session that could write the
-  clone, `$HOME` or the account home, or a folder above them. The Claude primary's project
-  CLI is unaffected.
+  clone, `$HOME` or the account home, or a folder above them, the learning state (the new
+  folder, and the old macOS one while it exists), or a folder that strictly contains a
+  set-up project ("Codex was opened on a folder that contains a set-up project (<name>);
+  open Codex on the project itself"). Set-up projects are those the runtime copies'
+  bindings name and the ledger's active registrations (read-only; skipped when
+  unreadable; the installer's ownership records hold only a digest of the project path).
+  Each finding carries `holds` (`home`, `clone`, `state` or `project`) and a plain
+  `message`. The Claude primary's project CLI is unaffected.
+- **Learning state location.** Until this change the default state on macOS was
+  `~/Library/Application Support/codex-agents`, a non-hidden home subtree: a session
+  opened on `~/Library` (for a project under it) could write the ledger, the digest key,
+  the collector authorization and `owner-allowed-signers`, and same-user modes do not stop
+  that. The default is now `~/.local/state/codex-agents` on every platform, with the home
+  folder from the account database, never HOME (`host_paths.default_state_root`). The
+  collector's socket path there is shorter than before.
+  - **XDG_STATE_HOME.** An absolute value moves the state to `$XDG_STATE_HOME/codex-agents`
+    only when it is canonical as written (no symbolic link at any component) and lies
+    strictly inside a hidden top-level folder of HOME (such as `~/.local/state`); anything
+    else refuses every command, the guard included: "XDG_STATE_HOME must be inside a hidden
+    folder in your home, such as ~/.local/state; unset it or move it". A value such as
+    `~/State` would put the ledger and the owner's signer in a folder a permitted session
+    may be opened on. A relative value is ignored, as the XDG specification says. The
+    check is anchored on HOME, not the account database, on purpose: HOME is the owner's
+    own environment, which no model sets for a rule-matched command, a hook or an owner
+    tool (an environment-assignment prefix breaks the rule's match), and tests isolate a
+    scratch home with `HOME=<scratch>` and `XDG_STATE_HOME=<scratch>/.local/state`.
+  - **Folders above the state.** Every existing folder between the home folder and the
+    state (`~/.local`, `~/.local/state`) must be a real folder, the owner's and writable by
+    no one else, or every command refuses; missing ones are created owner-only (0700) and
+    checked again before the state itself is created.
+  - **No second hard link.** Every state file the store checks (database and journals,
+    digest key, owner allowed-signers) refuses a link count other than one, and the signer
+    and digest key are also checked on the descriptor they are read from: a hard link in a
+    project would otherwise keep write access to the file. The allowed-signers file must be
+    exactly one canonical line of at most 4096 bytes, read whole (normal use, the staged
+    copy and the move): `ssh-keygen` reads the whole file, so a valid-looking over-long
+    first line must not hide a second key behind the part that was checked.
+  - **One-time move.** Only the owner's `learning-register` (the wizard's collector step,
+    run from the clone) moves the old folder, only while it is the only one, and only with
+    the owner's approval: `--move-legacy-state <sha256 of the old owner-allowed-signers, or
+    none>`. A session opened on `~/Library` could have created the old folder where none
+    existed, so the wizard first shows (attest.py `legacy-state`) when it was created, the
+    owner key its signer file names and whether that is the key in
+    `~/.ssh/codex-agents-owner.pub`, asks "Move these records to the protected folder?",
+    and passes the digest it showed. Without the flag the move refuses; the digest is
+    checked against the old file and again against the fresh staged copy before anything
+    is renamed, so a file changed after the review refuses. It checks
+    it (owner-only, no symlink, outside Git), refuses if the new socket path would exceed
+    the AF_UNIX limit (103 bytes on macOS, 107 on Linux) and prepares the new parent
+    folders as above. Then, with the collector stopped and its maintenance lock held
+    (`CollectorMaintenance`, as for registration) and the ledger's writer lock taken:
+    - a file with a second hard link, a symbolic link or a special file in the old folder
+      refuses with a plain message, before anything is copied;
+    - every file is copied into fresh inodes (`O_EXCL|O_NOFOLLOW`, 0600, folders 0700) in
+      an owner-only staging folder beside the new location, the ledger through SQLite's
+      backup API page by page (it can be hundreds of megabytes) and checked with
+      `quick_check`; the socket, lock files and transient `scratch` are not copied;
+    - the staged copy passes the usual checks (owner, modes, link count, digest key,
+      signer format, database files) and is renamed into place in one step;
+    - the old folder is renamed beside itself to `codex-agents.moved-<UTC yyyymmddThhmmssZ>`,
+      inert, and `state_moved` names it so the wizard can say it may be deleted.
+
+    A rename keeps the old inodes, so a hard link or a writable descriptor taken on the
+    old files before the move would have kept write access to the new state; the copy
+    leaves those pointing at the old copy only. On any failure the staging folder is
+    removed and the old folder is left as it was (a collector that was running is
+    restarted there); if setting the old folder aside fails, the published copy is taken
+    back. Registration then re-authorizes and starts the collector at the new folder. Both
+    folders present refuses with a plain message; only the new one is normal. The old
+    folder is found where the old code put it (HOME's `Library/Application Support`).
+  - **Everything else fails closed.** Any other use of the default state (every command,
+    the protected copy, the learning hooks, `learning-configure-owner-key`) refuses while
+    only the old folder exists, telling the owner to run `./setup.sh` (collector step), so
+    nothing starts a second, empty state beside it. Once moved, the old location is not
+    special: the guard does not protect it.
+  - **Owner tools.** `host_paths.owner_state_root()` is the folder that holds the owner's
+    state now: the old macOS folder while it is the only one, else the default. The
+    installer's ownership records and the attestation helper use it, so the install step,
+    which runs before the collector step, never creates the new folder beside the old one.
 - **Trusted installation folders.** The interpreter the rule names (and its standard
   library), every provider client and git must resolve under one of
   `host_paths.TRUSTED_INSTALL_ROOTS` (`/usr/bin`, `/bin`, `/usr/libexec`, `/usr/local`,
@@ -616,11 +714,92 @@ safety comes from redundant layers.
     recorded there is never removed. When an owner-only CLI subcommand is retired, add its
     name to `scripts/install.py` `HISTORICAL_OWNER_ONLY` so its old deny rules are still
     recognised as the installer's.
+  - The owner key: `attest.py` takes a private key only from the account's `~/.ssh`, with no
+    other hard link, and each operation that uses it (the passphrase check with the
+    derivation, signing, the passphrase change) first reads it once through a no-follow
+    descriptor into a fresh 0600 file in a new owner-only folder of the owner's scratch
+    container, runs every `ssh-keygen` step on that copy only and removes it when the
+    operation ends. A program that kept a descriptor or mapping on the key's inode (opened
+    through a link in a folder it could write before the key was moved) cannot change what
+    was checked before it is used. The passphrase change re-encrypts the copy, checks it with
+    the new passphrase, and only then writes it to a fresh 0600 file in `~/.ssh` that is
+    synced and renamed over the key, so the old inode is replaced rather than edited: a
+    retained descriptor on it then only ever writes to a file the tools no longer use.
   - Residual: the settings file is staged in that owner folder and renamed into place after
     re-comparing the destination's bytes; an edit landing in the sub-millisecond window
     between that comparison and the rename is overwritten (accepted). When the state folder
     is on another file system, the file is staged beside the destination under a random
     name instead.
+- **Learning hooks rendered per checkout.** Codex 0.164 runs every hook command on the host,
+  outside the sandbox, as `<session shell> -c "<command>"` (zsh, bash or sh; `$SHELL -lc` or
+  `/bin/sh -lc` when no shell is known), in the session's working directory, which may be a
+  subfolder, with no project-root variable for project hooks
+  (`codex-rs/hooks/src/engine/command_runner.rs` `build_command`;
+  `core/src/session/mod.rs` `build_hooks_config`). The static file ran `python3` from `PATH`
+  and found the hook with `git rev-parse`.
+  - The installer renders `.codex/hooks.json` (`hook_config.render_hooks`): the same nine
+    events, async set and timeout 3, each running
+    `/usr/bin/env xcrun_nocache=1 '<interpreter>' -I -B -S -X pycache_prefix=/dev/null
+    '<root>/.codex/orchestration/learning_hook.py' --checkout '<root>' --client-version
+    codex-hooks-v1`. The
+    interpreter is the one the installer runs under, which `./setup.sh` selected, checked as
+    for the rule (`interpreter_path`, `executable_location_problem`, not the xcrun shim). Each
+    path is single-quoted and may not hold a quote, a backslash or a control character, so
+    sh, bash, zsh and fish read the same words.
+  - The file holds absolute paths, which would leak a home path into a pushed project and
+    break every other clone, so it is never committed. No documented project-root variable
+    exists (option a), so the package's committed `.codex/.gitignore` ignores it and
+    `.codex/orchestration/local-install.json` (the recorded interpreter and the file's digest)
+    in every clone, without writing into `.git`. The installer owns both through that local
+    record: update and remove replace or delete them only at the recorded digest, and an
+    update replaces 0.8.x's committed static file, whose deletion the wizard's plumbing commit
+    records while the rendered file stays. `project_changes` never reports an untracked one.
+  - Linked worktrees and nested repositories: Codex 0.164 loads a linked worktree's hooks
+    from the matching folder of its main checkout (`config/src/loader/mod.rs`
+    `root_checkout_hooks_folder_for_dir`), so events from `.worktrees/<name>` run the main
+    checkout's rendered command. `--checkout` pins the checkout it was rendered for, and
+    `learning_hook.py`'s first action, with the standard library only and before importing
+    any of the package, is `belongs_to_checkout`: the payload's `cwd` must exist and,
+    resolved strictly, be the checkout or lie inside it, and the nearest `.git` entry (folder
+    or file, read with `lstat`) walking up from it must be the checkout's own. Only a missing
+    `.git` counts as absent: any other error, such as a folder whose search permission a
+    session removed, refuses, so an inaccessible worktree boundary is never walked past. A linked worktree (inside or outside the checkout), a
+    nested repository or anything else is a silent no-op (`{}` for `Stop` and
+    `SubagentStop`) that imports nothing, starts no collector and records nothing; an
+    accepted event binds the pinned checkout, so a session in a subfolder records for it.
+    No registration check exists short of the collector (the only one, a read-only ledger
+    query, would open the database on every event), so the checkout guard is what keeps a
+    foreign event from starting the collector. A separate clone gets its own file when the
+    wizard installs it there.
+  - Verify (`validation._validate_learning_hooks`, a project error) keeps every structural
+    check, then requires the local record, re-checks the recorded interpreter, and compares
+    the file byte for byte with `render_hooks(interpreter, root)`; the old `$(git rev-parse)`
+    form, an edited command, a moved project or an untrusted interpreter says to run
+    `./setup.sh`. Codex trusts each hook by its hash, so after an install or update the
+    wizard says "In Codex, open /hooks and trust the orchestrator's learning hooks"; the
+    installer never writes trust.
+  - `hook_config.py` is runtime code (validation imports it). `learning_hook.py` stays
+    package data: hooks run the project's installed hook, not the copy. Once installed, the
+    project's `.codex/orchestration` is protected like `hooks.json` itself (Codex keeps
+    `<project>/.codex` read-only for a session opened on the project, and the guard refuses
+    sessions that could write it from above), except from a process that was already
+    writing the project before the install, when `.codex` did not yet exist and so was not
+    excluded (see the residual risks). Nothing on the hook's path uses `PATH` or git;
+    `ensure_collector` starts the collector with `sys.executable` (the trusted interpreter)
+    and `xcrun_nocache=1`.
+  - Planted modules: the installer (install and update) refuses before writing anything,
+    and verify reports it, when `.codex/orchestration` holds any entry other than this
+    package's runtime and data files, the project's own files and files the install
+    manifest owns ("<project>/.codex/orchestration holds files the orchestrator does not
+    install: …; remove them and run ./setup.sh again"). The hook and the project's
+    `cli.py` append their folder to `sys.path` instead of putting it first: run with `-I`,
+    the script's folder is not on the path, so a planted `socket.py` can never shadow the
+    standard library. The wizard tells the owner to trust the hooks in Codex only after
+    `check-runtime` passes (the installed runtime is this release, byte for byte, with
+    nothing extra), and reminds them at the start of the install step to close every Codex
+    session in the project first.
+  - **v1.1 candidate:** run the hooks from a guard-protected owner copy (as the rule runs
+    the CLI) rather than from the project's installed code.
 - **Native admission (accepted residual).** A Claude primary's native children run in the
   primary's own session and allowance; admission for them is accounting and policy, not
   a spend boundary, and the native tool consumes no admission capability. A primary that
@@ -641,11 +820,36 @@ safety comes from redundant layers.
     it. Accepted: the primary already holds the rule's authority itself, and such a child
     is still held to this project and the owner's state by the own-root invariant and
     every run it opens to ledger admission.
-  - In a parent-folder session the project's configuration (provider routing,
-    operational checks, mapped agents and its `.git`) stays model-writable. The copy's
-    code never runs from there, git runs with every helper off, operational checks run in
-    their own sandbox, and every route is held to policy, but "committed and clean" is
-    then only as strong as that session's restraint.
+  - A session opened on a folder that contains a set-up project is refused by the guard,
+    but the guard only refuses commands: such a session can still write the project's
+    `.codex` (its hooks and `config.toml`, which Codex runs outside the sandbox when the
+    project is trusted), `.codex/orchestration/**` and `.git/config` directly, and no
+    package code can stop that. The wizard warns about recent ones, and the documentation
+    says to open Codex on the project itself.
+  - The learning hooks run the project's installed `learning_hook.py` (and the modules it
+    imports), not the protected copy. Close every Codex session in the project before
+    installing or updating: a process started in a sandbox before the install, when
+    `.codex` did not yet exist and so was not excluded from its writable root, can still
+    rewrite that code afterwards, and nothing in the package can detect a change made after
+    the last check. A rendered hooks file names the interpreter's
+    realpath: a Python upgrade that moves it breaks the hooks until `./setup.sh` runs again
+    (verify reports it). Codex re-trusts hooks only by hash, so the owner must re-trust them
+    after each render.
+  - A session that could write the old macOS state folder before the owner's collector
+    step moved it could have changed that state, or created it where none existed; the
+    owner reviews its creation time and owner key before approving the move, which then
+    carries the contents over as they are (in fresh files, so no link or descriptor it kept
+    reaches them).
+  - A workspace-write Codex session in the project can rewrite `.claude/settings*.json`
+    (its hooks and deny rules) and `.claude/skills/**`, which Claude Code loads and runs on
+    the host; the installer's deny rules are not a boundary against that session. Verify
+    warns when `.claude/settings.json` defines hooks, which the installer never writes.
+  - The old copy (`codex-agents.moved-<time>`, including the old digest key, which is the
+    one the new state keeps using) stays readable where it was until the owner deletes
+    it; the wizard should say so.
+  - The XDG_STATE_HOME check trusts HOME, the owner's environment, as the anchor.
+  - The scan is a warning: it follows only records from the last 14 days, and the set-up
+    projects it knows are the runtime bindings and the ledger's registrations.
   - The copy is verified against the project and this package's recorded runtime, not
     against an owner signature: an owner who installs a modified package gets that
     package copied.

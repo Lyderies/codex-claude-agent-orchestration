@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Interactive setup wizard for the Codex-Claude agent orchestration.
 #
 #   ./setup.sh [PROJECT_PATH]
@@ -21,8 +21,10 @@
 # with --project-root, never the project's copy, and only once the installed copy is this
 # release byte for byte. Git is a trusted real binary run with plumbing only (no status,
 # add or commit), every helper and transport off, and not at all on a partial clone or
-# while the project's own Git settings name a helper program. This folder must sit outside
-# every folder opened in Codex.
+# while the project's own Git settings name a helper program. Started as ./setup.sh, the bash
+# that runs this file and every basic tool it calls come from the system folders, never an
+# earlier PATH entry, and the Codex and Claude clients run only as the runtime runs them
+# (attest.py client-status). This folder must sit outside every folder opened in Codex.
 #
 # Test hook (no terminal needed):
 #   ./setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE
@@ -38,6 +40,13 @@
 #   ./setup.sh --print-trusted-roots           prints the trusted installation folders, one per line
 #   ./setup.sh --print-git-helpers PROJECT     prints helper programs the project's Git settings name, or "none"
 
+# Basic tools (dirname, uname, id, sed, tput and the rest) come only from the system folders:
+# an earlier PATH entry, which a Codex session opened on a folder above it could write, never
+# stands in for one. The PATH you set is kept only to find python3, which is trusted before it
+# ever runs (resolve_python), and to say where a client the runtime will not use was found.
+OWNER_PATH=${PATH-}
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
@@ -246,7 +255,19 @@ python_location_problem() {
   return 0
 }
 
-# resolve_python [START] -> PY, PY_PROBLEM : the python3 on PATH as its real file, trusted
+# owner_path_lookup NAME : the first executable NAME in the PATH you set, as `command -v`
+# finds it, but only in absolute folders. A lookup only: nothing found here runs unchecked.
+owner_path_lookup() {
+  local dir rest="$OWNER_PATH:"
+  while [ -n "$rest" ]; do
+    dir=${rest%%:*}; rest=${rest#*:}
+    case "$dir" in /*) ;; *) continue;; esac
+    if [ -f "$dir/$1" ] && [ -x "$dir/$1" ]; then printf '%s\n' "$dir/$1"; return 0; fi
+  done
+  return 1
+}
+
+# resolve_python [START] -> PY, PY_PROBLEM : the python3 on your PATH as its real file, trusted
 # before it runs at all. START (default: the current folder) stands for the project until one
 # is chosen; the chosen project is checked again in step 2.
 PY=""
@@ -254,7 +275,7 @@ PY_PROBLEM=""
 resolve_python() {
   local found top
   PY=""; PY_PROBLEM=""
-  found=$(command -v python3 2>/dev/null) || { PY_PROBLEM=missing; return 1; }
+  found=$(owner_path_lookup python3) || { PY_PROBLEM=missing; return 1; }
   case "$found" in /*) ;; *) PY_PROBLEM=missing; return 1;; esac
   PY=$(real_file "$found") || { PY=""; PY_PROBLEM=missing; return 1; }
   top=$(work_tree_top "${1:-$PWD}") || top=""
@@ -392,14 +413,15 @@ op = sys.argv[1]
 if op == "get":
     print(fmt(walk(load(sys.argv[2]), sys.argv[3])))
 elif op == "sessions":
-    # codex-session-scan's warnings, one per line: date, what it holds, folder. Control
-    # characters are dropped, so a folder name cannot drive the terminal.
+    # codex-session-scan's warnings, one per line: date, what it holds, folder and its plain
+    # message, separated by \x1f. Control characters are dropped, so a folder or project name
+    # cannot drive the terminal (or split a line).
     data = load(sys.argv[2])
     for item in (data.get("warnings") if isinstance(data, dict) else None) or []:
         if isinstance(item, dict):
             fields = [re.sub(r"[\x00-\x1f\x7f]", "", str(item.get(key, "")))
-                      for key in ("date", "holds", "folder")]
-            print("\t".join(fields))
+                      for key in ("date", "holds", "folder", "message")]
+            print("\x1f".join(fields))
 elif op == "claude":
     data = load("-")
     if isinstance(data, dict) and data.get("loggedIn") is True:
@@ -445,11 +467,17 @@ elif op in ("plan", "planpaths", "paths"):
                 out.append(("KEEP", rel))
             else:
                 out.append(("UPDATE", rel))
+        # Written for this checkout only and never committed (the rendered learning hooks);
+        # a copy an earlier release committed is taken out of Git, and the file stays.
+        local = [rel for rel in (codex.get("local_files") or []) if isinstance(rel, str)]
+        for rel in local:
+            out.append(("UNSAFE", None) if unsafe(rel) else ("LOCAL", rel))
         manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
         old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
         if isinstance(old, dict):
             for rel in sorted(set(old) - set(f for f in files if isinstance(f, str))):
-                out.append(("UNSAFE", None) if unsafe(rel) else ("REMOVE", rel))
+                kind = "UNTRACK" if rel in local else "REMOVE"
+                out.append(("UNSAFE", None) if unsafe(rel) else (kind, rel))
         settings = data.get("claude_settings") or {}
         for rel in (claude.get("changed_paths") or []) + (settings.get("changed_paths") or []):
             if unsafe(rel):
@@ -467,7 +495,7 @@ elif op in ("plan", "planpaths", "paths"):
         found = entries(sys.argv[2], sys.argv[3], sys.argv[4])
         if any(kind == "UNSAFE" for kind, _ in found):
             sys.exit(3)
-        for rel in sorted(set(r for k, r in found if k in ("ADD", "UPDATE", "REMOVE"))):
+        for rel in sorted(set(r for k, r in found if k in ("ADD", "UPDATE", "REMOVE", "UNTRACK"))):
             sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
     else:
         data = load(sys.argv[2]) or {}
@@ -1161,9 +1189,38 @@ run_cmd() {
   return "$LAST_RC"
 }
 
-# run_identity CMD... : for identity commands; output is parsed, never logged or shown.
-run_identity() {
-  "$@" 2>/dev/null </dev/null
+# client_check NAME : NAME's sign-in status (codex or claude) through attest.py's
+# client-status, which finds the client as the runtime does (its trusted search path, never
+# your PATH), checks the client's real file before it runs, and runs it with the runtime's
+# minimal environment. CLIENT_RC: 0 yes, 10 no, 11 not on that path, 12 refused, anything else
+# could not be checked. CLIENT_OUT: Claude's JSON, parsed, never logged or shown.
+CLIENT_RC=0
+CLIENT_OUT=""
+client_check() {
+  local top
+  top=$(work_tree_top "$START_DIR") || top=""
+  CLIENT_OUT=$(owner_tool client-status "$1" ${top:+"$top"} 2>/dev/null </dev/null)
+  CLIENT_RC=$?
+}
+
+# client_problem NAME PRODUCT LOGIN : explain a CLIENT_RC other than yes or no.
+client_problem() {
+  case $CLIENT_RC in
+    11)
+      if owner_path_lookup "$1" >/dev/null; then
+        list_add fail "$1: found on your PATH, but not where the orchestrator runs it from, so it was not run"
+        list_sub "The orchestrator runs $1 only from /opt/homebrew/bin, /usr/local/bin, /usr/bin, /bin or ~/.local/bin."
+        list_sub "Fix: install $2 with Homebrew or its official installer, then run: $3"
+      else
+        list_add fail "$1 not found"; list_sub "Fix: install $2, then run: $3"
+      fi;;
+    12)
+      list_add fail "$1: refused, so it was not run"
+      list_sub "Its program file is not in a protected installation folder, or a folder on the way to it is a link or can be changed by others, so an AI agent could replace it."
+      list_sub "Fix: reinstall $2 with Homebrew or its official installer, then re-check.";;
+    *)
+      list_add fail "$1: its sign-in could not be checked"; list_sub "Fix: run: $3, then re-check.";;
+  esac
 }
 
 # Only step names, command labels, exit codes and fixed hints ever reach the screen or the
@@ -1189,6 +1246,16 @@ explain_installer() {
   local label=$1 manual=$2 raw msg
   raw=$(pj raw "$LAST_OUT")
   case "$raw" in
+    *"holds files the orchestrator does not install"*)
+      msg="The project's .codex/orchestration holds files the orchestrator does not install, which code running outside Codex's sandbox could load (a Codex session may have planted them). Remove them, then run setup again. The installer names them: $manual";;
+    *"xdg_state_home must be inside a hidden folder"*)
+      msg="XDG_STATE_HOME must be inside a hidden folder in your home, such as ~/.local/state. Unset it or move it, then run setup again.";;
+    *"a folder above the learning state"*)
+      msg="A folder above your orchestrator records (such as ~/.local or ~/.local/state) is a symbolic link, is not a folder, belongs to another user or can be changed by other users. Fix it, or set XDG_STATE_HOME to another hidden folder in your home, then run setup again.";;
+    *"cannot install the learning hooks"*)
+      msg="The learning hooks could not be written: the project's folder path holds a quote, a backslash or a control character, or this Python is not in a trusted installation folder. Move the project, or run setup with a Python from Homebrew, python.org or the system.";;
+    *"learning hook"*)
+      msg="The project's learning hooks are missing, from an older release or edited by hand (Codex runs them outside its sandbox). Update the install (choose 'Update the install and walk through every step').";;
     *"merge"*"progress"*|*"rebase"*"progress"*|*"cherry-pick"*"progress"*|*"revert"*"progress"*|*"bisect"*"progress"*|*unmerged*)
       msg="A Git operation (merge, rebase, cherry-pick or similar) is unfinished in the project. Finish or abort it first.";;
     *"managed paths"*|*"uncommitted"*)
@@ -1327,26 +1394,28 @@ step_checks() {
       list_add fail "No trusted Git found"
       list_sub "Fix: install the Command Line Tools (xcode-select --install) or Homebrew's git on macOS, or git in /usr/bin on Linux."; hard=1
     fi
-    if command -v codex >/dev/null 2>&1; then
-      if run_identity codex login status >/dev/null; then
-        list_add ok "codex: installed, signed in"
-      else
-        list_add fail "codex: installed but not signed in"; list_sub "Fix: run: codex login"; soft=1
-      fi
+    if [ -n "$PY" ] && [ "$hard" -eq 0 ]; then
+      client_check codex
+      case $CLIENT_RC in
+        0) list_add ok "codex: installed, signed in";;
+        10) list_add fail "codex: installed but not signed in"; list_sub "Fix: run: codex login"; soft=1;;
+        *) client_problem codex "the Codex CLI" "codex login"; soft=1;;
+      esac
+      client_check claude
+      case $CLIENT_RC in
+        0|10)
+          out=$(printf '%s' "$CLIENT_OUT" | pj claude)
+          logged=${out%%|*}
+          if [ "$logged" = yes ]; then
+            plan=${out#*|}; method=${plan#*|}; plan=${plan%%|*}
+            list_add ok "claude: signed in (plan: $plan, login: $method)"
+          else
+            list_add fail "claude: installed but not signed in"; list_sub "Fix: run: claude auth login"; soft=1
+          fi;;
+        *) client_problem claude "Claude Code" "claude auth login"; soft=1;;
+      esac
     else
-      list_add fail "codex not found"; list_sub "Fix: install the Codex CLI, then run: codex login"; soft=1
-    fi
-    if command -v claude >/dev/null 2>&1; then
-      out=$(run_identity claude auth status --json | pj claude)
-      logged=${out%%|*}
-      if [ "$logged" = yes ]; then
-        plan=${out#*|}; method=${plan#*|}; plan=${plan%%|*}
-        list_add ok "claude: signed in (plan: $plan, login: $method)"
-      else
-        list_add fail "claude: installed but not signed in"; list_sub "Fix: run: claude auth login"; soft=1
-      fi
-    else
-      list_add fail "claude not found"; list_sub "Fix: install Claude Code, then run: claude auth login"; soft=1
+      list_add skip "codex and claude sign-ins: checked once the failures above are fixed"
     fi
     if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
       list_add fail "API key set in the environment (name only shown)"
@@ -1390,24 +1459,31 @@ step_checks() {
 }
 
 # session_warnings : warn about recent Codex sessions (records changed in the last 14 days)
-# that could write this setup folder, the home folder or a folder above it. This clone's CLI
+# that could write this setup folder, your orchestrator records (the learning state), the home
+# folder or a folder above it, or that were opened on a folder containing a set-up project,
+# each with the runtime's plain message. This clone's CLI
 # reads only each record's session settings, never the conversation, with the same parsing
 # as the guard the Codex commands rule applies. A scan that fails warns about nothing.
 session_warnings() {
-  local scan date holds folder what
+  local scan date holds folder message
   # Step 1 runs before the private working folder exists, so the report stays in memory.
   scan=$("$PY" "${PYF[@]}" "$CLONE_CLI" codex-session-scan --clone-root "$ROOT_DIR" 2>/dev/null) || return 0
-  while IFS=$'\t' read -r date holds folder; do
+  while IFS=$'\x1f' read -r date holds folder message; do
     [ -n "$folder" ] || continue
-    case "$holds" in
-      clone) what="this setup folder";;
-      *) what="your home folder";;
-    esac
-    list_add warn "A Codex session on $date could write to $folder, which holds $what."
+    # The runtime's plain message for what the folder holds (home, clone, state or project).
+    if [ -z "$message" ]; then
+      case "$holds" in
+        clone) message="Codex was opened on a folder that holds this setup folder";;
+        state) message="Codex was opened on a folder that holds the orchestrator's learning state";;
+        project) message="Codex was opened on a folder that contains a set-up project";;
+        *) message="Codex was opened on a folder that holds your home folder";;
+      esac
+    fi
+    list_add warn "A Codex session on $date could write to $folder. $message."
     SESSION_WARNING=1
   done < <(printf '%s' "$scan" | pj sessions -)
   if [ "$SESSION_WARNING" -eq 1 ]; then
-    list_sub "While the Codex commands rule exists, open Codex on a project folder only: never on your home folder, a folder above it, or a folder holding this setup folder. The orchestrator refuses commands from such a session."
+    list_sub "Open Codex on the project itself: never on a folder that contains a set-up project, this setup folder, your home folder, a folder above it or /."
   fi
 }
 
@@ -1730,6 +1806,11 @@ show_plan() {
     [ "$n" -gt "$shown" ] && list_sub "... and $((n - shown)) more"
   done
   list_add info "Files unchanged: $(printf '%s\n' "$PLAN_TEXT" | grep -c '^KEEP ')"
+  n=$(printf '%s\n' "$PLAN_TEXT" | grep -c '^LOCAL ')
+  [ "$n" -gt 0 ] && list_add info "Learning hooks: written for this checkout only, never committed ($n files)"
+  while IFS= read -r line; do
+    list_sub "Taken out of Git (now written for this checkout only): ${line#UNTRACK }"
+  done < <(printf '%s\n' "$PLAN_TEXT" | grep '^UNTRACK ')
   while IFS= read -r line; do
     list_add info "Project config: ${line#CONFIG }"
   done < <(printf '%s\n' "$PLAN_TEXT" | grep '^CONFIG ')
@@ -1748,7 +1829,7 @@ view_plan() {
   if [ "$#" -gt 0 ]; then
     text=$1
   else
-    text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE) ')
+    text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE|UNTRACK) ')
   fi
   hide_cursor
   while :; do
@@ -1800,11 +1881,23 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
   return 1
 }
 
+# hooks_trust_line OK : after an install, tell the owner to trust the learning hooks in Codex
+# only when check-runtime passed (OK=1); otherwise say not to, with its plain reason.
+hooks_trust_line() {
+  if [ "$1" -eq 1 ]; then
+    list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
+  else
+    list_add warn "Do not trust the orchestrator's learning hooks in Codex yet: $RUNTIME_WHY"
+  fi
+}
+
 step_install() {
   local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
   local commit_note paths_ok paths_rc nothing_to_commit candidates ignored_n=0 ignored_fail=0
+  local hooks_trust rc_before
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
+  body "Close every Codex session in this project first."
   body "Install into: $PROJECT"
   show_plan
   body "This adds or updates files under .codex, .agents and .claude, then writes .codex/orchestration/provider-routing.json. Nothing outside the project is touched."
@@ -1830,6 +1923,13 @@ step_install() {
   fi
   screen_reset; begin_step 4
   list_add ok "Packages installed"
+  # Codex trusts each hook by its hash, and the installer never writes that trust. The hooks
+  # run the project's installed code, so the owner is told to trust them only once that code
+  # is this release, byte for byte, with nothing extra beside it (check-runtime).
+  hooks_trust=0 rc_before=$LAST_RC
+  if runtime_matches; then hooks_trust=1; fi
+  LAST_RC=$rc_before
+  hooks_trust_line "$hooks_trust"
   if [ "$ROUTING_WRITE" -eq 1 ]; then
     if write_project_routing "$PROJECT" "$ROUTING_CONTENT" 2>"$LOGDIR/routing.err"; then
       list_add ok "Wrote .codex/orchestration/provider-routing.json"
@@ -1916,6 +2016,13 @@ step_install() {
     COMMIT_STATE=failed
   else
     body "Next: commit the installed files in the project. Only these $n_paths paths are committed, nothing is pushed. Setup commits with Git's plumbing commands only (hash-object, update-index, write-tree, commit-tree, update-ref), which start no hook, filter, signing program, pager or maintenance whatever the project's Git settings say, and with every network transport off. To commit them yourself instead, these are the commands; choose 'Show every path' for the full list."
+    while IFS= read -r line; do
+      for path in "${COMMIT_PATHS[@]}"; do
+        if [ "$path" = "${line#UNTRACK }" ]; then
+          list_cmd "git -C $q_project --literal-pathspecs rm --cached -q -- $(printf '%q' "$path")   # first; leave it out of the add below"
+        fi
+      done
+    done < <(printf '%s\n' "$PLAN_TEXT" | grep '^UNTRACK ')
     list_cmd "git -C $q_project --literal-pathspecs add -A -- <the $n_paths paths below>"
     list_cmd "git -C $q_project --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
     shown=0
@@ -1932,6 +2039,7 @@ step_install() {
     done
     screen_reset; begin_step 4
     list_add ok "Packages installed"
+    hooks_trust_line "$hooks_trust"
     COMMIT_STATE=not_committed
     if [ "$MENU_IDX" -eq 0 ]; then
       render
@@ -2034,8 +2142,49 @@ version_hint() {
   esac
 }
 
+# review_legacy_state : on a Mac whose orchestrator records are still in the old
+# ~/Library/Application Support folder, show when that folder was created, the owner key its
+# signer file names and whether that is the owner's ~/.ssh/codex-agents-owner.pub, and ask
+# before moving it (a session opened on ~/Library could have created it). Sets LEGACY_ARGS to
+# the approval learning-register needs; returns 1 when the owner declines or it cannot be read.
+LEGACY_ARGS=()
+review_legacy_state() {
+  local report="$LOGDIR/legacy.json" present created signer current match digest
+  LEGACY_ARGS=()
+  owner_tool legacy-state >"$report" 2>"$LOGDIR/legacy.err" || :
+  present=$(pj get "$report" present)
+  [ "$present" = true ] || return 0
+  created=$(pj get "$report" created); created=${created//[[:cntrl:]]/}
+  signer=$(pj get "$report" signer_key); signer=${signer//[[:cntrl:]]/}
+  current=$(pj get "$report" current_key); current=${current//[[:cntrl:]]/}
+  match=$(pj get "$report" match)
+  digest=$(pj get "$report" signers_sha256)
+  if [ "$(pj get "$report" usable)" != true ] || ! [[ "$digest" =~ ^([0-9a-f]{64}|none)$ ]]; then
+    list_add fail "Your old orchestrator records (~/Library/Application Support/codex-agents) cannot be checked safely, so they are not moved."
+    list_sub "Move that folder out of the way yourself if it is not yours, then run setup again."
+    return 1
+  fi
+  list_add warn "Your orchestrator records are still in the old folder ~/Library/Application Support/codex-agents (created ${created:-at an unknown time})."
+  list_sub "Owner key in those records: ${signer:-none}"
+  list_sub "Your owner key file ~/.ssh/codex-agents-owner.pub: ${current:-not found}"
+  case $match in
+    true) list_add ok "They match: these records name your owner key.";;
+    false) list_add warn "They do not match: these records may not be yours. Choose No unless you know why.";;
+    *) list_add info "Setup cannot compare them; check the owner key above yourself.";;
+  esac
+  body "Move these records to the protected folder? [Y/n]"
+  menu 0 "Yes, move them" "No, leave them where they are"
+  screen_reset; begin_step 5
+  if [ "$MENU_IDX" -ne 0 ]; then
+    list_add skip "The old records were not moved, so the collector was not registered."
+    return 1
+  fi
+  LEGACY_ARGS=(--move-legacy-state "$digest")
+  return 0
+}
+
 step_collector() {
-  local cli ready
+  local cli ready moved
   begin_step 5
   cli="$PROJECT/.codex/orchestration/cli.py"
   if [ ! -f "$cli" ]; then
@@ -2056,8 +2205,13 @@ step_collector() {
     mark_step 5 fail "orchestrator differs from this setup"
     pause; return 1
   fi
+  if ! review_legacy_state; then
+    mark_step 5 skip "old records not moved"
+    pause; return 0
+  fi
   render
-  run_owner_cli "Registering the collector" learning-register --project-root "$PROJECT"
+  run_owner_cli "Registering the collector" learning-register --project-root "$PROJECT" \
+    ${LEGACY_ARGS[@]+"${LEGACY_ARGS[@]}"}
   if [ "$?" -ne 0 ]; then
     failure_detail "Collector registration failed"
     version_hint
@@ -2065,6 +2219,14 @@ step_collector() {
     pause; return 1
   fi
   list_add ok "Collector registered"
+  # learning-register reports "state_moved": the old copy's path when it has just copied the
+  # learning state from its old macOS folder (once), else null. One fixed sentence says so and
+  # names that path, with control characters removed, so it cannot drive the terminal.
+  moved=$(pj get "$LAST_OUT" state_moved)
+  moved=${moved//[[:cntrl:]]/}
+  if [ "${moved:0:1}" = / ]; then
+    list_add info "Moved your orchestrator records once to a protected folder, ~/.local/state/codex-agents. The old copy at $moved can be deleted once you're happy."
+  fi
   render
   run_owner_cli "Checking collector status" learning-status --project-root "$PROJECT"
   ready=$(pj get "$LAST_OUT" ready)

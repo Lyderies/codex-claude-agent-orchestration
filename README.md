@@ -31,8 +31,8 @@ the result goes to a verifier (from the other provider when one is eligible), th
   runs until you have signed a billing attestation for that account.
 - **Independent checking.** Each meaningful result goes to a verifier from the other provider when one is
   eligible, then to your project's own hashed test and security commands.
-- **Evidence stays on your machine.** Routes, admission decisions and outcomes go to a local ledger that is
-  never committed, and every recorded route replays exactly.
+- **Evidence stays on your machine.** Routes, admission decisions and outcomes go to a local ledger in
+  `~/.local/state/codex-agents` that is never committed, and every recorded route replays exactly.
 
 It does not yet run write-capable children, and it never changes its own routing without you.
 
@@ -88,11 +88,13 @@ What v1 enforces:
   returns. QA accepts only the verifier opened for that outcome and runs only the project's hashed commands.
 - **Protected command rule and session guard.** The optional Codex rule lets only the 23 everyday
   orchestrator commands run outside Codex's sandbox, through an owner-only, byte-verified runtime copy in
-  `~/.codex`. Before each command the copy refuses a session that can write `/`, your home folder or a
-  folder above it, `~/.codex`, this repository or a tool folder, or runs without its sandbox.
+  `~/.codex`. Before each command the copy refuses a session opened above the project, one that can write
+  `/`, your home folder or a folder above it, `~/.codex`, your records, this repository or a tool folder,
+  and one without its sandbox.
 - **Owner authority stays with you.** `setup.sh`, `attest.py` and the installer run this repository's own
-  CLI, never the project's copy; Git on the project is plumbing only; and the interpreter, Git and provider
-  clients must come from trusted install folders.
+  CLI, never the project's copy; Git on the project is plumbing only; the interpreter, Git and provider
+  clients must come from trusted install folders, and setup never runs a client or basic tool from an
+  earlier `PATH` entry; and the owner key is used only from your own `~/.ssh`.
 
 ```mermaid
 flowchart TB
@@ -112,13 +114,19 @@ In words: a request meets these layers in order, and a failure at any layer stop
   A native Claude child has the primary's permissions, so its reads are advisory.
 - **A session that already writes `~/.codex`** (opened on `/`, or given it with `--add-dir`) can forge its
   own session record, the rule and the copy. The guard stops the ordinary mistake, not that.
-- **Parent-folder sessions.** A session opened above the project can change its configuration and `.git`.
+- **Parent-folder sessions.** A session opened above the project can still change its configuration and
+  `.git`; the orchestrator refuses that session's commands, but cannot undo what it wrote.
 - **A primary that ignores its route.** A Codex primary can still spawn a native Codex child that shares
   its rule; a Claude primary's native children spend its own allowance whatever admission says.
 - **Other spellings and detached processes.** The installer's Claude Code deny rules are a policy layer,
   so `bash -c` is not matched; a process that double-forks between snapshots can outlive cleanup.
 - **Prompt content and a modified package.** Repository text reaches every child's prompt as instructions;
   the protected copy is checked against this package, not against a signature.
+- **Sessions running during an install.** The learning hooks run the project's installed code outside the
+  sandbox. Close every Codex session in the project before installing or updating: one started before the
+  install, when `.codex` did not exist yet, can still rewrite that code.
+- **Claude settings and skills.** A Codex session in the project can rewrite `.claude/settings*.json` (hooks,
+  deny rules) and `.claude/skills/`, which Claude Code loads on the host; verify warns about hooks there.
 
 > [!WARNING]
 > The attestation is your own statement about your billing settings. Admission also checks what the clients
@@ -145,7 +153,7 @@ Codex CLI 0.164.0 or both, signed in with their subscriptions, with no API key i
 | 2. Project | Picks the project (top of a Git working tree) and previews the install; changes nothing |
 | 3. Providers | Codex children, Claude children and models, and whether Codex sessions may start Claude children |
 | 4. Install | Installs, writes `provider-routing.json`, offers to commit only the changed files (never pushed), verifies |
-| 5. Collector | Registers the project with the local learning collector and starts it |
+| 5. Collector | Registers the project with the local learning collector and starts it; on macOS it first moves your records to `~/.local/state/codex-agents`, once |
 | 6. Billing | Hands the terminal to `attest.py`, which only you can complete |
 | 7. Profile | Only if Codex sessions may start Claude children: the `codex -p orchestrator` profile, network on |
 | 8. Commands | Only if Codex sessions orchestrate the project: the Codex commands rule and its protected copy |
@@ -157,22 +165,26 @@ re-attest or change the owner key passphrase. Details: [setup wizard](docs/setup
 
 ### Where to open Codex
 
-Open Codex on your project folders, not on a folder that holds them all.
+Open Codex on the project itself. This repository (the orchestrator clone) is only for running
+`./setup.sh`; never open Codex on it.
 
 ```mermaid
 flowchart TB
-    H["Home folder, a folder above it, or /: never"] --> F["A folder holding several projects: avoid"]
-    H --> S["This repository: outside every Codex workspace"]
+    H["Home folder, a folder above it, or /: never"] --> F["A folder holding several projects: never"]
+    H --> S["This repository: only for ./setup.sh, outside every Codex workspace"]
     F --> A["Project A: open Codex here"]
     F --> B["Project B: open Codex here"]
 ```
 
-In words: open Codex on each project folder; never on the home folder, a folder above it or `/`; avoid a
-folder that holds several projects; and keep this repository outside every folder you open in Codex.
+In words: open Codex on each project itself; never on a folder that contains a set-up project, this
+repository, the home folder, a folder above it or `/`. A folder above a project is never safe: Codex runs
+a nested trusted project's `.codex/config.toml` and hooks outside the sandbox, so a session there could
+plant them.
 
 > [!CAUTION]
-> Never add `~` or `~/.codex` with `--add-dir` either. Setup warns about recent Codex sessions that could
-> write those folders, this repository or a tool folder, and the orchestrator refuses their commands.
+> Never add `~`, `~/.codex` or `~/.local` with `--add-dir` either. Setup warns about recent Codex sessions
+> that could write those folders, your records in `~/.local/state/codex-agents`, this repository or a tool
+> folder, and the orchestrator refuses their commands.
 
 ## Using it
 
@@ -198,6 +210,10 @@ and stops, with the reason, unless the commands rule is `installed` and the sess
 <details><summary>"That passphrase did not unlock the key."</summary>
 
 `attest.py` asks `Try again or Exit? [T/e]`; press Enter to try again.
+</details>
+<details><summary>"the owner key must be a file in your own ~/.ssh folder"</summary>
+
+Move the key into `~/.ssh` (mode 0600, no symbolic link, the folder writable only by you) and run again.
 </details>
 <details><summary>I lost my owner key passphrase</summary>
 
@@ -234,6 +250,7 @@ Toolchain v1 is G1 plus G2; native Windows support and operational QA on Linux a
 | G1 | Import both packages; one-command install, verify and remove | Shipped (0.1.0) |
 | G2 | Cross-provider read-only routing, admission, bridge, both primaries | Release candidate for toolchain v1 (0.2.0) |
 | v1.1 | Child liveness from real client events: reasoning summaries on, a silent child graded stale, the primary decides, abort after a long silence, the hard deadline as backstop | Planned |
+| v1.2 | Codex plan loop: a supervisor the orchestrator owns keeps a Codex primary working through a plan; code decides every stop | Planned |
 | G3 | Write-capable children in their own worktrees, verified by the other provider; enforced Codex read roots | Planned |
 | G4 | Evidence-driven routing: paired runs, a frozen evaluation set, a usage-cost model, headroom tie-breaking | Planned |
 

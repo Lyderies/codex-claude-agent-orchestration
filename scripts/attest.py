@@ -9,8 +9,10 @@ Admission requires, per provider account, an owner-signed statement that the acc
 cannot be charged beyond its subscription. This command walks the human owner through
 it. What proves a person signed is the owner key's passphrase: the key is refused unless
 it is encrypted, and signing runs without ssh-agent so a loaded key cannot sign silently.
-The command also insists on an interactive terminal, but that alone does not keep a
-program out; the passphrase does.
+The key is used only from the account's own ~/.ssh folder (the home folder the system account
+database names), checked again before every use, so no other program can swap the file
+between the checks and the signing. The command also insists on an interactive terminal, but
+that alone does not keep a program out; the passphrase does.
 
 The isolation flags, which ./setup.sh always passes, keep anything in the working directory,
 the environment, site-packages or a bytecode cache out of this process; it imports only the
@@ -25,11 +27,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import getpass
 import hashlib
 import importlib.util
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -72,9 +76,13 @@ MANIFEST_RELATIVE = RUNTIME_RELATIVE / "install-manifest.json"
 # cache prefix points below /dev/null, where no folder can exist).
 PYTHON_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
 GETCONF = "/usr/bin/getconf"
-SCRATCH_CONTAINER = "agent-orchestration-owner"
 SCRATCH_BASE: str | None = None  # tests only; the platform's private folder otherwise
+ACCOUNT_HOME: str | None = None  # tests only; the system account database's home otherwise
 MACOS_ADMIN_GROUP = 80
+# This repository's own orchestrator package, fixed to this file's location (a test may point
+# NATIVE_PACKAGE at a stand-in bundle; the code owner tools import never moves with it).
+CLONE_ORCHESTRATION = (Path(__file__).resolve().parents[1] / "packages" / "codex-agents" / "native-package"
+                       / ".codex" / "orchestration")
 
 
 class AttestError(RuntimeError):
@@ -264,12 +272,35 @@ def remove_scratch(path: Path) -> bool:
 # (host_paths.TRUSTED_INSTALL_ROOTS and install_location_problem), loaded by file from this
 # repository's package so owner tools and the runtime decide alike. It imports only the
 # standard library.
-_HOST_PATHS_FILE = (Path(__file__).resolve().parents[1] / "packages" / "codex-agents" / "native-package"
-                    / ".codex" / "orchestration" / "codex_agents" / "host_paths.py")
+_HOST_PATHS_FILE = CLONE_ORCHESTRATION / "codex_agents" / "host_paths.py"
 _HOST_PATHS_SPEC = importlib.util.spec_from_file_location("agent_orchestration_host_paths", _HOST_PATHS_FILE)
 host_paths = importlib.util.module_from_spec(_HOST_PATHS_SPEC)
 _HOST_PATHS_SPEC.loader.exec_module(host_paths)
 UNTRUSTED_PYTHON_ADVICE = "Put a system Python, such as Homebrew's or python.org's, first on PATH"
+# The owner tools' scratch container, by the runtime's name for it: the session guard refuses a
+# Codex session that can write it.
+SCRATCH_CONTAINER = host_paths.OWNER_SCRATCH_CONTAINER
+
+
+def clone_module(name: str):
+    """A module of this repository's own orchestrator package (``codex_agents.<name>``),
+    imported only when needed, so owner tools decide exactly as the runtime does. Never the
+    project's installed copy: a module loaded from anywhere else is refused."""
+
+    root = str(CLONE_ORCHESTRATION)
+    added = root not in sys.path
+    if added:
+        sys.path.insert(0, root)
+    try:
+        module = importlib.import_module(f"codex_agents.{name}")
+    except Exception as exc:
+        raise AttestError("this setup's own orchestrator package could not be loaded") from exc
+    finally:
+        if added:
+            sys.path.remove(root)
+    if not within(Path(os.path.realpath(module.__file__)), Path(os.path.realpath(root))):
+        raise AttestError("this setup's own orchestrator package could not be loaded")
+    return module
 
 
 def python_location_problem(executable: Path, project: Path | None = None) -> str | None:
@@ -328,8 +359,8 @@ def cli_command(project: Path, args: list[str]) -> list[str]:
 
 # The project's own configuration files the installer and setup write beside the runtime
 # (runtime_files.PROJECT_FILES; a test keeps them equal).
-PROJECT_FILES = ("install-manifest.json", "operational-checks.json", "project-agent-routing.json",
-                 "provider-routing.json")
+PROJECT_FILES = ("install-manifest.json", "local-install.json", "operational-checks.json",
+                 "project-agent-routing.json", "provider-routing.json")
 
 
 def _runtime_bundle() -> dict[str, bytes]:
@@ -499,12 +530,145 @@ def copy_input(source: Path, destination: Path, limit: int = 1024 * 1024) -> Non
         os.close(out)
 
 
+# --- provider sign-in checks ------------------------------------------------------------
+# ./setup.sh's sign-in checks run each client the way the runtime does: found only on the
+# runtime's trusted search path (providers.trusted_search_path), never the inherited PATH,
+# where an earlier folder a Codex session can write could hold a planted program; its real
+# file checked by the runtime's own rules (providers.resolve_client: no symlink, no component
+# another user can change, outside temporary folders and the project, in a trusted
+# installation folder) before it ever runs; and started with the runtime's minimal client
+# environment (providers.client_environment), a private TMPDIR and working folder, a deadline
+# and a size cap. Only the fixed read-only status command runs.
+CLIENT_COMMANDS = {"codex": ("login", "status"), "claude": ("auth", "status", "--json")}
+CLIENT_TIMEOUT_SECONDS = 15
+CLIENT_OUTPUT_LIMIT = 262_144
+# client-status exit codes: 0 the client said yes, then one per outcome ./setup.sh explains.
+CLIENT_SIGNED_OUT, CLIENT_MISSING, CLIENT_UNTRUSTED, CLIENT_FAILED = 10, 11, 12, 13
+
+
+def client_status(name: str, project: Path | None = None) -> tuple[int, bytes]:
+    """Run one provider client's status command safely; return an exit code and its output."""
+
+    providers = clone_module("providers")
+    if shutil.which(name, path=providers.trusted_search_path()) is None:
+        return CLIENT_MISSING, b""
+    untrusted = [Path(os.path.realpath(project))] if project is not None else []
+    try:
+        executable, _digest = providers.resolve_client(name, untrusted=untrusted)
+    except (providers.ContractError, OSError):
+        return CLIENT_UNTRUSTED, b""
+    scratch = make_scratch("client-")
+    try:
+        try:
+            process = subprocess.Popen(
+                [executable, *CLIENT_COMMANDS[name]], cwd=scratch,
+                env=providers.client_environment(os.environ, scratch),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError:
+            return CLIENT_FAILED, b""
+        # Read as it arrives, never more than the cap: a client that keeps writing is stopped
+        # (its whole process group) the moment it passes the cap or the deadline.
+        deadline = time.monotonic() + CLIENT_TIMEOUT_SECONDS
+        try:
+            output = providers.read_bounded(process.stdout, limit=CLIENT_OUTPUT_LIMIT, deadline=deadline)
+            process.wait(timeout=max(deadline - time.monotonic(), 0.1))
+        except (providers.BoundedReadError, subprocess.TimeoutExpired, OSError):
+            providers.stop_process_group(process)
+            return CLIENT_FAILED, b""
+        finally:
+            process.stdout.close()
+    finally:
+        remove_scratch(scratch)
+    return (0 if process.returncode == 0 else CLIENT_SIGNED_OUT), output
+
+
+KEY_TYPE = re.compile(r"[a-z0-9@.-]{1,40}")
+LEGACY_READ_LIMIT = 65_536
+
+
+def _read_small(path: Path) -> bytes | None:
+    """A small regular file through a no-follow descriptor; None when absent or unusable."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        content = os.read(descriptor, LEGACY_READ_LIMIT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return content if len(content) <= LEGACY_READ_LIMIT else None
+
+
+def _shown_key(fields: list[str]) -> tuple[tuple[str, str] | None, str | None]:
+    """((type, blob), "type SHA256:...") for a public key's fields, or (None, None)."""
+
+    if len(fields) < 2 or KEY_TYPE.fullmatch(fields[0]) is None:
+        return None, None
+    try:
+        return (fields[0], fields[1]), describe_key(fields[0], fields[1])
+    except AttestError:
+        return None, None
+
+
+def legacy_state_report() -> dict:
+    """What the wizard shows before the one-time move of the pre-0.8.9 macOS state.
+
+    The old folder sits where a Codex session opened on ~/Library could have created it, so
+    the owner sees when it was created, the owner key its signer file names and whether that
+    is the key in ~/.ssh/codex-agents-owner.pub, and approves the move by the signer file's
+    SHA-256 (learning-register --move-legacy-state), which the runtime checks again on its
+    fresh copy. Only fixed text, a date, key types and fingerprints are printed.
+    """
+
+    legacy = host_paths.legacy_state_root()
+    try:
+        default = host_paths.default_state_root()
+    except host_paths.HostPathError as exc:
+        raise AttestError(str(exc)) from None
+    if legacy is None or not os.path.lexists(legacy) or os.path.lexists(default):
+        return {"present": False}
+    try:
+        info = os.lstat(legacy)
+    except OSError:
+        return {"present": True, "usable": False}
+    created = getattr(info, "st_birthtime", None) or info.st_ctime
+    signers = _read_small(legacy / "owner-allowed-signers")
+    signer_key, signer_shown = (None, None)
+    if signers is not None:
+        first = signers.decode("utf-8", "replace").splitlines()[:1]
+        signer_key, signer_shown = _shown_key(first[0].split()[1:] if first else [])
+    current = _read_small(ssh_folder() / "codex-agents-owner.pub")
+    current_key, current_shown = (None, None)
+    if current is not None:
+        current_key, current_shown = _shown_key(current.decode("utf-8", "replace").split())
+    usable = stat.S_ISDIR(info.st_mode) and (signers is not None or not os.path.lexists(
+        legacy / "owner-allowed-signers"))
+    return {
+        "present": True,
+        "usable": usable,
+        "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(created)),
+        "signers_sha256": hashlib.sha256(signers).hexdigest() if signers is not None else "none",
+        "signer_key": signer_shown,
+        "current_key": current_shown,
+        "match": (signer_key == current_key) if signer_key and current_key else None,
+    }
+
+
 def owner_tool(argv: list[str]) -> int:
     """Non-interactive owner checks that ./setup.sh runs; prints only fixed text or a path.
 
     ``scratch PREFIX`` creates a private working folder and prints it; ``check-runtime
     PROJECT`` exits 0 only when the project's installed orchestrator is this repository's
-    copy; ``copy-input SOURCE DESTINATION`` snapshots an owner-chosen input file.
+    copy; ``copy-input SOURCE DESTINATION`` snapshots an owner-chosen input file;
+    ``client-status codex|claude [PROJECT]`` runs that client's sign-in status command as the
+    runtime would (client_status) and exits with its code, printing Claude's JSON for the
+    wizard to parse and nothing for Codex; ``legacy-state`` prints legacy_state_report as JSON.
     """
 
     try:
@@ -517,6 +681,15 @@ def owner_tool(argv: list[str]) -> int:
         if len(argv) == 3 and argv[0] == "copy-input":
             copy_input(Path(argv[1]), Path(argv[2]))
             return 0
+        if argv == ["legacy-state"]:
+            print(json.dumps(legacy_state_report(), sort_keys=True))
+            return 0
+        if len(argv) in (2, 3) and argv[0] == "client-status" and argv[1] in CLIENT_COMMANDS:
+            code, output = client_status(argv[1], Path(argv[2]) if len(argv) == 3 else None)
+            if argv[1] == "claude":
+                sys.stdout.buffer.write(output)
+                sys.stdout.flush()
+            return code
     except AttestError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -596,16 +769,36 @@ def ssh(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def default_state_root() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "codex-agents"
-    if os.name == "nt":
-        return Path(os.environ.get("LOCALAPPDATA", "")) / "codex-agents"
-    base = os.environ.get("XDG_STATE_HOME")
-    return Path(base) / "codex-agents" if base else Path.home() / ".local/state/codex-agents"
+    """The folder that holds your orchestrator records (the learning state) now, decided by
+    this repository's own package, never a path of its own: host_paths.owner_state_root.
+
+    That is the pre-0.8.9 macOS folder while it is the only one (the collector step's
+    learning-register moves it once), else the default ($XDG_STATE_HOME/codex-agents or the
+    account's ~/.local/state/codex-agents). The install step runs before the collector step,
+    so the installer's ownership record never creates the new folder beside the old one,
+    which would make the move refuse.
+    """
+
+    try:
+        return Path(host_paths.owner_state_root())
+    except host_paths.HostPathError as exc:
+        # A plain message (a bad XDG_STATE_HOME, an unsafe ~/.local); it never names a path.
+        raise AttestError(str(exc)) from None
+    except Exception as exc:
+        raise AttestError("the learning state folder cannot be found") from exc
+
+
+def account_home() -> Path:
+    """This account's home folder from the system account database, never from HOME."""
+
+    home = ACCOUNT_HOME if ACCOUNT_HOME is not None else pwd.getpwuid(os.getuid()).pw_dir
+    if not os.path.isabs(home):
+        raise AttestError("your home folder cannot be found in the account database")
+    return Path(os.path.normpath(home))
 
 
 def _expand(text: str) -> Path:
-    return Path.home() / text[2:] if text.startswith("~/") else Path(text)
+    return account_home() / text[2:] if text.startswith("~/") else Path(text)
 
 
 def ask_yes_no(prompt: str) -> bool:
@@ -715,6 +908,70 @@ def check_path_safe(path: Path) -> None:
             raise AttestError("a key path directory is writable by other users")
 
 
+KEY_HAS_LINK = (
+    "This key file has another link elsewhere; make a fresh copy in ~/.ssh (cp, not mv) and remove "
+    "the old one"
+)
+OUTSIDE_SSH = (
+    "the owner key must be a file in your own ~/.ssh folder (such as ~/.ssh/codex-agents-owner). "
+    "A key anywhere else could be swapped by another program between the checks and the "
+    "signing, so it is not used"
+)
+
+
+def ssh_folder() -> Path:
+    """The account's own ~/.ssh, under the home folder the system account database names."""
+
+    return account_home() / ".ssh"
+
+
+def check_key_location(key: Path, *, exists: bool = True) -> None:
+    """Refuse an owner private key outside the account's canonical ~/.ssh; run at every use.
+
+    Enrolment, signing and the passphrase change take a private key only from ~/.ssh (or a
+    folder in it), a folder no agent sandbox can write, so the file checked is the file
+    ssh-keygen opens. No component of the path, from / to the key, may be a symbolic link;
+    ~/.ssh and everything below it must be yours and writable by no one else, and the key file
+    may have no other hard link (KEY_HAS_LINK); the folders
+    above it must belong to you or root and be writable by no one else (a root-owned sticky
+    folder excepted). With `exists` false (a key about to be created) the key and ~/.ssh may
+    be missing; the home folder may not. A refusal never names the path: a mistyped
+    passphrase can look like one.
+    """
+
+    folder = ssh_folder()
+    if not key.is_absolute() or ".." in key.parts or key == folder or not within(key, folder):
+        raise AttestError(OUTSIDE_SSH)
+    uid = os.getuid()
+    current = Path(key.anchor)
+    for part in key.parts[1:]:
+        current = current / part
+        try:
+            info = _lstat(current)
+        except FileNotFoundError:
+            if not exists and within(current, folder):
+                return
+            raise AttestError("that private key file does not exist") from None
+        except OSError as exc:
+            raise AttestError("a key path component could not be checked") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise AttestError("the owner key's path may not pass through symbolic links, so it is not used")
+        if current == key and not stat.S_ISDIR(info.st_mode) and info.st_nlink != 1:
+            # A hard link elsewhere (a folder an agent can write, kept when the key was moved
+            # into ~/.ssh) would let that agent rewrite this same file after the checks.
+            raise AttestError(KEY_HAS_LINK)
+        writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if within(current, folder):
+            if info.st_uid != uid:
+                raise AttestError("your ~/.ssh folder and the owner key must be owned by you")
+            if writable:
+                raise AttestError("your ~/.ssh folder or the owner key is writable by other users")
+        elif info.st_uid not in (0, uid):
+            raise AttestError("a folder above your ~/.ssh is owned by another user")
+        elif writable and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX and info.st_uid == 0):
+            raise AttestError("a folder above your ~/.ssh is writable by other users")
+
+
 def _split_public(text: str) -> tuple[str, str]:
     fields = text.split()
     if len(fields) < 2:
@@ -735,24 +992,89 @@ def describe_key(key_type: str, blob: str) -> str:
     return f"{key_type} {fingerprint(key_type, blob)}"
 
 
-def validate_private_key(key: Path) -> None:
-    check_path_safe(key)
+MAX_KEY_BYTES = 65_536
+
+
+def _read_key_once(key: Path) -> bytes:
+    """The key file's bytes, read once through one no-follow descriptor, which must be a
+    regular file of yours, mode 0600 or stricter, with no other hard link."""
+
     try:
         info = key.lstat()
     except OSError as exc:
         raise AttestError("that private key file does not exist") from exc
     if not stat.S_ISREG(info.st_mode):
         raise AttestError("that path is not a regular file")
-    if info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise AttestError("the private key must be owned by you with mode 0600 or stricter")
     try:
-        with key.open("rb") as handle:
+        descriptor = os.open(key, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise AttestError("that private key file could not be read") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise AttestError("that path is not a regular file")
+        if opened.st_uid != os.getuid() or opened.st_mode & 0o077:
+            raise AttestError("the private key must be owned by you with mode 0600 or stricter")
+        if opened.st_nlink != 1:  # checked on the file actually opened, too
+            raise AttestError(KEY_HAS_LINK)
+        chunks, size = [], 0
+        while chunk := os.read(descriptor, 65_536):
+            size += len(chunk)
+            if size > MAX_KEY_BYTES:
+                raise AttestError("that file is too large to be a private key")
+            chunks.append(chunk)
+    except OSError as exc:
+        raise AttestError("that private key file could not be read") from exc
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
+
+
+@contextlib.contextmanager
+def key_snapshot(key: Path):
+    """A private copy of the owner key for one operation, removed when it ends.
+
+    After the location checks, the key is read once and written to a fresh 0600 file,
+    created exclusively in a new owner-only folder in the owner's scratch container. Every
+    ssh-keygen step of the operation (the passphrase check, deriving, signing, changing the
+    passphrase) uses that copy only, so a program that kept a descriptor or mapping on the
+    key's inode (from a folder it could write, before the key was moved into ~/.ssh) cannot
+    change what was checked between the checks and the use.
+    """
+
+    check_key_location(key)
+    content = _read_key_once(key)
+    folder = make_scratch("key-")
+    try:
+        snapshot = folder / "owner-key"
+        descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            view = memoryview(content)
+            while view:
+                view = view[os.write(descriptor, view):]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        yield snapshot
+    finally:
+        remove_scratch(folder)
+
+
+def validate_private_key(key: Path, snapshot: Path | None = None) -> None:
+    """Refuse anything but an encrypted private key in ~/.ssh; checks the operation's copy."""
+
+    if snapshot is None:
+        with key_snapshot(key) as copy:
+            validate_private_key(key, copy)
+        return
+    try:
+        with open(snapshot, "rb") as handle:
             head = handle.read(64)
     except OSError as exc:
         raise AttestError("that private key file could not be read") from exc
     if b"PRIVATE KEY-----" not in head:
         raise AttestError("that path is not a private key (a public key file cannot sign)")
-    unlocked = ssh(["-y", "-P", "", "-f", str(key)], capture_output=True, text=True,
+    unlocked = ssh(["-y", "-P", "", "-f", str(snapshot)], capture_output=True, text=True,
                    stdin=subprocess.DEVNULL)
     if unlocked.returncode == 0:
         raise AttestError(
@@ -793,29 +1115,43 @@ def offer_retry() -> bool:
             return False
 
 
-def derive_public(key: Path) -> tuple[str, str]:
-    """Ask ssh-keygen for the key's public half; it prompts for the passphrase, with retries."""
+def derive_public(key: Path, snapshot: Path | None = None) -> tuple[str, str]:
+    """Ask ssh-keygen for the key's public half from the operation's copy; it prompts for the
+    passphrase, with retries."""
 
+    if snapshot is None:
+        with key_snapshot(key) as copy:
+            return derive_public(key, copy)
     while True:
-        result = ssh(["-y", "-f", str(key)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = ssh(["-y", "-f", str(snapshot)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             return _split_public(result.stdout)
-        if wrong_passphrase(result, key, "load") and offer_retry():
+        if wrong_passphrase(result, snapshot, "load") and offer_retry():
             continue
-        if wrong_passphrase(result, key, "load"):
+        if wrong_passphrase(result, snapshot, "load"):
             raise AttestError("stopped: the passphrase did not unlock the key")
         raise AttestError("could not unlock the private key")
 
 
+def default_key() -> Path:
+    """Where the dedicated owner key is created and looked for first: ~/.ssh/codex-agents-owner
+    under the account database's home folder."""
+
+    return ssh_folder() / "codex-agents-owner"
+
+
 def _create_key(path: Path) -> None:
-    check_path_safe(path.parent)
-    if not path.parent.exists():
-        path.parent.mkdir(mode=0o700, parents=True)
-        check_path_safe(path.parent)
+    check_key_location(path, exists=False)
+    if not os.path.lexists(path.parent):
+        if path.parent != ssh_folder():
+            raise AttestError(OUTSIDE_SSH)
+        os.mkdir(path.parent, 0o700)  # ~/.ssh only; the home folder must already exist
+    check_key_location(path, exists=False)
     for candidate in (path, Path(str(path) + ".pub")):
         if os.path.lexists(candidate):  # also catches dangling symlinks
             raise AttestError("a file already exists where the key would go; choose another key")
     print("ssh-keygen will now ask for a passphrase. Choose one and remember it.")
+    check_key_location(path, exists=False)
     result = ssh(["-t", "ed25519", "-f", str(path), "-C", "codex-agents-owner"])
     if result.returncode != 0:
         raise AttestError("key creation did not finish")
@@ -825,9 +1161,10 @@ def _create_key(path: Path) -> None:
 def choose_new_key() -> Path:
     print(KEY_ADVICE)
     if ask_yes_no(f"Create a dedicated owner key at {DEFAULT_KEY}?"):
-        key = _expand(DEFAULT_KEY)
+        key = default_key()
         _create_key(key)
         return key
+    print("The key must be a file in your own ~/.ssh folder.")
     print("This asks for a file location, not your passphrase. What you type is not shown.")
     entered = read_location("File location of an existing private key (blank to stop): ")
     if not entered:
@@ -903,8 +1240,9 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
     configured = configured_public_key(state_root)
     if configured is None:
         key = choose_new_key()
-        validate_private_key(key)
-        derived = derive_public(key)
+        with key_snapshot(key) as copy:  # one copy for the passphrase check and the derivation
+            validate_private_key(key, copy)
+            derived = derive_public(key, copy)
         adjacent = Path(str(key) + ".pub")
         if os.path.lexists(adjacent):
             try:
@@ -925,7 +1263,10 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
         return key
     print(f"Owner key already configured: {describe_key(*configured)}")
     key = locate_key_file(configured)
-    if derive_public(key) != configured:
+    with key_snapshot(key) as copy:
+        validate_private_key(key, copy)
+        matches = derive_public(key, copy) == configured
+    if not matches:
         raise AttestError("that private key does not match the configured owner key")
     return key
 
@@ -949,9 +1290,9 @@ def _default_key_file(configured: tuple[str, str]) -> Path | None:
     needs no passphrase. The full check (deriving the public key) happens afterwards.
     """
 
-    key = _expand(DEFAULT_KEY)
     try:
-        check_path_safe(key)
+        key = default_key()
+        check_key_location(key)
         if not stat.S_ISREG(key.lstat().st_mode):
             return None
     except (AttestError, OSError):
@@ -974,11 +1315,11 @@ def locate_key_file(configured: tuple[str, str]) -> Path:
     if found:
         print(f"Using the owner key file at {key}")
     else:
-        print("Where is the private key file for this owner key?")
+        print("Where is the private key file for this owner key? It must be in your own ~/.ssh folder.")
         print("This asks for a file location, not your passphrase.")
         print("What you type is not shown.")
         entered = read_location(f"Press Enter to use {DEFAULT_KEY}, or type another file location: ")
-        key = _accept_location(entered) if entered else _expand(DEFAULT_KEY)
+        key = _accept_location(entered) if entered else default_key()
     validate_private_key(key)
     if not found:
         print(f"Using the private key file at {key}")  # only after it validated as a key file
@@ -1025,14 +1366,44 @@ def check_trusted_state(state_root: Path) -> None:
         raise AttestError("the owner key record is in a temporary folder or a project; refusing to trust it")
 
 
-CHANGE_UNSURE = (
-    "ssh-keygen had already finished, so the key may already have a new passphrase. If you "
-    "cancelled or left the new passphrase empty, run the change again and choose a non-empty one."
+KEY_UNCHANGED = "the passphrase was not changed: your key file is as it was. Run the change again"
+CHANGE_NOT_SAVED = (
+    "The new passphrase was not saved: your key file still has its current passphrase. Run the "
+    "change again and choose a non-empty passphrase."
 )
 
 
+def _replace_key(key: Path, content: bytes) -> None:
+    """Put `content` at `key` as a new file: a fresh 0600 file in ~/.ssh, written and synced,
+    then renamed over the key, so the old inode is replaced, never edited in place."""
+
+    check_key_location(key)
+    parent = os.open(key.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        name = f".{key.name}.{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                             dir_fd=parent)
+        try:
+            try:
+                view = memoryview(content)
+                while view:
+                    view = view[os.write(descriptor, view):]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(name, key.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=parent)
+            raise AttestError(f"the key file could not be saved, so {KEY_UNCHANGED}") from exc
+    finally:
+        os.close(parent)
+
+
 def change_passphrase(state_root: Path) -> None:
-    """Hand the terminal to ssh-keygen -p for the configured owner key, then re-verify it."""
+    """Change the configured owner key's passphrase on a private copy, check the copy with the
+    new passphrase, then replace the key file with it."""
 
     check_trusted_state(state_root)
     configured = configured_public_key(state_root)
@@ -1040,31 +1411,37 @@ def change_passphrase(state_root: Path) -> None:
         raise AttestError("no owner key is configured yet; run the billing attestation first")
     print(f"Owner key: {describe_key(*configured)}")
     key = locate_key_file(configured)
-    print("First, ssh-keygen checks that this file is the owner key. Enter the current passphrase.")
-    if derive_public(key) != configured:
-        raise AttestError("that private key does not match the configured owner key")
-    print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
-    while True:
-        result = ssh(["-p", "-f", str(key)], stderr=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            break
-        # A wrong current passphrase fails before anything is written, so retrying is safe.
-        if wrong_passphrase(result, key, "change"):
-            if offer_retry():
-                continue
-            raise AttestError("the passphrase was not changed")
-        # Any other failure may have come after ssh-keygen began writing: never retry it.
-        raise AttestError(
-            "ssh-keygen stopped before it finished, so the passphrase may or may not have "
-            "changed. Run the change again; the passphrase that unlocks the key is the current one"
-        )
-    try:
-        validate_private_key(key)  # still encrypted, still safe
-        print("Checking the key with the new passphrase. Enter it when asked.")
-        if derive_public(key) != configured:
-            raise AttestError("that private key no longer matches the configured owner key")
-    except AttestError as exc:
-        raise AttestError(f"{exc}. {CHANGE_UNSURE}") from exc
+    with key_snapshot(key) as copy:
+        validate_private_key(key, copy)
+        print("First, ssh-keygen checks that this file is the owner key. Enter the current passphrase.")
+        if derive_public(key, copy) != configured:
+            raise AttestError("that private key does not match the configured owner key")
+        print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
+        while True:
+            result = ssh(["-p", "-f", str(copy)], stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                break
+            if wrong_passphrase(result, copy, "change"):
+                if offer_retry():
+                    continue
+                raise AttestError("the passphrase was not changed")
+            # ssh-keygen worked on the private copy only, so the key file is untouched.
+            raise AttestError(f"ssh-keygen stopped before it finished, so {KEY_UNCHANGED}")
+        try:
+            validate_private_key(key, copy)  # still encrypted, still safe
+            print("Checking the key with the new passphrase. Enter it when asked.")
+            if derive_public(key, copy) != configured:
+                raise AttestError("that private key no longer matches the configured owner key")
+        except AttestError as exc:
+            raise AttestError(f"{exc}. {CHANGE_NOT_SAVED}") from exc
+        try:
+            with open(copy, "rb") as handle:
+                changed = handle.read(MAX_KEY_BYTES + 1)
+        except OSError as exc:
+            raise AttestError(f"the changed key could not be read, so {KEY_UNCHANGED}") from exc
+        if len(changed) > MAX_KEY_BYTES:
+            raise AttestError(f"the changed key is too large, so {KEY_UNCHANGED}")
+        _replace_key(key, changed)
     print("Passphrase changed. The owner key is unchanged.")
 
 
@@ -1202,13 +1579,17 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
 SIGNATURE_HEAD = b"-----BEGIN SSH SIGNATURE-----"
 
 
-def sign_in_memory(key: Path, payload: bytes) -> bytes:
-    """Sign the approved bytes with ssh-keygen: they go in on stdin, the signature comes back on
-    stdout, and ssh-keygen asks for the passphrase on the terminal. Nothing touches disk."""
+def sign_in_memory(key: Path, payload: bytes, snapshot: Path | None = None) -> bytes:
+    """Sign the approved bytes with ssh-keygen from the operation's copy of the key: they go in
+    on stdin, the signature comes back on stdout, and ssh-keygen asks for the passphrase on
+    the terminal. Neither the payload nor the signature touches disk."""
 
+    if snapshot is None:
+        with key_snapshot(key) as copy:
+            return sign_in_memory(key, payload, copy)
     print("Now sign the statement. Enter your key's passphrase when asked.")
     while True:
-        signed = ssh(["-Y", "sign", "-f", str(key), "-n", NAMESPACE], input=payload,
+        signed = ssh(["-Y", "sign", "-f", str(snapshot), "-n", NAMESPACE], input=payload,
                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         errors = signed.stderr or b""
         result = subprocess.CompletedProcess(
@@ -1216,7 +1597,7 @@ def sign_in_memory(key: Path, payload: bytes) -> bytes:
             errors.decode("utf-8", "replace") if isinstance(errors, bytes) else errors)
         if signed.returncode == 0 and (signed.stdout or b"").startswith(SIGNATURE_HEAD):
             return signed.stdout
-        if wrong_passphrase(result, key, "load"):
+        if wrong_passphrase(result, snapshot, "load"):
             if offer_retry():
                 continue
             raise AttestError("stopped: the passphrase did not unlock the key")
@@ -1238,7 +1619,11 @@ def main(argv: list[str] | None = None) -> int:
         print("This is a human step: run it yourself in an interactive terminal. "
               "It will not run from a script, pipe or agent.", file=sys.stderr)
         return 2
-    state_root = (args.state_root or default_state_root()).expanduser()
+    try:
+        state_root = (args.state_root or default_state_root()).expanduser()
+    except AttestError as exc:
+        print(f"Stopped: {exc}", file=sys.stderr)
+        return 1
     if args.change_passphrase:
         previous = _install_handlers()
         try:

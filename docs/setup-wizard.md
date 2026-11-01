@@ -10,9 +10,11 @@ private log, shown only if something fails. `NO_COLOR=1` gives plain output. Pat
 
 1. **Checks.** The OS (macOS or Linux; on Linux, verify reports not ready because operational checks need
    macOS), bash, a trusted `python3` 3.11 or later, a trusted Git, both sign-ins, and that no
-   `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set. It also scans Codex's session records from the last 14
-   days and warns, with Continue or Quit, about a session that could write this repository, your home
-   folder or a folder above them.
+   `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set. Each client is found and run only as the orchestrator
+   runs it (from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` or `~/.local/bin`, its file
+   checked first); one elsewhere on your `PATH` is reported, never run. It also scans Codex's session
+   records from the last 14 days and warns, with Continue or Quit, about a session that could write this
+   repository, your orchestrator records, your home folder or a folder above them.
 2. **Project.** The top folder of a Git working tree. Nothing changes; it previews the install. A project
    that has never been set up needs a prepared `operational-checks.json` (see the
    [recipe](manual-setup.md#operational-checks)); the wizard asks for its path and works from a private
@@ -26,9 +28,15 @@ private log, shown only if something fails. `NO_COLOR=1` gives plain output. Pat
    says "Nothing to commit" and skips the question). The commit uses Git plumbing only and is never
    pushed. The summary says `committed`, `nothing to commit`, `not committed (you chose to commit
    yourself)` or `commit failed`, and lists anything left uncommitted, including files `.gitignore` hides.
-   Then it verifies the install.
+   The learning hooks (`.codex/hooks.json`, which Codex runs outside its sandbox) are rendered for this
+   checkout with the trusted Python and absolute paths, and are never committed; an older committed copy
+   is taken out of Git. The step says "In Codex, open /hooks and trust the orchestrator's learning hooks",
+   because Codex trusts hooks by hash and setup never writes that trust. Then it verifies the install.
 5. **Collector.** Registers the project with the one local learning collector shared by every project on
-   the machine, and starts it.
+   the machine, and starts it. Your orchestrator records (the ledger, the owner key record and the
+   collector's files) live in `~/.local/state/codex-agents` (or `$XDG_STATE_HOME/codex-agents`); on macOS
+   the first registration after this update moves them there from
+   `~/Library/Application Support/codex-agents` and says so once.
 6. **Billing.** Hands the terminal to `scripts/attest.py`; the wizard never touches its screens.
 7. **Profile.** Only when Codex sessions may orchestrate Claude children: creates
    `~/.codex/orchestrator.config.toml` with network on, for sessions started with `codex -p orchestrator`.
@@ -47,17 +55,18 @@ inside a Git working tree. Only Exit or Quit ends the wizard.
 
 ## Where to open Codex
 
-Open Codex on your project folders, not on a folder that holds them all. While the Codex commands rule
-exists, never open Codex on your home folder, a folder above it or `/`, never add `~` or `~/.codex` with
-`--add-dir`, and keep this repository outside every folder you open in Codex. Before each command the
-rule runs, the orchestrator reads the calling session's own Codex record (only its settings, never the
-conversation) and refuses a session that runs without its sandbox, left no record (`--ephemeral`), or can
-write your home folder, a folder above it, `~/.codex`, this repository or a tool folder (`~/.local`,
-`/opt/homebrew` and the like, including one added with `--add-dir`). In a Codex session, `host-command`
-prints that verdict as `session_guard`.
-
-A session opened on a folder that holds several projects, and none of the folders above, is not refused,
-but every project's configuration and `.git` in it are then writable by that session's model.
+Open Codex on the project itself; this repository is only for running `./setup.sh`. Never open Codex on
+a folder that contains a set-up project, this repository, your home folder, a folder above it or `/`, and
+never add `~`, `~/.codex` or `~/.local` with `--add-dir`. A folder above a project is never safe: Codex
+runs a nested trusted project's `.codex/config.toml` and hooks outside the sandbox, and keeps a project's
+`.codex`, `.agents` and `.git` read-only only when the project is the top of the session's folder, so a
+session opened above it could plant them. Before each command the rule runs, the orchestrator reads the
+calling session's own Codex record (only its settings, never the conversation) and refuses a session that
+runs without its sandbox, left no record (`--ephemeral`), was opened on a folder that contains the
+project, or can write your home folder, a folder above it, `~/.codex`, this repository, your records in
+`~/.local/state/codex-agents`, the private working folders or a tool folder (`~/.local`, `/opt/homebrew`
+and the like, including one added with `--add-dir`). In a Codex session, `host-command` prints that verdict
+as `session_guard`. A refused session's commands stop, but what it already wrote stays.
 
 ## How setup keeps your authority away from the agents
 
@@ -73,6 +82,14 @@ or a folder above it (a nested project's tree, `.git` and `.claude` included).
   `~/.local`), so a sibling install like `/srv/work/tools` is refused. Owner tools and the runtime use
   one list. It runs with `-I -B -S -X pycache_prefix=/dev/null`, so nothing in the working folder, the
   environment, site-packages or a bytecode cache loads.
+- **Clients and basic tools.** The wizard runs with `/bin/bash` and finds its basic tools only in the
+  system folders, so a program planted in an earlier `PATH` entry (say `~/Work/tools/bin`, which a session
+  opened on `~/Work` could write) never runs; your `PATH` is used only to find `python3`, which is checked
+  as above. The Codex and Claude sign-in checks go through the runtime's own client lookup: the client is
+  found only in `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` or `~/.local/bin`, its real file
+  must pass the same location checks as the interpreter before it runs, and it runs with the runtime's
+  minimal environment (no `CODEX_HOME` or API keys) in a private working folder. A client that fails is
+  reported in plain words and never run.
 - **Private working files.** Logs, the install plan and a snapshot of the operational-checks file you
   chose live in a fresh owner-only folder in your per-user cache folder (macOS) or `$XDG_RUNTIME_DIR`
   (Linux; setup refuses without it, or when it is under your home folder), never in `/tmp` or `$TMPDIR`.
@@ -85,7 +102,10 @@ or a folder above it (a nested project's tree, `.git` and `.claude` included).
   refuses anything else. The statement goes to `ssh-keygen` on standard input, the signature comes back on
   standard output and is checked against those bytes, and the key being enrolled and the signature reach
   the orchestrator through pipes: nothing touches disk. After enrolling, the owner key record must hold
-  exactly one key, the one it showed you.
+  exactly one key, the one it showed you. The private key is used only from your own `~/.ssh` (your home
+  folder as the system account database names it): no symbolic link anywhere on its path, `~/.ssh` yours
+  and writable by no one else. That is checked again before every use, so no other program can swap the
+  file between the checks and the signing; a key anywhere else is refused.
 - **Git plumbing only.** Git is a real binary at a fixed location (never macOS's `/usr/bin/git` shim,
   never one on a search path an agent could change). Setup and the installer never run `status`, `add` or
   `commit` on the project: they read its state with `ls-files` and `ls-tree` and compare file bytes
@@ -98,9 +118,9 @@ or a folder above it (a nested project's tree, `.git` and `.claude` included).
   Git would start (a filter, diff or merge driver, pager, editor, SSH, signing or credential helper, or an
   include); commit by hand in that case.
 - **Claude primaries cannot run owner commands through Claude Code's tools.** The installer merges deny
-  rules into the project's `.claude/settings.json` and records which ones it added in your learning state
-  folder, outside the project, so nothing in the project can claim a rule for it: two `Bash` rules for
-  each owner-only CLI subcommand (every command that is not one of the 23 primary-host commands), in the
+  rules into the project's `.claude/settings.json` and records which ones it added in your orchestrator
+  records folder, outside the project, so nothing in the project can claim a rule for it: two `Bash` rules
+  for each owner-only CLI subcommand (every command that is not one of the 23 primary-host commands), in the
   forms `Bash(*.codex/orchestration/cli.py <command>)` and `Bash(*.codex/orchestration/cli.py <command> *)`,
   plus `Edit` rules for `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`. Existing
   settings are kept; `verify` reports missing rules and `remove` takes out only the entries that record

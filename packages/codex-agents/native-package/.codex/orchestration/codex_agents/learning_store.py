@@ -96,6 +96,8 @@ COLLECTOR_RUNTIME_DIGEST = _collector_runtime_digest()
 PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
 # The one line `install_owner_public_key` writes; the allowed-signers file holds nothing else.
+# The owner's allowed-signers file is read whole up to this size; anything longer refuses.
+OWNER_SIGNERS_MAX_BYTES = 4096
 OWNER_SIGNER_LINE = re.compile(
     rb"codex-agents-owner (?:ssh-ed25519|sk-ssh-ed25519@openssh\.com|ssh-rsa|"
     rb"ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+\n"
@@ -660,21 +662,386 @@ def _verify_backup_envelope(
 
 
 def default_state_root() -> Path:
-    if sys_platform() == "darwin":
-        return Path.home() / "Library" / "Application Support" / "codex-agents"
+    """`$XDG_STATE_HOME/codex-agents`, else `~/.local/state/codex-agents` in the
+    account's home folder (host_paths.default_state_root), macOS included."""
+
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA")
         if not base:
             raise StateError("LOCALAPPDATA is required on Windows")
         return Path(base) / "codex-agents"
-    base = os.environ.get("XDG_STATE_HOME")
-    return Path(base) / "codex-agents" if base else Path.home() / ".local/state/codex-agents"
+    from .host_paths import HostPathError
+    from .host_paths import default_state_root as host_default_state_root
+
+    try:
+        return host_default_state_root()
+    except HostPathError as exc:
+        raise StateError(str(exc)) from None
 
 
-def sys_platform() -> str:
-    import sys
+def _prepare_default_state_root() -> Path:
+    """The default state root, its missing parent folders created owner-only."""
 
-    return sys.platform
+    from .host_paths import HostPathError, prepare_default_state_root
+
+    try:
+        return prepare_default_state_root()
+    except HostPathError as exc:
+        raise StateError(str(exc)) from None
+
+
+# The pre-0.8.9 macOS folder (host_paths.legacy_state_root) is moved once, by the
+# owner's `learning-register`; every other use of the default state refuses while
+# only the old folder exists, so nothing starts a second, empty state beside it.
+UNMOVED_STATE = (
+    "the learning state is still in its old macOS folder "
+    "(~/Library/Application Support/codex-agents); ask the owner to run ./setup.sh "
+    "(collector step), which moves it to ~/.local/state/codex-agents"
+)
+BOTH_STATES = (
+    "the learning state exists both in its old macOS folder "
+    "(~/Library/Application Support/codex-agents) and in its new one "
+    "(~/.local/state/codex-agents, or $XDG_STATE_HOME/codex-agents); keep the one in "
+    "use, move the other out of both places, then run ./setup.sh (collector step) again"
+)
+STATE_MOVE_FAILED = (
+    "the learning state could not be copied from ~/Library/Application Support/codex-agents "
+    "to ~/.local/state/codex-agents (or $XDG_STATE_HOME/codex-agents), for example because "
+    "the disk is full; the old folder was not changed. Fix the cause, then run ./setup.sh "
+    "(collector step) again"
+)
+LINKED_STATE = (
+    "the old learning state folder holds a file with a second hard link, a symbolic link "
+    "or a special file, which something else could still use to change the state; nothing "
+    "was copied. Remove the extra link or file, then run ./setup.sh (collector step) again"
+)
+STATE_IN_USE = (
+    "the old learning state is still in use by another process; close every Codex and "
+    "Claude session, then run ./setup.sh (collector step) again"
+)
+STATE_COPY_INVALID = (
+    "the copied learning state did not pass its checks (permissions, owner key or database "
+    "integrity); the old folder was not changed. Run ./setup.sh (collector step) again, "
+    "and report it if it repeats"
+)
+LEGACY_NOT_REVIEWED = (
+    "the learning state is still in its old macOS folder "
+    "(~/Library/Application Support/codex-agents), and it is moved only after you have "
+    "reviewed it: run ./setup.sh (collector step), which shows its owner key and asks first"
+)
+LEGACY_CHANGED = (
+    "the owner key record in the old macOS learning state folder is not the one you "
+    "reviewed (it changed, or something else was approved); nothing was moved. Run "
+    "./setup.sh (collector step) again and check it before moving"
+)
+STATE_SOCKET_TOO_LONG = (
+    "the new learning state folder's path is too long for the collector's local socket; "
+    "set XDG_STATE_HOME to a shorter folder, or unset it, then run ./setup.sh "
+    "(collector step) again"
+)
+# sun_path holds 104 bytes on macOS and 108 on Linux, with a terminating NUL.
+UNIX_SOCKET_PATH_MAX = 103 if sys.platform == "darwin" else 107
+
+
+def _unmoved_legacy_state() -> bool:
+    """Whether only the pre-0.8.9 macOS state folder exists."""
+
+    if os.name == "nt":
+        return False
+    from .host_paths import legacy_state_root
+
+    legacy = legacy_state_root()
+    return (
+        legacy is not None
+        and os.path.lexists(legacy)
+        and not os.path.lexists(default_state_root())
+    )
+
+
+# Not copied: the stale socket, lock files (recreated on use), the database and
+# its journals (copied through SQLite's backup API), and transient scratch.
+_STATE_COPY_SKIPPED = frozenset({
+    "collector.sock", "collector.lock", "collector-runtime.lock",
+    "collector-client-health.lock", "scratch", "learning.sqlite3",
+    "learning.sqlite3-wal", "learning.sqlite3-shm", "learning.sqlite3-journal",
+})
+_STATE_COPY_CHUNK = 1 << 20
+
+
+def _authoritative_file(info: os.stat_result) -> bool:
+    """A regular file of this user with exactly one hard link."""
+
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+
+
+def _copy_state_tree(source: int, target: int, *, top: bool) -> None:
+    """Copy a state folder into fresh inodes, refusing links and special files.
+
+    Every file is opened without following symlinks and recreated with
+    O_EXCL|O_NOFOLLOW (0600), every folder with 0700, so no hard link or
+    descriptor taken on the old files reaches the copy.
+    """
+
+    with os.scandir(source) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        if top and name in _STATE_COPY_SKIPPED:
+            continue
+        info = os.stat(name, dir_fd=source, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
+            os.mkdir(name, 0o700, dir_fd=target)
+            child_source = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source
+            )
+            try:
+                child_target = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target
+                )
+                try:
+                    os.fchmod(child_target, 0o700)
+                    _copy_state_tree(child_source, child_target, top=False)
+                finally:
+                    os.close(child_target)
+            finally:
+                os.close(child_source)
+            continue
+        if not _authoritative_file(info):
+            raise StateError(LINKED_STATE)
+        _copy_state_file(source, target, name)
+
+
+def _copy_state_file(source: int, target: int, name: str) -> None:
+    reader = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source)
+    try:
+        if not _authoritative_file(os.fstat(reader)):
+            raise StateError(LINKED_STATE)
+        writer = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target
+        )
+        try:
+            os.fchmod(writer, 0o600)
+            while chunk := os.read(reader, _STATE_COPY_CHUNK):
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(writer, view):]
+            os.fsync(writer)
+        finally:
+            os.close(writer)
+    finally:
+        os.close(reader)
+
+
+def _backup_state_database(old: "LearningState", staged: Path) -> None:
+    """Copy the ledger consistently into a fresh file with SQLite's backup API.
+
+    The backup proceeds page by page, so the ledger is never read into memory
+    at once; the copy must pass `quick_check`.
+    """
+
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(str(old.database) + suffix)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not _authoritative_file(info):
+            raise StateError(LINKED_STATE)
+    target = staged / old.database.name
+    os.close(os.open(
+        target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    ))
+    if not old.database.exists():
+        return
+    source = sqlite3.connect(old.database, timeout=5)
+    try:
+        copy = sqlite3.connect(target)
+        try:
+            source.backup(copy, pages=4096)
+            if copy.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise StateError(STATE_COPY_INVALID)
+        finally:
+            copy.close()
+    finally:
+        source.close()
+    os.chmod(target, 0o600)
+
+
+def _validate_staged_state(staged: Path) -> None:
+    """The copy's folders, files, owner key and digest key pass the usual checks."""
+
+    try:
+        state = LearningState(staged, create=False)
+        for current, folders, files in os.walk(staged, followlinks=False):
+            for name in folders:
+                _check_owner_mode(Path(current) / name, directory=True)
+            for name in files:
+                _check_owner_mode(Path(current) / name, directory=False)
+        if state.key_path.exists():
+            state.digest_key()
+        if state.allowed_signers_path.exists() and state.allowed_signers_path.stat().st_size:
+            state.owner_allowed_signers()
+        state.harden_database_files()
+    except (StateError, OSError) as exc:
+        raise StateError(STATE_COPY_INVALID) from exc
+
+
+LEGACY_SIGNERS_READ_LIMIT = 65_536
+
+
+def legacy_signers_digest(root: Path) -> str:
+    """SHA-256 of `<root>/owner-allowed-signers` as the owner reviewed it, or "none".
+
+    Read through a no-follow descriptor, bounded; anything but a regular file refuses.
+    """
+
+    try:
+        descriptor = os.open(root / "owner-allowed-signers", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "none"
+    except OSError as exc:
+        raise StateError(LEGACY_CHANGED) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise StateError(LEGACY_CHANGED)
+        # Bounded well above a valid record, so an oversized one still fails the copy's
+        # own checks (with their message) rather than this one.
+        content = os.read(descriptor, LEGACY_SIGNERS_READ_LIMIT + 1)
+    finally:
+        os.close(descriptor)
+    if len(content) > LEGACY_SIGNERS_READ_LIMIT:
+        raise StateError(LEGACY_CHANGED)
+    return hashlib.sha256(content).hexdigest()
+
+
+def migrate_legacy_state(
+    cli_path: Path, project_root: Path, approved_signers: str | None = None
+) -> Path | None:
+    """Copy the pre-0.8.9 macOS learning state to the default folder, once (owner).
+
+    Only the owner's `learning-register` calls this, and only while the old
+    folder is the only one. With the collector stopped and its maintenance
+    lock held (CollectorMaintenance, as for registration) and the ledger's
+    writer lock taken, every file is copied into fresh inodes in an owner-only
+    staging folder beside the new location (the ledger through SQLite's backup
+    API); a file with a second hard link, a symlink or a special file refuses
+    first, since a link or descriptor taken on the old files must not reach the
+    new state. The staged copy is checked, renamed into place in one step, and
+    the old folder is renamed to `codex-agents.moved-<UTC time>` beside itself,
+    inert. On any failure the staging folder is removed and the old folder is
+    left as it was. Returns the old copy's new path, or None when nothing was
+    moved; both folders present refuses.
+
+    The old folder sits where a session opened on `~/Library` could have created
+    it, so it moves only with the owner's approval: `approved_signers` is the
+    SHA-256 of its `owner-allowed-signers` (or "none") that the wizard showed the
+    owner with that key's fingerprint. Without it the move refuses, and the staged
+    copy's signer file must match it before anything is renamed.
+    """
+
+    from .host_paths import (
+        HostPathError,
+        _open_verified_directory,
+        legacy_state_root,
+        remove_tree_at,
+    )
+
+    legacy = legacy_state_root()
+    if legacy is None or not os.path.lexists(legacy):
+        return None
+    target = default_state_root()
+    if os.path.lexists(target):
+        raise StateError(BOTH_STATES)
+    if approved_signers is None:
+        raise StateError(LEGACY_NOT_REVIEWED)
+    if approved_signers != "none" and (
+        len(approved_signers) != 64 or any(ch not in "0123456789abcdef" for ch in approved_signers)
+    ):
+        raise StateError(LEGACY_CHANGED)
+    if legacy_signers_digest(legacy) != approved_signers:
+        raise StateError(LEGACY_CHANGED)
+    if len(os.fsencode(str(target / "collector.sock"))) > UNIX_SOCKET_PATH_MAX:
+        raise StateError(STATE_SOCKET_TOO_LONG)
+    old = LearningState(legacy, create=False)
+    _prepare_default_state_root()
+    if _inside_git_tree(target.parent):
+        raise StateError("state root must be outside a Git working tree")
+    try:
+        parent, parent_path = _open_verified_directory(target.parent)
+    except (HostPathError, OSError) as exc:
+        raise StateError(STATE_MOVE_FAILED) from exc
+    staging_name = f".{target.name}.staging-{secrets.token_hex(6)}"
+    staged = parent_path / staging_name
+    aside = old.root.with_name(
+        f"{old.root.name}.moved-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    )
+    try:
+        maintenance = CollectorMaintenance.acquire(
+            old, cli_path, project_root, owner_registration=True
+        )
+        moved = False
+        writer = None
+        try:
+            if fcntl is not None:
+                writer = os.open(
+                    old.lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+                )
+                try:
+                    fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise StateError(STATE_IN_USE) from exc
+            if os.path.lexists(target) or os.path.lexists(aside):
+                raise StateError(BOTH_STATES)
+            os.mkdir(staging_name, 0o700, dir_fd=parent)
+            try:
+                source = os.open(old.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    staging = os.open(
+                        staging_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=parent,
+                    )
+                    try:
+                        os.fchmod(staging, 0o700)
+                        _copy_state_tree(source, staging, top=True)
+                    finally:
+                        os.close(staging)
+                finally:
+                    os.close(source)
+                _backup_state_database(old, staged)
+                # The fresh copy, which nothing else can reach, is what the owner approved.
+                if legacy_signers_digest(staged) != approved_signers:
+                    raise StateError(LEGACY_CHANGED)
+                _validate_staged_state(staged)
+                os.rename(staging_name, target.name, src_dir_fd=parent, dst_dir_fd=parent)
+                try:
+                    os.rename(old.root, aside)
+                except OSError:
+                    os.rename(target.name, staging_name, src_dir_fd=parent, dst_dir_fd=parent)
+                    raise
+                moved = True
+            except StateError:
+                raise
+            except (OSError, sqlite3.Error) as exc:
+                raise StateError(STATE_MOVE_FAILED) from exc
+            finally:
+                if not moved:
+                    with contextlib.suppress(OSError):
+                        remove_tree_at(parent, staging_name)
+        finally:
+            if writer is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(writer, fcntl.LOCK_UN)
+                os.close(writer)
+            if moved:
+                # Never restart a collector at the old folder; registration starts it.
+                maintenance.restart = False
+                maintenance.resume()
+            else:
+                with contextlib.suppress(CollectorError, OSError):
+                    maintenance.resume()
+    finally:
+        os.close(parent)
+    LearningState(target, create=False)
+    return aside
 
 
 def _inside_git_tree(path: Path) -> bool:
@@ -702,13 +1069,23 @@ def _check_owner_mode(path: Path, *, directory: bool) -> None:
     expected = 0o700 if directory else 0o600
     if stat.S_IMODE(info.st_mode) != expected:
         raise StateError("state path has unsafe permissions")
+    # A second hard link would let whoever holds it change the file in place.
+    if not directory and info.st_nlink != 1:
+        raise StateError("state file has another hard link")
 
 
 class LearningState:
     """Validated paths and the local keyed-digest secret."""
 
     def __init__(self, root: Path | None = None, *, create: bool = True) -> None:
-        requested = (root or default_state_root()).expanduser()
+        if root is None:
+            if _unmoved_legacy_state():
+                raise StateError(UNMOVED_STATE)
+            # The folders above the default state are checked, and created
+            # owner-only, before the state itself.
+            requested = _prepare_default_state_root() if create else default_state_root()
+        else:
+            requested = root.expanduser()
         if not requested.is_absolute():
             raise StateError("state root must be absolute")
         _assert_no_symlink_components(requested)
@@ -796,6 +1173,8 @@ class LearningState:
         _check_owner_mode(path, directory=False)
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(descriptor, "rb") as handle:
+            if os.fstat(handle.fileno()).st_nlink != 1:
+                raise StateError(f"{label} key path is unsafe")
             key = handle.read(33)
         if len(key) != 32:
             raise StateError(f"{label} key has an invalid length")
@@ -854,11 +1233,21 @@ class LearningState:
 
         if self.allowed_signers_path.is_symlink():
             raise StateError("owner allowed-signers path is unsafe")
+        # One owner-only file with a single hard link: a second link (say, in a
+        # project) would let whoever holds it replace the owner's key.
         _check_owner_mode(self.allowed_signers_path, directory=False)
-        content = self.allowed_signers_path.read_bytes()
+        descriptor = os.open(
+            self.allowed_signers_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            if os.fstat(handle.fileno()).st_nlink != 1:
+                raise StateError("owner allowed-signers path is unsafe")
+            content = handle.read(OWNER_SIGNERS_MAX_BYTES + 1)
         if not content:
             raise StateError("owner public key is not configured")
-        if OWNER_SIGNER_LINE.fullmatch(content) is None:
+        # The whole file must be the one line: ssh-keygen reads all of it, and a
+        # key after an over-long first line would otherwise go unchecked.
+        if len(content) > OWNER_SIGNERS_MAX_BYTES or OWNER_SIGNER_LINE.fullmatch(content) is None:
             raise StateError("owner allowed-signers must name exactly one owner key")
         return self.allowed_signers_path
 
@@ -869,6 +1258,34 @@ class LearningState:
                 if path.is_symlink() or not path.is_file():
                     raise StateError("database state contains an unsafe path")
                 _check_owner_mode(path, directory=False)
+
+
+def registered_project_roots() -> list[Path]:
+    """Active registered project roots, read-only, for the wizard's session warning.
+
+    Read from whichever folder holds the owner's state now
+    (host_paths.owner_state_root); an unreadable ledger gives none.
+    """
+
+    from .host_paths import HostPathError, owner_state_root
+
+    try:
+        state = LearningState(owner_state_root(), create=False)
+        if state.database.is_symlink() or not state.database.is_file():
+            return []
+        connection = sqlite3.connect(f"{state.database.as_uri()}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = connection.execute(
+                "SELECT canonical_root FROM projects WHERE status='active' "
+                "AND canonical_root IS NOT NULL LIMIT 256"
+            ).fetchall()
+        finally:
+            connection.close()
+    except (StateError, HostPathError, OSError, sqlite3.Error):
+        return []
+    return [
+        Path(row[0]) for row in rows if isinstance(row[0], str) and os.path.isabs(row[0])
+    ]
 
 
 def validate_collector_runtime(cli_path: Path) -> dict[str, str | int]:
@@ -9339,7 +9756,9 @@ def _start_collector_locked(
         stderr=subprocess.DEVNULL,
         cwd="/",
         close_fds=True,
-        env={"PATH": os.defpath},
+        # No inherited environment; macOS developer tools skip the xcrun lookup cache
+        # under $TMPDIR, which a sandboxed session can write.
+        env={"PATH": os.defpath, "xcrun_nocache": "1"},
         start_new_session=True,
     )
     deadline = time.monotonic() + timeout

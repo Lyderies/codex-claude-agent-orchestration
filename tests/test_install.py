@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -33,6 +35,32 @@ PROJECT_CONFIG = {
     ".codex/orchestration/project-agent-routing.json",
     ".codex/orchestration/operational-checks.json",
 }
+
+
+def hook_python() -> str | None:
+    """A Python the Codex package installer, a subprocess, may name in the learning hooks.
+
+    The package installer renders .codex/hooks.json with the interpreter it runs under, and
+    refuses one outside the trusted installation folders, such as CI's toolcache Python; a
+    mock in this process cannot reach it, so a system or Homebrew Python is looked for.
+    """
+
+    check = ("import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path\n"
+             "if sys.version_info < (3, 11): sys.exit(2)\n"
+             "from codex_agents.host_commands import interpreter_path\n"
+             "from codex_agents.hook_config import interpreter_problem\n"
+             "sys.exit(1 if interpreter_problem(Path(interpreter_path()), Path('/nonexistent-project')) else 0)")
+    for candidate in (sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/usr/bin/python3"):
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and subprocess.run(
+                [real, "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null", "-c", check, str(installer.ORCHESTRATION)],
+                capture_output=True, stdin=subprocess.DEVNULL, check=False).returncode == 0:
+            return real
+    return None
+
+
+HOOK_PYTHON = hook_python()
 
 
 def outside_temporary_folders() -> Path | None:
@@ -99,24 +127,49 @@ def make_target(base: Path) -> tuple[Path, list[str]]:
     return target, ["--project-agent-routing", str(routing), "--operational-checks", str(checks)]
 
 
+def assert_state_inside(test: unittest.TestCase, home: Path) -> None:
+    """Guard: the learning state the owner tools would use lies inside this test's home.
+
+    The runtime places it by the account database's home unless XDG_STATE_HOME names a
+    folder, so a test that forgot to set XDG_STATE_HOME would write the real
+    ~/.local/state/codex-agents; this stops the test first.
+    """
+
+    state = Path(os.path.realpath(installer.attest.default_state_root()))
+    test.assertTrue(state.is_relative_to(os.path.realpath(home)), "the learning state is outside the test home")
+
+
 def isolate_home(test: unittest.TestCase, home: Path) -> None:
-    """Point HOME at a test folder (remove runs remove-codex-rule, which reads ~/.codex; the
-    ownership record lives in the learning state under it)."""
+    """Point HOME at a test folder (remove runs remove-codex-rule, which reads ~/.codex), and
+    XDG_STATE_HOME below it: the ownership record lives in the learning state, which the
+    runtime may place by the account's own home folder unless XDG_STATE_HOME names one."""
 
     home.mkdir(mode=0o700, exist_ok=True)
+    # Both canonical: the runtime refuses an XDG_STATE_HOME that is not, and on macOS a temporary
+    # folder under /var is really under /private/var.
+    home = Path(os.path.realpath(home))
     environment = {key: value for key, value in os.environ.items() if key not in ("CODEX_HOME", "XDG_STATE_HOME")}
     # The installer's plumbing commit needs an identity; CI runners have no Git identity.
     identity = {"GIT_AUTHOR_NAME": "Tests", "GIT_AUTHOR_EMAIL": "tests@example.invalid",
                 "GIT_COMMITTER_NAME": "Tests", "GIT_COMMITTER_EMAIL": "tests@example.invalid"}
-    patcher = mock.patch.dict(os.environ, {**environment, **identity, "HOME": str(home)}, clear=True)
+    patcher = mock.patch.dict(os.environ, {**environment, **identity, "HOME": str(home),
+                                           "XDG_STATE_HOME": str(home / ".local" / "state")}, clear=True)
     patcher.start()
     test.addCleanup(patcher.stop)
+    assert_state_inside(test, home)
     # A CI toolcache Python sits outside the trusted installation folders; the rule itself is
     # tested in test_attest, so here this test's own interpreter counts as installed.
     if installer.attest.python_location_problem(Path(os.path.realpath(sys.executable))) is not None:
         trusted = mock.patch.object(installer.attest.host_paths, "install_location_problem", return_value=None)
         trusted.start()
         test.addCleanup(trusted.stop)
+    # The package installers run in a Python the learning hooks may name (hook_python).
+    if HOOK_PYTHON is None:
+        test.skipTest("no Python here may be named in the learning hooks")
+    if HOOK_PYTHON != os.path.realpath(sys.executable):
+        python = mock.patch.object(installer, "_python", lambda: HOOK_PYTHON)
+        python.start()
+        test.addCleanup(python.stop)
 
 
 class UmbrellaInstallTests(unittest.TestCase):
@@ -275,10 +328,9 @@ class UmbrellaInstallTests(unittest.TestCase):
 
         with mock.patch.object(installer.subprocess, "run", spy):
             self.install()
-        pythons = [command for command in seen if command[0] == os.path.realpath(sys.executable)]
+        pythons = [command for command in seen if command[0] == installer._python()]
         self.assertEqual(len(pythons), 2)
         for command in pythons:
-            self.assertEqual(command[0], os.path.realpath(sys.executable))
             self.assertEqual(command[1:6], ["-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"])
         trusted = installer.git_executable([self.target])
         gits = [command for command in seen if os.path.basename(command[0]) == "git"]
@@ -405,6 +457,55 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assertEqual(git(self.target, "status", "--porcelain").stdout.splitlines(), ["M  README.md"])
         self.assertEqual(installer.commit_paths(self.target, "Again", "x", [".codex/a"]), "nothing")
 
+    def test_an_unusable_state_location_refuses_with_its_plain_message(self) -> None:
+        outside = str(Path(os.path.realpath(self.base)) / "elsewhere")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": outside}):
+            summary = self.install()
+            self.assertFalse(summary["ok"])
+            self.assertIn("XDG_STATE_HOME must be inside a hidden folder", summary["claude_settings"]["error"])
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                code = installer.main(["install", "--target", str(self.target), *self.codex_options])
+            self.assertEqual(code, 2)
+            report = json.loads(printed.getvalue())
+            self.assertIn("XDG_STATE_HOME must be inside a hidden folder", report["claude_settings"]["error"])
+            self.assertNotIn(outside, printed.getvalue())
+
+    def test_checkout_local_hooks_are_never_committed_and_an_old_tracked_copy_is_untracked(self) -> None:
+        installed = self.install(apply=True)
+        self.assertTrue(installed["ok"], installed)
+        self.assertEqual(installed["codex"]["local_files"], sorted(installer.LOCAL_ONLY))
+        hooks = self.target / ".codex" / "hooks.json"
+        rendered = hooks.read_bytes()
+        self.assertIn(b"/usr/bin/env xcrun_nocache=1", rendered)
+        self.assertNotIn(b"git rev-parse", rendered)
+        # The rendered hooks and their record are ignored, so they are never a change.
+        changed = installer.project_changes(self.target, list(installer.MANAGED_PATHS))
+        self.assertNotIn(".codex/hooks.json", changed)
+        self.assertNotIn(".codex/orchestration/local-install.json", changed)
+        self.assertEqual(installer.commit_paths(self.target, "Install", "x", changed), "committed")
+        self.assertEqual(git(self.target, "ls-files", "--", *installer.LOCAL_ONLY).stdout, "")
+        self.assertEqual(installer.project_changes(self.target, list(installer.MANAGED_PATHS)), [])
+        # Even a missing .gitignore never makes an untracked local file a change.
+        (self.target / ".codex" / ".gitignore").rename(self.base / "gitignore")
+        self.assertEqual(installer.project_changes(self.target, [".codex/hooks.json"]), [])
+        (self.base / "gitignore").rename(self.target / ".codex" / ".gitignore")
+        # 0.8.x committed a static hooks file: unchanged, it is no change; once rendered over,
+        # the commit takes it out of the index and leaves the file in place.
+        hooks.write_text("static\n")
+        git(self.target, "add", "-f", ".codex/hooks.json")
+        git(self.target, "commit", "-qm", "an earlier release's static hooks")
+        self.assertEqual(installer.project_changes(self.target, [".codex/hooks.json"]), [])
+        hooks.write_bytes(rendered)
+        self.assertEqual(installer.project_changes(self.target, [".codex/hooks.json"]), [".codex/hooks.json"])
+        self.assertEqual(installer.commit_paths(self.target, "Untrack", "x", [".codex/hooks.json"]), "committed")
+        self.assertEqual(git(self.target, "ls-files", "--", ".codex/hooks.json").stdout, "")
+        self.assertEqual(git(self.target, "show", "--name-status", "--format=", "HEAD").stdout.split(),
+                         ["D", ".codex/hooks.json"])
+        self.assertEqual(hooks.read_bytes(), rendered)
+        self.assertEqual(installer.project_changes(self.target, list(installer.MANAGED_PATHS)), [])
+        self.assertEqual(git(self.target, "status", "--porcelain").stdout, "")
+
     def test_a_plumbing_commit_refuses_when_the_branch_moved(self) -> None:
         (self.target / ".codex").mkdir()
         (self.target / ".codex" / "a").write_text("a\n")
@@ -491,6 +592,24 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assertEqual(removed["claude_settings"]["action"], "remove")
         self.assertFalse((self.target / ".claude" / "settings.json").exists())
         self.assertFalse(self.owner_record_path().exists())
+
+    def test_the_ownership_record_follows_the_runtimes_owner_state_folder(self) -> None:
+        # The owner tools never name the learning state's folder themselves.
+        for script in ("attest.py", "install.py"):
+            self.assertNotIn("Application Support", (installer.ROOT / "scripts" / script).read_text(encoding="utf-8"))
+        self.assertEqual(installer.attest.default_state_root(), installer.attest.host_paths.owner_state_root())
+        # Where the runtime says the owner's state is now (the old macOS folder until the
+        # collector step moves it), the record goes; the new folder is never created beside it.
+        old = self.base / "home" / "old-state" / "codex-agents"
+        old.mkdir(parents=True, mode=0o700)
+        new = Path(os.environ["XDG_STATE_HOME"]) / "codex-agents"
+        with mock.patch.object(installer.attest.host_paths, "owner_state_root", lambda: old):
+            self.assertEqual(installer.attest.default_state_root(), old)
+            self.assertTrue(self.install(apply=True)["ok"])
+            name = installer.OwnerState.record_name(self.target)
+            record = json.loads((old / "installer" / name).read_text())
+        self.assertEqual(record["deny"], installer.deny_rules())
+        self.assertFalse(new.exists())
 
     def test_user_settings_are_kept_and_only_added_entries_are_removed(self) -> None:
         mine = installer.deny_rules()[0]
@@ -701,6 +820,16 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assertIn("symlink", summary["claude_settings"]["error"])
         self.assert_refused_before_any_write(summary, before)
         self.assertEqual(elsewhere.read_text(), "{}")
+
+    def test_verify_warns_about_hooks_in_the_claude_settings(self) -> None:
+        self.assertTrue(self.install(apply=True)["ok"])
+        settings = self.target / ".claude" / "settings.json"
+        self.assertNotIn("warnings", installer.verify_settings(self.target))
+        data = json.loads(settings.read_text())
+        data["hooks"] = {"PreToolUse": [{"hooks": [{"type": "command", "command": "true"}]}]}
+        settings.write_text(json.dumps(data))
+        report = installer.verify_settings(self.target)
+        self.assertIn("defines hooks, which the installer did not write", report["warnings"][0])
 
     def test_verify_reports_missing_deny_rules(self) -> None:
         self.assertTrue(self.install(apply=True)["ok"])

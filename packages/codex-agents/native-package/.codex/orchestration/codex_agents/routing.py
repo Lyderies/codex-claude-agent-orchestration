@@ -1210,6 +1210,16 @@ def _codex_verifier(
     return verifier
 
 
+def _bridged_writable(agent: dict[str, Any]) -> str:
+    """Why a mapped Codex agent was skipped: Codex children are bridged read-only."""
+
+    return (
+        f"the mapped Codex agent {agent.get('agent_type', 'agent')} is "
+        f"{agent['sandbox_mode']}, and Codex children are bridged read-only in this "
+        "release, so it is not used for Codex routes"
+    )
+
+
 def _select_verifier(
     policy: dict[str, Any],
     routed_family: str,
@@ -1221,6 +1231,7 @@ def _select_verifier(
     """Prefer the other vendor's reviewer, then the worker's own vendor."""
 
     order = ("codex", "claude") if worker_provider == "claude" else ("claude", "codex")
+    skipped: str | None = None
     for provider in order:
         dispatch = _dispatch(primary_provider, provider)
         if provider == "codex":
@@ -1228,6 +1239,7 @@ def _select_verifier(
                 policy, routed_family, use_legacy_fallback=use_legacy_fallback
             )
             if dispatch == "bridge" and verifier["sandbox_mode"] != "read-only":
+                skipped = _bridged_writable(verifier)
                 continue
         else:
             claude = policy.get("providers", {}).get("claude")
@@ -1249,7 +1261,8 @@ def _select_verifier(
         verifier["provider"] = provider
         verifier["dispatch"] = dispatch
         return verifier
-    raise ContractError("no verifier candidate is eligible for this route")
+    message = "no verifier candidate is eligible for this route"
+    raise ContractError(f"{message}: {skipped}" if skipped else message)
 
 
 def _route_task(
@@ -1304,6 +1317,7 @@ def _route_task(
             policy, *_route_key(policy, routed_family, candidate)
         )
     )
+    skipped: str | None = None
     for entry in candidate_entries:
         provider = entry["provider"]
         source = candidate if entry == CODEX_POLICY_CANDIDATE else entry
@@ -1318,6 +1332,7 @@ def _route_task(
                 _dispatch(primary_provider, provider) == "bridge"
                 and codex_agent.get("sandbox_mode", "read-only") != "read-only"
             ):
+                skipped = _bridged_writable(codex_agent)
                 continue
         else:
             agent = _claude_agent(policy, routed_family)
@@ -1326,7 +1341,8 @@ def _route_task(
         picked = (provider, model_effort, agent)
         break
     if picked is None:
-        raise ContractError("no provider candidate is eligible for this route")
+        message = "no provider candidate is eligible for this route"
+        raise ContractError(f"{message}: {skipped}" if skipped else message)
     provider, primary, claude_agent = picked
     selected = primary
     reason = candidate["reason"]

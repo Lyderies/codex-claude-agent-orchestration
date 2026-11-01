@@ -3676,7 +3676,7 @@ class LearningStoreTests(unittest.TestCase):
                     project_root=self.project_a,
                 ),
             )
-        self.assertEqual({"PATH": os.defpath}, popen.call_args.kwargs["env"])
+        self.assertEqual({"PATH": os.defpath, "xcrun_nocache": "1"}, popen.call_args.kwargs["env"])
 
     def test_second_collector_cannot_replace_the_active_socket(self) -> None:
         first = CollectorServer(self.ledger)

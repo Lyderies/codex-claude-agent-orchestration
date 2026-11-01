@@ -419,11 +419,14 @@ def _runtime_contents(root: Path) -> dict[str, bytes]:
     return contents
 
 
-def _unexpected_entries(base: Path, files: set[str], *, ignore_finder: bool = False) -> bool:
-    """Whether `base` holds anything but `files` and the directories that hold them.
+def unexpected_entries(
+    base: Path, files: set[str], *, ignore_finder: bool = False, limit: int = 64
+) -> list[str]:
+    """The entries under `base` other than `files` and the directories that hold them.
 
-    A `__pycache__` directory, a module or package of any kind, an extension
-    module, a symlink or any other extra entry counts.
+    A `__pycache__` directory, a module or package of any kind, an extension module, a
+    symlink or any other extra entry counts. Paths are relative to `base`, in walk order,
+    at most `limit` of them; an extra directory is reported once, not its contents.
     """
 
     directories = {
@@ -431,31 +434,49 @@ def _unexpected_entries(base: Path, files: set[str], *, ignore_finder: bool = Fa
         for item in files
         for index in range(1, len(PurePosixPath(item).parts))
     }
+    found: list[str] = []
     for current, subdirectories, names in os.walk(base, followlinks=False):
         here = Path(current).relative_to(base)
-        for name in subdirectories:
-            if os.path.islink(Path(current, name)) or (here / name).as_posix() not in directories:
-                return True
-        for name in names:
+        for name in sorted(subdirectories):
+            relative = (here / name).as_posix()
+            if os.path.islink(Path(current, name)) or relative not in directories:
+                found.append(relative)
+        subdirectories[:] = sorted(
+            name for name in subdirectories
+            if not os.path.islink(Path(current, name)) and (here / name).as_posix() in directories
+        )
+        for name in sorted(names):
             path = Path(current, name)
             if ignore_finder and name == ".DS_Store" and not os.path.islink(path):
                 continue
             if (here / name).as_posix() not in files or os.path.islink(path):
-                return True
-    return False
+                found.append((here / name).as_posix())
+        if len(found) >= limit:
+            return found[:limit]
+    return found
+
+
+def _unexpected_entries(base: Path, files: set[str], *, ignore_finder: bool = False) -> bool:
+    return bool(unexpected_entries(base, files, ignore_finder=ignore_finder, limit=1))
+
+
+def project_extra_files(root: Path, also_allowed: set[str] | None = None) -> list[str]:
+    """What the project's `.codex/orchestration` holds beyond the package's files.
+
+    Only this package's runtime and data files and the project's own configuration
+    (and `also_allowed`, paths relative to that folder) may be there: a planted
+    top-level module (`socket.py`), a package, bytecode or an extension module would be
+    a sign of tampering. Finder's `.DS_Store`, which nothing imports, is ignored.
+    """
+
+    allowed = {*RUNTIME_FILES, *PACKAGE_DATA_FILES, *PROJECT_FILES, *(also_allowed or ())}
+    return unexpected_entries(root / ".codex" / "orchestration", allowed, ignore_finder=True)
 
 
 def _project_holds_extra_files(root: Path) -> bool:
-    """Whether the project's `.codex/orchestration` holds files the package does not.
+    """Whether the project's `.codex/orchestration` holds files the package does not."""
 
-    Only this package's runtime and data files and the project's own
-    configuration may be there: a planted top-level module (`socket.py`), a
-    package, bytecode or an extension module would be a sign of tampering.
-    Finder's `.DS_Store`, which nothing imports, is ignored.
-    """
-
-    allowed = {*RUNTIME_FILES, *PACKAGE_DATA_FILES, *PROJECT_FILES}
-    return _unexpected_entries(root / ".codex" / "orchestration", allowed, ignore_finder=True)
+    return bool(project_extra_files(root))
 
 
 def _copy_manifest(version: str, contents: dict[str, bytes]) -> bytes:

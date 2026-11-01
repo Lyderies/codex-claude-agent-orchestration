@@ -45,18 +45,20 @@ class PackageValidationTests(unittest.TestCase):
         self.assertFalse(report["project_ready"])
         self.assertFalse(report["ready"])
 
-    def test_installed_hooks_use_surface_identity_without_binary_version(self) -> None:
-        hooks = json.loads((BUNDLE_ROOT / ".codex" / "hooks.json").read_text())[
-            "hooks"
-        ]
-        commands = [
-            group["hooks"][0]["command"]
-            for groups in hooks.values()
-            for group in groups
-        ]
-        self.assertEqual(9, len(commands))
-        self.assertTrue(all("--client-version codex-hooks-v1" in item for item in commands))
-        self.assertTrue(all("codex-cli-0.153.0" not in item for item in commands))
+    def test_package_ships_no_hooks_file_and_ignores_the_rendered_one(self) -> None:
+        # The installer renders .codex/hooks.json for each checkout (hook_config); the
+        # package ships only the .gitignore that keeps it and its record out of Git.
+        self.assertFalse((BUNDLE_ROOT / ".codex" / "hooks.json").exists())
+        ignored = (BUNDLE_ROOT / ".codex" / ".gitignore").read_text().splitlines()
+        self.assertIn("/hooks.json", ignored)
+        self.assertIn("/orchestration/local-install.json", ignored)
+        report = validate_package(BUNDLE_ROOT)
+        self.assertIn(
+            "learning hooks are not installed in this checkout; run ./setup.sh and choose "
+            "to update the install",
+            report["project_errors"],
+        )
+        self.assertFalse(any("hook" in item for item in report["package_errors"]))
 
     def test_every_package_agent_requires_literal_result_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -235,6 +237,56 @@ class PackageValidationTests(unittest.TestCase):
                 "verification role must match package verifier",
                 wrong_verifier["errors"],
             )
+
+    def test_smoke_routes_ignore_a_workspace_write_project_mapping_and_warn(self) -> None:
+        # Mapping a workspace-write Codex coding agent and verifier was allowed
+        # before every Codex child was bridged read-only; install verification
+        # must still pass, and say why those agents are not used.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "target"
+            shutil.copytree(BUNDLE_ROOT, root)
+            for name, description in (
+                ("implementation_worker", "Project implementation role."),
+                ("verification_worker", "Project verification role."),
+            ):
+                (root / ".codex" / "agents" / f"{name}.toml").write_text(
+                    f'name = "{name}"\n'
+                    f'description = "{description}"\n'
+                    'sandbox_mode = "workspace-write"\n'
+                    'developer_instructions = "Use only project-approved authority."\n'
+                    "mcp_servers = []\n"
+                    "skills = []\n"
+                )
+            (root / ".codex" / "orchestration" / "project-agent-routing.json").write_text(
+                json.dumps({
+                    "version": 1,
+                    "roles": {
+                        "coding": "implementation_worker",
+                        "verification": "verification_worker",
+                    },
+                    "verifiers": {"coding": "verification_worker"},
+                })
+            )
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            for key, value in (("user.email", "tests@example.invalid"),
+                               ("user.name", "Validation Tests")):
+                subprocess.run(["git", "-C", str(root), "config", key, value], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "mapping"], check=True)
+
+            report = validate_package(root)
+
+            self.assertTrue(report["package_ready"], report)
+            self.assertFalse(
+                any("smoke" in error or "eligible" in error for error in report["errors"]),
+                report,
+            )
+            for name in ("implementation_worker", "verification_worker"):
+                self.assertIn(
+                    f"{name} is workspace-write; Codex children are bridged read-only in "
+                    "this release, so it is not used for Codex routes",
+                    report["warnings"],
+                )
 
     def test_operational_checks_must_be_committed_and_clean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

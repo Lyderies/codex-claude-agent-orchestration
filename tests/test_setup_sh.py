@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import pwd
 import re
@@ -63,6 +64,37 @@ TRUSTED_PYTHON = interpreter_trusted()
 SCRATCH_CONTAINER = "agent-orchestration-owner"
 FAKE_RULE = '"""A stand-in for the CLI\'s host-command and install-codex-rule replies (FAKE_RULE)."""\nimport hashlib, json, os, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nwith open(os.environ["FAKE_RULE_LOG"], "a") as log:\n    log.write(" ".join(args) + "\\n")\ncommand = next(item for item in args if item in ("host-command", "install-codex-rule"))\nroot = Path(os.path.realpath(args[args.index("--project-root") + 1]))\ndigest = hashlib.sha256(str(root).encode()).hexdigest()[:12]\nhome = Path(os.environ["HOME"]) / ".codex"\nrule = str(home / "rules" / f"agent-orchestration-{digest}.rules")\ncopy = str(home / "agent-orchestration" / digest / ("0" * 64))\nstatus = os.environ["FAKE_RULE"]\nif command == "host-command":\n    report = {"ready": status == "installed", "codex_rule": status, "rule_file": rule, "runtime_copy": copy}\nelif "--print" in args:\n    report = {"ready": True, "rule_file": rule, "runtime_copy": copy,\n              "rule_text": \'prefix_rule(pattern = ["python3"], decision = "allow")\\n\'}\nelse:\n    report = {"ready": True, "codex_rule": "replaced" if "--replace" in args else "created",\n              "rule_file": rule, "runtime_copy": copy, "runtime_copy_status": "created"}\nprint(json.dumps(report))\n'
 ACCOUNT_HOME = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+# The real learning state the runtime would use without XDG_STATE_HOME; no test may create it.
+REAL_STATE = ACCOUNT_HOME / ".local" / "state" / "codex-agents"
+REAL_STATE_EXISTED = os.path.lexists(REAL_STATE)
+# Runs attest.py's real client-status, as setup.sh asks for it, with the runtime's trusted
+# search path pointed at the test's fake clients (FAKE_CLIENT_DIRS) instead of the system's.
+CLIENT_TOOL = (
+    '"""Runs attest.py client-status with the client search path set to FAKE_CLIENT_DIRS."""\n'
+    "import importlib.util, os, sys\n"
+    "args = sys.argv[1:]\n"
+    "index = next(i for i, arg in enumerate(args) if arg.endswith('/scripts/attest.py'))\n"
+    "spec = importlib.util.spec_from_file_location('agent_orchestration_attest', args[index])\n"
+    "module = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(module)\n"
+    "providers = module.clone_module('providers')\n"
+    "providers.TRUSTED_SEARCH_DIRECTORIES = tuple(os.environ['FAKE_CLIENT_DIRS'].split(':'))\n"
+    "sys.exit(module.owner_tool(args[index + 1:]))\n"
+)
+# Basic tools the wizard calls before (and after) its own checks. A planted copy of any of
+# them, or of the clients, earlier on PATH must never run.
+PLANTED_TOOLS = ("bash", "env", "uname", "id", "dirname", "basename", "readlink", "sed", "tput", "stty",
+                 "fold", "mktemp", "cat", "tr", "cut", "grep", "sleep", "mkdir", "rm", "mv", "chmod",
+                 "getconf", "git", "codex", "claude")
+
+
+def plant_tools(folder: Path, marker: Path) -> None:
+    """Fill `folder` with stand-ins for PLANTED_TOOLS that record that they ran."""
+
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in PLANTED_TOOLS:
+        (folder / name).write_text(f'#!/bin/sh\necho {name} >> "{marker}"\nexit 1\n')
+        (folder / name).chmod(0o755)
 
 
 def _host_paths():
@@ -511,6 +543,47 @@ class SetupScriptTests(unittest.TestCase):
             if sys.platform == "darwin":
                 self.assertNotEqual(os.path.dirname(found), "/usr/bin")  # the xcrun shim
 
+    def test_provider_clients_are_never_run_by_name(self) -> None:
+        text = SETUP.read_text(encoding="utf-8")
+        # The shell code only: not comments, and not the embedded Python helper.
+        shell = re.sub(r"<<'PY'\n.*?\nPY\n", "\n", text, flags=re.S)
+        self.assertNotIn("data.get(", shell)
+        code = [line for line in shell.splitlines() if not line.lstrip().startswith("#")]
+        for line in code:
+            stripped = line.strip()
+            # A client in command position: at the start, after a separator or in $( ... ).
+            if re.search(r'(^|[;&|]\s*|\$\(|\bthen\s+|\bdo\s+)(codex|claude)\s', stripped):
+                self.fail(f"client run by name: {stripped}")
+            self.assertNotRegex(stripped, r"command -v (codex|claude)")
+        self.assertNotIn("run_identity", text)
+        self.assertIn('owner_tool client-status "$1"', text)
+        # The message naming where the orchestrator runs clients from is the runtime's list.
+        sys.path.insert(0, str(ORCHESTRATION))
+        try:
+            from codex_agents.providers import TRUSTED_SEARCH_DIRECTORIES
+        finally:
+            sys.path.remove(str(ORCHESTRATION))
+        message = re.search(r"The orchestrator runs \$1 only from ([^\"]*)\.\"", text).group(1)
+        self.assertEqual(re.split(r", | or ", message), list(TRUSTED_SEARCH_DIRECTORIES))
+
+    def test_the_shell_and_basic_tools_never_come_from_an_earlier_path_entry(self) -> None:
+        self.assertTrue(SETUP.read_text(encoding="utf-8").startswith("#!/bin/bash\n"))
+        expected = subprocess.run([str(SETUP), "--print-python"], capture_output=True, text=True,
+                                  check=True).stdout
+        self.assertNotIn("refused", expected)
+        with tempfile.TemporaryDirectory() as directory:
+            planted, marker = Path(directory) / "work" / "tools" / "bin", Path(directory) / "ran"
+            plant_tools(planted, marker)
+            env = dict(os.environ, PATH=f"{planted}:{os.environ['PATH']}")
+            for hook in (["--print-python"], ["--print-git"], ["--print-expanded-path", "~/x"],
+                         ["--print-uncommitted", directory]):
+                with self.subTest(hook=hook[0]):
+                    result = subprocess.run([str(SETUP), *hook], capture_output=True, text=True, env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(subprocess.run([str(SETUP), "--print-python"], capture_output=True, text=True,
+                                            env=env).stdout, expected)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+
     def test_helper_programs_in_the_repository_stop_porcelain_git(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = self.git_project(directory)
@@ -953,8 +1026,10 @@ class WizardTerminalTests(unittest.TestCase):
         self.fakes = account_home_folder(self) / "bin"
         self.fakes.mkdir()
         (self.fakes / "fake_rule.py").write_text(FAKE_RULE)
+        (self.fakes / "fake_client_tool.py").write_text(CLIENT_TOOL)
         self.rule_log = self.base / "rule.log"
-        self.home = self.base / "home"
+        # Canonical, as the runtime requires of XDG_STATE_HOME (macOS /var is /private/var).
+        self.home = Path(os.path.realpath(self.base / "home"))
         self.home.mkdir()
         self.tmpdir = self.base / "tmp"
         self.tmpdir.mkdir()
@@ -965,6 +1040,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.py_args = self.base / "python-args.log"
         self.py_full = self.base / "python-full.log"
         self.slow_pid = self.base / "slow.pid"
+        # The private working folders this test's wizards create, as attest.py printed them.
+        self.scratch_log = self.base / "scratch.log"
         (self.fakes / "python3").write_text(
             "#!/bin/sh\n"
             f'echo "$PYTHONDONTWRITEBYTECODE" >> "{self.py_log}"\n'
@@ -986,6 +1063,17 @@ class WizardTerminalTests(unittest.TestCase):
             ' exit 2;; esac; fi\n'
             'if [ -n "$FAKE_RULE" ]; then case "$*" in *"cli.py host-command"*|*"cli.py install-codex-rule"*)'
             f' exec "{TRUSTED_PY}" "{self.fakes / "fake_rule.py"}" "$@";; esac; fi\n'
+            'if [ -n "$FAKE_CLIENT_DIRS" ]; then case "$*" in *"attest.py client-status "*)'
+            f' exec "{TRUSTED_PY}" -I -B -S "{self.fakes / "fake_client_tool.py"}" "$@";; esac; fi\n'
+            'if [ -n "$FAKE_SCAN" ]; then case "$*" in *"cli.py codex-session-scan "*)'
+            ' echo "$FAKE_SCAN"; exit 0;; esac; fi\n'
+            'if [ -n "$FAKE_REGISTER" ]; then case "$*" in *"cli.py learning-register "*)'
+            f' printf "%s\\n" "$*" >> "{self.base / "register.log"}"; echo "$FAKE_REGISTER"; exit 0;;'
+            ' *"cli.py learning-status "*)'
+            ' echo \'{"ready": true, "collector_runtime_version": "0.0.0"}\'; exit 0;; esac; fi\n'
+            'case "$*" in *"attest.py scratch setup-"*)'
+            f' out=$("{TRUSTED_PY}" "$@"); rc=$?; printf "%s\\n" "$out" >> "{self.scratch_log}";'
+            ' printf "%s\\n" "$out"; exit $rc;; esac\n'
             f'exec "{TRUSTED_PY}" "$@"\n')
         (self.fakes / "python3.real").symlink_to(TRUSTED_PY)
         for fake in self.fakes.iterdir():
@@ -998,10 +1086,20 @@ class WizardTerminalTests(unittest.TestCase):
                                  "PYTHONDONTWRITEBYTECODE", "CODEX_HOME", "CODEX_THREAD_ID")}
         self.env.update(
             PATH=f"{self.fakes}:{os.environ['PATH']}", HOME=str(self.home), TERM="xterm",
-            FAKE_RULE_LOG=str(self.rule_log),
+            FAKE_RULE_LOG=str(self.rule_log), FAKE_CLIENT_DIRS=str(self.fakes),
+            # The learning state stays under the test's home, wherever the runtime places it.
+            XDG_STATE_HOME=str(self.home / ".local" / "state"),
             TMPDIR=str(self.tmpdir), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
             GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
             GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        # Guard: the learning state the wizard's owner tools would use lies in this test's home.
+        state = subprocess.run(
+            [TRUSTED_PY, "-I", "-B", "-S", "-c", "import sys; sys.path.insert(0, sys.argv[1]);"
+             "from codex_agents.host_paths import owner_state_root; print(owner_state_root())",
+             str(ORCHESTRATION)], env=self.env, capture_output=True, text=True, check=True).stdout.strip()
+        self.assertTrue(Path(os.path.realpath(state)).is_relative_to(self.home), state)
+        self.addCleanup(lambda: self.assertEqual(os.path.lexists(REAL_STATE), REAL_STATE_EXISTED,
+                                                 "a test created the real learning state"))
         if sys.platform == "darwin":  # the per-user cache folder, from getconf
             cache = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"], capture_output=True,
                                    text=True, check=True).stdout.strip()
@@ -1011,21 +1109,23 @@ class WizardTerminalTests(unittest.TestCase):
             runtime.mkdir(mode=0o700)
             self.env["XDG_RUNTIME_DIR"] = str(runtime)
             self.scratch = runtime / SCRATCH_CONTAINER
-        self.scratch_before = self.scratch_entries()
         self.pid = 0
         self.fd = -1
         self.screen = ""
         self.transcript = ""
 
     def scratch_entries(self) -> set[str]:
+        """The private working folders this test's wizards created, never another run's: the
+        per-user cache folder that holds them is shared with every other checkout's tests."""
+
         try:
-            return {name for name in os.listdir(self.scratch) if name.startswith("setup-")}
+            return {line for line in self.scratch_log.read_text().splitlines() if line}
         except FileNotFoundError:
             return set()
 
     def assert_no_working_files_left(self) -> None:
         self.assertEqual(list(self.tmpdir.iterdir()), [], "something was written to TMPDIR")
-        self.assertEqual(self.scratch_entries() - self.scratch_before, set(),
+        self.assertEqual([path for path in self.scratch_entries() if os.path.lexists(path)], [],
                          "the private working folder was kept")
 
     def assert_python_isolated(self) -> None:
@@ -1034,7 +1134,10 @@ class WizardTerminalTests(unittest.TestCase):
         for line in lines:
             self.assertEqual(line, "-I -B -S -X pycache_prefix=/dev/null", line)
 
-    def start(self, cwd: Path, extra_env: dict | None = None) -> None:
+    def start(self, cwd: Path, extra_env: dict | None = None, *, direct: bool = False) -> None:
+        """Start the wizard in a pty: `bash setup.sh`, or with `direct` as `./setup.sh` would
+        start it, through its own first line."""
+
         import fcntl
         import pty
         import struct
@@ -1044,6 +1147,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd)
+            if direct:
+                os.execve(str(SETUP), [str(SETUP)], env)
             os.execvpe("bash", ["bash", str(SETUP)], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         self.addCleanup(self._reap)
@@ -1056,8 +1161,9 @@ class WizardTerminalTests(unittest.TestCase):
         except OSError:
             pass
         # A wizard killed with SIGKILL cannot remove its private working folder.
-        for name in self.scratch_entries() - self.scratch_before:
-            shutil.rmtree(self.scratch / name, ignore_errors=True)
+        for path in self.scratch_entries():
+            if Path(path).parent == self.scratch:
+                shutil.rmtree(path, ignore_errors=True)
 
     def _kill_and_wait(self) -> None:
         try:
@@ -1207,9 +1313,10 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Read the warning above")
         self.expect("Up/Down move")
         plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
-        self.assertIn(f"A Codex session on 2026-11-01 could write to {ROOT.parent}, which holds "
-                      "this setup folder", plain)
-        self.assertIn("never on your home folder", plain)
+        self.assertIn(f"A Codex session on 2026-11-01 could write to {ROOT.parent}. Codex was opened on "
+                      "a folder that holds this setup folder; open Codex on a project folder only.", plain)
+        self.assertIn("Open Codex on the project itself: never on a folder that contains a set-up project, "
+                      "this setup folder, your home folder, a folder above it or /.", plain)
         self.send("\r")  # Continue: it is a warning, not a stop
         self.expect("Project path")
         # Quit through the wizard: bash 5 runs the INT trap only once `read -e` returns.
@@ -1218,6 +1325,27 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("y")
         self.assertEqual(self.finish(), 130)
         self.assertEqual(list((self.home / ".codex").iterdir()), [self.home / ".codex" / "sessions"])
+
+    def test_sessions_able_to_write_the_records_or_a_set_up_project_are_warned_about(self) -> None:
+        import json
+        # The runtime's own message is shown, with control characters removed; without one the
+        # wizard says what the folder holds.
+        warnings = [{"date": "2026-11-01", "holds": "state", "folder": "/x/state-parent"},
+                    {"date": "2026-11-02", "holds": "project", "folder": "/x/projects",
+                     "message": "Codex was opened on a folder that contains a set-up project (demo\x1b[2J); "
+                                "open Codex on the project itself"}]
+        self.start(self.base, {"FAKE_SCAN": json.dumps({"ready": True, "warnings": warnings})})
+        self.expect("Read the warning above")
+        self.expect("Up/Down move")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("A Codex session on 2026-11-01 could write to /x/state-parent. Codex was opened on a "
+                      "folder that holds the orchestrator's learning state.", plain)
+        self.assertIn("A Codex session on 2026-11-02 could write to /x/projects. Codex was opened on a "
+                      "folder that contains a set-up project (demo[2J); open Codex on the project itself.", plain)
+        self.assertNotIn("demo\x1b", self.screen)  # the escape never reached the terminal
+        self.assertIn("never on a folder that contains a set-up project", plain)
+        self.send("\x1b[B\r")  # Quit
+        self.assertEqual(self.finish(), 0)
 
     def test_a_project_codex_session_is_not_warned_about(self) -> None:
         project = self.base / "some-project"
@@ -1231,6 +1359,119 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Quit setup?")
         self.send("y")
         self.assertEqual(self.finish(), 130)
+
+    def test_planted_clients_and_tools_earlier_on_path_never_run(self) -> None:
+        # A Codex session opened on ~/Work could plant programs in ~/Work/tools/bin, which the
+        # owner's PATH lists first. Started as ./setup.sh, nothing there may ever run.
+        planted, marker = self.base / "Work" / "tools" / "bin", self.base / "planted-ran"
+        plant_tools(planted, marker)
+        self.start(self.base, {"PATH": f"{planted}:{self.env['PATH']}"}, direct=True)
+        self.expect("Everything looks good")
+        self.expect("Up/Down move")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("codex: installed, signed in", plain)
+        self.assertIn("claude: signed in (plan: max, login: x)", plain)
+        self.send("q")
+        self.expect("Quit setup?")
+        self.send("y")
+        self.assertEqual(self.finish(), 130)
+        self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+        self.assert_no_working_files_left()
+
+    def test_clients_outside_the_runtimes_folders_are_refused_and_never_run(self) -> None:
+        # The search path holds a codex in a temporary folder (refused before it runs) and no
+        # claude, while a claude on PATH is not where the orchestrator runs it from.
+        untrusted, marker = self.base / "untrusted-bin", self.base / "client-ran"
+        plant_tools(untrusted, marker)
+        (untrusted / "claude").unlink()
+        self.start(self.base, {"FAKE_CLIENT_DIRS": str(untrusted)})
+        self.expect("Some checks failed")
+        self.expect("Up/Down move")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("codex: refused, so it was not run", plain)
+        self.assertIn("claude: found on your PATH, but not where the orchestrator runs it from", plain)
+        self.assertIn("/opt/homebrew/bin, /usr/local/bin, /usr/bin, /bin or ~/.local/bin", plain)
+        self.send("\x1b[B\x1b[B\r")  # Quit
+        self.assertEqual(self.finish(), 1)
+        self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+
+    def test_the_one_time_move_of_the_records_is_explained(self) -> None:
+        project, checks = self.make_project()
+        # The old copy's path, with a DEL byte (a control character JSON allows unescaped).
+        moved = ('{"ready": true, "state_moved": "/somewhere/old\x7f copy", '
+                 '"state_root": "/elsewhere/codex-agents"}')
+        self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": moved})
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\r")
+        self.expect("Collector status: ready")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("Moved your orchestrator records once to a protected folder, "
+                      "~/.local/state/codex-agents. The old copy at /somewhere/old copy can be "
+                      "deleted once you're happy.", plain)
+        self.assertNotIn("\x7f", self.screen)  # control characters are removed
+        self.assertNotIn("/elsewhere", plain)  # the state root itself is never shown
+
+    def plant_legacy_records(self) -> str:
+        """An old-format records folder in the test home, as a session on ~/Library could make."""
+
+        legacy = self.home / "Library" / "Application Support" / "codex-agents"
+        legacy.mkdir(parents=True, mode=0o700)
+        subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.base / "k")],
+                       check=True, capture_output=True)
+        fields = (self.base / "k.pub").read_text().split()
+        signers = f"codex-agents-owner {fields[0]} {fields[1]}\n".encode()
+        (legacy / "owner-allowed-signers").write_bytes(signers)
+        return hashlib.sha256(signers).hexdigest()
+
+    def drive_to_legacy_question(self) -> None:
+        project, checks = self.make_project()
+        moved = '{"ready": true, "state_moved": "/somewhere/old copy", "state_root": "/x"}'
+        self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": moved})
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\r")
+        self.expect("Move these records to the protected folder?")
+        self.expect("No, leave them where they are")
+        self.settle()
+
+    @unittest.skipUnless(sys.platform == "darwin", "the old records folder was macOS's")
+    def test_old_records_are_shown_and_moved_only_when_approved(self) -> None:
+        digest = self.plant_legacy_records()
+        self.drive_to_legacy_question()
+        last = self.screen.split("\x1b[2J")[-1]
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", last))
+        self.assertIn("still in the old folder ~/Library/Application Support/codex-agents (created 2", plain)
+        self.assertRegex(plain, r"Owner key in those records: ssh-ed25519 SHA256:[A-Za-z0-9+/]+")
+        self.assertIn("Your owner key file ~/.ssh/codex-agents-owner.pub:", plain)
+        self.assertTrue(any(line in plain for line in ("They match", "They do not match", "cannot compare")))
+        self.send("\r")  # Yes, move them
+        self.expect("Collector status: ready")
+        registered = (self.base / "register.log").read_text()
+        self.assertIn(f"--move-legacy-state {digest}", registered)
+
+    @unittest.skipUnless(sys.platform == "darwin", "the old records folder was macOS's")
+    def test_declining_the_move_registers_nothing(self) -> None:
+        self.plant_legacy_records()
+        self.drive_to_legacy_question()
+        self.send("\x1b[B\r")  # No
+        self.expect("The old records were not moved")
+        self.assertFalse((self.base / "register.log").exists())
+
+    def test_no_move_no_records_sentence(self) -> None:
+        project, checks = self.make_project()
+        self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": '{"ready": true, "state_moved": null}'})
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\r")
+        self.expect("Collector status: ready")
+        self.assertNotIn("Moved your orchestrator records", self.screen)
 
     def test_quit_on_the_first_screen_changes_nothing(self) -> None:
         self.start(self.base)
@@ -1748,9 +1989,9 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.assertEqual(self.finish(), 0)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "the wizard's basic tools come from the system folders, so only Linux says Linux")
     def test_linux_warns_that_operational_checks_need_macos(self) -> None:
-        (self.fakes / "uname").write_text('#!/bin/sh\necho Linux\n')
-        (self.fakes / "uname").chmod(0o755)
         self.start(self.base)
         self.expect("Operational checks need macOS today")
         self.expect("known limitation")
@@ -1857,6 +2098,49 @@ class WizardTerminalTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertNotEqual(status, "")
+
+    def test_the_hooks_are_offered_for_trust_only_after_the_runtime_check(self) -> None:
+        project, checks = self.make_project()
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Close every Codex session in this project first.")
+        self.expect("Install now")
+        self.send("\r")
+        self.expect("Commit now")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("In Codex, open /hooks and trust the orchestrator's learning hooks", plain)
+        self.assertNotIn("Do not trust", plain)
+        self.send("\x1b[B\r")
+        self.finish_after_install()
+
+    def test_a_file_planted_in_the_orchestration_folder_stops_the_install(self) -> None:
+        project, checks = self.make_project()
+        planted = project / ".codex" / "orchestration"
+        planted.mkdir(parents=True)
+        (planted / "socket.py").write_text("raise SystemExit(1)\n")
+        # Committed, as a session could have done before the install: the tree is clean.
+        subprocess.run(["git", "-C", str(project), "add", "-f", ".codex"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "planted"], check=True, env=self.env)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        self.expect("holds files the orchestrator does not install")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertNotIn("open /hooks", plain)
+        self.assertFalse((project / ".codex" / "hooks.json").exists())
+        self.assertFalse((project / ".codex" / "orchestration" / "install-manifest.json").exists())
 
     def test_a_failed_path_helper_stages_and_commits_nothing(self) -> None:
         project, checks = self.make_project()

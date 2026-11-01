@@ -2,7 +2,7 @@
 
 - **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
   0.1.0). G2 is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.9);
-  the tag follows the G2 exit. Next: v1.1 child liveness, then G3. Scope changes are listed under
+  the tag follows the G2 exit. Next: v1.1 child liveness, then v1.2 Codex plan loop, then G3. Scope changes are listed under
   "Decisions and open questions".
 - **Updated:** 2026-11-01.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
@@ -104,6 +104,7 @@ Effort is an estimate in focused working sessions.
 | G1 | Import and one-command install | Manual, logged by hand | Imported tests pass here; installer reproduces the pilot's current install | 1–2 | Done (0.1.0) |
 | G2 | **MVP:** cross-provider read-only routing | Starts at exit | Both primaries reach both providers read-only through recorded, replayable routes | 2–4 | Release candidate for toolchain v1 (0.2.0) |
 | v1.1 | Child liveness from real client events | Read-only sub-tasks | Not yet defined | Not yet estimated | Planned |
+| v1.2 | Codex plan loop | Read-only sub-tasks | Not yet defined | Not yet estimated | Planned |
 | G3 | Write-capable children | Read and write sub-tasks | Contained write children, verified by the other provider | 2–3 | Planned |
 | G4 | Evidence-driven routing | Full, with a paired sample | First evidence-backed routing decision | 1–2, then ongoing | Planned |
 
@@ -213,6 +214,24 @@ however long it stays silent. v1.1 judges liveness from the client's real events
   primary decides whether to keep waiting.
 - **Abort after a long silence,** by rule, without waiting for the deadline.
 - **Hard deadline as backstop:** the existing deadline and watchdog stay.
+
+## v1.2: Codex plan loop
+
+Planned (owner decision, 2026-11-01), not yet designed or estimated. It depends on v1.1. A Claude
+Code primary can keep working through a plan with `/loop`; Codex has no equivalent that this
+project's code controls. Codex's built-in `/goal` continues until the model reports the goal done
+or blocked, a token budget runs out or a usage limit is reached, with no time or turn limit. A Stop
+hook that keeps blocking can loop without end, and hooks run outside the sandbox. v1.2 adds a
+supervisor that the orchestrator owns:
+
+- **One thread, bounded steps:** `codex exec`, then `codex exec resume <thread>`, one step at a
+  time, each under a hard process timeout.
+- **Code decides every stop:** attempts, wall time, subscription headroom, and no progress (plan
+  items, the working tree and the verification result unchanged for a set number of steps).
+- **Stops for the owner:** a decision only the owner can make ends the loop through a marker the
+  supervisor reads.
+- **Model output may end the loop, never extend it.**
+- **No steering hooks.**
 
 ## G3: Write-capable children
 

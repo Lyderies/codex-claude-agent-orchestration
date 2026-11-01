@@ -45,3 +45,22 @@ for _name in (
     os.environ.pop(_name, None)
 for _name in [name for name in os.environ if name.startswith("CLAUDE_CODE_USE_")]:
     os.environ.pop(_name, None)
+
+
+def trusted_hook_interpreter() -> Path | None:
+    """A Python the rendered learning hooks may name (hook_config.interpreter_problem).
+
+    CI's toolcache Python sits outside the trusted installation folders, so a system or
+    Homebrew one is looked for; None when there is none.
+    """
+
+    from codex_agents.hook_config import interpreter_problem
+
+    candidates = [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                  "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+                  "/usr/bin/python3"]
+    for candidate in candidates:
+        real = Path(os.path.realpath(candidate))
+        if real.is_file() and interpreter_problem(real, Path("/nonexistent-project")) is None:
+            return real
+    return None

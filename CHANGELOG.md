@@ -2,6 +2,144 @@
 
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.9)
 
+- **G2 v1 final hooks (0.8.9).** Codex runs the learning hooks outside its sandbox, and the
+  static `.codex/hooks.json` ran `python3` from `PATH` (on macOS the `/usr/bin` xcrun shim,
+  which reads a cache a session can write) and found the hook through `git rev-parse`
+  (which follows `.git` and `core.worktree`).
+  - The installer now renders the file per checkout (`codex_agents/hook_config.py`): every
+    hook runs `/usr/bin/env xcrun_nocache=1 '<interpreter>' -I -B -S -X pycache_prefix=/dev/null
+    '<project>/.codex/orchestration/learning_hook.py' --checkout '<project>' --client-version
+    codex-hooks-v1`, with
+    the trusted interpreter the installer runs under (the same checks as the Codex rule) and
+    no PATH lookup or git. Paths holding a quote, a backslash or a control character are
+    refused.
+  - The file holds this checkout's absolute paths, so it is never committed: the package's
+    `.codex/.gitignore` keeps it and `.codex/orchestration/local-install.json` (the
+    interpreter and the file's digest, which verify, update and remove use) out of Git. An
+    update replaces 0.8.x's committed static file, and the wizard's commit takes it out of
+    the index.
+  - Codex 0.164 runs a linked worktree's events through its main checkout's hooks, so the
+    command pins `--checkout '<project>'` and the hook first checks, with the standard library
+    only, that the event's folder belongs to that checkout (it exists and resolves inside it,
+    and the nearest `.git` is its own; a `.git` that cannot be read refuses); events from a
+    worktree or a nested repository import nothing and start no collector. A subfolder's events record for the checkout.
+  - Verify compares the file byte for byte with a fresh render and re-checks the recorded
+    interpreter; the old form, an edited command or an untrusted interpreter is a project
+    error that says to run `./setup.sh`.
+  - Codex trusts hooks by hash: after an install or update, open `/hooks` in Codex and trust
+    the orchestrator's learning hooks (the wizard says so; the installer never writes trust).
+  - The hook's collector start gets `xcrun_nocache=1`; an unusable state location is a
+    silent no-op like an unregistered project. The 0.8.9 runtime digest is recomputed.
+
+- **G2 v1 final runtime fixes (0.8.9).** From the final whole-release review.
+  - **Learning state location.** On macOS the default learning state was
+    `~/Library/Application Support/codex-agents`, which a Codex session opened on `~/Library`
+    could write (ledger, digest key, collector authorization, `owner-allowed-signers`). The
+    default is now `~/.local/state/codex-agents` on every platform, with the home folder
+    from the account database, never HOME. `XDG_STATE_HOME` moves it only when it is
+    canonical and strictly inside a hidden folder of HOME (such as `~/.local/state`); any
+    other value refuses ("XDG_STATE_HOME must be inside a hidden folder in your home, such
+    as ~/.local/state; unset it or move it"). The folders above the state must be the
+    owner's, writable by no one else and not symbolic links; missing ones are created 0700.
+  - **No second hard link.** State files, including the owner's allowed signer and the
+    digest key, refuse a link count other than one. The allowed-signers file is validated
+    whole: anything over 4096 bytes refuses, since `ssh-keygen` reads every line.
+  - **One-time move.** The owner's `learning-register` (the wizard's collector step) moves
+    the old macOS folder by copying, not renaming: with the collector stopped and the
+    ledger locked, it refuses a hard-linked, symbolic or special file, copies every file
+    into fresh inodes in an owner-only staging folder (the ledger through SQLite's backup
+    API), checks the copy, renames it into place and renames the old folder to
+    `codex-agents.moved-<UTC time>`, which `state_moved` names. On any failure the staging
+    folder is removed and the old folder is untouched; both folders present, or a socket
+    path that would be too long, refuse. Every other use of the default state refuses while
+    only the old folder exists, telling the owner to run `./setup.sh` (collector step).
+    `host_paths.owner_state_root()` gives the owner tools the folder in use until then. The
+    old copy, with the digest key, stays readable until the owner deletes it.
+  - **Session guard coverage.** The guard also refuses a session that can write the learning
+    state (with its `scratch`), the bridge's or the owner tools' host-private scratch
+    container, a folder that strictly contains the copy's bound project, or the project's
+    `.codex`, `.agents` or `.git` as a folder of its own: Codex runs a nested trusted
+    project's `.codex/config.toml` and hooks outside the sandbox. `dispatch` is guarded like
+    every rule-matched command, so a session that could write the bridge's control files
+    never starts a child. Open Codex on the project itself.
+  - **Session scan.** `codex-session-scan` also warns about a recent session that could
+    write the learning state (and the old macOS folder while it exists) or that was opened
+    on a folder containing a set-up project (named by runtime-copy bindings or the ledger's
+    registrations). Each warning carries `holds` (`home`, `clone`, `state`, `project`) and
+    a plain `message`.
+  - **Install verification with mapped writers.** The package smoke routes use the package
+    policy alone, so a project that maps a workspace-write Codex agent (for coding, or as
+    verifier) no longer fails install verification; validation warns instead ("<agent> is
+    workspace-write; Codex children are bridged read-only in this release, so it is not
+    used for Codex routes"), and a route denied for that reason says so.
+  - The 0.8.9 runtime digest is recomputed.
+
+- **Final review (0.8.9).**
+  - The package installer refuses, before writing anything, when the project's
+    `.codex/orchestration` holds files it does not install (a `socket.py` planted by a
+    session that ran before the install, bytecode, a package), and verify reports it. The
+    hook and the project's `cli.py` append their folder to `sys.path` instead of putting it
+    first, so with `-I` a planted module never shadows the standard library. The wizard says
+    to trust the hooks in Codex only after `check-runtime` passes, and the install step
+    starts with "Close every Codex session in this project first".
+  - The one-time move of the old macOS state needs the owner's approval
+    (`learning-register --move-legacy-state <signer file SHA-256 or none>`): the wizard shows
+    the old folder's creation time, the owner key it names and whether that is
+    `~/.ssh/codex-agents-owner.pub`, asks, and the runtime checks the digest on its fresh copy.
+  - Verify warns when `.claude/settings.json` defines hooks; the README, SECURITY.md and S6
+    list the residuals (sessions running during an install; Claude settings and skills a
+    Codex session can rewrite). The 0.8.9 runtime digest is recomputed.
+
+- **Owner key links and client output (owner review).** `attest.py` refuses an owner private
+  key whose file has another hard link ("This key file has another link elsewhere; make a fresh
+  copy in ~/.ssh (cp, not mv) and remove the old one"), at every use and again on the file it
+  opens itself: a key moved into `~/.ssh` from a folder an agent can write kept that link, through
+  which the agent could rewrite it after the checks. Each operation that uses the key (the
+  passphrase check with the derivation, signing, the passphrase change) now works on a private
+  0600 copy read once into the owner's scratch container and removed afterwards, so a
+  descriptor kept on the key's inode cannot change what was checked; the passphrase change
+  saves the re-encrypted copy only after checking it, as a new file renamed over the key. `client-status` reads a client's output with
+  the runtime's bounded reader (`providers.read_bounded`) and stops the client's process group the
+  moment it passes 256 KiB, instead of buffering it all first.
+
+- **Owner tools follow the state rules.** `scripts/attest.py` and `scripts/install.py` show the
+  runtime's plain refusal when the learning state location is unusable (an `XDG_STATE_HOME`
+  outside a hidden home folder or not canonical, or an unsafe `~/.local`), and the wizard maps
+  it to a fixed message. The collector step's one sentence about the move now names the old
+  copy (`state_moved`, control characters removed) and says it can be deleted once you're
+  happy. Tests set a canonical `HOME` and `XDG_STATE_HOME`.
+
+- **Owner-side final fixes (whole-release review).**
+  - `setup.sh` no longer runs `codex` or `claude` from the inherited `PATH`, where an earlier
+    folder a Codex session can write could hold a planted program. The sign-in checks go
+    through attest.py's `client-status` owner tool, which finds each client with the
+    runtime's own `providers.resolve_client` (only `/opt/homebrew/bin`, `/usr/local/bin`,
+    `/usr/bin`, `/bin` or `~/.local/bin`, its real file location-checked before it runs) and
+    runs only its fixed status command with the runtime's minimal client environment
+    (`client_environment`: no `CODEX_HOME` or API keys) in a private working folder, with a
+    deadline. A client that fails is reported in plain words and never run; one elsewhere on
+    `PATH` is named as such.
+  - The wizard starts with `/bin/bash` (not `/usr/bin/env bash`) and finds its basic tools
+    only in `/usr/bin:/bin:/usr/sbin:/sbin`; the owner's `PATH` is used only to look up
+    `python3`, which is checked before it runs.
+  - `attest.py` takes an owner private key only from the account's own `~/.ssh` (the home
+    folder from the system account database, not `HOME`): no symbolic link anywhere on its
+    path, `~/.ssh` and below owned by the user and writable by no one else, checked again
+    before every `ssh-keygen` use (enrolment, signing, passphrase change). A key anywhere
+    else is refused, which closes the swap between the encryption check and the derivation.
+  - Owner tools locate the learning state only through this repository's package
+    (`host_paths.owner_state_root`), so the installer's ownership record follows the move to
+    `~/.local/state/codex-agents` and is never created beside the old macOS folder before
+    the collector step moves it; their scratch container is the runtime's
+    `OWNER_SCRATCH_CONTAINER`, which the guard protects. The collector step says once when
+    `learning-register` moved the records (`state_moved`), and the session warning shows the
+    scan's own `message` for each finding (home, clone, state or project). Tests pin
+    `XDG_STATE_HOME` inside their scratch home and fail if the state would resolve outside it.
+  - README, the setup wizard reference and manual setup now say to open Codex on the project
+    itself, never on a folder that contains a set-up project (Codex runs a nested trusted
+    project's `.codex/config.toml` and hooks outside the sandbox), and that the clone is
+    only for running `./setup.sh`.
+
 - **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
   - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
     which a session opened on a parent folder could rewrite. `install-codex-rule` copies
