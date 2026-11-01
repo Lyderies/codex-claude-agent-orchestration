@@ -11,7 +11,11 @@ the working directory may be any folder below the project.
 So the command names everything absolutely and looks nothing up: the trusted
 interpreter the installer ran under (never a PATH `python3`, never macOS's
 `/usr/bin` xcrun shim) and this checkout's own `learning_hook.py`, no `$(...)`,
-no git. ``/usr/bin/env xcrun_nocache=1`` sets the variable without relying on a
+no git. ``--checkout`` pins the checkout the file was rendered for: Codex 0.164 loads a
+linked worktree's hooks from its main checkout (`config/src/loader/mod.rs`
+`root_checkout_hooks_folder_for_dir`), so `learning_hook.py` first checks, with the
+standard library only, that the event's working folder belongs to that checkout, and
+does nothing otherwise. ``/usr/bin/env xcrun_nocache=1`` sets the variable without relying on a
 shell's ``VAR=value cmd`` syntax. Each path is single-quoted and may not hold a
 single quote, a backslash or any control character, so sh, bash, zsh and fish
 all read the same words.
@@ -121,6 +125,8 @@ def hook_command(interpreter: Path, project_root: Path) -> str:
             _quoted(str(interpreter), "interpreter path"),
             *PYTHON_ISOLATION_FLAGS,
             _quoted(str(project_root / HOOK_SCRIPT_RELATIVE), "project folder"),
+            "--checkout",
+            _quoted(str(project_root), "project folder"),
             "--client-version",
             CLIENT_VERSION,
         ]

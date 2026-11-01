@@ -721,7 +721,8 @@ safety comes from redundant layers.
   - The installer renders `.codex/hooks.json` (`hook_config.render_hooks`): the same nine
     events, async set and timeout 3, each running
     `/usr/bin/env xcrun_nocache=1 '<interpreter>' -I -B -S -X pycache_prefix=/dev/null
-    '<root>/.codex/orchestration/learning_hook.py' --client-version codex-hooks-v1`. The
+    '<root>/.codex/orchestration/learning_hook.py' --checkout '<root>' --client-version
+    codex-hooks-v1`. The
     interpreter is the one the installer runs under, which `./setup.sh` selected, checked as
     for the rule (`interpreter_path`, `executable_location_problem`, not the xcrun shim). Each
     path is single-quoted and may not hold a quote, a backslash or a control character, so
@@ -734,12 +735,21 @@ safety comes from redundant layers.
     record: update and remove replace or delete them only at the recorded digest, and an
     update replaces 0.8.x's committed static file, whose deletion the wizard's plumbing commit
     records while the rendered file stays. `project_changes` never reports an untracked one.
-  - Linked worktrees: Codex 0.164 loads a linked worktree's hooks from the matching folder
-    of its main checkout (`config/src/loader/mod.rs` `root_checkout_hooks_folder_for_dir`),
-    so a session in `.worktrees/<name>` runs the main checkout's rendered hooks and its
-    protected `learning_hook.py`, never code from the worktree, which a session on the main
-    project can write. The hook binds the payload's `cwd`; an unregistered worktree is a
-    silent no-op. A separate clone gets its own file when the wizard installs it there.
+  - Linked worktrees and nested repositories: Codex 0.164 loads a linked worktree's hooks
+    from the matching folder of its main checkout (`config/src/loader/mod.rs`
+    `root_checkout_hooks_folder_for_dir`), so events from `.worktrees/<name>` run the main
+    checkout's rendered command. `--checkout` pins the checkout it was rendered for, and
+    `learning_hook.py`'s first action, with the standard library only and before importing
+    any of the package, is `belongs_to_checkout`: the payload's `cwd`, resolved, must be the
+    checkout or lie inside it, and the nearest `.git` entry (folder or file) walking up from
+    it must be the checkout's own. A linked worktree (inside or outside the checkout), a
+    nested repository or anything else is a silent no-op (`{}` for `Stop` and
+    `SubagentStop`) that imports nothing, starts no collector and records nothing; an
+    accepted event binds the pinned checkout, so a session in a subfolder records for it.
+    No registration check exists short of the collector (the only one, a read-only ledger
+    query, would open the database on every event), so the checkout guard is what keeps a
+    foreign event from starting the collector. A separate clone gets its own file when the
+    wizard installs it there.
   - Verify (`validation._validate_learning_hooks`, a project error) keeps every structural
     check, then requires the local record, re-checks the recorded interpreter, and compares
     the file byte for byte with `render_hooks(interpreter, root)`; the old `$(git rev-parse)`

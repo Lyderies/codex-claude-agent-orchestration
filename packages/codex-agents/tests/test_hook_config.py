@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ class RenderTests(unittest.TestCase):
             "/usr/bin/env xcrun_nocache=1 '/opt/homebrew/Cellar/python 3/bin/python3' "
             "-I -B -S -X pycache_prefix=/dev/null "
             "'/srv/work/my \"project\" $(touch x) `y`/.codex/orchestration/learning_hook.py' "
+            "--checkout '/srv/work/my \"project\" $(touch x) `y`' "
             "--client-version codex-hooks-v1",
         )
         # The shell reads back exactly these words: no expansion, no lookup but env's.
@@ -48,6 +50,7 @@ class RenderTests(unittest.TestCase):
                 "/usr/bin/env", "xcrun_nocache=1", str(interpreter),
                 "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null",
                 str(root / ".codex/orchestration/learning_hook.py"),
+                "--checkout", str(root),
                 "--client-version", "codex-hooks-v1",
             ],
         )
@@ -99,10 +102,16 @@ class PlantedPathTests(unittest.TestCase):
 
     def test_planted_python_and_git_never_run(self) -> None:
         interpreter = Path(os.path.realpath(sys.executable))
-        command = hook_command(interpreter, BUNDLE_ROOT)
         payload = json.loads(FIXTURE.read_text())
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
             base = Path(os.path.realpath(directory))
+            # A checkout of its own (the hook's checkout guard passes for its subfolders).
+            checkout = base / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            shutil.copytree(BUNDLE_ROOT / ".codex" / "orchestration", checkout / ".codex" / "orchestration",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copy(BUNDLE_ROOT / "VERSION", checkout / "VERSION")  # the version an install manifest would give
+            command = hook_command(interpreter, checkout)
             marker = base / "planted-ran"
             planted = base / "planted-bin"
             planted.mkdir()
@@ -112,8 +121,8 @@ class PlantedPathTests(unittest.TestCase):
                 tool.chmod(0o755)
             home = base / "home"
             (home / ".local" / "state").mkdir(parents=True)
-            project = base / "project"
-            project.mkdir()
+            project = checkout / "src" / "deep"
+            project.mkdir(parents=True)
             # A Stop event makes the hook print "{}", so a clean run is visible; the
             # learning state does not exist, so nothing is recorded or started.
             payload.update(cwd=str(project), hook_event_name="Stop")

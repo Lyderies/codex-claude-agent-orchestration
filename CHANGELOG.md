@@ -8,7 +8,8 @@
   (which follows `.git` and `core.worktree`).
   - The installer now renders the file per checkout (`codex_agents/hook_config.py`): every
     hook runs `/usr/bin/env xcrun_nocache=1 '<interpreter>' -I -B -S -X pycache_prefix=/dev/null
-    '<project>/.codex/orchestration/learning_hook.py' --client-version codex-hooks-v1`, with
+    '<project>/.codex/orchestration/learning_hook.py' --checkout '<project>' --client-version
+    codex-hooks-v1`, with
     the trusted interpreter the installer runs under (the same checks as the Codex rule) and
     no PATH lookup or git. Paths holding a quote, a backslash or a control character are
     refused.
@@ -16,7 +17,12 @@
     `.codex/.gitignore` keeps it and `.codex/orchestration/local-install.json` (the
     interpreter and the file's digest, which verify, update and remove use) out of Git. An
     update replaces 0.8.x's committed static file, and the wizard's commit takes it out of
-    the index; a linked worktree uses its main checkout's hooks (Codex 0.164 behaviour).
+    the index.
+  - Codex 0.164 runs a linked worktree's events through its main checkout's hooks, so the
+    command pins `--checkout '<project>'` and the hook first checks, with the standard library
+    only, that the event's folder belongs to that checkout (inside it, nearest `.git` its
+    own); events from a worktree or a nested repository import nothing and start no
+    collector. A subfolder's events record for the checkout.
   - Verify compares the file byte for byte with a fresh render and re-checks the recorded
     interpreter; the old form, an edited command or an untrusted interpreter is a project
     error that says to run `./setup.sh`.
