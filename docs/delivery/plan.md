@@ -1,8 +1,10 @@
 # Delivery plan: cross-provider agent orchestration
 
-- **Status:** in execution since the owner started it on 2026-10-31. Scope changes since then
-  are listed under "Decisions and open questions".
-- **Updated:** 2026-10-31.
+- **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
+  0.1.0). G2 is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.9);
+  the tag follows the G2 exit. Next: v1.1 child liveness, then G3. Scope changes are listed under
+  "Decisions and open questions".
+- **Updated:** 2026-11-01.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
   sub-tasks to Codex or Claude child agents.
 
@@ -97,12 +99,13 @@ The work is mostly integration. The genuinely new pieces are:
 
 Effort is an estimate in focused working sessions.
 
-| Goal | Feature set | Dogfooding | Exit | Effort |
-|---|---|---|---|---|
-| G1 | Import and one-command install | Manual, logged by hand | Imported tests pass here; installer reproduces the pilot's current install | 1–2 |
-| G2 | **MVP:** cross-provider read-only routing | Starts at exit | Both primaries reach both providers read-only through recorded, replayable routes | 2–4 |
-| G3 | Write-capable children | Read and write sub-tasks | Contained write children, verified by the other provider | 2–3 |
-| G4 | Evidence-driven routing | Full, with a paired sample | First evidence-backed routing decision | 1–2, then ongoing |
+| Goal | Feature set | Dogfooding | Exit | Effort | Status |
+|---|---|---|---|---|---|
+| G1 | Import and one-command install | Manual, logged by hand | Imported tests pass here; installer reproduces the pilot's current install | 1–2 | Done (0.1.0) |
+| G2 | **MVP:** cross-provider read-only routing | Starts at exit | Both primaries reach both providers read-only through recorded, replayable routes | 2–4 | Release candidate for toolchain v1 (0.2.0) |
+| v1.1 | Child liveness from real client events | Read-only sub-tasks | Not yet defined | Not yet estimated | Planned |
+| G3 | Write-capable children | Read and write sub-tasks | Contained write children, verified by the other provider | 2–3 | Planned |
+| G4 | Evidence-driven routing | Full, with a paired sample | First evidence-backed routing decision | 1–2, then ongoing | Planned |
 
 ## G1: Import and one-command install
 
@@ -154,22 +157,28 @@ Effort is an estimate in focused working sessions.
     - Hooks, plugins and MCP off.
     - The model pinned, no fallback model, read tools only.
     - Never `--bare`, which switches to API-key billing.
-  - **Codex:** `codex exec` with a read-only sandbox and ephemeral session, user config ignored,
-    and schema-checked output.
+  - **Codex:** `codex exec` with a read-only sandbox and ephemeral session, user config and
+    execpolicy rules ignored (`--ignore-user-config`, `--ignore-rules`), approvals never granted,
+    connectors, web search, image generation and goals disabled, an event allowlist, and
+    schema-checked output. Every Codex child is bridged, from either primary.
 - **Launch discipline:** a durable intent is recorded before launch, with a hard deadline, no
   resend, and an ambiguous send fenced from rerouting.
 - **Eligibility, failing closed:**
   - subscription authentication confirmed from client metadata;
+  - an owner-signed billing attestation for the account;
+  - an identity observation under 30 minutes old;
+  - billing evidence showing no usable paid usage;
   - no API-key environment variables;
   - client version within the reviewed range;
   - provider enabled in project configuration;
-  - headroom not exhausted.
+  - headroom not exhausted;
+  - a per-account run cap per usage window.
 - **Usage observations:** every run records the signals that cost and headroom depend on.
   - Codex: the percentage of each usage window used, before and after the run.
   - Claude: tokens, model, and the rate-limit status, type and reset time.
 - **Signal-based limits:**
-  - New children stop for that provider above about 90% for Codex, or on a rejection, until
-    the reset time.
+  - New children stop for that provider when a usage window reaches 90%, for Codex or Claude,
+    or on a rejection, until the reset time.
   - A per-window run count is a backstop, mainly for Claude.
 - **Orchestration skills** for both kinds of primary: they handle bridge routes through the same
   lifecycle as native children (validate, verify, operational QA).
@@ -194,6 +203,17 @@ Effort is an estimate in focused working sessions.
 **Dogfooding:** from here on, read-only sub-tasks go through toolchain v1: research, plan review,
 code review and verification. That applies both in this repository and in the pilot project.
 
+## v1.1: Child liveness
+
+Planned, not yet designed or estimated. In v1 a bridged child is bounded only by its hard deadline,
+however long it stays silent. v1.1 judges liveness from the client's real events:
+
+- **Reasoning summaries on** for children, so a working child keeps emitting events.
+- **Graded staleness:** a child that has been silent past a threshold is graded stale, and the
+  primary decides whether to keep waiting.
+- **Abort after a long silence,** by rule, without waiting for the deadline.
+- **Hard deadline as backstop:** the existing deadline and watchdog stay.
+
 ## G3: Write-capable children
 
 **Features**
@@ -207,6 +227,9 @@ code review and verification. That applies both in this repository and in the pi
 - **Integration:** the primary integrates a child's diff only after verification by the other
   provider and the project's checks pass. Cancellation and cleanup are tested.
 - **Sandboxed shell for Claude children:** a separately reviewed sub-slice, with network off.
+- **Enforced read roots for Codex children:** run `codex exec` inside an outer macOS Seatbelt
+  profile so its reads are contained, as Claude children's already are (moved here from G2; see
+  the [G2 design](g2-design.md), S2).
 
 **Exit**
 
@@ -263,7 +286,7 @@ change it, approved by the owner.
 
 | Primary | Child | Path |
 |---|---|---|
-| Codex | Codex | Native subagent, unchanged |
+| Codex | Codex | Bridge runs `codex exec --ignore-rules`, read-only (child worktree for writes); no native Codex children since 0.8.9 |
 | Codex | Claude | Bridge runs `claude -p` (child worktree for writes) |
 | Claude | Codex | Bridge runs `codex exec` (child worktree for writes) |
 | Claude | Claude | Bridge for writes; the native subagent only for read-only work |
@@ -287,6 +310,9 @@ tests, and a changelog of every change with its evidence.
    observation and policy, so the route replays exactly.
 7. A route never changes after a send.
 
+In G2, step 4 is the routing table's fixed order: headroom only gates admission until G4 adds
+headroom tie-breaking.
+
 ## Parking lot (not needed for the objective)
 
 - Native Windows support and a Windows CI job.
@@ -306,6 +332,12 @@ tests, and a changelog of every change with its evidence.
   exit does not need it, and G4 already owns paired runs, so the explicit paired mode and the
   comparison-run pause it governs now ship with G4. Until then, paired tests are run by hand and
   logged as before.
+- **Every Codex child is bridged (decided in the v1 hardening):** a native Codex child shared the
+  Codex primary's session and its command rule, so every Codex child now runs through the bridge
+  with `--ignore-rules`. Codex routes that need write access wait for G3.
+- **Codex primary network (as shipped):** a project opts in with
+  `codex_primary_may_bridge_to_claude`, and only Codex sessions started with the opt-in
+  `codex -p orchestrator` profile get sandbox network. See the [G2 design](g2-design.md).
 - **Cost (researched in G4):** the owner expects Codex to use noticeably less allowance than
   Claude for comparable work. Quality stays the first rule; cost decides only between options
   of equivalent quality, once it is measured.

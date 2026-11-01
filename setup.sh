@@ -796,7 +796,7 @@ esac
 if [ ! -t 0 ] || [ ! -t 1 ]; then
   echo "setup.sh is interactive and must run in a terminal (stdin and stdout)." >&2
   echo "The billing attestation is a human step, so it cannot be scripted or piped." >&2
-  echo "Run ./setup.sh from a terminal window. For manual commands, see README.md (Advanced)." >&2
+  echo "Run ./setup.sh from a terminal window. For manual commands, see docs/manual-setup.md." >&2
   exit 2
 fi
 
@@ -1443,7 +1443,7 @@ basic_problem() {
 managed_problem() {
   local dirty
   if ! git_porcelain_ok "$1"; then
-    echo "$(git_helpers_text) Remove those settings from .git/config, or install and commit by hand (README, Advanced)."
+    echo "$(git_helpers_text) Remove those settings from .git/config, or install and commit by hand (docs/manual-setup.md)."
     return 1
   fi
   if ! dirty=$(owner_git changes "$1" .codex .agents .claude 2>"$LOGDIR/changes.err" | tr '\0' '\n'; exit "${PIPESTATUS[0]}"); then
@@ -1469,7 +1469,7 @@ prepare_project_inputs() {
     while :; do
       screen_reset
       begin_step 2
-      body "This project has no operational checks file yet. The installer needs one: it names the exact test and security commands, with their hashes, that operational QA may run. It cannot be guessed. README.md, section 'Advanced: manual setup', has a short recipe to build it (a wrapper script plus two hashes). A future wizard step will generate it; for now it is a manual preparation step."
+      body "This project has no operational checks file yet. The installer needs one: it names the exact test and security commands, with their hashes, that operational QA may run. It cannot be guessed. docs/manual-setup.md, section 'Operational checks', has a short recipe to build it (two wrapper scripts and their hashes). A future wizard step will generate it; for now it is a manual preparation step."
       body "Enter the path to your prepared operational-checks.json (it is copied into the project), or type q to quit."
       ask_text "Path to operational-checks.json" ""
       path=$ANSWER

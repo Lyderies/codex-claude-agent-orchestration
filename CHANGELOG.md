@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0: cross-provider read-only routing (G2)
+## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.9)
 
 - **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
   - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
@@ -141,13 +141,17 @@
     `-I -B -S`; `attest.py` imports only the standard library. The project's CLI runs only after
     its runtime files match this repository's copy byte for byte (same version, no extra
     modules), with `-X pycache_prefix=/dev/null` so a planted `__pycache__` file is never loaded.
+    The owner-side review fixes above later moved every owner command to this repository's own
+    CLI.
   - Git on the project runs with `-c core.hooksPath=/dev/null -c core.fsmonitor=false`
     (`--no-optional-locks` for status); the wizard says its commit skips the project's hooks.
+    Owner-side round 2 above replaced `status`, `add` and `commit` with plumbing.
   - `scripts/install.py remove` first removes the Codex commands rule and its protected runtime
     copy through the project's `remove-codex-rule`; an installed CLI without that command makes
-    it stop and name the rule file to delete. The Commands step now says every Codex session
-    loads the rule, which runs a protected copy, and never to use the home folder's parent or `/`
-    as a Codex workspace.
+    it stop and name the rule file to delete (the owner-side review fixes above later made it run
+    this repository's own `remove-codex-rule` instead). The Commands step now says every Codex
+    session loads the rule, which runs a protected copy, and never to use the home folder's parent
+    or `/` as a Codex workspace.
   - The installer merges Claude Code permission deny rules into `.claude/settings.json` for every
     owner-only CLI subcommand (the parser's commands minus the 23 primary-host ones) and `Edit`
     rules for `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`, keeping user
@@ -169,8 +173,8 @@
     deadline watchdog verifies the child's identity before the run continues and tracks the
     tree too. A process that detaches between snapshots is left running in the sandbox rather
     than risk killing an unrelated one.
-  - Native Codex children share the primary's session and its command rule; the design's
-    residual risks and the Codex skill now say so.
+  - Native Codex children shared the primary's session and its command rule; the design's
+    residual risks and the Codex skill said so until 0.8.9 bridged every Codex child.
 - **Setup wizard retry.** A wrong owner-key passphrase no longer stops `scripts/attest.py`: it says
   "That passphrase did not unlock the key." and offers Try again or Exit, for the key check, the
   signing and the passphrase change (other failures still stop). In `setup.sh`, no failed step
@@ -183,7 +187,8 @@
   route's provider, model and effort.
 - **Codex agent paths bind (0.8.7).** Codex 0.164 names a spawned child by its agent path
   (for example `/root/<task_name>`); `learning-bind-host-agent` accepts slash-separated paths of
-  the same bounded tokens, and the Codex skill says to bind that path.
+  the same bounded tokens, and the Codex skill said to bind that path. Since 0.8.9 a Codex
+  primary spawns no native children, so the Codex skill no longer binds one.
 - **Setup wizard polish.**
   - The commit step lists and commits only files that really changed; with none it says
     "Nothing to commit" and skips the question. An existing install is described as an update.
@@ -219,7 +224,8 @@
   - a per-account run-count cap.
 
   Billing, headroom and bootstrap evidence apply account-wide, across projects.
-- **Dispatch bridge.** Starts the other provider's client for a read-only child.
+- **Dispatch bridge.** Starts a provider's client for a read-only child: the other provider's,
+  and since 0.8.9 every Codex child, from either primary.
   - The workspace holds only the committed bytes of granted paths.
   - The Claude profile is locked.
   - The Codex profile is locked: account connectors, web search, image generation and goals are
@@ -238,15 +244,15 @@
   `codex_credits_spending_disabled: true`, which lets a reading of credits that are not unlimited
   be admitted, at admission and at the launch re-check. `unlimited` credits still deny.
   `spendControlReached` is now recorded and denies as `codex_spend_control_reached`.
-- **Package version.** The Codex package is now 0.8.0. It had kept the imported 0.7.2, so an existing
+- **Package version.** The Codex package moved to 0.8.0. It had kept the imported 0.7.2, so an existing
   collector authorized for 0.7.2 refused the changed build as a conflict instead of upgrading.
 - **Release guard.** A collector authorizes exactly one build per package version, so every runtime
   change needs a version bump. `packages/codex-agents/runtime-releases.json` records the runtime digest
-  for each version, and a test fails when the code changes without a new version and entry. The
-  package is now 0.8.1.
+  for each version, and a test fails when the code changes without a new version and entry. This
+  was 0.8.1.
 - **Collector bytecode.** The detached learning collector runs in isolated mode, which ignores
   `PYTHONDONTWRITEBYTECODE`, so it wrote `__pycache__` into the project's managed `.codex/` paths.
-  It now starts with `-B`. The package is 0.8.2.
+  It now starts with `-B`. This was 0.8.2.
 - **CI.** The checkout and Python setup actions move to releases that run on Node 24.
 - **Verifier handoff and lifecycle fixes (0.8.3).** A verification task may set
   `verification_for_outcome` to the worker's `host_outcome_digest`; the router checks it is
@@ -288,11 +294,14 @@
   result template and the bridged child's prompt state one evidence entry per criterion,
   at its most severe outcome, so neither a child nor a repair can soften a `fail`. The
   orchestration report's `runs.native_agent_bound` is now `agent_bound`, because it counts
-  bridged runs too.
+  bridged runs too. 0.8.9 replaced the project `cli.py` in the rule with an owner-only protected
+  copy and added `-X pycache_prefix=/dev/null` to every Python launched outside the sandbox.
 
 Security: two whole-release reviews by two vendors, over two rounds, found 14 defects; all were
-fixed. A separate review of the Codex lockdown narrowed the reviewed Codex client range to the
-build where containment was shown live.
+fixed. Two further whole-release reviews of the v1 candidate returned NO-GO; their findings are
+fixed in the G2 v1 runtime hardening and the owner-side entries above. A separate review of the
+Codex lockdown narrowed the reviewed Codex client range to the build where containment was shown
+live.
 
 ## 0.1.0: import and one-command install (G1)
 

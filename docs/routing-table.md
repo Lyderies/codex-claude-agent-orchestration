@@ -1,7 +1,10 @@
 # Routing table
 
 This is the living starting table the orchestrator routes by. It starts as a set of researched
-hypotheses and changes only when recorded evidence justifies it. Every change is logged below.
+hypotheses and changes only when recorded evidence justifies it. Every change is logged below. The
+routing policy (`config/routing-policy.json`, policy v5) lists the same order as ordered provider
+candidates, and a test in `packages/codex-agents/tests/test_routing.py` holds the policy to this
+table, so a row change needs the same change in the policy and that test.
 
 The rule is **quality first, then usage cost per finished task, then quota headroom, then speed**.
 
@@ -9,7 +12,8 @@ The rule is **quality first, then usage cost per finished task, then quota headr
 - Where quality is tied or unproven, the option that is cheaper per task wins. That is usually
   Codex, because GPT-6 models use 5–13x fewer tokens per task. At API list prices the matched tiers
   cost the same per token: Luna and Haiku, Sol and Sonnet.
-- When two options are still close, the task goes to whichever subscription has more headroom.
+- When two options are still close, headroom will decide once G4 adds headroom tie-breaking. Until
+  then the table's order decides, and headroom only gates admission.
 
 ## Current table
 
@@ -17,6 +21,7 @@ Effort is always passed explicitly and set per provider.
 
 - Codex's `ultra` level is never used, because it starts its own subagents.
 - `max` is never chosen automatically.
+- In v1 every child runs read-only, including on coding rows; children that edit files arrive with G3.
 
 Usage figures are estimates:
 
@@ -28,7 +33,7 @@ Usage figures are estimates:
 |---|---|---|---|---|---|---|
 | Routine planning | GPT-6.1 Sol (high), plan reviewed by Opus 5.5 (medium) | Opus 5.5 (medium) | Ambiguous, architectural or irreversible plan: use the next row | Sol high 3–14% Plus | 4–12 | Low |
 | Ambiguous or architectural planning | Opus 5.5 (medium; high if irreversible), with a time budget | GPT-6.1 Sol (high) | Astra (high) reviews irreversible plans; Fable (high) consults on architecture nobody can check by inspection | 0.4–2.7% Max 5x | 4–17 | Low |
-| Single scoped coding (clear criteria, automated check) | GPT-6.1 Sol (medium) **and** Sonnet 5.5 (medium) as joint first choices, picked by headroom and run as paired tests | Haiku 5.5 (high) for a few named files under 100K context | Opus 5.5 (medium) after one failed check, or at once if the task proves ambiguous | Sol 1–2% Plus; Sonnet under 0.6% Max 5x | 2–6 | Low–medium |
+| Single scoped coding (clear criteria, automated check) | GPT-6.1 Sol (medium), then Sonnet 5.5 (medium), in that order until G4 adds headroom tie-breaking and paired evidence | Haiku 5.5 (high) for a few named files under 100K context | Opus 5.5 (medium) after one failed check, or at once if the task proves ambiguous | Sol 1–2% Plus; Sonnet under 0.6% Max 5x | 2–6 | Low–medium |
 | Substantial multi-file coding and debugging | Opus 5.5 (medium; high for unknown-cause bugs or a retry) | GPT-6.1 Sol (high) behind the full test suite; Sonnet 5.5 (medium) for fully specified migrations | Astra (high, then xhigh) after one failed attempt per vendor; Fable (high) last | Opus 1–9% Max 5x; Sol high 13–50% Plus | 20–60 | Medium |
 | Mechanical edit (agentic) | Haiku 5.5 (medium) | GPT-6.1 Sol (low) | None; two failed checks reclassify it as scoped coding | Under 0.1% Max 5x; Sol about 1% Plus | 0.5–3 | Medium |
 | Non-agentic transform (text, messages, formatting) | GPT-6 Luna (high), behind a deterministic check | Haiku 5.5 (medium) | None | About 0.05–0.2% Plus | Under 1 | Low |
