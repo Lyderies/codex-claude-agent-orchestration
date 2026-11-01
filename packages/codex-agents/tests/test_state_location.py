@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -19,10 +20,13 @@ from pathlib import Path
 from unittest import mock
 
 from tests.support import ORCHESTRATION_ROOT
+from tests.learning_support import generate_test_owner_key
 
 from codex_agents import host_paths, learning_store
+from codex_agents.host_paths import STATE_PARENT_UNSAFE, XDG_STATE_REFUSED
 from codex_agents.learning_store import (
     BOTH_STATES,
+    LINKED_STATE,
     STATE_MOVE_FAILED,
     STATE_SOCKET_TOO_LONG,
     UNMOVED_STATE,
@@ -40,8 +44,6 @@ from codex_agents.learning_store import (
 from cli import main as cli_main
 
 CLI = ORCHESTRATION_ROOT / "cli.py"
-
-
 _REAL_ACCOUNT = pwd.getpwuid(os.getuid())
 
 
@@ -51,7 +53,7 @@ def _account(home: Path) -> pwd.struct_passwd:
 
 
 class DefaultStateRootTests(unittest.TestCase):
-    """The default learning state comes from the account database, on every platform."""
+    """The default learning state: the account database's home, or a hidden XDG folder."""
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -62,13 +64,26 @@ class DefaultStateRootTests(unittest.TestCase):
         self.other = self.base / "other-home"
         self.other.mkdir()
 
-    def resolve(self, platform: str, **environ: str) -> tuple[Path, Path | None]:
+    @contextlib.contextmanager
+    def environment(self, platform: str = sys.platform, **environ: str):
         environment = {k: v for k, v in os.environ.items() if k != "XDG_STATE_HOME"}
         environment.update(HOME=str(self.other), **environ)
         with mock.patch.object(host_paths.pwd, "getpwuid", lambda _uid: _account(self.account)), \
                 mock.patch.object(host_paths.sys, "platform", platform), \
                 mock.patch.dict(os.environ, environment, clear=True):
+            yield
+
+    def resolve(self, platform: str = sys.platform, **environ: str) -> tuple[Path, Path | None]:
+        with self.environment(platform, **environ):
             return default_state_root(), host_paths.legacy_state_root()
+
+    def assert_xdg_refused(self, value: str) -> None:
+        with self.environment(XDG_STATE_HOME=value):
+            with self.assertRaises(StateError) as caught:
+                default_state_root()
+            self.assertEqual(XDG_STATE_REFUSED, str(caught.exception))
+            with self.assertRaises(StateError):
+                LearningState()
 
     def test_macos_and_linux_use_the_account_homes_local_state(self) -> None:
         for platform in ("darwin", "linux"):
@@ -77,13 +92,62 @@ class DefaultStateRootTests(unittest.TestCase):
                 # Never the overridden HOME, and the same hidden folder on both.
                 self.assertEqual(self.account / ".local" / "state" / "codex-agents", default)
 
-    def test_xdg_state_home_is_honoured_when_absolute(self) -> None:
+    def test_a_hidden_xdg_folder_in_home_is_accepted(self) -> None:
+        # How the tests isolate a scratch home: HOME and XDG_STATE_HOME under it.
         for platform in ("darwin", "linux"):
             with self.subTest(platform=platform):
-                default, _ = self.resolve(platform, XDG_STATE_HOME=str(self.base / "xdg"))
-                self.assertEqual(self.base / "xdg" / "codex-agents", default)
-                default, _ = self.resolve(platform, XDG_STATE_HOME="relative/state")
-                self.assertEqual(self.account / ".local" / "state" / "codex-agents", default)
+                default, _ = self.resolve(
+                    platform, XDG_STATE_HOME=str(self.other / ".local" / "state")
+                )
+                self.assertEqual(self.other / ".local" / "state" / "codex-agents", default)
+        # A relative value is ignored, as the XDG specification says.
+        default, _ = self.resolve(XDG_STATE_HOME="relative/state")
+        self.assertEqual(self.account / ".local" / "state" / "codex-agents", default)
+
+    def test_a_non_hidden_or_outside_xdg_folder_is_refused(self) -> None:
+        for value in (
+            self.other / "State",  # a folder a permitted session may be opened on
+            self.other / ".local",  # the hidden folder itself, not inside it
+            self.base / "elsewhere" / ".state" / "x",  # outside HOME
+            self.account / ".local" / "state",  # the account home is not HOME here
+            self.other,
+        ):
+            with self.subTest(value=value):
+                self.assert_xdg_refused(str(value))
+        with self.environment(XDG_STATE_HOME=str(self.other / ".local" / "state")), \
+                mock.patch.dict(os.environ, {"HOME": "relative"}):
+            with self.assertRaisesRegex(StateError, "XDG_STATE_HOME must be inside"):
+                default_state_root()
+
+    def test_a_symlinked_xdg_folder_is_refused(self) -> None:
+        real = self.other / ".real-local"
+        (real / "state").mkdir(parents=True)
+        (self.other / ".local").symlink_to(real)
+        self.assert_xdg_refused(str(self.other / ".local" / "state"))
+        # Also a link further down, and one written through a symlinked HOME.
+        (self.other / ".data").mkdir()
+        (self.other / ".data" / "state").symlink_to(real / "state")
+        self.assert_xdg_refused(str(self.other / ".data" / "state"))
+
+    def test_unsafe_folders_above_the_state_are_refused(self) -> None:
+        local = self.account / ".local"
+        local.mkdir(mode=0o700)
+        os.chmod(local, 0o777)
+        with self.environment():
+            with self.assertRaises(StateError) as caught:
+                LearningState()
+            self.assertEqual(STATE_PARENT_UNSAFE, str(caught.exception))
+        os.chmod(local, 0o755)
+        (local / "state").symlink_to(self.base / "elsewhere")
+        with self.environment(), self.assertRaisesRegex(StateError, "symbolic link"):
+            default_state_root()
+
+    def test_missing_folders_above_the_state_are_created_owner_only(self) -> None:
+        with self.environment():
+            state = LearningState()
+        self.assertEqual(self.account / ".local" / "state" / "codex-agents", state.root)
+        for folder in (self.account / ".local", self.account / ".local" / "state", state.root):
+            self.assertEqual(0, stat.S_IMODE(folder.stat().st_mode) & 0o077, folder)
 
     def test_only_macos_has_an_old_state_folder(self) -> None:
         _default, legacy = self.resolve("darwin")
@@ -92,16 +156,71 @@ class DefaultStateRootTests(unittest.TestCase):
         self.assertIsNone(self.resolve("linux")[1])
 
 
+class HardLinkTests(unittest.TestCase):
+    """No state file may have a second hard link that something else could write."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(os.path.realpath(self.temporary.name))
+        self.state = LearningState(self.base / "state")
+        _key, public = generate_test_owner_key(self.base)
+        self.state.install_owner_public_key(public)
+
+    def test_a_hard_linked_signer_or_key_is_refused(self) -> None:
+        self.state.owner_allowed_signers()
+        os.link(self.state.allowed_signers_path, self.base / "linked-signer")
+        with self.assertRaisesRegex(StateError, "hard link|unsafe"):
+            self.state.owner_allowed_signers()
+        os.unlink(self.base / "linked-signer")
+        self.state.owner_allowed_signers()
+        os.link(self.state.key_path, self.base / "linked-key")
+        with self.assertRaisesRegex(StateError, "hard link|unsafe"):
+            self.state.digest_key()
+
+
+class OversizedSignerTests(unittest.TestCase):
+    """The allowed-signers file is checked whole: ssh-keygen reads every line."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(os.path.realpath(self.temporary.name))
+        _key, public = generate_test_owner_key(self.base)
+        self.content = self.oversized(public)
+
+    @staticmethod
+    def oversized(public: str) -> bytes:
+        # A first line that matches the canonical form and is exactly 4097 bytes,
+        # then a second, real key line.
+        prefix = b"codex-agents-owner ssh-ed25519 "
+        first = prefix + b"A" * (4096 - len(prefix)) + b"\n"
+        assert len(first) == 4097
+        kind, key = public.split()[:2]
+        return first + f"codex-agents-owner {kind} {key}\n".encode("ascii")
+
+    def test_an_over_long_first_line_hiding_a_second_key_is_refused(self) -> None:
+        state = LearningState(self.base / "state")
+        state.allowed_signers_path.write_bytes(self.content)
+        with self.assertRaisesRegex(StateError, "exactly one owner key"):
+            state.owner_allowed_signers()
+        # The old check passed on the first 4097 bytes alone.
+        self.assertIsNotNone(
+            learning_store.OWNER_SIGNER_LINE.fullmatch(self.content[:4097])
+        )
+
+
 class LegacyStateMoveTests(unittest.TestCase):
-    """The one-time, owner-driven move of the pre-0.8.9 macOS state folder."""
+    """The one-time, owner-driven copy of the pre-0.8.9 macOS state folder."""
 
     def setUp(self) -> None:
         # Short: the collector's socket path is limited to about 100 bytes.
         self.base = Path(tempfile.mkdtemp(prefix="mv-", dir=os.path.realpath("/tmp")))
         self.addCleanup(shutil.rmtree, self.base, True)
         self.home = self.base / "h"
+        self.home.mkdir()
         self.legacy = self.home / "Library" / "Application Support" / "codex-agents"
-        self.target = self.base / "x" / "codex-agents"
+        self.target = self.home / ".local" / "state" / "codex-agents"
         self.project = self.base / "p"
         self.project.mkdir()
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
@@ -137,6 +256,13 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.legacy.parent.mkdir(parents=True)
         state = LearningState(self.legacy)
         authorize_collector_runtime(state, CLI)
+        _key, public = generate_test_owner_key(self.base)
+        state.install_owner_public_key(public)
+        # The installer's records live here too; a large file is copied in chunks.
+        installer = state.root / "installer"
+        installer.mkdir(mode=0o700)
+        (installer / "claude-settings-0123.json").write_bytes(b"x" * 3_000_000)
+        os.chmod(installer / "claude-settings-0123.json", 0o600)
         if register:
             ledger = LearningLedger(state)
             try:
@@ -153,6 +279,14 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.assertEqual(expected, code, stdout.getvalue())
         return json.loads(stdout.getvalue())
 
+    def moved_aside(self) -> list[Path]:
+        return sorted(self.legacy.parent.glob("codex-agents.moved-*"))
+
+    def assert_nothing_staged(self) -> None:
+        parent = self.target.parent
+        self.assertEqual([], list(parent.glob(".codex-agents.staging-*")) if parent.exists() else [])
+        self.assertFalse(os.path.lexists(self.target))
+
     def test_only_the_old_folder_refuses_every_other_use(self) -> None:
         self.old_state()
         for create in (True, False):
@@ -167,32 +301,45 @@ class LegacyStateMoveTests(unittest.TestCase):
         # An explicitly named state root is not the default and is not checked.
         LearningState(self.legacy, create=False)
 
-    def test_registration_stops_the_collector_then_moves_the_folder(self) -> None:
+    def test_registration_stops_the_collector_copies_and_sets_the_old_folder_aside(self) -> None:
         state = self.old_state()
         ensure_collector(state, CLI, project_root=self.project)
         CollectorClient(self.legacy / "collector.sock").health()
-        before = (self.legacy / "digest.key").read_bytes()
-        real_rename = os.rename
-        renamed: list[bool] = []
+        before = {
+            name: (self.legacy / name).read_bytes()
+            for name in ("digest.key", "owner-allowed-signers", "collector-authorization.json")
+        }
+        old_inode = os.stat(self.legacy / "owner-allowed-signers").st_ino
+        real_backup = learning_store._backup_state_database
+        stopped: list[bool] = []
 
-        def checking_rename(source, destination, *args, **kwargs):
-            if Path(source) == self.legacy:
-                # The old collector answers no more when the folder moves.
-                with self.assertRaises(CollectorError):
-                    CollectorClient(self.legacy / "collector.sock", timeout=0.2).health()
-                renamed.append(True)
-            return real_rename(source, destination, *args, **kwargs)
+        def checking_backup(old, staged):
+            # The old collector answers no more when the ledger is copied.
+            with self.assertRaises(CollectorError):
+                CollectorClient(self.legacy / "collector.sock", timeout=0.2).health()
+            stopped.append(True)
+            return real_backup(old, staged)
 
-        with mock.patch.object(learning_store.os, "rename", checking_rename):
+        with mock.patch.object(learning_store, "_backup_state_database", checking_backup):
             report = self.run_cli("learning-register", "--project-root", str(self.project))
-        self.assertEqual([True], renamed)
+        self.assertEqual([True], stopped)
         self.assertTrue(report["ready"])
-        self.assertTrue(report["state_moved"])
+        # The old folder is renamed aside, inert, and the report names it.
+        aside = self.moved_aside()
+        self.assertEqual(1, len(aside))
+        self.assertEqual(str(aside[0]), report["state_moved"])
+        self.assertRegex(aside[0].name, r"^codex-agents\.moved-\d{8}T\d{6}Z$")
         self.assertFalse(os.path.lexists(self.legacy))
-        # The same state, owner-only, now at the default folder, with the
-        # collector running there.
-        self.assertEqual(before, (self.target / "digest.key").read_bytes())
+        # The same state, in fresh files, owner-only, with the collector running there.
+        for name, content in before.items():
+            self.assertEqual(content, (self.target / name).read_bytes(), name)
+        self.assertNotEqual(old_inode, os.stat(self.target / "owner-allowed-signers").st_ino)
+        self.assertEqual(
+            3_000_000,
+            (self.target / "installer" / "claude-settings-0123.json").stat().st_size,
+        )
         self.assertEqual(0o700, stat.S_IMODE(self.target.stat().st_mode))
+        self.assertEqual([], list(self.target.parent.glob(".codex-agents.staging-*")))
         moved = LearningState()
         self.assertEqual(self.target, moved.root)
         # The registration the old ledger held is still there.
@@ -200,7 +347,93 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.assertEqual([self.project.resolve()], registered_project_roots())
         # Only once: a later registration finds the new folder alone.
         again = self.run_cli("learning-register", "--project-root", str(self.project))
-        self.assertFalse(again["state_moved"])
+        self.assertIsNone(again["state_moved"])
+
+    def test_a_descriptor_held_before_the_move_cannot_change_the_new_signer(self) -> None:
+        self.old_state(register=False)
+        held = os.open(self.legacy / "owner-allowed-signers", os.O_WRONLY)
+        self.addCleanup(os.close, held)
+        aside = migrate_legacy_state(CLI, self.project)
+        before = (self.target / "owner-allowed-signers").read_bytes()
+        os.lseek(held, 0, os.SEEK_SET)
+        os.write(held, b"codex-agents-owner ssh-ed25519 AAAAattacker\n")
+        self.assertEqual(before, (self.target / "owner-allowed-signers").read_bytes())
+        LearningState().owner_allowed_signers()
+        # The write landed in the inert old copy only.
+        self.assertIn(b"attacker", (aside / "owner-allowed-signers").read_bytes())
+
+    def test_a_hard_linked_old_file_refuses_and_changes_nothing(self) -> None:
+        self.old_state(register=False)
+        planted = self.base / "project-link"
+        os.link(self.legacy / "owner-allowed-signers", planted)
+        with self.assertRaises(StateError) as caught:
+            migrate_legacy_state(CLI, self.project)
+        self.assertEqual(LINKED_STATE, str(caught.exception))
+        self.assert_nothing_staged()
+        self.assertTrue(os.path.lexists(self.legacy))
+        self.assertEqual([], self.moved_aside())
+        os.unlink(planted)
+        # A symlink or a special file in the old folder refuses the same way.
+        (self.legacy / "artifacts" / "planted").symlink_to(self.base / "elsewhere")
+        with self.assertRaisesRegex(StateError, "second hard link, a symbolic link"):
+            migrate_legacy_state(CLI, self.project)
+        self.assert_nothing_staged()
+
+    def test_an_old_signer_with_an_over_long_first_line_is_not_copied(self) -> None:
+        state = self.old_state(register=False)
+        attacker = self.base / "attacker"
+        attacker.mkdir()
+        _key, public = generate_test_owner_key(attacker)
+        state.allowed_signers_path.write_bytes(OversizedSignerTests.oversized(public))
+        with self.assertRaisesRegex(StateError, "did not pass its checks"):
+            migrate_legacy_state(CLI, self.project)
+        self.assert_nothing_staged()
+        self.assertTrue(os.path.lexists(self.legacy))
+        self.assertEqual([], self.moved_aside())
+
+    def test_a_failed_copy_removes_the_staging_folder_and_keeps_the_old_one(self) -> None:
+        self.old_state()
+
+        def disk_full(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        for patched in ("_copy_state_file", "_backup_state_database"):
+            with self.subTest(step=patched), \
+                    mock.patch.object(learning_store, patched, disk_full):
+                with self.assertRaises(StateError) as caught:
+                    migrate_legacy_state(CLI, self.project)
+                self.assertEqual(STATE_MOVE_FAILED, str(caught.exception))
+                self.assert_nothing_staged()
+                self.assertTrue(os.path.lexists(self.legacy))
+                self.assertEqual([], self.moved_aside())
+        # A copy that fails its checks is removed the same way.
+        with mock.patch.object(
+            learning_store.LearningState, "owner_allowed_signers",
+            side_effect=StateError("owner allowed-signers must name exactly one owner key"),
+        ):
+            with self.assertRaisesRegex(StateError, "did not pass its checks"):
+                migrate_legacy_state(CLI, self.project)
+        self.assert_nothing_staged()
+        # Setting the old folder aside fails: the published copy is taken back.
+        real_rename = os.rename
+
+        def refuse_aside(source, destination, *args, **kwargs):
+            if Path(source) == self.legacy:
+                raise OSError(errno.EACCES, "permission denied")
+            return real_rename(source, destination, *args, **kwargs)
+
+        with mock.patch.object(learning_store.os, "rename", refuse_aside):
+            with self.assertRaises(StateError):
+                migrate_legacy_state(CLI, self.project)
+        self.assert_nothing_staged()
+        self.assertTrue(os.path.lexists(self.legacy))
+        # And afterwards the move still works.
+        self.assertIsNotNone(migrate_legacy_state(CLI, self.project))
+        ledger = sqlite3.connect(self.target / "learning.sqlite3")
+        try:
+            self.assertEqual("ok", ledger.execute("PRAGMA integrity_check").fetchone()[0])
+        finally:
+            ledger.close()
 
     def test_both_folders_refuse(self) -> None:
         self.old_state()
@@ -217,25 +450,12 @@ class LegacyStateMoveTests(unittest.TestCase):
 
     def test_only_the_new_folder_is_normal(self) -> None:
         LearningState(self.target)
-        self.assertFalse(migrate_legacy_state(CLI, self.project))
+        self.assertIsNone(migrate_legacy_state(CLI, self.project))
         self.assertEqual(self.target, LearningState(create=False).root)
         report = self.run_cli("learning-register", "--project-root", str(self.project))
-        self.assertEqual((True, False), (report["ready"], report["state_moved"]))
+        self.assertEqual((True, None), (report["ready"], report["state_moved"]))
 
-    def test_a_move_that_cannot_happen_in_one_step_refuses_and_keeps_the_old_folder(self) -> None:
-        self.old_state(register=False)
-
-        def cross_device(*_args, **_kwargs):
-            raise OSError(errno.EXDEV, "cross-device link")
-
-        with mock.patch.object(learning_store.os, "rename", cross_device):
-            with self.assertRaises(StateError) as caught:
-                migrate_legacy_state(CLI, self.project)
-        self.assertEqual(STATE_MOVE_FAILED, str(caught.exception))
-        self.assertTrue(os.path.lexists(self.legacy))
-        self.assertFalse(os.path.lexists(self.target))
-
-    def test_a_new_folder_too_long_for_the_socket_refuses_before_moving(self) -> None:
+    def test_a_new_folder_too_long_for_the_socket_refuses_before_copying(self) -> None:
         self.old_state(register=False)
         with mock.patch.object(learning_store, "UNIX_SOCKET_PATH_MAX", 20):
             with self.assertRaises(StateError) as caught:
@@ -243,7 +463,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.assertEqual(STATE_SOCKET_TOO_LONG, str(caught.exception))
         self.assertTrue(os.path.lexists(self.legacy))
 
-    def test_an_unsafe_old_folder_is_not_moved(self) -> None:
+    def test_an_unsafe_old_folder_is_not_copied(self) -> None:
         self.old_state(register=False)
         os.chmod(self.legacy, 0o755)
         with self.assertRaisesRegex(StateError, "unsafe permissions"):
@@ -251,7 +471,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.target))
 
     def test_no_old_folder_moves_nothing(self) -> None:
-        self.assertFalse(migrate_legacy_state(CLI, self.project))
+        self.assertIsNone(migrate_legacy_state(CLI, self.project))
         self.assertFalse(os.path.lexists(self.target))
 
 

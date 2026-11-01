@@ -464,8 +464,8 @@ safety comes from redundant layers.
     contains or lies inside `~/.codex` (and so the copy), the orchestrator clone that
     installed the copy (recorded in its binding, format 2), a trusted installation folder,
     any hidden top-level home folder, the learning state as the commands use it
-    (`$XDG_STATE_HOME/codex-agents` or the account's `~/.local/state/codex-agents`, with
-    its `scratch`), or a host-private scratch container (the bridge's
+    (`$XDG_STATE_HOME/codex-agents`, only inside a hidden folder of HOME, or the account's
+    `~/.local/state/codex-agents`, with its `scratch`), or a host-private scratch container (the bridge's
     `codex-agents-scratch` and the owner tools' `agent-orchestration-owner`, in the
     per-user cache folder on macOS or `$XDG_RUNTIME_DIR` on Linux); and a writable
     `special` root or home entry, or one it cannot place.
@@ -501,22 +501,56 @@ safety comes from redundant layers.
   `~/Library/Application Support/codex-agents`, a non-hidden home subtree: a session
   opened on `~/Library` (for a project under it) could write the ledger, the digest key,
   the collector authorization and `owner-allowed-signers`, and same-user modes do not stop
-  that. The default is now `$XDG_STATE_HOME/codex-agents` (absolute values only), else
-  `~/.local/state/codex-agents`, on every platform, with the home folder from the account
-  database, never HOME (`host_paths.default_state_root`). The collector's socket path there
-  is shorter than before.
+  that. The default is now `~/.local/state/codex-agents` on every platform, with the home
+  folder from the account database, never HOME (`host_paths.default_state_root`). The
+  collector's socket path there is shorter than before.
+  - **XDG_STATE_HOME.** An absolute value moves the state to `$XDG_STATE_HOME/codex-agents`
+    only when it is canonical as written (no symbolic link at any component) and lies
+    strictly inside a hidden top-level folder of HOME (such as `~/.local/state`); anything
+    else refuses every command, the guard included: "XDG_STATE_HOME must be inside a hidden
+    folder in your home, such as ~/.local/state; unset it or move it". A value such as
+    `~/State` would put the ledger and the owner's signer in a folder a permitted session
+    may be opened on. A relative value is ignored, as the XDG specification says. The
+    check is anchored on HOME, not the account database, on purpose: HOME is the owner's
+    own environment, which no model sets for a rule-matched command, a hook or an owner
+    tool (an environment-assignment prefix breaks the rule's match), and tests isolate a
+    scratch home with `HOME=<scratch>` and `XDG_STATE_HOME=<scratch>/.local/state`.
+  - **Folders above the state.** Every existing folder between the home folder and the
+    state (`~/.local`, `~/.local/state`) must be a real folder, the owner's and writable by
+    no one else, or every command refuses; missing ones are created owner-only (0700) and
+    checked again before the state itself is created.
+  - **No second hard link.** Every state file the store checks (database and journals,
+    digest key, owner allowed-signers) refuses a link count other than one, and the signer
+    and digest key are also checked on the descriptor they are read from: a hard link in a
+    project would otherwise keep write access to the file. The allowed-signers file must be
+    exactly one canonical line of at most 4096 bytes, read whole (normal use, the staged
+    copy and the move): `ssh-keygen` reads the whole file, so a valid-looking over-long
+    first line must not hide a second key behind the part that was checked.
   - **One-time move.** Only the owner's `learning-register` (the wizard's collector step,
-    run from the clone) moves the old folder. With only the old folder present it checks
+    run from the clone) moves the old folder, and only while it is the only one. It checks
     it (owner-only, no symlink, outside Git), refuses if the new socket path would exceed
-    the AF_UNIX limit (103 bytes on macOS, 107 on Linux), creates the new parent
-    owner-only, stops the running collector and holds its maintenance lock
-    (`CollectorMaintenance`, as for registration), renames the folder in one step on the
-    same volume, checks it again and continues with registration, which re-authorizes and
-    starts the collector at the new folder; `state_moved` reports it. A rename that fails
-    (another disk) refuses with a plain message, keeps the old folder and restarts a
-    collector that was running. Both folders present refuses with a plain message; only
-    the new one is normal. The old folder is found where the old code put it (HOME's
-    `Library/Application Support`).
+    the AF_UNIX limit (103 bytes on macOS, 107 on Linux) and prepares the new parent
+    folders as above. Then, with the collector stopped and its maintenance lock held
+    (`CollectorMaintenance`, as for registration) and the ledger's writer lock taken:
+    - a file with a second hard link, a symbolic link or a special file in the old folder
+      refuses with a plain message, before anything is copied;
+    - every file is copied into fresh inodes (`O_EXCL|O_NOFOLLOW`, 0600, folders 0700) in
+      an owner-only staging folder beside the new location, the ledger through SQLite's
+      backup API page by page (it can be hundreds of megabytes) and checked with
+      `quick_check`; the socket, lock files and transient `scratch` are not copied;
+    - the staged copy passes the usual checks (owner, modes, link count, digest key,
+      signer format, database files) and is renamed into place in one step;
+    - the old folder is renamed beside itself to `codex-agents.moved-<UTC yyyymmddThhmmssZ>`,
+      inert, and `state_moved` names it so the wizard can say it may be deleted.
+
+    A rename keeps the old inodes, so a hard link or a writable descriptor taken on the
+    old files before the move would have kept write access to the new state; the copy
+    leaves those pointing at the old copy only. On any failure the staging folder is
+    removed and the old folder is left as it was (a collector that was running is
+    restarted there); if setting the old folder aside fails, the published copy is taken
+    back. Registration then re-authorizes and starts the collector at the new folder. Both
+    folders present refuses with a plain message; only the new one is normal. The old
+    folder is found where the old code put it (HOME's `Library/Application Support`).
   - **Everything else fails closed.** Any other use of the default state (every command,
     the protected copy, the learning hooks, `learning-configure-owner-key`) refuses while
     only the old folder exists, telling the owner to run `./setup.sh` (collector step), so
@@ -752,7 +786,12 @@ safety comes from redundant layers.
     (verify reports it). Codex re-trusts hooks only by hash, so the owner must re-trust them
     after each render.
   - A session that could write the old macOS state folder before the owner's collector
-    step moved it could have changed that state; the move carries it over as it is.
+    step moved it could have changed that state; the move carries the contents over as
+    they are (in fresh files, so no link or descriptor it kept reaches them).
+  - The old copy (`codex-agents.moved-<time>`, including the old digest key, which is the
+    one the new state keeps using) stays readable where it was until the owner deletes
+    it; the wizard should say so.
+  - The XDG_STATE_HOME check trusts HOME, the owner's environment, as the anchor.
   - The scan is a warning: it follows only records from the last 14 days, and the set-up
     projects it knows are the runtime bindings and the ledger's registrations.
   - The copy is verified against the project and this package's recorded runtime, not

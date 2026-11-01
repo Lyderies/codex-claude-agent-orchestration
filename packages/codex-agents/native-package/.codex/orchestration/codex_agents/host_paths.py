@@ -152,23 +152,112 @@ BRIDGE_SCRATCH_CONTAINER = "codex-agents-scratch"
 OWNER_SCRATCH_CONTAINER = "agent-orchestration-owner"
 
 
-def default_state_root(home: Path | None = None) -> Path:
-    """The owner's learning state: `$XDG_STATE_HOME/codex-agents`, else
-    `~/.local/state/codex-agents`, on every platform.
+XDG_STATE_REFUSED = (
+    "XDG_STATE_HOME must be inside a hidden folder in your home, such as ~/.local/state; "
+    "unset it or move it"
+)
+STATE_PARENT_UNSAFE = (
+    "a folder above the learning state (such as ~/.local or ~/.local/state) is a symbolic "
+    "link, is not a folder, belongs to another user or can be changed by other users; fix "
+    "it, or set XDG_STATE_HOME to another hidden folder in your home"
+)
 
-    The home folder is the account's (from the account database), never HOME. A
-    hidden top-level home folder is where no supported Codex session is opened;
-    the session guard also protects this folder wherever it resolves. Until
-    0.8.9 macOS used `~/Library/Application Support/codex-agents`, a non-hidden
-    home folder that a session opened on `~/Library` could write; see
-    legacy_state_root. A relative XDG_STATE_HOME is ignored, as the XDG
-    specification says.
+
+def _state_location(home: Path | None) -> tuple[Path, Path]:
+    """(state root, the home folder it must lie under), unchecked beyond XDG_STATE_HOME.
+
+    An absolute XDG_STATE_HOME counts only when it is canonical as written (no
+    symbolic link anywhere on it) and lies strictly inside a hidden top-level
+    folder of HOME (such as `~/.local/state`); any other absolute value refuses.
+    HOME, not the account database, anchors that check: the variable is the
+    owner's own environment, which no model sets for a rule-matched command, a
+    hook or an owner tool, and tests isolate a scratch home through both. A
+    relative value is ignored, as the XDG specification says. Without it the
+    state is `~/.local/state/codex-agents` in the account database's home
+    folder (or `home`), never HOME's.
     """
 
     base = os.environ.get("XDG_STATE_HOME")
     if base and os.path.isabs(base):
-        return Path(base) / STATE_FOLDER
-    return (home if home is not None else account_home()) / ".local" / "state" / STATE_FOLDER
+        environment_home = os.environ.get("HOME")
+        written = Path(os.path.normpath(base))
+        if (
+            not environment_home
+            or not os.path.isabs(environment_home)
+            or Path(os.path.realpath(written)) != written
+        ):
+            raise HostPathError(XDG_STATE_REFUSED)
+        anchor = Path(os.path.realpath(environment_home))
+        try:
+            parts = written.relative_to(anchor).parts
+        except ValueError:
+            raise HostPathError(XDG_STATE_REFUSED) from None
+        if len(parts) < 2 or not parts[0].startswith(".") or parts[0] in {".", ".."}:
+            raise HostPathError(XDG_STATE_REFUSED)
+        return written / STATE_FOLDER, anchor
+    anchor = home if home is not None else account_home()
+    return anchor / ".local" / "state" / STATE_FOLDER, anchor
+
+
+def _state_parent_unsafe(info: os.stat_result) -> bool:
+    return (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or bool(info.st_mode & 0o022)
+    )
+
+
+def default_state_root(home: Path | None = None) -> Path:
+    """The owner's learning state: `$XDG_STATE_HOME/codex-agents` (see
+    _state_location), else `~/.local/state/codex-agents`, on every platform.
+
+    A hidden top-level home folder is where no supported Codex session is
+    opened, and the session guard also protects this folder. Every existing
+    folder between the home folder and the state (`~/.local`, `~/.local/state`)
+    must be a real folder, the owner's, writable by no one else. Until 0.8.9
+    macOS used `~/Library/Application Support/codex-agents`, a non-hidden home
+    folder that a session opened on `~/Library` could write; see
+    legacy_state_root. Raises HostPathError with a plain message.
+    """
+
+    root, anchor = _state_location(home)
+    current = anchor
+    for part in root.relative_to(anchor).parts[:-1]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError:
+            raise HostPathError(STATE_PARENT_UNSAFE) from None
+        if _state_parent_unsafe(info):
+            raise HostPathError(STATE_PARENT_UNSAFE)
+    return root
+
+
+def prepare_default_state_root() -> Path:
+    """The default state root, after creating each missing folder above it
+    owner-only (0700) and checking every one (default_state_root's rules)."""
+
+    root, anchor = _state_location(None)
+    default_state_root()
+    current = anchor
+    for part in root.relative_to(anchor).parts[:-1]:
+        current = current / part
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise HostPathError(STATE_PARENT_UNSAFE) from None
+        try:
+            info = os.lstat(current)
+        except OSError:
+            raise HostPathError(STATE_PARENT_UNSAFE) from None
+        if _state_parent_unsafe(info):
+            raise HostPathError(STATE_PARENT_UNSAFE)
+    return root
 
 
 def legacy_state_root() -> Path | None:

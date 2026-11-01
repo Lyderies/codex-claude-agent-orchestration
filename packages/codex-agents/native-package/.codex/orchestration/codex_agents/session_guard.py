@@ -404,9 +404,16 @@ def _forms(path: Path) -> list[Chain]:
 
 def state_folders() -> list[Path]:
     """The owner's learning state as the commands use it (XDG_STATE_HOME or the
-    account's `~/.local/state`), from this module's account home."""
+    account's `~/.local/state`), from this module's account home.
 
-    return [default_state_root(account_home())]
+    An XDG_STATE_HOME outside a hidden home folder, or an unsafe folder above
+    the state, refuses here as it does for every command.
+    """
+
+    try:
+        return [default_state_root(account_home())]
+    except HostPathError as exc:
+        raise SessionRefused(str(exc)) from None
 
 
 def scratch_folders() -> list[Path]:
@@ -647,7 +654,10 @@ def scan_recent_sessions(
     # and as they resolve, compared like the guard compares them.
     homes = [*_forms(home), *_forms(account_home())]
     clones = _forms(clone)
-    state = [default_state_root(account_home())]
+    try:
+        state = [default_state_root(account_home())]
+    except HostPathError:
+        state = []
     legacy = legacy_state_root()
     if legacy is not None and os.path.lexists(legacy):
         state.append(legacy)
