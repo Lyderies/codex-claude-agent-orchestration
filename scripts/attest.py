@@ -9,8 +9,10 @@ Admission requires, per provider account, an owner-signed statement that the acc
 cannot be charged beyond its subscription. This command walks the human owner through
 it. What proves a person signed is the owner key's passphrase: the key is refused unless
 it is encrypted, and signing runs without ssh-agent so a loaded key cannot sign silently.
-The command also insists on an interactive terminal, but that alone does not keep a
-program out; the passphrase does.
+The key is used only from the account's own ~/.ssh folder (the home folder the system account
+database names), checked again before every use, so no other program can swap the file
+between the checks and the signing. The command also insists on an interactive terminal, but
+that alone does not keep a program out; the passphrase does.
 
 The isolation flags, which ./setup.sh always passes, keep anything in the working directory,
 the environment, site-packages or a bytecode cache out of this process; it imports only the
@@ -30,6 +32,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -74,7 +77,12 @@ PYTHON_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
 GETCONF = "/usr/bin/getconf"
 SCRATCH_CONTAINER = "agent-orchestration-owner"
 SCRATCH_BASE: str | None = None  # tests only; the platform's private folder otherwise
+ACCOUNT_HOME: str | None = None  # tests only; the system account database's home otherwise
 MACOS_ADMIN_GROUP = 80
+# This repository's own orchestrator package, fixed to this file's location (a test may point
+# NATIVE_PACKAGE at a stand-in bundle; the code owner tools import never moves with it).
+CLONE_ORCHESTRATION = (Path(__file__).resolve().parents[1] / "packages" / "codex-agents" / "native-package"
+                       / ".codex" / "orchestration")
 
 
 class AttestError(RuntimeError):
@@ -264,12 +272,32 @@ def remove_scratch(path: Path) -> bool:
 # (host_paths.TRUSTED_INSTALL_ROOTS and install_location_problem), loaded by file from this
 # repository's package so owner tools and the runtime decide alike. It imports only the
 # standard library.
-_HOST_PATHS_FILE = (Path(__file__).resolve().parents[1] / "packages" / "codex-agents" / "native-package"
-                    / ".codex" / "orchestration" / "codex_agents" / "host_paths.py")
+_HOST_PATHS_FILE = CLONE_ORCHESTRATION / "codex_agents" / "host_paths.py"
 _HOST_PATHS_SPEC = importlib.util.spec_from_file_location("agent_orchestration_host_paths", _HOST_PATHS_FILE)
 host_paths = importlib.util.module_from_spec(_HOST_PATHS_SPEC)
 _HOST_PATHS_SPEC.loader.exec_module(host_paths)
 UNTRUSTED_PYTHON_ADVICE = "Put a system Python, such as Homebrew's or python.org's, first on PATH"
+
+
+def clone_module(name: str):
+    """A module of this repository's own orchestrator package (``codex_agents.<name>``),
+    imported only when needed, so owner tools decide exactly as the runtime does. Never the
+    project's installed copy: a module loaded from anywhere else is refused."""
+
+    root = str(CLONE_ORCHESTRATION)
+    added = root not in sys.path
+    if added:
+        sys.path.insert(0, root)
+    try:
+        module = importlib.import_module(f"codex_agents.{name}")
+    except Exception as exc:
+        raise AttestError("this setup's own orchestrator package could not be loaded") from exc
+    finally:
+        if added:
+            sys.path.remove(root)
+    if not within(Path(os.path.realpath(module.__file__)), Path(os.path.realpath(root))):
+        raise AttestError("this setup's own orchestrator package could not be loaded")
+    return module
 
 
 def python_location_problem(executable: Path, project: Path | None = None) -> str | None:
@@ -499,12 +527,71 @@ def copy_input(source: Path, destination: Path, limit: int = 1024 * 1024) -> Non
         os.close(out)
 
 
+# --- provider sign-in checks ------------------------------------------------------------
+# ./setup.sh's sign-in checks run each client the way the runtime does: found only on the
+# runtime's trusted search path (providers.trusted_search_path), never the inherited PATH,
+# where an earlier folder a Codex session can write could hold a planted program; its real
+# file checked by the runtime's own rules (providers.resolve_client: no symlink, no component
+# another user can change, outside temporary folders and the project, in a trusted
+# installation folder) before it ever runs; and started with the runtime's minimal client
+# environment (providers.client_environment), a private TMPDIR and working folder, a deadline
+# and a size cap. Only the fixed read-only status command runs.
+CLIENT_COMMANDS = {"codex": ("login", "status"), "claude": ("auth", "status", "--json")}
+CLIENT_TIMEOUT_SECONDS = 15
+CLIENT_OUTPUT_LIMIT = 262_144
+# client-status exit codes: 0 the client said yes, then one per outcome ./setup.sh explains.
+CLIENT_SIGNED_OUT, CLIENT_MISSING, CLIENT_UNTRUSTED, CLIENT_FAILED = 10, 11, 12, 13
+
+
+def client_status(name: str, project: Path | None = None) -> tuple[int, bytes]:
+    """Run one provider client's status command safely; return an exit code and its output."""
+
+    providers = clone_module("providers")
+    if shutil.which(name, path=providers.trusted_search_path()) is None:
+        return CLIENT_MISSING, b""
+    untrusted = [Path(os.path.realpath(project))] if project is not None else []
+    try:
+        executable, _digest = providers.resolve_client(name, untrusted=untrusted)
+    except (providers.ContractError, OSError):
+        return CLIENT_UNTRUSTED, b""
+    scratch = make_scratch("client-")
+    try:
+        try:
+            process = subprocess.Popen(
+                [executable, *CLIENT_COMMANDS[name]], cwd=scratch,
+                env=providers.client_environment(os.environ, scratch),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError:
+            return CLIENT_FAILED, b""
+        try:
+            output, _ = process.communicate(timeout=CLIENT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            return CLIENT_FAILED, b""
+    finally:
+        remove_scratch(scratch)
+    if len(output) > CLIENT_OUTPUT_LIMIT:
+        return CLIENT_FAILED, b""
+    return (0 if process.returncode == 0 else CLIENT_SIGNED_OUT), output
+
+
 def owner_tool(argv: list[str]) -> int:
     """Non-interactive owner checks that ./setup.sh runs; prints only fixed text or a path.
 
     ``scratch PREFIX`` creates a private working folder and prints it; ``check-runtime
     PROJECT`` exits 0 only when the project's installed orchestrator is this repository's
-    copy; ``copy-input SOURCE DESTINATION`` snapshots an owner-chosen input file.
+    copy; ``copy-input SOURCE DESTINATION`` snapshots an owner-chosen input file;
+    ``client-status codex|claude [PROJECT]`` runs that client's sign-in status command as the
+    runtime would (client_status) and exits with its code, printing Claude's JSON for the
+    wizard to parse and nothing for Codex.
     """
 
     try:
@@ -517,6 +604,12 @@ def owner_tool(argv: list[str]) -> int:
         if len(argv) == 3 and argv[0] == "copy-input":
             copy_input(Path(argv[1]), Path(argv[2]))
             return 0
+        if len(argv) in (2, 3) and argv[0] == "client-status" and argv[1] in CLIENT_COMMANDS:
+            code, output = client_status(argv[1], Path(argv[2]) if len(argv) == 3 else None)
+            if argv[1] == "claude":
+                sys.stdout.buffer.write(output)
+                sys.stdout.flush()
+            return code
     except AttestError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -596,16 +689,37 @@ def ssh(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def default_state_root() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "codex-agents"
-    if os.name == "nt":
-        return Path(os.environ.get("LOCALAPPDATA", "")) / "codex-agents"
-    base = os.environ.get("XDG_STATE_HOME")
-    return Path(base) / "codex-agents" if base else Path.home() / ".local/state/codex-agents"
+    """The folder that holds your orchestrator records (the learning state) now, decided by
+    this repository's own package, never a path of its own.
+
+    host_paths.owner_state_root, where the package has it: the pre-0.8.9 macOS folder while
+    it is the only one (the collector step's learning-register moves it once), else the
+    default, so an earlier step (the installer's ownership record) never creates the new
+    folder beside the old one. Otherwise learning_store.default_state_root.
+    """
+
+    try:
+        owner_state_root = getattr(host_paths, "owner_state_root", None)
+        if owner_state_root is not None:
+            return Path(owner_state_root())
+        return Path(clone_module("learning_store").default_state_root())
+    except AttestError:
+        raise
+    except Exception as exc:
+        raise AttestError("the learning state folder cannot be found") from exc
+
+
+def account_home() -> Path:
+    """This account's home folder from the system account database, never from HOME."""
+
+    home = ACCOUNT_HOME if ACCOUNT_HOME is not None else pwd.getpwuid(os.getuid()).pw_dir
+    if not os.path.isabs(home):
+        raise AttestError("your home folder cannot be found in the account database")
+    return Path(os.path.normpath(home))
 
 
 def _expand(text: str) -> Path:
-    return Path.home() / text[2:] if text.startswith("~/") else Path(text)
+    return account_home() / text[2:] if text.startswith("~/") else Path(text)
 
 
 def ask_yes_no(prompt: str) -> bool:
@@ -715,6 +829,61 @@ def check_path_safe(path: Path) -> None:
             raise AttestError("a key path directory is writable by other users")
 
 
+OUTSIDE_SSH = (
+    "the owner key must be a file in your own ~/.ssh folder (such as ~/.ssh/codex-agents-owner). "
+    "A key anywhere else could be swapped by another program between the checks and the "
+    "signing, so it is not used"
+)
+
+
+def ssh_folder() -> Path:
+    """The account's own ~/.ssh, under the home folder the system account database names."""
+
+    return account_home() / ".ssh"
+
+
+def check_key_location(key: Path, *, exists: bool = True) -> None:
+    """Refuse an owner private key outside the account's canonical ~/.ssh; run at every use.
+
+    Enrolment, signing and the passphrase change take a private key only from ~/.ssh (or a
+    folder in it), a folder no agent sandbox can write, so the file checked is the file
+    ssh-keygen opens. No component of the path, from / to the key, may be a symbolic link;
+    ~/.ssh and everything below it must be yours and writable by no one else; the folders
+    above it must belong to you or root and be writable by no one else (a root-owned sticky
+    folder excepted). With `exists` false (a key about to be created) the key and ~/.ssh may
+    be missing; the home folder may not. A refusal never names the path: a mistyped
+    passphrase can look like one.
+    """
+
+    folder = ssh_folder()
+    if not key.is_absolute() or ".." in key.parts or key == folder or not within(key, folder):
+        raise AttestError(OUTSIDE_SSH)
+    uid = os.getuid()
+    current = Path(key.anchor)
+    for part in key.parts[1:]:
+        current = current / part
+        try:
+            info = _lstat(current)
+        except FileNotFoundError:
+            if not exists and within(current, folder):
+                return
+            raise AttestError("that private key file does not exist") from None
+        except OSError as exc:
+            raise AttestError("a key path component could not be checked") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise AttestError("the owner key's path may not pass through symbolic links, so it is not used")
+        writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if within(current, folder):
+            if info.st_uid != uid:
+                raise AttestError("your ~/.ssh folder and the owner key must be owned by you")
+            if writable:
+                raise AttestError("your ~/.ssh folder or the owner key is writable by other users")
+        elif info.st_uid not in (0, uid):
+            raise AttestError("a folder above your ~/.ssh is owned by another user")
+        elif writable and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX and info.st_uid == 0):
+            raise AttestError("a folder above your ~/.ssh is writable by other users")
+
+
 def _split_public(text: str) -> tuple[str, str]:
     fields = text.split()
     if len(fields) < 2:
@@ -736,7 +905,7 @@ def describe_key(key_type: str, blob: str) -> str:
 
 
 def validate_private_key(key: Path) -> None:
-    check_path_safe(key)
+    check_key_location(key)
     try:
         info = key.lstat()
     except OSError as exc:
@@ -797,6 +966,7 @@ def derive_public(key: Path) -> tuple[str, str]:
     """Ask ssh-keygen for the key's public half; it prompts for the passphrase, with retries."""
 
     while True:
+        check_key_location(key)  # again at every use, right before ssh-keygen opens it
         result = ssh(["-y", "-f", str(key)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             return _split_public(result.stdout)
@@ -807,15 +977,25 @@ def derive_public(key: Path) -> tuple[str, str]:
         raise AttestError("could not unlock the private key")
 
 
+def default_key() -> Path:
+    """Where the dedicated owner key is created and looked for first: ~/.ssh/codex-agents-owner
+    under the account database's home folder."""
+
+    return ssh_folder() / "codex-agents-owner"
+
+
 def _create_key(path: Path) -> None:
-    check_path_safe(path.parent)
-    if not path.parent.exists():
-        path.parent.mkdir(mode=0o700, parents=True)
-        check_path_safe(path.parent)
+    check_key_location(path, exists=False)
+    if not os.path.lexists(path.parent):
+        if path.parent != ssh_folder():
+            raise AttestError(OUTSIDE_SSH)
+        os.mkdir(path.parent, 0o700)  # ~/.ssh only; the home folder must already exist
+    check_key_location(path, exists=False)
     for candidate in (path, Path(str(path) + ".pub")):
         if os.path.lexists(candidate):  # also catches dangling symlinks
             raise AttestError("a file already exists where the key would go; choose another key")
     print("ssh-keygen will now ask for a passphrase. Choose one and remember it.")
+    check_key_location(path, exists=False)
     result = ssh(["-t", "ed25519", "-f", str(path), "-C", "codex-agents-owner"])
     if result.returncode != 0:
         raise AttestError("key creation did not finish")
@@ -825,9 +1005,10 @@ def _create_key(path: Path) -> None:
 def choose_new_key() -> Path:
     print(KEY_ADVICE)
     if ask_yes_no(f"Create a dedicated owner key at {DEFAULT_KEY}?"):
-        key = _expand(DEFAULT_KEY)
+        key = default_key()
         _create_key(key)
         return key
+    print("The key must be a file in your own ~/.ssh folder.")
     print("This asks for a file location, not your passphrase. What you type is not shown.")
     entered = read_location("File location of an existing private key (blank to stop): ")
     if not entered:
@@ -949,9 +1130,9 @@ def _default_key_file(configured: tuple[str, str]) -> Path | None:
     needs no passphrase. The full check (deriving the public key) happens afterwards.
     """
 
-    key = _expand(DEFAULT_KEY)
     try:
-        check_path_safe(key)
+        key = default_key()
+        check_key_location(key)
         if not stat.S_ISREG(key.lstat().st_mode):
             return None
     except (AttestError, OSError):
@@ -974,11 +1155,11 @@ def locate_key_file(configured: tuple[str, str]) -> Path:
     if found:
         print(f"Using the owner key file at {key}")
     else:
-        print("Where is the private key file for this owner key?")
+        print("Where is the private key file for this owner key? It must be in your own ~/.ssh folder.")
         print("This asks for a file location, not your passphrase.")
         print("What you type is not shown.")
         entered = read_location(f"Press Enter to use {DEFAULT_KEY}, or type another file location: ")
-        key = _accept_location(entered) if entered else _expand(DEFAULT_KEY)
+        key = _accept_location(entered) if entered else default_key()
     validate_private_key(key)
     if not found:
         print(f"Using the private key file at {key}")  # only after it validated as a key file
@@ -1045,6 +1226,7 @@ def change_passphrase(state_root: Path) -> None:
         raise AttestError("that private key does not match the configured owner key")
     print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
     while True:
+        check_key_location(key)  # again at every use, right before ssh-keygen opens it
         result = ssh(["-p", "-f", str(key)], stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             break
@@ -1208,6 +1390,7 @@ def sign_in_memory(key: Path, payload: bytes) -> bytes:
 
     print("Now sign the statement. Enter your key's passphrase when asked.")
     while True:
+        check_key_location(key)  # again at every use, right before ssh-keygen opens it
         signed = ssh(["-Y", "sign", "-f", str(key), "-n", NAMESPACE], input=payload,
                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         errors = signed.stderr or b""

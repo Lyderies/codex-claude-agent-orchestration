@@ -92,6 +92,8 @@ RUNNER = (
     "spec.loader.exec_module(attest)\n"
     "attest.NATIVE_PACKAGE = Path(sys.argv[2])\n"
     "attest.SCRATCH_BASE = sys.argv[3]\n"
+    "import os\n"
+    "attest.ACCOUNT_HOME = os.environ['HOME']  # the test's home stands in for the account's\n"
     "if sys.argv[4].endswith('+trust'):\n"
     "    attest.host_paths.install_location_problem = lambda path: None\n"
     "if sys.argv[4].startswith('break-echo'):\n"
@@ -309,7 +311,8 @@ class AttestHarness(unittest.TestCase):
         trust_this_interpreter(self)
         for patcher in (mock.patch.object(attest, "check_ssh_keygen"),
                         mock.patch.object(attest, "check_project_runtime"),
-                        mock.patch.object(attest, "SCRATCH_BASE", str(self.scratch_base))):
+                        mock.patch.object(attest, "SCRATCH_BASE", str(self.scratch_base)),
+                        mock.patch.object(attest, "ACCOUNT_HOME", str(self.home))):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -317,10 +320,15 @@ class AttestHarness(unittest.TestCase):
         config = {"version": 1, "providers": {n: {"enabled": v} for n, v in enabled.items()}}
         (self.target / ".codex/orchestration/provider-routing.json").write_text(json.dumps(config))
 
-    def configure_key(self) -> Path:
+    def ssh_dir(self) -> Path:
+        """The test account's ~/.ssh (ACCOUNT_HOME stands in for the account database's home)."""
+
         ssh_dir = self.home / ".ssh"
-        ssh_dir.mkdir(mode=0o700)
-        key = ssh_dir / "codex-agents-owner"
+        ssh_dir.mkdir(mode=0o700, exist_ok=True)
+        return ssh_dir
+
+    def configure_key(self) -> Path:
+        key = self.ssh_dir() / "codex-agents-owner"
         write_key(key)
         (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
         return key
@@ -408,7 +416,7 @@ class AttestTests(AttestHarness):
 
     def test_existing_private_key_path_is_enrolled_from_derived_key(self) -> None:
         self.set_providers(codex=True)
-        other = self.root / "mykey"
+        other = self.ssh_dir() / "mykey"
         write_key(other)
         Path(str(other) + ".pub").write_text(f"ssh-ed25519 AAAAkey {COMMENT}\n")
         self.assertEqual(self.run_main(["n", str(other), "y", "y", "y"]), 0)
@@ -418,7 +426,7 @@ class AttestTests(AttestHarness):
 
     def test_pub_mismatch_is_refused(self) -> None:
         self.set_providers(codex=True)
-        other = self.root / "mykey"
+        other = self.ssh_dir() / "mykey"
         write_key(other)
         Path(str(other) + ".pub").write_text("ssh-ed25519 AAAAdifferent c\n")
         self.assertEqual(self.run_main(["n", str(other)]), 1)
@@ -427,7 +435,7 @@ class AttestTests(AttestHarness):
 
     def test_public_key_file_cannot_be_the_signing_key(self) -> None:
         self.set_providers(codex=True)
-        public = self.root / "mykey.pub"
+        public = self.ssh_dir() / "mykey.pub"
         public.write_text("ssh-ed25519 AAAAkey c\n")
         public.chmod(0o600)
         self.assertEqual(self.run_main(["n", str(public)]), 1)
@@ -466,10 +474,10 @@ class AttestTests(AttestHarness):
 
     def test_missing_default_key_asks_in_words_that_are_not_a_passphrase_prompt(self) -> None:
         (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
-        other = self.home / "elsewhere-key"
+        other = self.ssh_dir() / "elsewhere-key"
         write_key(other)
         self.set_providers(codex=True)
-        self.assertEqual(self.run_main(["~/elsewhere-key", "y", "y", "y"]), 0)
+        self.assertEqual(self.run_main(["~/.ssh/elsewhere-key", "y", "y", "y"]), 0)
         self.assertIn("This asks for a file location, not your passphrase.", self.output)
         self.assertIn("Press Enter to use ~/.ssh/codex-agents-owner", self.prompts[0])
         self.assertNotIn("passphrase:", self.prompts[0].lower())
@@ -812,6 +820,139 @@ class AttestTests(AttestHarness):
 
     def test_normal_home_path_passes(self) -> None:
         attest.check_path_safe(self.configure_key())
+        attest.check_key_location(self.configure_key())
+
+    # owner private keys only from the account's own ~/.ssh
+
+    def no_keygen_ran(self, key: Path | None = None) -> None:
+        """No ssh-keygen call at all, or (with `key`) none that names that key file."""
+
+        calls = [c for c in self.world.calls if "ssh-keygen" in c[0]]
+        self.assertFalse([c for c in calls if key is None or str(key) in c])
+
+    def test_a_private_key_outside_the_account_ssh_folder_is_refused_at_every_use(self) -> None:
+        # A key in a project or temporary folder could be swapped between the checks and the
+        # signing by a model that can write there; none of the key operations accepts one.
+        elsewhere = self.root / "project-keys"
+        elsewhere.mkdir(mode=0o700)
+        key = elsewhere / "owner"
+        write_key(key)
+        self.ssh_dir()
+        sneaky = self.home / ".ssh" / ".." / "project-keys" / "owner"
+        for path in (key, sneaky, self.home / "owner", self.home / ".ssh"):
+            for name, call in (("validate", lambda: attest.validate_private_key(path)),
+                               ("derive", lambda: attest.derive_public(path)),
+                               ("sign", lambda: attest.sign_in_memory(path, b"payload")),
+                               ("create", lambda: attest._create_key(path.parent / "new-key"))):
+                with self.subTest(path=str(path), call=name), \
+                        mock.patch.object(attest.subprocess, "run", self.world.run), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(attest.AttestError, r"own ~/\.ssh folder"):
+                        call()
+        self.no_keygen_ran()
+
+    def test_enrolling_a_typed_key_location_outside_ssh_is_refused_without_echo(self) -> None:
+        self.set_providers(codex=True)
+        other = self.root / "mykey"
+        write_key(other)
+        Path(str(other) + ".pub").write_text(f"ssh-ed25519 AAAAkey {COMMENT}\n")
+        for entered in (str(other), "~/Work/owner-key", "~/.ssh/../mykey"):
+            with self.subTest(entered=entered):
+                self.assertEqual(self.run_main(["n", entered]), 1)
+                self.assertIn("own ~/.ssh folder", self.output)
+                self.assertNotIn(entered, self.output)
+        self.no_keygen_ran()
+        self.assertFalse(any("learning-configure-owner-key" in c for c in self.world.calls))
+
+    def test_the_key_folder_comes_from_the_account_database_not_home(self) -> None:
+        with mock.patch.object(attest, "ACCOUNT_HOME", None), \
+                mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            import pwd
+            expected = Path(os.path.normpath(pwd.getpwuid(os.getuid()).pw_dir))
+            self.assertEqual(attest.account_home(), expected)
+            self.assertEqual(attest.default_key(), expected / ".ssh" / "codex-agents-owner")
+            self.assertEqual(attest._expand("~/.ssh/k"), expected / ".ssh" / "k")
+            # A key under HOME's .ssh is refused when HOME is not the account's home folder.
+            if expected != self.home:
+                with self.assertRaisesRegex(attest.AttestError, r"own ~/\.ssh folder"):
+                    attest.check_key_location(self.configure_key())
+
+    def test_ssh_folder_owner_writability_and_symlinks_are_checked(self) -> None:
+        key = self.configure_key()
+        attest.check_key_location(key)
+        with self._fake_lstat({self.home / ".ssh": (0, stat.S_IFDIR | 0o700)}):
+            with self.assertRaisesRegex(attest.AttestError, "owned by you"):
+                attest.check_key_location(key)
+        for mode in (0o720, 0o702):
+            (self.home / ".ssh").chmod(mode)
+            with self.assertRaisesRegex(attest.AttestError, "writable by other users"):
+                attest.check_key_location(key)
+        (self.home / ".ssh").chmod(0o700)
+        nested = self.home / ".ssh" / "keys"
+        nested.mkdir(mode=0o700)
+        write_key(nested / "owner")
+        attest.check_key_location(nested / "owner")  # a folder inside ~/.ssh is fine
+        real = self.root / "real-keys"
+        real.mkdir(mode=0o700)
+        write_key(real / "owner")
+        linked = self.home / ".ssh" / "linked"
+        linked.symlink_to(real)
+        with self.assertRaisesRegex(attest.AttestError, "symbolic links"):
+            attest.check_key_location(linked / "owner")
+        (self.home / ".ssh" / "key-link").symlink_to(key)
+        with self.assertRaisesRegex(attest.AttestError, "symbolic links"):
+            attest.check_key_location(self.home / ".ssh" / "key-link")
+        # A root-owned link above the home folder is refused too: no symlink anywhere.
+        with self._fake_lstat({self.home: (0, stat.S_IFLNK | 0o777)}):
+            with self.assertRaisesRegex(attest.AttestError, "symbolic links"):
+                attest.check_key_location(key)
+        # A folder above ~/.ssh that others can write.
+        with self._fake_lstat({self.home: (os.getuid(), stat.S_IFDIR | 0o777)}):
+            with self.assertRaisesRegex(attest.AttestError, "above your ~/.ssh is writable"):
+                attest.check_key_location(key)
+
+    def test_the_key_location_is_checked_again_before_signing(self) -> None:
+        # The key passed every check while it was derived; then ~/.ssh is swapped for a link.
+        self.configure_key()
+        self.set_providers(codex=True)
+        real_run = self.world.run
+
+        def swapping(command, **kwargs):
+            result = real_run(command, **kwargs)
+            if command[0] == attest.SSH_KEYGEN and command[1] == "-y" and "-P" not in command:
+                swapped = self.root / "swapped"
+                shutil.copytree(self.home / ".ssh", swapped)
+                shutil.rmtree(self.home / ".ssh")
+                (self.home / ".ssh").symlink_to(swapped)
+            return result
+
+        with mock.patch.object(self.world, "run", swapping):
+            self.assertEqual(self.run_main(["y", "y", "y"]), 1)
+        self.assertIn("symbolic links", self.output)
+        self.assertFalse(any(c[1:3] == ["-Y", "sign"] for c in self.world.calls))
+        self.assertEqual(self.world.recorded, [])
+
+    def test_change_passphrase_refuses_a_key_outside_ssh(self) -> None:
+        (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
+        other = self.root / "mykey"
+        write_key(other)
+        self.assertEqual(self.run_main([str(other)], change=True), 1)
+        self.assertIn("own ~/.ssh folder", self.output)
+        self.assertEqual(self.world.passphrase_changes, [])
+        self.no_keygen_ran(other)
+
+    def test_a_new_key_creates_only_ssh_itself_owner_only(self) -> None:
+        self.set_providers(codex=True)
+        self.assertFalse((self.home / ".ssh").exists())
+        self.assertEqual(self.run_main(["y", "y", "y", "y"]), 0)
+        self.assertEqual((self.home / ".ssh").stat().st_mode & 0o777, 0o700)
+        created = [c for c in self.world.calls if c[:2] == [attest.SSH_KEYGEN, "-t"]]
+        self.assertEqual([c[c.index("-f") + 1] for c in created],
+                         [str(self.home / ".ssh" / "codex-agents-owner")])
+        nested = self.home / ".ssh" / "missing" / "key"
+        with self.assertRaisesRegex(attest.AttestError, r"own ~/\.ssh folder"):
+            attest._create_key(nested)
+        self.assertFalse(nested.parent.exists())
 
     def test_existing_or_dangling_output_files_block_creation(self) -> None:
         self.set_providers(codex=True)
@@ -1099,6 +1240,122 @@ class SignOnlyWhatWasApprovedTests(AttestHarness):
         self.assertEqual(self.run_main(["y", "y", "y", "y"]), 1)
         self.assertIn("does not hold exactly one owner key", self.output)
         self.assertEqual(self.world.grants, {})
+
+
+class ClientStatusTests(unittest.TestCase):
+    """setup.sh's sign-in checks find and run a client only as the runtime would."""
+
+    def setUp(self) -> None:
+        import pwd
+
+        # A hidden top-level folder of the account's home is a trusted installation folder.
+        home = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+        parent = home / ".cache" / "agent-orch-tests"
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.trusted = Path(tempfile.mkdtemp(prefix="clients-", dir=parent))
+        self.addCleanup(shutil.rmtree, self.trusted, True)
+        self.temp = Path(tempfile.mkdtemp(prefix="client-test-")).resolve()
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.record = self.temp / "record"
+        self.marker = self.temp / "planted-ran"
+        # A Codex session opened on ~/Work planted these; the owner's PATH lists them first.
+        planted = self.temp / "Work" / "tools" / "bin"
+        planted.mkdir(parents=True)
+        for name in ("codex", "claude"):
+            self.write(planted / name, f'#!/bin/sh\necho {name} >> "{self.marker}"\nexit 0\n')
+        base = private_base(self)
+        self.scratch = base / attest.SCRATCH_CONTAINER
+        self.search = [str(self.trusted)]
+        providers = attest.clone_module("providers")
+        for patcher in (mock.patch.object(attest, "SCRATCH_BASE", str(base)),
+                        mock.patch.object(providers, "TRUSTED_SEARCH_DIRECTORIES", self.search),
+                        mock.patch.dict(os.environ, {"PATH": f"{planted}:{os.environ['PATH']}",
+                                                     "CODEX_HOME": "/planted/codex-home",
+                                                     "OPENAI_API_KEY": "sk-test", "ANTHROPIC_API_KEY": "sk-test"})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.home = home
+
+    @staticmethod
+    def write(path: Path, text: str) -> None:
+        path.write_text(text)
+        path.chmod(0o755)
+
+    def client(self, name: str, folder: Path | None = None, rc: int = 0, extra: str = "") -> Path:
+        path = (folder or self.trusted) / name
+        self.write(path, f'#!/bin/sh\n{{ echo "ARGS $*"; echo "CWD $(pwd)"; /usr/bin/env; }} > "{self.record}"\n'
+                         f"{extra}echo '{{\"loggedIn\": true, \"subscriptionType\": \"max\"}}'\nexit {rc}\n")
+        return path
+
+    def recorded(self) -> tuple[str, str, dict[str, str]]:
+        lines = self.record.read_text().splitlines()
+        env = dict(line.split("=", 1) for line in lines[2:] if "=" in line)
+        return lines[0][5:], lines[1][4:], env
+
+    def test_the_trusted_client_runs_with_the_runtimes_environment_never_the_path_one(self) -> None:
+        self.client("codex")
+        self.assertEqual(attest.client_status("codex"), (0, self.recorded_output()))
+        args, cwd, env = self.recorded()
+        self.assertEqual(args, "login status")
+        self.assertFalse(self.marker.exists())
+        for name in ("CODEX_HOME", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            self.assertNotIn(name, env)
+        self.assertEqual(env["PATH"], str(self.trusted))
+        self.assertEqual(env["HOME"], str(self.home))
+        self.assertEqual(env["xcrun_nocache"], "1")
+        # A private working folder and TMPDIR, inside the owner's scratch, removed afterwards.
+        self.assertEqual(os.path.realpath(env["TMPDIR"]), os.path.realpath(cwd))
+        self.assertTrue(Path(os.path.realpath(cwd)).is_relative_to(os.path.realpath(self.scratch)))
+        self.assertFalse(Path(cwd).exists())
+        self.client("claude")
+        code, output = attest.client_status("claude")
+        self.assertEqual((code, json.loads(output)["loggedIn"]), (0, True))
+        self.assertEqual(self.recorded()[0], "auth status --json")
+        self.assertFalse(self.marker.exists())
+
+    def recorded_output(self) -> bytes:
+        return b'{"loggedIn": true, "subscriptionType": "max"}\n'
+
+    def test_missing_untrusted_and_signed_out_clients(self) -> None:
+        self.assertEqual(attest.client_status("codex"), (attest.CLIENT_MISSING, b""))
+        # In a temporary folder: refused before it ever runs.
+        untrusted = self.temp / "untrusted-bin"
+        untrusted.mkdir()
+        self.client("codex", untrusted)
+        self.search[:] = [str(untrusted)]
+        self.assertEqual(attest.client_status("codex"), (attest.CLIENT_UNTRUSTED, b""))
+        self.assertFalse(self.record.exists())
+        # Inside the project: refused too.
+        self.search[:] = [str(self.trusted)]
+        self.client("codex")
+        self.assertEqual(attest.client_status("codex", self.trusted), (attest.CLIENT_UNTRUSTED, b""))
+        self.assertFalse(self.record.exists())
+        # A symlink on the search path into a writable folder is refused, never run.
+        (self.trusted / "codex").unlink()
+        (self.trusted / "codex").symlink_to(untrusted / "codex")
+        self.assertEqual(attest.client_status("codex"), (attest.CLIENT_UNTRUSTED, b""))
+        self.assertFalse(self.record.exists())
+        (self.trusted / "codex").unlink()
+        self.client("codex", rc=1)
+        self.assertEqual(attest.client_status("codex")[0], attest.CLIENT_SIGNED_OUT)
+        self.assertFalse(self.marker.exists())
+
+    def test_a_client_that_hangs_is_stopped(self) -> None:
+        self.client("codex", extra="exec /bin/sleep 30\n")
+        with mock.patch.object(attest, "CLIENT_TIMEOUT_SECONDS", 1):
+            self.assertEqual(attest.client_status("codex"), (attest.CLIENT_FAILED, b""))
+
+    def test_owner_tool_prints_only_claudes_json(self) -> None:
+        for name, printed in (("codex", b""), ("claude", self.recorded_output())):
+            self.client(name)
+            stream = io.TextIOWrapper(io.BytesIO())
+            with self.subTest(client=name), contextlib.redirect_stdout(stream):
+                self.assertEqual(attest.owner_tool(["client-status", name]), 0)
+            stream.flush()
+            self.assertEqual(stream.buffer.getvalue(), printed)
+        for argv in (["client-status", "bash"], ["client-status"], ["client-status", "codex", "a", "b"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(attest.owner_tool(argv), 2)
 
 
 class OwnerScratchTests(unittest.TestCase):

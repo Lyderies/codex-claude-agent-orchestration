@@ -61,7 +61,7 @@ python3 -I -B -S -X pycache_prefix=/dev/null scripts/install.py verify --target 
 
 Commit the installed files in the project, including `.claude/settings.json`, which now holds Claude Code
 deny rules for the owner-only commands (an earlier version's `.claude/agent-orchestration-permissions.json`
-is migrated to your learning state and deleted). If you commit by hand, skip the project's hooks:
+is migrated to your orchestrator records and deleted). If you commit by hand, skip the project's hooks:
 `git -c core.hooksPath=/dev/null -c core.fsmonitor=false commit ...`. The wizard itself commits with Git
 plumbing only, and stops when the project's settings name a program Git would start.
 
@@ -95,7 +95,10 @@ python3 -I -B -S -X pycache_prefix=/dev/null "$CLI" learning-register --project-
 python3 -I -B -S -X pycache_prefix=/dev/null "$CLI" learning-status --project-root /path/to/project
 ```
 
-One collector is shared by every project on the machine.
+One collector is shared by every project on the machine. Your orchestrator records (the learning state)
+live in `~/.local/state/codex-agents`, or `$XDG_STATE_HOME/codex-agents`; on macOS, the first
+`learning-register` after this update moves them there from `~/Library/Application Support/codex-agents`
+and reports `"state_moved": true`.
 
 ## 4. Attest billing
 
@@ -107,9 +110,11 @@ python3 -I -B -S -X pycache_prefix=/dev/null scripts/attest.py --target /path/to
 
 No child runs until you confirm that each account cannot be charged beyond its subscription.
 
-- It creates the owner key at `~/.ssh/codex-agents-owner` if you have none. Keys without a passphrase are
-  refused, and signing runs without `ssh-agent`, so no program, including an AI agent, can sign in your
-  name. The owner key record must hold exactly one key.
+- It creates the owner key at `~/.ssh/codex-agents-owner` if you have none. Any owner key must be a file in
+  your own `~/.ssh` (no symbolic link on its path, the folder writable only by you), checked again before
+  every use; a key anywhere else is refused. Keys without a passphrase are refused, and signing runs
+  without `ssh-agent`, so no program, including an AI agent, can sign in your name. The owner key record
+  must hold exactly one key.
 - It asks whether pay-as-you-go extra usage and Codex credit spending are turned off, and has you sign each
   answer. It signs in memory, only the bytes it rebuilt from your answers, and checks the signature.
 - A wrong passphrase offers Try again or Exit. To change the passphrase, choose "Change the owner key

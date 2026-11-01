@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Interactive setup wizard for the Codex-Claude agent orchestration.
 #
 #   ./setup.sh [PROJECT_PATH]
@@ -21,8 +21,10 @@
 # with --project-root, never the project's copy, and only once the installed copy is this
 # release byte for byte. Git is a trusted real binary run with plumbing only (no status,
 # add or commit), every helper and transport off, and not at all on a partial clone or
-# while the project's own Git settings name a helper program. This folder must sit outside
-# every folder opened in Codex.
+# while the project's own Git settings name a helper program. Started as ./setup.sh, the bash
+# that runs this file and every basic tool it calls come from the system folders, never an
+# earlier PATH entry, and the Codex and Claude clients run only as the runtime runs them
+# (attest.py client-status). This folder must sit outside every folder opened in Codex.
 #
 # Test hook (no terminal needed):
 #   ./setup.sh --print-provider-routing CODEX CLAUDE MODELS BRIDGE
@@ -38,6 +40,13 @@
 #   ./setup.sh --print-trusted-roots           prints the trusted installation folders, one per line
 #   ./setup.sh --print-git-helpers PROJECT     prints helper programs the project's Git settings name, or "none"
 
+# Basic tools (dirname, uname, id, sed, tput and the rest) come only from the system folders:
+# an earlier PATH entry, which a Codex session opened on a folder above it could write, never
+# stands in for one. The PATH you set is kept only to find python3, which is trusted before it
+# ever runs (resolve_python), and to say where a client the runtime will not use was found.
+OWNER_PATH=${PATH-}
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 # Never let Python write bytecode into the project (it would dirty managed paths).
 export PYTHONDONTWRITEBYTECODE=1
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
@@ -246,7 +255,19 @@ python_location_problem() {
   return 0
 }
 
-# resolve_python [START] -> PY, PY_PROBLEM : the python3 on PATH as its real file, trusted
+# owner_path_lookup NAME : the first executable NAME in the PATH you set, as `command -v`
+# finds it, but only in absolute folders. A lookup only: nothing found here runs unchecked.
+owner_path_lookup() {
+  local dir rest="$OWNER_PATH:"
+  while [ -n "$rest" ]; do
+    dir=${rest%%:*}; rest=${rest#*:}
+    case "$dir" in /*) ;; *) continue;; esac
+    if [ -f "$dir/$1" ] && [ -x "$dir/$1" ]; then printf '%s\n' "$dir/$1"; return 0; fi
+  done
+  return 1
+}
+
+# resolve_python [START] -> PY, PY_PROBLEM : the python3 on your PATH as its real file, trusted
 # before it runs at all. START (default: the current folder) stands for the project until one
 # is chosen; the chosen project is checked again in step 2.
 PY=""
@@ -254,7 +275,7 @@ PY_PROBLEM=""
 resolve_python() {
   local found top
   PY=""; PY_PROBLEM=""
-  found=$(command -v python3 2>/dev/null) || { PY_PROBLEM=missing; return 1; }
+  found=$(owner_path_lookup python3) || { PY_PROBLEM=missing; return 1; }
   case "$found" in /*) ;; *) PY_PROBLEM=missing; return 1;; esac
   PY=$(real_file "$found") || { PY=""; PY_PROBLEM=missing; return 1; }
   top=$(work_tree_top "${1:-$PWD}") || top=""
@@ -1161,9 +1182,38 @@ run_cmd() {
   return "$LAST_RC"
 }
 
-# run_identity CMD... : for identity commands; output is parsed, never logged or shown.
-run_identity() {
-  "$@" 2>/dev/null </dev/null
+# client_check NAME : NAME's sign-in status (codex or claude) through attest.py's
+# client-status, which finds the client as the runtime does (its trusted search path, never
+# your PATH), checks the client's real file before it runs, and runs it with the runtime's
+# minimal environment. CLIENT_RC: 0 yes, 10 no, 11 not on that path, 12 refused, anything else
+# could not be checked. CLIENT_OUT: Claude's JSON, parsed, never logged or shown.
+CLIENT_RC=0
+CLIENT_OUT=""
+client_check() {
+  local top
+  top=$(work_tree_top "$START_DIR") || top=""
+  CLIENT_OUT=$(owner_tool client-status "$1" ${top:+"$top"} 2>/dev/null </dev/null)
+  CLIENT_RC=$?
+}
+
+# client_problem NAME PRODUCT LOGIN : explain a CLIENT_RC other than yes or no.
+client_problem() {
+  case $CLIENT_RC in
+    11)
+      if owner_path_lookup "$1" >/dev/null; then
+        list_add fail "$1: found on your PATH, but not where the orchestrator runs it from, so it was not run"
+        list_sub "The orchestrator runs $1 only from /opt/homebrew/bin, /usr/local/bin, /usr/bin, /bin or ~/.local/bin."
+        list_sub "Fix: install $2 with Homebrew or its official installer, then run: $3"
+      else
+        list_add fail "$1 not found"; list_sub "Fix: install $2, then run: $3"
+      fi;;
+    12)
+      list_add fail "$1: refused, so it was not run"
+      list_sub "Its program file is not in a protected installation folder, or a folder on the way to it is a link or can be changed by others, so an AI agent could replace it."
+      list_sub "Fix: reinstall $2 with Homebrew or its official installer, then re-check.";;
+    *)
+      list_add fail "$1: its sign-in could not be checked"; list_sub "Fix: run: $3, then re-check.";;
+  esac
 }
 
 # Only step names, command labels, exit codes and fixed hints ever reach the screen or the
@@ -1327,26 +1377,28 @@ step_checks() {
       list_add fail "No trusted Git found"
       list_sub "Fix: install the Command Line Tools (xcode-select --install) or Homebrew's git on macOS, or git in /usr/bin on Linux."; hard=1
     fi
-    if command -v codex >/dev/null 2>&1; then
-      if run_identity codex login status >/dev/null; then
-        list_add ok "codex: installed, signed in"
-      else
-        list_add fail "codex: installed but not signed in"; list_sub "Fix: run: codex login"; soft=1
-      fi
+    if [ -n "$PY" ] && [ "$hard" -eq 0 ]; then
+      client_check codex
+      case $CLIENT_RC in
+        0) list_add ok "codex: installed, signed in";;
+        10) list_add fail "codex: installed but not signed in"; list_sub "Fix: run: codex login"; soft=1;;
+        *) client_problem codex "the Codex CLI" "codex login"; soft=1;;
+      esac
+      client_check claude
+      case $CLIENT_RC in
+        0|10)
+          out=$(printf '%s' "$CLIENT_OUT" | pj claude)
+          logged=${out%%|*}
+          if [ "$logged" = yes ]; then
+            plan=${out#*|}; method=${plan#*|}; plan=${plan%%|*}
+            list_add ok "claude: signed in (plan: $plan, login: $method)"
+          else
+            list_add fail "claude: installed but not signed in"; list_sub "Fix: run: claude auth login"; soft=1
+          fi;;
+        *) client_problem claude "Claude Code" "claude auth login"; soft=1;;
+      esac
     else
-      list_add fail "codex not found"; list_sub "Fix: install the Codex CLI, then run: codex login"; soft=1
-    fi
-    if command -v claude >/dev/null 2>&1; then
-      out=$(run_identity claude auth status --json | pj claude)
-      logged=${out%%|*}
-      if [ "$logged" = yes ]; then
-        plan=${out#*|}; method=${plan#*|}; plan=${plan%%|*}
-        list_add ok "claude: signed in (plan: $plan, login: $method)"
-      else
-        list_add fail "claude: installed but not signed in"; list_sub "Fix: run: claude auth login"; soft=1
-      fi
-    else
-      list_add fail "claude not found"; list_sub "Fix: install Claude Code, then run: claude auth login"; soft=1
+      list_add skip "codex and claude sign-ins: checked once the failures above are fixed"
     fi
     if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
       list_add fail "API key set in the environment (name only shown)"
@@ -1390,7 +1442,8 @@ step_checks() {
 }
 
 # session_warnings : warn about recent Codex sessions (records changed in the last 14 days)
-# that could write this setup folder, the home folder or a folder above it. This clone's CLI
+# that could write this setup folder, your orchestrator records (the learning state), the home
+# folder or a folder above it. This clone's CLI
 # reads only each record's session settings, never the conversation, with the same parsing
 # as the guard the Codex commands rule applies. A scan that fails warns about nothing.
 session_warnings() {
@@ -1401,13 +1454,15 @@ session_warnings() {
     [ -n "$folder" ] || continue
     case "$holds" in
       clone) what="this setup folder";;
+      state) what="your orchestrator records";;
+      project) what="a project set up with this orchestrator";;
       *) what="your home folder";;
     esac
     list_add warn "A Codex session on $date could write to $folder, which holds $what."
     SESSION_WARNING=1
   done < <(printf '%s' "$scan" | pj sessions -)
   if [ "$SESSION_WARNING" -eq 1 ]; then
-    list_sub "While the Codex commands rule exists, open Codex on a project folder only: never on your home folder, a folder above it, or a folder holding this setup folder. The orchestrator refuses commands from such a session."
+    list_sub "While the Codex commands rule exists, open Codex on a project folder only: never on your home folder, a folder above it, or a folder holding this setup folder, your orchestrator records or a set-up project. The orchestrator refuses commands from such a session."
   fi
 }
 
@@ -2035,7 +2090,7 @@ version_hint() {
 }
 
 step_collector() {
-  local cli ready
+  local cli ready moved from
   begin_step 5
   cli="$PROJECT/.codex/orchestration/cli.py"
   if [ ! -f "$cli" ]; then
@@ -2065,6 +2120,14 @@ step_collector() {
     pause; return 1
   fi
   list_add ok "Collector registered"
+  # learning-register reports state_moved (true) when it has just moved the learning state
+  # from its old macOS folder, once; migrated_state_from (a path) is read the same way. Only
+  # a fixed sentence is shown, never a reported path.
+  moved=$(pj get "$LAST_OUT" state_moved)
+  from=$(pj get "$LAST_OUT" migrated_state_from)
+  if [ "$moved" = true ] || { [ -n "$from" ] && [ "$from" != false ]; }; then
+    list_add info "Moved your orchestrator records once to a protected folder, ~/.local/state/codex-agents."
+  fi
   render
   run_owner_cli "Checking collector status" learning-status --project-root "$PROJECT"
   ready=$(pj get "$LAST_OUT" ready)

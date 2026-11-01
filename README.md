@@ -31,8 +31,8 @@ the result goes to a verifier (from the other provider when one is eligible), th
   runs until you have signed a billing attestation for that account.
 - **Independent checking.** Each meaningful result goes to a verifier from the other provider when one is
   eligible, then to your project's own hashed test and security commands.
-- **Evidence stays on your machine.** Routes, admission decisions and outcomes go to a local ledger that is
-  never committed, and every recorded route replays exactly.
+- **Evidence stays on your machine.** Routes, admission decisions and outcomes go to a local ledger in
+  `~/.local/state/codex-agents` that is never committed, and every recorded route replays exactly.
 
 It does not yet run write-capable children, and it never changes its own routing without you.
 
@@ -89,10 +89,11 @@ What v1 enforces:
 - **Protected command rule and session guard.** The optional Codex rule lets only the 23 everyday
   orchestrator commands run outside Codex's sandbox, through an owner-only, byte-verified runtime copy in
   `~/.codex`. Before each command the copy refuses a session that can write `/`, your home folder or a
-  folder above it, `~/.codex`, this repository or a tool folder, or runs without its sandbox.
+  folder above it, `~/.codex`, your records, this repository or a tool folder, or runs without its sandbox.
 - **Owner authority stays with you.** `setup.sh`, `attest.py` and the installer run this repository's own
-  CLI, never the project's copy; Git on the project is plumbing only; and the interpreter, Git and provider
-  clients must come from trusted install folders.
+  CLI, never the project's copy; Git on the project is plumbing only; the interpreter, Git and provider
+  clients must come from trusted install folders, and setup never runs a client or basic tool from an
+  earlier `PATH` entry; and the owner key is used only from your own `~/.ssh`.
 
 ```mermaid
 flowchart TB
@@ -145,7 +146,7 @@ Codex CLI 0.164.0 or both, signed in with their subscriptions, with no API key i
 | 2. Project | Picks the project (top of a Git working tree) and previews the install; changes nothing |
 | 3. Providers | Codex children, Claude children and models, and whether Codex sessions may start Claude children |
 | 4. Install | Installs, writes `provider-routing.json`, offers to commit only the changed files (never pushed), verifies |
-| 5. Collector | Registers the project with the local learning collector and starts it |
+| 5. Collector | Registers the project with the local learning collector and starts it; on macOS it first moves your records to `~/.local/state/codex-agents`, once |
 | 6. Billing | Hands the terminal to `attest.py`, which only you can complete |
 | 7. Profile | Only if Codex sessions may start Claude children: the `codex -p orchestrator` profile, network on |
 | 8. Commands | Only if Codex sessions orchestrate the project: the Codex commands rule and its protected copy |
@@ -171,8 +172,9 @@ In words: open Codex on each project folder; never on the home folder, a folder 
 folder that holds several projects; and keep this repository outside every folder you open in Codex.
 
 > [!CAUTION]
-> Never add `~` or `~/.codex` with `--add-dir` either. Setup warns about recent Codex sessions that could
-> write those folders, this repository or a tool folder, and the orchestrator refuses their commands.
+> Never add `~`, `~/.codex` or `~/.local` with `--add-dir` either. Setup warns about recent Codex sessions
+> that could write those folders, your records in `~/.local/state/codex-agents`, this repository or a tool
+> folder, and the orchestrator refuses their commands.
 
 ## Using it
 
@@ -198,6 +200,10 @@ and stops, with the reason, unless the commands rule is `installed` and the sess
 <details><summary>"That passphrase did not unlock the key."</summary>
 
 `attest.py` asks `Try again or Exit? [T/e]`; press Enter to try again.
+</details>
+<details><summary>"the owner key must be a file in your own ~/.ssh folder"</summary>
+
+Move the key into `~/.ssh` (mode 0600, no symbolic link, the folder writable only by you) and run again.
 </details>
 <details><summary>I lost my owner key passphrase</summary>
 

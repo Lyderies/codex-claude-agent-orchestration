@@ -2,6 +2,31 @@
 
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.9)
 
+- **Owner-side final fixes (whole-release review).**
+  - `setup.sh` no longer runs `codex` or `claude` from the inherited `PATH`, where an earlier
+    folder a Codex session can write could hold a planted program. The sign-in checks go
+    through attest.py's `client-status` owner tool, which finds each client with the
+    runtime's own `providers.resolve_client` (only `/opt/homebrew/bin`, `/usr/local/bin`,
+    `/usr/bin`, `/bin` or `~/.local/bin`, its real file location-checked before it runs) and
+    runs only its fixed status command with the runtime's minimal client environment
+    (`client_environment`: no `CODEX_HOME` or API keys) in a private working folder, with a
+    deadline. A client that fails is reported in plain words and never run; one elsewhere on
+    `PATH` is named as such.
+  - The wizard starts with `/bin/bash` (not `/usr/bin/env bash`) and finds its basic tools
+    only in `/usr/bin:/bin:/usr/sbin:/sbin`; the owner's `PATH` is used only to look up
+    `python3`, which is checked before it runs.
+  - `attest.py` takes an owner private key only from the account's own `~/.ssh` (the home
+    folder from the system account database, not `HOME`): no symbolic link anywhere on its
+    path, `~/.ssh` and below owned by the user and writable by no one else, checked again
+    before every `ssh-keygen` use (enrolment, signing, passphrase change). A key anywhere
+    else is refused, which closes the swap between the encryption check and the derivation.
+  - Owner tools locate the learning state only through this repository's package
+    (`host_paths.owner_state_root` where present, else `learning_store.default_state_root`),
+    so the installer's ownership record follows the move to `~/.local/state/codex-agents`
+    and is never created beside the old macOS folder before the collector step moves it.
+    The collector step says once when `learning-register` moved the records (`state_moved`),
+    and the session warning names sessions that could write the records or a set-up project.
+
 - **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
   - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
     which a session opened on a parent folder could rewrite. `install-codex-rule` copies
