@@ -166,7 +166,9 @@
         "tests/test_host_paths.py": "new: private scratch, trusted interpreter and host scratch tests (G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)); G2 S5b final review fixes (temporary projects, resolved interpreter, isolated Python launches, no git transports, scratch overlap); G2 bridged child containment; G2 v1 runtime hardening",
         "native-package/.codex/orchestration/codex_agents/process_tree.py": "new: conservative descendant tracking by ancestry from single kernel process records (parent, group and birth time together), verified kill rounds and the identity-verified deadline watchdog (G2 bridged child containment)",
         "native-package/.codex/hooks.json": "G2 v1 runtime hardening",
-        "native-package/.codex/orchestration/codex_agents/runtime_files.py": "new: the runtime file set the protected copy and runtime digest use (G2 v1 runtime hardening)"
+        "native-package/.codex/orchestration/codex_agents/runtime_files.py": "new: the runtime file set the protected copy and runtime digest use (G2 v1 runtime hardening)",
+        "native-package/.codex/orchestration/codex_agents/session_guard.py": "new: the Codex session workspace guard (G2 v1 runtime hardening)",
+        "tests/test_session_guard.py": "new: the Codex session workspace guard (G2 v1 runtime hardening)"
       }
     },
     "claude-agents": {

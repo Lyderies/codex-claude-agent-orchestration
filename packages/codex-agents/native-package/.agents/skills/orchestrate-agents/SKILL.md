@@ -16,7 +16,11 @@ if this session's workspace is one of those, stop and tell the owner. Before any
 CLI call, run `python3 -I -B -S -X pycache_prefix=/dev/null .codex/orchestration/cli.py
 host-command --project-root <exact-root>`. If its `codex_rule` is not `installed`, stop
 and tell the owner to run `./setup.sh` (Codex commands step), with its `reason` when it
-says `unsupported`; do not retry or work around it. Otherwise run every later CLI command
+says `unsupported`; do not retry or work around it. If its `session_guard` is not `ok`,
+stop and report that reason to the owner word for word: the orchestrator refuses every
+command from a session that can write the home folder, a folder above it, `~/.codex`, the
+orchestrator's setup folder or a tool folder, or that runs without its sandbox or with
+`--ephemeral`, and only reopening Codex on the project folder fixes it. Otherwise run every later CLI command
 as exactly its `argv_prefix` (the absolute base interpreter, the isolation flags
 `-I -B -S -X pycache_prefix=/dev/null`, then the absolute `cli.py` of the protected copy
 in `~/.codex`, never the project's own `.codex/orchestration/cli.py`) followed by the

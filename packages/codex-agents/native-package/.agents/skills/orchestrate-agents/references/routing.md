@@ -142,7 +142,12 @@ collector. It prints `argv_prefix` (naming the copy), `runtime_copy` and `codex_
 the project's own `cli.py`, without an install manifest, or for a symlink. The rule is
 safe only while no Codex session uses the home folder, its parent or `/` as its workspace,
 or adds `~` or `~/.codex` with `--add-dir`: such a session could write `~/.codex` and
-home-installed tools. The rule leaves every argument after the subcommand to the CLI, so
+home-installed tools. The copy checks that itself before every command: it finds the
+calling session's Codex record from `CODEX_THREAD_ID` (only `session_meta` and the last
+`turn_context`, never conversation content) and refuses a session that runs without its
+sandbox, has no record (`--ephemeral`), or can write `/`, the home folder or a folder
+above it, `~/.codex`, the copy, the orchestrator clone that installed it, or a trusted
+installation folder; `host-command` reports the verdict as `session_guard`. The rule leaves every argument after the subcommand to the CLI, so
 for these commands the copy refuses a `--project-root` or `--root` other than its bound
 project, a `--state-root` other than the default learning state, and any `--policy`, before doing any other work. Commands it runs outside the sandbox never use a
 sandbox-writable location: trust checks read the repository with git plumbing only (no

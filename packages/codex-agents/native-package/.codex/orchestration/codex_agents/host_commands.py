@@ -96,7 +96,7 @@ MANIFEST_RELATIVE = ".codex/orchestration/install-manifest.json"
 # Present only in a protected runtime copy, never in a project or the source tree.
 BINDING_RELATIVE = ".codex/orchestration/runtime-binding.json"
 RUNTIME_CONTAINER = "agent-orchestration"
-BINDING_FORMAT = 1
+BINDING_FORMAT = 2
 MAX_MANIFEST_BYTES = 1_048_576
 MAX_MANIFEST_FILES = 4096
 MAX_RUNTIME_FILE_BYTES = 8 * 1_048_576
@@ -505,12 +505,23 @@ def runtime_copy_root(project_root: Path, environ: Mapping[str, str] | None = No
     return _copy_root(root, runtime_digest(_runtime_contents(root)), environ)
 
 
-def _binding_bytes(root: Path, digest: str, version: str) -> bytes:
+def installer_root(orchestration_root: Path) -> Path:
+    """The orchestrator clone a CLI runs from (or the project, for an installed CLI)."""
+
+    parts = orchestration_root.parts
+    if parts[-5:] == ("packages", "codex-agents", "native-package", ".codex", "orchestration"):
+        return Path(*parts[:-5])
+    return orchestration_root.parent.parent
+
+
+def _binding_bytes(root: Path, digest: str, version: str, clone: Path) -> bytes:
     binding = {
         "format": BINDING_FORMAT,
         "project_root": str(root),
         "runtime_digest": digest,
         "version": version,
+        # The clone that installed the copy: no session may write it (session_guard).
+        "clone_root": str(clone),
     }
     return (json.dumps(binding, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -522,10 +533,14 @@ def _parse_binding(raw: bytes) -> dict[str, str]:
         raise HostCommandError("the protected runtime binding is invalid") from exc
     if (
         not isinstance(binding, dict)
-        or set(binding) != {"format", "project_root", "runtime_digest", "version"}
+        or set(binding) != {
+            "format", "project_root", "runtime_digest", "version", "clone_root",
+        }
         or binding["format"] != BINDING_FORMAT
         or not isinstance(binding["project_root"], str)
         or not os.path.isabs(binding["project_root"])
+        or not isinstance(binding["clone_root"], str)
+        or not os.path.isabs(binding["clone_root"])
         or not isinstance(binding["runtime_digest"], str)
         or len(binding["runtime_digest"]) != 64
         or not set(binding["runtime_digest"]) <= _HEX
@@ -534,6 +549,18 @@ def _parse_binding(raw: bytes) -> dict[str, str]:
         raise HostCommandError("the protected runtime binding is invalid")
     _checked_text(binding["project_root"], "bound project root")
     return binding
+
+
+def runtime_binding(orchestration_root: Path) -> dict[str, str] | None:
+    """A protected copy's verified binding (see `bound_project_root`); None elsewhere."""
+
+    copy = orchestration_root.parent.parent
+    if bound_project_root(orchestration_root) is None:
+        return None
+    raw = _read_nofollow(copy, BINDING_RELATIVE, MAX_BINDING_BYTES)
+    if raw is None:
+        raise HostCommandError("the protected runtime binding is unavailable")
+    return _parse_binding(raw)
 
 
 def bound_project_root(orchestration_root: Path) -> Path | None:
@@ -906,7 +933,9 @@ def _validate_runtime(cli: Path) -> None:
 
 
 def install_runtime_copy(
-    project_root: Path, environ: Mapping[str, str] | None = None
+    project_root: Path,
+    environ: Mapping[str, str] | None = None,
+    clone_root: Path | None = None,
 ) -> tuple[Path, str]:
     """Copy the project's installed runtime to its protected location; return it and what happened.
 
@@ -955,9 +984,10 @@ def install_runtime_copy(
     token = secrets.token_hex(8)
     staging = f".{copy.name}.{token}.tmp"
     aside = f".{copy.name}.{token}.old"
+    clone = Path(os.path.realpath(clone_root)) if clone_root is not None else root
     try:
         if os.path.lexists(copy):
-            if runtime_copy_problem(copy, root) is None:
+            if runtime_copy_problem(copy, root) is None and _bound_clone(copy) == clone:
                 return copy, "unchanged"
             os.rename(copy.name, aside, src_dir_fd=container, dst_dir_fd=container)
             outcome = "replaced"
@@ -967,7 +997,9 @@ def install_runtime_copy(
             for relative in RUNTIME_FILES:
                 _write_new_file(staged, ORCHESTRATION_PREFIX + relative, files[relative])
             _write_new_file(staged, MANIFEST_RELATIVE, _copy_manifest(version, files))
-            _write_new_file(staged, BINDING_RELATIVE, _binding_bytes(root, digest, version))
+            _write_new_file(
+                staged, BINDING_RELATIVE, _binding_bytes(root, digest, version, clone)
+            )
         finally:
             os.close(staged)
         try:
@@ -991,6 +1023,11 @@ def install_runtime_copy(
         raise HostCommandError(f"the runtime copy could not be verified: {problem}")
     _validate_runtime(copy / CLI_RELATIVE)
     return copy, outcome
+
+
+def _bound_clone(copy: Path) -> Path | None:
+    raw = _read_nofollow(copy, BINDING_RELATIVE, MAX_BINDING_BYTES)
+    return None if raw is None else Path(_parse_binding(raw)["clone_root"])
 
 
 def prune_runtime_copies(
@@ -1023,6 +1060,7 @@ def install_rule(
     interpreter: str | None = None,
     *,
     replace: bool = False,
+    clone_root: Path | None = None,
 ) -> dict[str, str]:
     """Owner setup: write the protected runtime copy, then the rule that names it.
 
@@ -1031,7 +1069,7 @@ def install_rule(
     are removed; when another rule is left in place (``differs``), they stay.
     """
 
-    copy, copy_outcome = install_runtime_copy(project_root, environ)
+    copy, copy_outcome = install_runtime_copy(project_root, environ, clone_root)
     outcome = write_rule(project_root, environ, interpreter, replace=replace)
     if outcome != "differs":
         try:

@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import shutil
 import stat
 import subprocess
@@ -44,7 +45,9 @@ from codex_agents.host_commands import (
     runtime_copy_root,
     write_rule,
 )
+from codex_agents import session_guard
 from codex_agents.runtime_files import ORCHESTRATION_PREFIX, RUNTIME_FILES, runtime_digest
+from tests.test_session_guard import THREAD, SessionFiles
 from codex_agents.learning_store import (
     COLLECTOR_RUNTIME_DIGEST,
     PACKAGE_VERSION,
@@ -80,6 +83,7 @@ OWNER_COMMANDS = {
     "learning-expire",
     "install-codex-rule",
     "remove-codex-rule",
+    "codex-session-scan",
 }
 PYTHON = "/opt/example/bin/python3"
 # The interpreter the rule names when tests run: the base one, never a venv's,
@@ -554,8 +558,10 @@ class ProtectedCopyTests(unittest.TestCase):
                 self.assertEqual(0o600, stat.S_IMODE(os.lstat(Path(current, name)).st_mode))
         binding = json.loads((copy / BINDING_RELATIVE).read_text())
         self.assertEqual(
-            {"format": 1, "project_root": str(self.project.resolve()),
-             "runtime_digest": copy.name, "version": PACKAGE_VERSION},
+            {"format": 2, "project_root": str(self.project.resolve()),
+             "runtime_digest": copy.name, "version": PACKAGE_VERSION,
+             # Installed through the API without a clone, the project stands in.
+             "clone_root": str(self.project.resolve())},
             binding,
         )
         # The copy serves its bound project, wherever it sits.
@@ -874,7 +880,9 @@ class HostCommandCliTests(unittest.TestCase):
             {"ready": False, "argv_prefix": [BASE_PYTHON, *PYTHON_FLAGS, str(copy / CLI_RELATIVE)],
              "codex_rule": "missing",
              "rule_file": str(rule_path(self.project, self.environ)),
-             "runtime_copy": str(copy)},
+             "runtime_copy": str(copy),
+             # These tests' CODEX_THREAD_ID is no Codex session ID, so the guard says so.
+             "session_guard": "CODEX_THREAD_ID is not a Codex session ID"},
             report,
         )
         self.assertFalse(self.codex_home.exists())
@@ -893,6 +901,38 @@ class HostCommandCliTests(unittest.TestCase):
         report = self.run_cli("host-command")
         self.assertEqual(("installed", True), (report["codex_rule"], report["ready"]))
         self.assertEqual(str(Path(written["runtime_copy"]) / CLI_RELATIVE), report["argv_prefix"][-1])
+        # The binding records the installing clone (this source tree's repository).
+        binding = json.loads((Path(written["runtime_copy"]) / BINDING_RELATIVE).read_text())
+        self.assertEqual(str(Path(os.path.realpath(BUNDLE_ROOT)).parents[2]), binding["clone_root"])
+
+    def run_copy(self, copy_cli: Path, *arguments: str, expected: int = 0,
+                 workspace: Path | None = None) -> dict:
+        """Run the copy's own cli.py in this process, as the rule would, for a session
+        recorded (synthetically) under this test's account home."""
+
+        SessionFiles(self.home).write(workspace or self.project)
+        (self.base / "tmp").mkdir(exist_ok=True)
+        environment = {
+            **without_codex_home(os.environ), **self.environ, "CODEX_THREAD_ID": THREAD,
+            "TMPDIR": str(self.base / "tmp"),
+            "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+        }
+        stdout = io.StringIO()
+        saved_path = list(sys.path)
+        with mock.patch.object(sys, "argv", [str(copy_cli), *arguments]), \
+                mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(session_guard, "account_home", lambda: self.home), \
+                mock.patch.object(session_guard, "SLASH_TMP", str(self.base / "tmp")), \
+                contextlib.redirect_stdout(stdout):
+            try:
+                runpy.run_path(str(copy_cli), run_name="__main__")
+                code = 0
+            except SystemExit as exit_:
+                code = exit_.code
+            finally:
+                sys.path[:] = saved_path
+        self.assertEqual(expected, code, stdout.getvalue())
+        return json.loads(stdout.getvalue())
 
     def test_the_copy_serves_only_its_project_and_only_while_it_matches(self) -> None:
         copy = Path(self.run_cli("install-codex-rule")["runtime_copy"])
@@ -906,20 +946,29 @@ class HostCommandCliTests(unittest.TestCase):
                 )
                 self.assertEqual(0, completed.returncode, completed.stderr)
         # The own-root invariant uses the bound project, not the copy's location.
-        report = self.run_cli("validate", "--root", str(self.project), cli_path=copy_cli,
-                              expected=1, own_project=False)
+        report = self.run_copy(copy_cli, "validate", "--root", str(self.project), expected=1)
         self.assertIn("package_ready", report)
         other = self.base / "other"
         other.mkdir()
-        refused = self.run_cli(
-            "learning-status", "--project-root", str(other), cli_path=copy_cli, expected=2,
-            own_project=False,
+        refused = self.run_copy(
+            copy_cli, "learning-status", "--project-root", str(other), expected=2
         )
         self.assertTrue(refused["error"].startswith("--project-root is refused"), refused)
-        refused = self.run_cli(
-            "validate", "--root", str(copy), cli_path=copy_cli, expected=2, own_project=False
-        )
+        refused = self.run_copy(copy_cli, "validate", "--root", str(copy), expected=2)
         self.assertTrue(refused["error"].startswith("--root is refused"), refused)
+        # A session that can write the home folder is refused before anything runs.
+        refused = self.run_copy(
+            copy_cli, "validate", "--root", str(self.project), expected=2, workspace=self.home
+        )
+        self.assertIn("can write to your home folder", refused["error"])
+        # So is a command that did not come from a Codex session at all.
+        completed = subprocess.run(
+            [BASE_PYTHON, *PYTHON_FLAGS, str(copy_cli), "validate", "--root", str(self.project)],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False,
+            env={key: value for key, value in os.environ.items() if key != "CODEX_THREAD_ID"},
+        )
+        self.assertEqual(2, completed.returncode, completed.stdout)
+        self.assertIn("CODEX_THREAD_ID is not set", json.loads(completed.stdout)["error"])
         # Owner and setup commands never run from the copy.
         for command in ("host-command", "install-codex-rule", "learning-register"):
             refused = self.run_cli(command, cli_path=copy_cli, expected=2)
@@ -930,8 +979,7 @@ class HostCommandCliTests(unittest.TestCase):
         policy = self.project / ".codex" / "orchestration" / "config" / "routing-policy.json"
         original = policy.read_bytes()
         policy.write_bytes(original + b"\n")
-        refused = self.run_cli("validate", "--root", str(self.project), cli_path=copy_cli,
-                               expected=2, own_project=False)
+        refused = self.run_copy(copy_cli, "validate", "--root", str(self.project), expected=2)
         self.assertIn("differs from its protected copy", refused["error"])
         self.assertEqual("stale", self.run_cli("host-command", expected=1)["codex_rule"])
         policy.write_bytes(original)
@@ -981,6 +1029,23 @@ class HostCommandCliTests(unittest.TestCase):
         self.assertIn("holds files it should not", refused["error"])
         self.assertFalse(marker.exists())
         self.assertEqual("stale", self.run_cli("host-command", expected=1)["codex_rule"])
+
+    def test_host_command_reports_whether_the_session_passes_the_guard(self) -> None:
+        self.run_cli("install-codex-rule")
+        sessions = SessionFiles(self.home)
+        (self.base / "tmp").mkdir()
+        env = {"CODEX_THREAD_ID": THREAD, "TMPDIR": str(self.base / "tmp")}
+        with mock.patch.object(session_guard, "account_home", lambda: self.home), \
+                mock.patch.object(session_guard, "SLASH_TMP", str(self.base / "tmp")):
+            sessions.write(self.project)
+            self.assertEqual("ok", self.run_cli("host-command", env=env)["session_guard"])
+            sessions.write(self.home)
+            report = self.run_cli("host-command", env=env)
+            self.assertIn("can write to your home folder", report["session_guard"])
+            # The clone recorded at install is protected too.
+            sessions.write(Path(os.path.realpath(BUNDLE_ROOT)).parents[2])
+            report = self.run_cli("host-command", env=env)
+            self.assertIn("orchestrator's setup folder", report["session_guard"])
 
     def test_host_command_reports_an_overridden_home(self) -> None:
         other = self.base / "other-home"
