@@ -236,6 +236,56 @@ class PackageValidationTests(unittest.TestCase):
                 wrong_verifier["errors"],
             )
 
+    def test_smoke_routes_ignore_a_workspace_write_project_mapping_and_warn(self) -> None:
+        # Mapping a workspace-write Codex coding agent and verifier was allowed
+        # before every Codex child was bridged read-only; install verification
+        # must still pass, and say why those agents are not used.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "target"
+            shutil.copytree(BUNDLE_ROOT, root)
+            for name, description in (
+                ("implementation_worker", "Project implementation role."),
+                ("verification_worker", "Project verification role."),
+            ):
+                (root / ".codex" / "agents" / f"{name}.toml").write_text(
+                    f'name = "{name}"\n'
+                    f'description = "{description}"\n'
+                    'sandbox_mode = "workspace-write"\n'
+                    'developer_instructions = "Use only project-approved authority."\n'
+                    "mcp_servers = []\n"
+                    "skills = []\n"
+                )
+            (root / ".codex" / "orchestration" / "project-agent-routing.json").write_text(
+                json.dumps({
+                    "version": 1,
+                    "roles": {
+                        "coding": "implementation_worker",
+                        "verification": "verification_worker",
+                    },
+                    "verifiers": {"coding": "verification_worker"},
+                })
+            )
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            for key, value in (("user.email", "tests@example.invalid"),
+                               ("user.name", "Validation Tests")):
+                subprocess.run(["git", "-C", str(root), "config", key, value], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "mapping"], check=True)
+
+            report = validate_package(root)
+
+            self.assertTrue(report["package_ready"], report)
+            self.assertFalse(
+                any("smoke" in error or "eligible" in error for error in report["errors"]),
+                report,
+            )
+            for name in ("implementation_worker", "verification_worker"):
+                self.assertIn(
+                    f"{name} is workspace-write; Codex children are bridged read-only in "
+                    "this release, so it is not used for Codex routes",
+                    report["warnings"],
+                )
+
     def test_operational_checks_must_be_committed_and_clean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "target"

@@ -660,21 +660,120 @@ def _verify_backup_envelope(
 
 
 def default_state_root() -> Path:
-    if sys_platform() == "darwin":
-        return Path.home() / "Library" / "Application Support" / "codex-agents"
+    """`$XDG_STATE_HOME/codex-agents`, else `~/.local/state/codex-agents` in the
+    account's home folder (host_paths.default_state_root), macOS included."""
+
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA")
         if not base:
             raise StateError("LOCALAPPDATA is required on Windows")
         return Path(base) / "codex-agents"
-    base = os.environ.get("XDG_STATE_HOME")
-    return Path(base) / "codex-agents" if base else Path.home() / ".local/state/codex-agents"
+    from .host_paths import default_state_root as host_default_state_root
+
+    return host_default_state_root()
 
 
-def sys_platform() -> str:
-    import sys
+# The pre-0.8.9 macOS folder (host_paths.legacy_state_root) is moved once, by the
+# owner's `learning-register`; every other use of the default state refuses while
+# only the old folder exists, so nothing starts a second, empty state beside it.
+UNMOVED_STATE = (
+    "the learning state is still in its old macOS folder "
+    "(~/Library/Application Support/codex-agents); ask the owner to run ./setup.sh "
+    "(collector step), which moves it to ~/.local/state/codex-agents"
+)
+BOTH_STATES = (
+    "the learning state exists both in its old macOS folder "
+    "(~/Library/Application Support/codex-agents) and in its new one "
+    "(~/.local/state/codex-agents, or $XDG_STATE_HOME/codex-agents); keep the one in "
+    "use, move the other out of both places, then run ./setup.sh (collector step) again"
+)
+STATE_MOVE_FAILED = (
+    "the learning state could not be moved in one step from "
+    "~/Library/Application Support/codex-agents to ~/.local/state/codex-agents (or "
+    "$XDG_STATE_HOME/codex-agents), for example because they are on different disks; "
+    "with no Codex or Claude session running, move the folder yourself, then run "
+    "./setup.sh (collector step) again"
+)
+STATE_SOCKET_TOO_LONG = (
+    "the new learning state folder's path is too long for the collector's local socket; "
+    "set XDG_STATE_HOME to a shorter folder, or unset it, then run ./setup.sh "
+    "(collector step) again"
+)
+# sun_path holds 104 bytes on macOS and 108 on Linux, with a terminating NUL.
+UNIX_SOCKET_PATH_MAX = 103 if sys.platform == "darwin" else 107
 
-    return sys.platform
+
+def _unmoved_legacy_state() -> bool:
+    """Whether only the pre-0.8.9 macOS state folder exists."""
+
+    if os.name == "nt":
+        return False
+    from .host_paths import legacy_state_root
+
+    legacy = legacy_state_root()
+    return (
+        legacy is not None
+        and os.path.lexists(legacy)
+        and not os.path.lexists(default_state_root())
+    )
+
+
+def migrate_legacy_state(cli_path: Path, project_root: Path) -> bool:
+    """Move the pre-0.8.9 macOS learning state to the default folder, once (owner).
+
+    Only the owner's `learning-register` calls this. With only the old folder
+    present it is checked (owner-only, no symlink, outside Git), the collector
+    is stopped and its maintenance lock held (CollectorMaintenance, as for
+    registration), and the folder is renamed in one step on the same volume;
+    the moved folder is checked again. The collector is not restarted at the
+    old folder after a move. Both folders present refuses; neither, or only
+    the new one, does nothing. Returns whether it moved the folder.
+    """
+
+    from .host_paths import legacy_state_root
+
+    legacy = legacy_state_root()
+    if legacy is None or not os.path.lexists(legacy):
+        return False
+    target = default_state_root()
+    if os.path.lexists(target):
+        raise StateError(BOTH_STATES)
+    if len(os.fsencode(str(target / "collector.sock"))) > UNIX_SOCKET_PATH_MAX:
+        raise StateError(STATE_SOCKET_TOO_LONG)
+    old = LearningState(legacy, create=False)
+    parent = target.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise StateError(STATE_MOVE_FAILED) from exc
+    _assert_no_symlink_components(parent)
+    if _inside_git_tree(parent):
+        raise StateError("state root must be outside a Git working tree")
+    info = parent.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise StateError("the new learning state folder's parent is not the owner's alone")
+    maintenance = CollectorMaintenance.acquire(
+        old, cli_path, project_root, owner_registration=True
+    )
+    moved = False
+    try:
+        if os.path.lexists(target):
+            raise StateError(BOTH_STATES)
+        try:
+            os.rename(old.root, target)
+        except OSError as exc:
+            raise StateError(STATE_MOVE_FAILED) from exc
+        moved = True
+    finally:
+        if moved:
+            # Never restart a collector at the old folder; registration starts it.
+            maintenance.restart = False
+            maintenance.resume()
+        else:
+            with contextlib.suppress(CollectorError, OSError):
+                maintenance.resume()
+    LearningState(target, create=False)
+    return True
 
 
 def _inside_git_tree(path: Path) -> bool:
@@ -708,6 +807,8 @@ class LearningState:
     """Validated paths and the local keyed-digest secret."""
 
     def __init__(self, root: Path | None = None, *, create: bool = True) -> None:
+        if root is None and _unmoved_legacy_state():
+            raise StateError(UNMOVED_STATE)
         requested = (root or default_state_root()).expanduser()
         if not requested.is_absolute():
             raise StateError("state root must be absolute")
@@ -869,6 +970,34 @@ class LearningState:
                 if path.is_symlink() or not path.is_file():
                     raise StateError("database state contains an unsafe path")
                 _check_owner_mode(path, directory=False)
+
+
+def registered_project_roots() -> list[Path]:
+    """Active registered project roots, read-only, for the wizard's session warning.
+
+    Read from whichever folder holds the owner's state now
+    (host_paths.owner_state_root); an unreadable ledger gives none.
+    """
+
+    from .host_paths import owner_state_root
+
+    try:
+        state = LearningState(owner_state_root(), create=False)
+        if state.database.is_symlink() or not state.database.is_file():
+            return []
+        connection = sqlite3.connect(f"{state.database.as_uri()}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = connection.execute(
+                "SELECT canonical_root FROM projects WHERE status='active' "
+                "AND canonical_root IS NOT NULL LIMIT 256"
+            ).fetchall()
+        finally:
+            connection.close()
+    except (StateError, OSError, sqlite3.Error):
+        return []
+    return [
+        Path(row[0]) for row in rows if isinstance(row[0], str) and os.path.isabs(row[0])
+    ]
 
 
 def validate_collector_runtime(cli_path: Path) -> dict[str, str | int]:

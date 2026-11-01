@@ -35,9 +35,10 @@ from .contracts import (
 from .git_plumbing import git_executable as find_git
 from .git_plumbing import repository_layout_problem, run_git
 from .host_paths import (
+    BRIDGE_SCRATCH_CONTAINER,
     PYTHON_ISOLATION_FLAGS,
     HostPathError,
-    darwin_directory,
+    host_scratch_base,
     overlaps_untrusted,
     private_directory,
     remove_private_directory,
@@ -174,7 +175,10 @@ CODEX_MANAGED_PATHS = {
 # .claude directory sits above them: the per-user cache directory on macOS and
 # $XDG_RUNTIME_DIR elsewhere. Tests set WORKSPACE_PARENT instead.
 WORKSPACE_PARENT: str | None = None
-SCRATCH_CONTAINER = "codex-agents-scratch"
+# The session guard protects this container (session_guard.protected_folders),
+# so no session that could write it passes a rule-matched command such as
+# `dispatch`.
+SCRATCH_CONTAINER = BRIDGE_SCRATCH_CONTAINER
 WATCHDOG_GRACE_SECONDS = 2
 # The verifier of a write result gets the bridge-owned envelope here, at the top
 # of its read-only export. The name is not a repository path: no assignment may
@@ -1160,11 +1164,8 @@ def scratch_base() -> Path:
 
     if WORKSPACE_PARENT is not None:
         return Path(WORKSPACE_PARENT)
-    if sys.platform == "darwin":
-        value = darwin_directory("DARWIN_USER_CACHE_DIR")
-    else:
-        value = os.environ.get("XDG_RUNTIME_DIR")
-    if not value or not os.path.isabs(value):
+    value = host_scratch_base()
+    if value is None:
         raise BridgeRefused("host_scratch_unavailable")
     return Path(value)
 

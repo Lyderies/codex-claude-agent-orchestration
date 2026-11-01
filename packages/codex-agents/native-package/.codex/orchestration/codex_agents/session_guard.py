@@ -3,8 +3,11 @@
 The owner's command rule runs the primary-host commands outside the sandbox for
 every Codex session on the machine. That is safe only while no session can write
 the folders that rule depends on: the home folder and its ancestors, `~/.codex`
-(the rule and the protected copy), the orchestrator clone and the trusted
-installation folders. Codex 0.164 records each session in
+(the rule and the protected copy), the orchestrator clone, the trusted
+installation folders, the owner's learning state and the host-private scratch
+containers, nor a folder that contains the project (Codex runs a nested trusted
+project's `.codex/config.toml` and hooks outside the sandbox) or the project's
+own `.codex`, `.agents` or `.git`. Codex 0.164 records each session in
 `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread id>.jsonl` (JSON
 lines): a `session_meta` record first, with `payload.cwd` and
 `payload.runtime_workspace_roots`, then a `turn_context` record at every turn,
@@ -32,11 +35,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .host_paths import (
+    BRIDGE_SCRATCH_CONTAINER,
+    OWNER_SCRATCH_CONTAINER,
     TRUSTED_INSTALL_ROOTS,
     HostPathError,
     _component_problem,
     _open_verified_directory,
     account_home,
+    default_state_root,
+    host_scratch_base,
+    legacy_state_root,
 )
 
 THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -58,6 +66,9 @@ TAIL_BLOCK = 256 * 1024
 # The wizard's scan: records changed in the last 14 days, at most this many.
 SCAN_DAYS = 14
 MAX_SCANNED_RECORDS = 200
+# Inside a project, Codex keeps these read-only at the top of a writable root; a
+# session may not be given them as writable folders of their own.
+PROJECT_CONTROL_FOLDERS = (".codex", ".agents", ".git")
 
 
 class SessionRefused(RuntimeError):
@@ -91,6 +102,15 @@ REASONS = {
              "the project folder instead",
     "tools": "This Codex session can write to a folder where trusted tools are installed "
              "(such as ~/.local or /opt/homebrew); open Codex on the project folder instead",
+    "state": "This Codex session can write to the orchestrator's learning state (its ledger "
+             "and the owner's key); open Codex on the project folder instead",
+    "scratch": "This Codex session can write to the orchestrator's private working folder; "
+               "open Codex on the project folder instead",
+    "project_parent": "This Codex session was opened on a folder that contains this project, "
+                      "where it could change the project's Codex settings and hooks; open "
+                      "Codex on the project folder itself",
+    "project_control": "This Codex session can write to this project's .codex, .agents or "
+                       ".git folder; open Codex on the project folder without adding them",
     "unsandboxed": "This Codex session runs without its sandbox (danger-full-access); open "
                    "Codex with its normal sandbox",
 }
@@ -382,11 +402,30 @@ def _forms(path: Path) -> list[Chain]:
     return [_chain(lexical)] + ([_chain(real)] if real != lexical else [])
 
 
+def state_folders() -> list[Path]:
+    """The owner's learning state as the commands use it (XDG_STATE_HOME or the
+    account's `~/.local/state`), from this module's account home."""
+
+    return [default_state_root(account_home())]
+
+
+def scratch_folders() -> list[Path]:
+    """The host-private scratch containers (bridge and owner tools), when available.
+
+    The learning state's own `scratch` lies inside the state folder.
+    """
+
+    base = host_scratch_base()
+    if base is None:
+        return []
+    return [Path(base) / BRIDGE_SCRATCH_CONTAINER, Path(base) / OWNER_SCRATCH_CONTAINER]
+
+
 def protected_folders(copy: Path | None, clone: Path | None) -> list[tuple[str, list[Chain]]]:
     """The folders no session may write, inside or around, with their reason keys.
 
     The copy and the clone are taken as recorded at install (lexically) and as
-    they resolve now.
+    they resolve now; so are the learning state and the scratch containers.
     """
 
     home = account_home()
@@ -395,11 +434,33 @@ def protected_folders(copy: Path | None, clone: Path | None) -> list[tuple[str, 
         folders.append(("copy", _forms(copy)))
     if clone is not None:
         folders.append(("clone", _forms(clone)))
+    folders.extend(("state", _forms(folder)) for folder in state_folders())
+    folders.extend(("scratch", _forms(folder)) for folder in scratch_folders())
     folders.extend(("tools", _forms(Path(root))) for root in TRUSTED_INSTALL_ROOTS)
     return folders
 
 
-def writable_problem(path: Path, protected: list[tuple[str, list[Chain]]]) -> str | None:
+def _project_problem(written: Chain, project: Path) -> str | None:
+    """A folder that strictly contains the project, or its `.codex`, `.agents` or
+    `.git` (or a folder inside one) as a writable folder of its own.
+
+    The project itself stays allowed: Codex keeps those three read-only at the
+    top of every writable root (the record lists them as read entries).
+    """
+
+    for held in _forms(project):
+        if len(written) < len(held) and _prefix(written, held):
+            return "project_parent"
+    for name in PROJECT_CONTROL_FOLDERS:
+        for held in _forms(project / name):
+            if _prefix(held, written):
+                return "project_control"
+    return None
+
+
+def writable_problem(
+    path: Path, protected: list[tuple[str, list[Chain]]], project: Path | None = None
+) -> str | None:
     """The reason key when a session able to write `path` defeats the rule, or None.
 
     Containment is decided component by component on file-system identity and
@@ -416,17 +477,25 @@ def writable_problem(path: Path, protected: list[tuple[str, list[Chain]]]) -> st
                 return "home" if len(written) == len(home) else "above_home"
         for home in homes:
             if _prefix(home, written) and written[len(home)][1].startswith("."):
-                # Inside a hidden top-level folder: ~/.codex or an installation
-                # such as ~/.local.
+                # Inside a hidden top-level folder: ~/.codex, an installation such
+                # as ~/.local, or the default learning state under ~/.local/state.
                 return "codex_home" if written[len(home)][1] == ".codex" else "tools"
         for key, chains in protected:
             for folder in chains:
                 if _prefix(written, folder) or _prefix(folder, written):
                     return key
+        if project is not None:
+            key = _project_problem(written, project)
+            if key is not None:
+                return key
     return None
 
 
-def check_record(record: SessionRecord, protected: list[tuple[str, list[Chain]]]) -> None:
+def check_record(
+    record: SessionRecord,
+    protected: list[tuple[str, list[Chain]]],
+    project: Path | None = None,
+) -> None:
     """Refuse unless the session is sandboxed and can write none of the protected folders."""
 
     if record.sandbox_type in UNSANDBOXED_TYPES:
@@ -440,38 +509,137 @@ def check_record(record: SessionRecord, protected: list[tuple[str, list[Chain]]]
             raise SessionRefused(REASONS["home"])
         raise SessionRefused(UNKNOWN_SHAPE)
     for path in record.writable:
-        key = writable_problem(path, protected)
+        key = writable_problem(path, protected, project)
         if key is not None:
             raise SessionRefused(REASONS[key])
 
 
-def check_current_session(copy: Path | None, clone: Path | None) -> None:
-    """The guard every primary-host command the rule runs passes first."""
+def check_current_session(
+    copy: Path | None, clone: Path | None, project: Path | None = None
+) -> None:
+    """The guard every primary-host command the rule runs passes first.
+
+    `project` is the copy's bound project: no writable folder may strictly
+    contain it or be its `.codex`, `.agents` or `.git`.
+    """
 
     record = find_session(os.environ.get("CODEX_THREAD_ID"))
-    check_record(record, protected_folders(copy, clone))
+    check_record(record, protected_folders(copy, clone), project)
 
 
-def session_guard_status(copy: Path | None, clone: Path | None) -> str:
+def session_guard_status(
+    copy: Path | None, clone: Path | None, project: Path | None = None
+) -> str:
     """``ok``, or the plain reason the guard would refuse this session."""
 
     try:
-        check_current_session(copy, clone)
+        check_current_session(copy, clone, project)
     except SessionRefused as exc:
         return str(exc)
     return "ok"
 
 
+# The wizard's warning for each finding of codex-session-scan.
+SCAN_MESSAGES = {
+    "home": "Codex was opened on a folder that holds your home folder; open Codex on a "
+            "project folder only",
+    "clone": "Codex was opened on a folder that holds this setup folder; open Codex on a "
+             "project folder only",
+    "state": "Codex was opened on a folder that holds the orchestrator's learning state; "
+             "open Codex on a project folder only",
+    "project": "Codex was opened on a folder that contains a set-up project ({name}); open "
+               "Codex on the project itself",
+}
+# Runtime copies (host_commands.RUNTIME_CONTAINER) and their bindings name the
+# projects set up with the Codex commands rule.
+RUNTIME_CONTAINER = "agent-orchestration"
+BINDING_PARTS = (".codex", "orchestration", "runtime-binding.json")
+MAX_SETUP_PROJECTS = 256
+
+
+def _read_small(parent: int, name: str, limit: int = 65_536) -> bytes:
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("not a regular file")
+        return os.read(descriptor, limit + 1)[:limit]
+    finally:
+        os.close(descriptor)
+
+
+def bound_projects(codex_home: Path) -> list[Path]:
+    """The projects named by runtime-copy bindings under `<codex_home>/agent-orchestration`.
+
+    For the wizard's warning only: every folder is opened without following
+    symlinks, and anything unreadable is skipped.
+    """
+
+    projects: list[Path] = []
+    try:
+        container = os.open(
+            Path(os.path.realpath(codex_home)) / RUNTIME_CONTAINER,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError:
+        return projects
+    try:
+        for digest in _names(container, re.compile(r"[0-9a-f]{1,64}")):
+            try:
+                digest_fd = os.open(
+                    digest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=container
+                )
+            except OSError:
+                continue
+            try:
+                for runtime in _names(digest_fd, re.compile(r"[0-9a-f]{64}")):
+                    if len(projects) >= MAX_SETUP_PROJECTS:
+                        return projects
+                    descriptor = digest_fd
+                    opened: list[int] = []
+                    try:
+                        for part in (runtime, *BINDING_PARTS[:-1]):
+                            descriptor = os.open(
+                                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=descriptor,
+                            )
+                            opened.append(descriptor)
+                        binding = json.loads(_read_small(descriptor, BINDING_PARTS[-1]))
+                        root = binding["project_root"]
+                        if isinstance(root, str) and os.path.isabs(root):
+                            projects.append(Path(os.path.normpath(root)))
+                    except (OSError, ValueError, KeyError, TypeError):
+                        continue
+                    finally:
+                        for item in opened:
+                            os.close(item)
+            finally:
+                os.close(digest_fd)
+    except OSError:
+        return projects
+    finally:
+        os.close(container)
+    return projects
+
+
 def scan_recent_sessions(
-    clone: Path, codex_home: Path, home: Path, now: float | None = None
+    clone: Path,
+    codex_home: Path,
+    home: Path,
+    now: float | None = None,
+    *,
+    projects: Iterable[Path] = (),
 ) -> list[dict[str, str]]:
-    """Recent sessions that could write the clone, the home folder or a folder above it.
+    """Recent sessions that could write the clone, the home folder or a folder above
+    it, the learning state, or a folder that contains a set-up project.
 
     For the wizard's warning, with the same parsing as the guard: records in
     `<codex_home>/sessions` changed in the last SCAN_DAYS days, at most
     MAX_SCANNED_RECORDS, newest day folders first. A record it cannot read is
     skipped; this is a warning, not the guard, so it follows the folders Codex
-    itself uses in this environment.
+    itself uses in this environment. The set-up projects are `projects` and
+    those the runtime-copy bindings name; the learning state is the default
+    folder and, while it exists, the pre-0.8.9 macOS one. Each finding has a
+    plain `message`.
     """
 
     now = time.time() if now is None else now
@@ -479,6 +647,18 @@ def scan_recent_sessions(
     # and as they resolve, compared like the guard compares them.
     homes = [*_forms(home), *_forms(account_home())]
     clones = _forms(clone)
+    state = [default_state_root(account_home())]
+    legacy = legacy_state_root()
+    if legacy is not None and os.path.lexists(legacy):
+        state.append(legacy)
+    states = [chain for folder in state for chain in _forms(folder)]
+    setup: list[tuple[str, list[Chain]]] = []
+    seen: set[Path] = set()
+    for project in [*projects, *bound_projects(codex_home)]:
+        project = Path(os.path.normpath(project))
+        if project.is_absolute() and project not in seen:
+            seen.add(project)
+            setup.append((project.name, _forms(project)))
     findings: list[dict[str, str]] = []
     try:
         sessions = _sessions_folder(Path(os.path.realpath(codex_home)) / "sessions")
@@ -487,6 +667,13 @@ def scan_recent_sessions(
     if sessions is None:
         return findings
     read = 0
+
+    def finding(day: str, folder: Path, kind: str, name: str = "") -> dict[str, str]:
+        return {
+            "date": day, "folder": str(folder), "holds": kind,
+            "message": SCAN_MESSAGES[kind].format(name=name),
+        }
+
     try:
         for day, folder in _day_folders(sessions):
             for name in _names(folder, ROLLOUT_NAME):
@@ -506,20 +693,26 @@ def scan_recent_sessions(
                 for path in record.writable:
                     forms = _forms(path)
                     if any(_prefix(written, held) for written in forms for held in homes):
-                        kind = "home"
-                    elif any(
+                        found.append(finding(record.day, path, "home"))
+                        continue
+                    if any(
                         _prefix(written, held) or _prefix(held, written)
                         for written in forms for held in clones
                     ):
-                        kind = "clone"
-                    else:
-                        continue
-                    found.append({"date": record.day, "folder": str(path), "holds": kind})
+                        found.append(finding(record.day, path, "clone"))
+                    if any(
+                        _prefix(written, held) or _prefix(held, written)
+                        for written in forms for held in states
+                    ):
+                        found.append(finding(record.day, path, "state"))
+                    for project, chains in setup:
+                        if any(
+                            len(written) < len(held) and _prefix(written, held)
+                            for written in forms for held in chains
+                        ):
+                            found.append(finding(record.day, path, "project", project))
                 if any(kind in {"root", "home"} for kind in record.special_writes):
-                    found.append({
-                        "date": record.day, "folder": str(Path(os.path.normpath(home))),
-                        "holds": "home",
-                    })
+                    found.append(finding(record.day, Path(os.path.normpath(home)), "home"))
                 # The workspace is both an entry and a runtime root: one line each.
                 findings.extend(item for index, item in enumerate(found) if item not in found[:index])
     except (OSError, SessionRefused):

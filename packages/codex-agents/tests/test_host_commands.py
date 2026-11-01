@@ -961,6 +961,18 @@ class HostCommandCliTests(unittest.TestCase):
             copy_cli, "validate", "--root", str(self.project), expected=2, workspace=self.home
         )
         self.assertIn("can write to your home folder", refused["error"])
+        # `dispatch` is guarded the same way: a session that can write the bridge's
+        # scratch container (its control files and exports) is refused first.
+        cache = self.base / "cache"
+        cache.mkdir()
+        with mock.patch.object(session_guard, "host_scratch_base", lambda: str(cache)):
+            refused = self.run_copy(
+                copy_cli, "dispatch", "--project-root", str(self.project),
+                "--assignment", "a.json", "--task", "t.json", "--parent-grant", "g.json",
+                "--route", "r.json", "--run-handle", "h", expected=2, workspace=cache,
+            )
+        self.assertIn("orchestrator's private working folder", refused["error"])
+        self.assertFalse((cache / "codex-agents-scratch").exists())
         # So is a command that did not come from a Codex session at all.
         completed = subprocess.run(
             [BASE_PYTHON, *PYTHON_FLAGS, str(copy_cli), "validate", "--root", str(self.project)],

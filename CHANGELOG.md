@@ -2,6 +2,39 @@
 
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.9)
 
+- **G2 v1 final runtime fixes (0.8.9).** From the final whole-release review.
+  - **Learning state location.** On macOS the default learning state was
+    `~/Library/Application Support/codex-agents`, which a Codex session opened on `~/Library`
+    could write (ledger, digest key, collector authorization, `owner-allowed-signers`). The
+    default is now `$XDG_STATE_HOME/codex-agents`, else `~/.local/state/codex-agents`, on
+    every platform, with the home folder from the account database, never HOME.
+  - **One-time move.** The owner's `learning-register` (the wizard's collector step) moves
+    the old macOS folder: it checks it, stops the collector and holds its maintenance lock,
+    renames the folder in one step on the same volume, checks it again and continues; it
+    refuses when both folders exist, when the move cannot happen in one step, or when the
+    new socket path would be too long. The report says `state_moved`. Every other use of
+    the default state refuses while only the old folder exists, telling the owner to run
+    `./setup.sh` (collector step). `host_paths.owner_state_root()` gives the owner tools the
+    folder in use until then.
+  - **Session guard coverage.** The guard also refuses a session that can write the learning
+    state (with its `scratch`), the bridge's or the owner tools' host-private scratch
+    container, a folder that strictly contains the copy's bound project, or the project's
+    `.codex`, `.agents` or `.git` as a folder of its own: Codex runs a nested trusted
+    project's `.codex/config.toml` and hooks outside the sandbox. `dispatch` is guarded like
+    every rule-matched command, so a session that could write the bridge's control files
+    never starts a child. Open Codex on the project itself.
+  - **Session scan.** `codex-session-scan` also warns about a recent session that could
+    write the learning state (and the old macOS folder while it exists) or that was opened
+    on a folder containing a set-up project (named by runtime-copy bindings or the ledger's
+    registrations). Each warning carries `holds` (`home`, `clone`, `state`, `project`) and
+    a plain `message`.
+  - **Install verification with mapped writers.** The package smoke routes use the package
+    policy alone, so a project that maps a workspace-write Codex agent (for coding, or as
+    verifier) no longer fails install verification; validation warns instead ("<agent> is
+    workspace-write; Codex children are bridged read-only in this release, so it is not
+    used for Codex routes"), and a route denied for that reason says so.
+  - The 0.8.9 runtime digest is recomputed.
+
 - **G2 v1 runtime hardening (0.8.9).** Fixes from two whole-release security reviews.
   - The Codex command rule no longer runs the project's `.codex/orchestration/cli.py`,
     which a session opened on a parent folder could rewrite. `install-codex-rule` copies

@@ -988,6 +988,42 @@ class ProviderRoutingTests(unittest.TestCase):
             table["planning"]["default"],
         )
 
+    def test_a_workspace_write_codex_mapping_explains_the_denial(self) -> None:
+        # Every Codex child is bridged read-only, so a mapped workspace-write Codex
+        # agent is skipped, and the denial says so.
+        policy = deepcopy(self.policy)
+        policy.update(
+            project_agent_mapping_digest="a" * 64,
+            project_agent_roles={
+                "coding": "implementation_worker", "verification": "verification_worker",
+            },
+            project_agent_role_sandboxes={
+                "coding": "workspace-write", "verification": "workspace-write",
+            },
+            project_agent_verifiers={},
+            project_agent_verifier_sandboxes={},
+            project_agent_paths={},
+        )
+        coding = self.task()
+        with self.assertRaisesRegex(
+            ContractError,
+            "no provider candidate is eligible for this route: the mapped Codex agent "
+            "implementation_worker is workspace-write, and Codex children are bridged "
+            "read-only in this release",
+        ):
+            route_task(coding, policy)
+        with self.assertRaisesRegex(
+            ContractError,
+            "no verifier candidate is eligible for this route: the mapped Codex agent "
+            "verification_worker is workspace-write",
+        ):
+            route_task(self.task(
+                family="planning", complexity="high", risk="critical",
+                operation="synthesis", ambiguity="high", context_breadth="cross_system",
+                acceptance_strength="independent_judgment", deterministic_validation=False,
+                independent_parts=2, parallel_safe=True,
+            ), policy)
+
     def test_no_eligible_candidate_denies_instead_of_falling_back(self) -> None:
         policy = self.provider_policy(
             codex={"enabled": False}, claude={"enabled": False}
