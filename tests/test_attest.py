@@ -204,6 +204,7 @@ class FakeWorld:
         self.sign_other_bytes = False
         self.cli_commands: list[list[str]] = []
         self.signed_inputs: list[bytes] = []
+        self.key_files: list[tuple[str, bytes | None]] = []  # each -f file and its bytes then
 
     def _cli(self, command: list[str], stdin: str | None) -> subprocess.CompletedProcess:
         self.cli_commands.append(command)
@@ -257,6 +258,9 @@ class FakeWorld:
             return self._cli([str(part) for part in command], kwargs.get("input"))
         assert command[0] == "/usr/bin/ssh-keygen", command[0]
         self.envs.append(kwargs["env"])
+        if "-f" in command and command[command.index("-f") + 1] != "-":
+            used = Path(command[command.index("-f") + 1])
+            self.key_files.append((str(used), used.read_bytes() if used.is_file() else None))
         if command[1] == "-t":
             key = Path(command[command.index("-f") + 1])
             write_key(key)
@@ -327,6 +331,19 @@ class AttestHarness(unittest.TestCase):
         ssh_dir = self.home / ".ssh"
         ssh_dir.mkdir(mode=0o700, exist_ok=True)
         return ssh_dir
+
+    def assert_used_a_removed_copy_of(self, key: Path, call: list[str]) -> Path:
+        """ssh-keygen ran `call` on a private copy of `key` (its bytes when the operation began)
+        in the owner's scratch container, and the copy is gone now."""
+
+        used = Path(call[call.index("-f") + 1])
+        self.assertEqual(used.name, "owner-key")
+        self.assertTrue(used.parent.name.startswith("key-"), used)
+        self.assertEqual(Path(os.path.realpath(used.parent.parent)),
+                         Path(os.path.realpath(self.scratch_base)) / attest.SCRATCH_CONTAINER)
+        self.assertFalse(os.path.lexists(used.parent), "the key copy was not removed")
+        self.assertIn((str(used), key.read_bytes()), self.world.key_files)
+        return used
 
     def configure_key(self) -> Path:
         key = self.ssh_dir() / "codex-agents-owner"
@@ -423,7 +440,7 @@ class AttestTests(AttestHarness):
         self.assertEqual(self.run_main(["n", str(other), "y", "y", "y"]), 0)
         self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
         self.assertTrue(any("-y" in c and "-P" not in c for c in self.world.calls))
-        self.assertIn(str(other), next(c for c in self.world.calls if "-Y" in c))
+        self.assert_used_a_removed_copy_of(other, next(c for c in self.world.calls if "-Y" in c))
 
     def test_pub_mismatch_is_refused(self) -> None:
         self.set_providers(codex=True)
@@ -456,7 +473,7 @@ class AttestTests(AttestHarness):
         self.assertEqual(self.run_main(["y", "y", "y"]), 0)  # key found at the default, no path prompt
         self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
         self.assertFalse(any("learning-configure-owner-key" in c for c in self.world.calls))
-        self.assertIn(str(key), next(c for c in self.world.calls if "-Y" in c))
+        self.assert_used_a_removed_copy_of(key, next(c for c in self.world.calls if "-Y" in c))
 
     def test_default_key_is_found_without_prompting_for_a_path(self) -> None:
         key = self.configure_key()
@@ -482,7 +499,7 @@ class AttestTests(AttestHarness):
         self.assertIn("This asks for a file location, not your passphrase.", self.output)
         self.assertIn("Press Enter to use ~/.ssh/codex-agents-owner", self.prompts[0])
         self.assertNotIn("passphrase:", self.prompts[0].lower())
-        self.assertIn(str(other), next(c for c in self.world.calls if "-Y" in c))
+        self.assert_used_a_removed_copy_of(other, next(c for c in self.world.calls if "-Y" in c))
 
     def test_a_non_path_entry_is_refused_and_never_echoed(self) -> None:
         (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAkey\n")
@@ -497,13 +514,81 @@ class AttestTests(AttestHarness):
 
     def test_change_passphrase_runs_fixed_keygen_with_p_and_verifies(self) -> None:
         key = self.configure_key()
+        before = key.stat().st_ino
         self.assertEqual(self.run_main([], change=True), 0)
-        self.assertEqual(self.world.passphrase_changes, [["/usr/bin/ssh-keygen", "-p", "-f", str(key)]])
+        self.assertEqual(len(self.world.passphrase_changes), 1)
+        self.assertEqual(self.world.passphrase_changes[0][:3], ["/usr/bin/ssh-keygen", "-p", "-f"])
+        # -p ran on a private copy, which is gone; the key file is a new inode with its bytes.
+        self.assert_used_a_removed_copy_of(key, self.world.passphrase_changes[0])
+        self.assertNotEqual(key.stat().st_ino, before)
+        self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+        self.assertEqual(sorted(path.name for path in key.parent.iterdir()), [key.name])
         self.assertNotIn("SSH_AUTH_SOCK", self.world.envs[-1])
         calls = [c for c in self.world.calls if c[0] == "/usr/bin/ssh-keygen"]
         self.assertEqual(calls[-1][:2], ["/usr/bin/ssh-keygen", "-y"])  # verified afterwards
         self.assertFalse(any("-Y" in c for c in self.world.calls))
         self.assertIn("Passphrase changed", self.output)
+
+    def key_copies_left(self) -> list[str]:
+        container = self.scratch_base / attest.SCRATCH_CONTAINER
+        return sorted(p.name for p in container.iterdir() if p.name.startswith("key-")) if container.exists() else []
+
+    def test_a_retained_descriptor_cannot_change_what_is_checked_and_derived(self) -> None:
+        # A program kept a writable descriptor on the key's inode (opened through an alias in a
+        # folder it could write, since unlinked, so the link count is 1). Right after the
+        # passphrase check it rewrites the key; the derivation still sees the checked bytes.
+        key = self.configure_key()
+        original = key.read_bytes()
+        retained = os.open(key, os.O_WRONLY)
+        self.addCleanup(os.close, retained)
+        real = self.world.run
+        checks = {"n": 0}
+
+        def rewrite_after_the_operations_check(command, **kwargs):
+            result = real(command, **kwargs)
+            if command[0] == attest.SSH_KEYGEN and command[1] == "-y" and "-P" in command:
+                checks["n"] += 1
+                if checks["n"] == 2:  # the check on the operation's own copy
+                    os.ftruncate(retained, 0)
+                    os.pwrite(retained, b"-----BEGIN OPENSSH PRIVATE KEY-----\nplanted\n", 0)
+            return result
+
+        self.world.run = rewrite_after_the_operations_check
+        with mock.patch.object(attest.subprocess, "run", self.world.run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(attest.ensure_owner_key(self.target, self.state, None), key)
+        derive = [(path, data) for path, data in self.world.key_files
+                  if path.endswith("/owner-key")]
+        self.assertGreaterEqual(len(derive), 3)
+        check_and_derive = [entry for entry in derive if entry[1] is not None][-2:]
+        self.assertEqual({data for _path, data in check_and_derive}, {original})
+        self.assertEqual(len({path for path, _data in check_and_derive}), 1)  # one copy for both
+        self.assertNotEqual(key.read_bytes(), original)  # the rewrite did land on the key file
+        self.assertEqual(self.key_copies_left(), [])
+
+    def test_the_key_copy_is_removed_when_the_operation_fails(self) -> None:
+        self.configure_key()
+        self.world.derived = "ssh-ed25519 AAAAother\n"  # not the configured key
+        with mock.patch.object(attest.subprocess, "run", self.world.run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(attest.AttestError, "does not match"):
+                attest.ensure_owner_key(self.target, self.state, None)
+        self.assertTrue(any(path.endswith("/owner-key") for path, _ in self.world.key_files))
+        self.assertEqual(self.key_copies_left(), [])
+        self.world.derived = f"ssh-ed25519 AAAAkey {COMMENT}\n"
+        self.world.change_rc = 1
+        self.assertEqual(self.run_main([], change=True), 1)
+        self.assertEqual(self.key_copies_left(), [])
+
+    def test_after_a_passphrase_change_a_retained_descriptor_writes_to_an_unused_file(self) -> None:
+        key = self.configure_key()
+        retained = os.open(key, os.O_WRONLY)
+        self.addCleanup(os.close, retained)
+        self.assertEqual(self.run_main([], change=True), 0)
+        changed = key.read_bytes()
+        os.pwrite(retained, b"planted", 0)
+        self.assertEqual(key.read_bytes(), changed)
+        self.assertEqual(self.key_copies_left(), [])
 
     def test_change_passphrase_needs_a_configured_key_and_a_terminal(self) -> None:
         self.assertEqual(self.run_main([], change=True), 1)
@@ -517,7 +602,7 @@ class AttestTests(AttestHarness):
         self.configure_key()
         self.world.change_rc = 1
         self.assertEqual(self.run_main([], change=True), 1)
-        self.assertIn("may or may not have changed", self.output)  # not a known wrong passphrase
+        self.assertIn("your key file is as it was", self.output)  # -p only touched the copy
         self.world.change_rc = 0
         self.world.passphrase_changes.clear()
         self.world.derived = "ssh-ed25519 AAAAother\n"
@@ -525,8 +610,9 @@ class AttestTests(AttestHarness):
         self.assertIn("does not match", self.output)
         self.assertEqual(self.world.passphrase_changes, [])  # -p never ran on the wrong key
 
-    def test_a_failed_check_after_the_change_says_the_key_may_have_changed(self) -> None:
-        self.configure_key()
+    def test_a_failed_check_after_the_change_keeps_the_key_file(self) -> None:
+        key = self.configure_key()
+        before = key.stat().st_ino
         real = self.world.run
         state = {"derives": 0}
 
@@ -541,11 +627,11 @@ class AttestTests(AttestHarness):
         self.world.run = cancelled_second_derive
         self.assertEqual(self.run_main([], change=True), 1)
         self.assertEqual(len(self.world.passphrase_changes), 1)
-        self.assertIn("may already have a new passphrase", self.output)
+        self.assertIn("The new passphrase was not saved", self.output)
         self.assertIn("non-empty", self.output)
-        self.assertNotIn("was not changed", self.output)
+        self.assertEqual(key.stat().st_ino, before)  # never replaced
 
-    def test_an_empty_new_passphrase_is_reported_as_possibly_changed(self) -> None:
+    def test_an_empty_new_passphrase_is_never_saved(self) -> None:
         self.configure_key()
         real = self.world.run
 
@@ -556,7 +642,7 @@ class AttestTests(AttestHarness):
 
         self.world.run = empties_the_passphrase
         self.assertEqual(self.run_main([], change=True), 1)
-        self.assertIn("may already have a new passphrase", self.output)
+        self.assertIn("The new passphrase was not saved", self.output)
 
     def test_every_ssh_keygen_call_drops_askpass_and_agent_variables(self) -> None:
         self.configure_key()
@@ -660,7 +746,7 @@ class AttestTests(AttestHarness):
         self.assertEqual(self.run_main(["t", "t"], change=True), 1)
         self.assertEqual(len(self.world.passphrase_changes), 1)  # one attempt, no retry prompt
         self.assertNotIn("That passphrase did not unlock the key.", self.output)
-        self.assertIn("may or may not have changed", self.output)
+        self.assertIn("your key file is as it was", self.output)
 
     def test_wrong_passphrase_in_the_post_check_retries_that_check_only(self) -> None:
         self.configure_key()
@@ -680,7 +766,7 @@ class AttestTests(AttestHarness):
         seen["derives"] = 0
         self.scripted_failures(second_derive, 1)
         self.assertEqual(self.run_main(["e"], change=True), 1)
-        self.assertIn("may already have a new passphrase", self.output)
+        self.assertIn("The new passphrase was not saved", self.output)
 
     def test_wrong_passphrase_while_signing_can_be_retried(self) -> None:
         self.configure_key()
@@ -1101,7 +1187,14 @@ class AttestTests(AttestHarness):
 
     def test_nothing_the_owner_approves_touches_disk(self) -> None:
         self.set_providers(codex=True)
-        with mock.patch.object(attest, "make_scratch", side_effect=AssertionError("no scratch")):
+        real_scratch = attest.make_scratch
+
+        def key_copies_only(prefix, *args, **kwargs):
+            # The only files: each operation's private copy of the key, never the statement.
+            assert prefix == "key-", prefix
+            return real_scratch(prefix, *args, **kwargs)
+
+        with mock.patch.object(attest, "make_scratch", side_effect=key_copies_only):
             self.assertEqual(self.run_main(["y", "y", "y", "y"]), 0)  # enrol a new key, then sign
         # The enrolled key and the signature reached the CLI through pipes.
         self.assertEqual(len(self.world.handed_over), 2)

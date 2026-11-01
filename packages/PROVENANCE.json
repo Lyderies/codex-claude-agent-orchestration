@@ -119,7 +119,7 @@
         "tests/test_installer.py": "portable temp directory; operational-sandbox tests skipped off macOS; G2 S3 Claude host client and orchestration skills; G2 v1 final hooks (rendered learning hooks)",
         "tests/test_learning_cli.py": "portable temp directory instead of macOS-only /private/tmp; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates); G2 S2a provider admission and observations; G2 S3c policy table; G2 v1 runtime hardening",
         "tests/test_learning_engine.py": "portable temp directory; operational-sandbox tests skipped off macOS; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates); G2 S3c policy table; G2 S5b host boundary hardening (trusted interpreter, git plumbing, private scratch)",
-        "tests/test_learning_hook.py": "portable temp directory instead of macOS-only /private/tmp; G2 v1 final hooks: checkout guard",
+        "tests/test_learning_hook.py": "portable temp directory instead of macOS-only /private/tmp; G2 v1 final hooks: checkout guard; strict checkout guard (round 2 review)",
         "tests/test_learning_store.py": "portable temp directory instead of macOS-only /private/tmp; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates); G2 S2a provider admission and observations; G2 S5c review fixes (verifier outcome binding, canonical result size); G2 S5b agent_bound summary count; G2 S5b own-root invariant for installed CLIs; G2 Codex agent-path binding; G2 v1 single owner signer; G2 v1 final hooks (rendered learning hooks)",
         "tests/test_qa_tree_scan.py": "portable temp directory instead of macOS-only /private/tmp",
         "tests/test_routing.py": "portable temp directory instead of macOS-only /private/tmp; G2 S1 provider-qualified routes (policy v5, GPT-6.1 Sol, Claude candidates); G2 S3b eligibility and observation gaps; G2 S3c policy table; G2 S4b Codex child tool lockdown; G2 S5 verifier worker-result handoff and lifecycle fixes; G2 v1 runtime hardening; G2 v1 final runtime fixes (state location, guard coverage, smoke routes)",
@@ -170,7 +170,7 @@
         "native-package/.codex/orchestration/codex_agents/session_guard.py": "new: the Codex session workspace guard (G2 v1 runtime hardening); G2 v1 final runtime fixes (state location, guard coverage, smoke routes)",
         "tests/test_session_guard.py": "new: the Codex session workspace guard (G2 v1 runtime hardening); G2 v1 final runtime fixes (state location, guard coverage, smoke routes)",
         "tests/test_state_location.py": "new: learning state location and the one-time macOS move (G2 v1 final runtime fixes (state location, guard coverage, smoke routes))",
-        "native-package/.codex/orchestration/learning_hook.py": "G2 v1 final hooks (rendered learning hooks); G2 v1 final hooks: checkout guard",
+        "native-package/.codex/orchestration/learning_hook.py": "G2 v1 final hooks (rendered learning hooks); G2 v1 final hooks: checkout guard; strict checkout guard (round 2 review)",
         "native-package/.codex/.gitignore": "new: keeps the rendered hooks and their local record out of Git (G2 v1 final hooks (rendered learning hooks))",
         "native-package/.codex/orchestration/codex_agents/hook_config.py": "new: renders and checks the checkout's learning hooks (G2 v1 final hooks (rendered learning hooks)); G2 v1 final hooks: checkout guard",
         "tests/test_hook_config.py": "new: renderer, quoting and planted-PATH tests (G2 v1 final hooks (rendered learning hooks)); G2 v1 final hooks: checkout guard"

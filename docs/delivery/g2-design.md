@@ -706,6 +706,17 @@ safety comes from redundant layers.
     recorded there is never removed. When an owner-only CLI subcommand is retired, add its
     name to `scripts/install.py` `HISTORICAL_OWNER_ONLY` so its old deny rules are still
     recognised as the installer's.
+  - The owner key: `attest.py` takes a private key only from the account's `~/.ssh`, with no
+    other hard link, and each operation that uses it (the passphrase check with the
+    derivation, signing, the passphrase change) first reads it once through a no-follow
+    descriptor into a fresh 0600 file in a new owner-only folder of the owner's scratch
+    container, runs every `ssh-keygen` step on that copy only and removes it when the
+    operation ends. A program that kept a descriptor or mapping on the key's inode (opened
+    through a link in a folder it could write before the key was moved) cannot change what
+    was checked before it is used. The passphrase change re-encrypts the copy, checks it with
+    the new passphrase, and only then writes it to a fresh 0600 file in `~/.ssh` that is
+    synced and renamed over the key, so the old inode is replaced rather than edited: a
+    retained descriptor on it then only ever writes to a file the tools no longer use.
   - Residual: the settings file is staged in that owner folder and renamed into place after
     re-comparing the destination's bytes; an edit landing in the sub-millisecond window
     between that comparison and the rename is overwritten (accepted). When the state folder
@@ -740,9 +751,11 @@ safety comes from redundant layers.
     `root_checkout_hooks_folder_for_dir`), so events from `.worktrees/<name>` run the main
     checkout's rendered command. `--checkout` pins the checkout it was rendered for, and
     `learning_hook.py`'s first action, with the standard library only and before importing
-    any of the package, is `belongs_to_checkout`: the payload's `cwd`, resolved, must be the
-    checkout or lie inside it, and the nearest `.git` entry (folder or file) walking up from
-    it must be the checkout's own. A linked worktree (inside or outside the checkout), a
+    any of the package, is `belongs_to_checkout`: the payload's `cwd` must exist and,
+    resolved strictly, be the checkout or lie inside it, and the nearest `.git` entry (folder
+    or file, read with `lstat`) walking up from it must be the checkout's own. Only a missing
+    `.git` counts as absent: any other error, such as a folder whose search permission a
+    session removed, refuses, so an inaccessible worktree boundary is never walked past. A linked worktree (inside or outside the checkout), a
     nested repository or anything else is a silent no-op (`{}` for `Stop` and
     `SubagentStop`) that imports nothing, starts no collector and records nothing; an
     accepted event binds the pinned checkout, so a session in a subfolder records for it.

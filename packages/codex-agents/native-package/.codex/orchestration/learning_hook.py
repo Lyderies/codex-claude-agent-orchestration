@@ -30,19 +30,33 @@ QUIET_JSON_EVENTS = {"Stop", "SubagentStop"}
 def belongs_to_checkout(cwd: str, checkout: str) -> bool:
     """Whether the working folder `cwd` is the checkout `checkout` or one of its folders.
 
-    Both are resolved; `cwd` must be the checkout or lie inside it, and the nearest `.git`
-    entry (a folder or a file) walking up from `cwd` must be the checkout's own: a linked
-    worktree, a clone or a repository nested inside the checkout has its own `.git` first.
+    Both must exist and are resolved strictly; `cwd` must be the checkout or lie inside
+    it, and the nearest `.git` entry (a folder or a file) walking up from `cwd` must be the
+    checkout's own: a linked worktree, a clone or a repository nested inside the checkout
+    has its own `.git` first. Only a missing `.git` counts as absent; any other error (a
+    folder whose search permission was removed, say) refuses, so an inaccessible boundary
+    is never walked past.
     """
 
     if not os.path.isabs(cwd) or not os.path.isabs(checkout):
         return False
-    root = os.path.realpath(checkout)
-    current = os.path.realpath(cwd)
+    try:
+        root = os.path.realpath(checkout, strict=True)
+        current = os.path.realpath(cwd, strict=True)
+    except (OSError, ValueError):
+        return False
     if current != root and not current.startswith(root.rstrip("/") + "/"):
         return False
     while True:
-        if os.path.lexists(os.path.join(current, ".git")):
+        try:
+            os.lstat(os.path.join(current, ".git"))
+        except FileNotFoundError:
+            found = False
+        except (OSError, ValueError):
+            return False
+        else:
+            found = True
+        if found:
             return current == root
         if current == root:
             return False

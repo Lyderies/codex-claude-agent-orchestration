@@ -20,9 +20,9 @@
     the index.
   - Codex 0.164 runs a linked worktree's events through its main checkout's hooks, so the
     command pins `--checkout '<project>'` and the hook first checks, with the standard library
-    only, that the event's folder belongs to that checkout (inside it, nearest `.git` its
-    own); events from a worktree or a nested repository import nothing and start no
-    collector. A subfolder's events record for the checkout.
+    only, that the event's folder belongs to that checkout (it exists and resolves inside it,
+    and the nearest `.git` is its own; a `.git` that cannot be read refuses); events from a
+    worktree or a nested repository import nothing and start no collector. A subfolder's events record for the checkout.
   - Verify compares the file byte for byte with a fresh render and re-checks the recorded
     interpreter; the old form, an edited command or an untrusted interpreter is a project
     error that says to run `./setup.sh`.
@@ -78,7 +78,11 @@
   key whose file has another hard link ("This key file has another link elsewhere; make a fresh
   copy in ~/.ssh (cp, not mv) and remove the old one"), at every use and again on the file it
   opens itself: a key moved into `~/.ssh` from a folder an agent can write kept that link, through
-  which the agent could rewrite it after the checks. `client-status` reads a client's output with
+  which the agent could rewrite it after the checks. Each operation that uses the key (the
+  passphrase check with the derivation, signing, the passphrase change) now works on a private
+  0600 copy read once into the owner's scratch container and removed afterwards, so a
+  descriptor kept on the key's inode cannot change what was checked; the passphrase change
+  saves the re-encrypted copy only after checking it, as a new file renamed over the key. `client-status` reads a client's output with
   the runtime's bounded reader (`providers.read_bounded`) and stops the client's process group the
   moment it passes 256 KiB, instead of buffering it all first.
 

@@ -290,6 +290,39 @@ class CheckoutGuardTests(unittest.TestCase):
                 self.assertEqual([], imported)
         self.assertFalse(state.exists())
 
+    def test_an_unreadable_nested_worktree_is_a_silent_no_op(self) -> None:
+        # A session in nested worktree B removes search permission from B: its .git can no
+        # longer be seen, which must refuse the event, never walk on to the checkout's .git.
+        state = self.base / "state"
+        inner = self.checkout / ".worktrees" / "feature"
+        self.git("worktree", "add", "-q", "-b", "feature", str(inner))
+        (inner / "src").mkdir()
+        for mode in (0o000, 0o600):
+            inner.chmod(mode)
+            self.addCleanup(inner.chmod, 0o755)
+            if os.access(inner / ".git", os.F_OK):
+                self.skipTest("chmod does not take search permission away here (running as root?)")
+            for cwd in (inner, inner / "src"):
+                with self.subTest(mode=oct(mode), cwd=cwd.name):
+                    stdout, imported = self.probe(cwd, state)
+                    self.assertEqual("{}\n", stdout)
+                    self.assertEqual([], imported)
+            inner.chmod(0o755)
+        self.assertFalse(state.exists())
+
+    def test_the_working_folder_must_exist_and_be_absolute(self) -> None:
+        state = self.base / "state"
+        for cwd in (self.checkout / "missing", self.checkout / "missing" / "deeper", Path("src")):
+            with self.subTest(cwd=str(cwd)):
+                stdout, imported = self.probe(cwd, state)
+                self.assertEqual("{}\n", stdout)
+                self.assertEqual([], imported)
+        # A link inside the checkout that leads out of it resolves outside: refused.
+        (self.checkout / "escape").symlink_to(self.base)
+        stdout, imported = self.probe(self.checkout / "escape", state)
+        self.assertEqual([], imported)
+        self.assertFalse(state.exists())
+
     def test_a_subfolder_of_the_checkout_records_for_the_checkout(self) -> None:
         state = LearningState(self.base / "state")
         authorize_collector_runtime(state, ORCHESTRATION_ROOT / "cli.py")

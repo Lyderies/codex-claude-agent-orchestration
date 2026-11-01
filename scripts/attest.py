@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import getpass
 import hashlib
 import importlib.util
@@ -911,16 +912,19 @@ def describe_key(key_type: str, blob: str) -> str:
     return f"{key_type} {fingerprint(key_type, blob)}"
 
 
-def validate_private_key(key: Path) -> None:
-    check_key_location(key)
+MAX_KEY_BYTES = 65_536
+
+
+def _read_key_once(key: Path) -> bytes:
+    """The key file's bytes, read once through one no-follow descriptor, which must be a
+    regular file of yours, mode 0600 or stricter, with no other hard link."""
+
     try:
         info = key.lstat()
     except OSError as exc:
         raise AttestError("that private key file does not exist") from exc
     if not stat.S_ISREG(info.st_mode):
         raise AttestError("that path is not a regular file")
-    if info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise AttestError("the private key must be owned by you with mode 0600 or stricter")
     try:
         descriptor = os.open(key, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
@@ -929,16 +933,68 @@ def validate_private_key(key: Path) -> None:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise AttestError("that path is not a regular file")
+        if opened.st_uid != os.getuid() or opened.st_mode & 0o077:
+            raise AttestError("the private key must be owned by you with mode 0600 or stricter")
         if opened.st_nlink != 1:  # checked on the file actually opened, too
             raise AttestError(KEY_HAS_LINK)
-        head = os.read(descriptor, 64)
+        chunks, size = [], 0
+        while chunk := os.read(descriptor, 65_536):
+            size += len(chunk)
+            if size > MAX_KEY_BYTES:
+                raise AttestError("that file is too large to be a private key")
+            chunks.append(chunk)
     except OSError as exc:
         raise AttestError("that private key file could not be read") from exc
     finally:
         os.close(descriptor)
+    return b"".join(chunks)
+
+
+@contextlib.contextmanager
+def key_snapshot(key: Path):
+    """A private copy of the owner key for one operation, removed when it ends.
+
+    After the location checks, the key is read once and written to a fresh 0600 file,
+    created exclusively in a new owner-only folder in the owner's scratch container. Every
+    ssh-keygen step of the operation (the passphrase check, deriving, signing, changing the
+    passphrase) uses that copy only, so a program that kept a descriptor or mapping on the
+    key's inode (from a folder it could write, before the key was moved into ~/.ssh) cannot
+    change what was checked between the checks and the use.
+    """
+
+    check_key_location(key)
+    content = _read_key_once(key)
+    folder = make_scratch("key-")
+    try:
+        snapshot = folder / "owner-key"
+        descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            view = memoryview(content)
+            while view:
+                view = view[os.write(descriptor, view):]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        yield snapshot
+    finally:
+        remove_scratch(folder)
+
+
+def validate_private_key(key: Path, snapshot: Path | None = None) -> None:
+    """Refuse anything but an encrypted private key in ~/.ssh; checks the operation's copy."""
+
+    if snapshot is None:
+        with key_snapshot(key) as copy:
+            validate_private_key(key, copy)
+        return
+    try:
+        with open(snapshot, "rb") as handle:
+            head = handle.read(64)
+    except OSError as exc:
+        raise AttestError("that private key file could not be read") from exc
     if b"PRIVATE KEY-----" not in head:
         raise AttestError("that path is not a private key (a public key file cannot sign)")
-    unlocked = ssh(["-y", "-P", "", "-f", str(key)], capture_output=True, text=True,
+    unlocked = ssh(["-y", "-P", "", "-f", str(snapshot)], capture_output=True, text=True,
                    stdin=subprocess.DEVNULL)
     if unlocked.returncode == 0:
         raise AttestError(
@@ -979,17 +1035,20 @@ def offer_retry() -> bool:
             return False
 
 
-def derive_public(key: Path) -> tuple[str, str]:
-    """Ask ssh-keygen for the key's public half; it prompts for the passphrase, with retries."""
+def derive_public(key: Path, snapshot: Path | None = None) -> tuple[str, str]:
+    """Ask ssh-keygen for the key's public half from the operation's copy; it prompts for the
+    passphrase, with retries."""
 
+    if snapshot is None:
+        with key_snapshot(key) as copy:
+            return derive_public(key, copy)
     while True:
-        check_key_location(key)  # again at every use, right before ssh-keygen opens it
-        result = ssh(["-y", "-f", str(key)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = ssh(["-y", "-f", str(snapshot)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             return _split_public(result.stdout)
-        if wrong_passphrase(result, key, "load") and offer_retry():
+        if wrong_passphrase(result, snapshot, "load") and offer_retry():
             continue
-        if wrong_passphrase(result, key, "load"):
+        if wrong_passphrase(result, snapshot, "load"):
             raise AttestError("stopped: the passphrase did not unlock the key")
         raise AttestError("could not unlock the private key")
 
@@ -1101,8 +1160,9 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
     configured = configured_public_key(state_root)
     if configured is None:
         key = choose_new_key()
-        validate_private_key(key)
-        derived = derive_public(key)
+        with key_snapshot(key) as copy:  # one copy for the passphrase check and the derivation
+            validate_private_key(key, copy)
+            derived = derive_public(key, copy)
         adjacent = Path(str(key) + ".pub")
         if os.path.lexists(adjacent):
             try:
@@ -1123,7 +1183,10 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
         return key
     print(f"Owner key already configured: {describe_key(*configured)}")
     key = locate_key_file(configured)
-    if derive_public(key) != configured:
+    with key_snapshot(key) as copy:
+        validate_private_key(key, copy)
+        matches = derive_public(key, copy) == configured
+    if not matches:
         raise AttestError("that private key does not match the configured owner key")
     return key
 
@@ -1223,14 +1286,44 @@ def check_trusted_state(state_root: Path) -> None:
         raise AttestError("the owner key record is in a temporary folder or a project; refusing to trust it")
 
 
-CHANGE_UNSURE = (
-    "ssh-keygen had already finished, so the key may already have a new passphrase. If you "
-    "cancelled or left the new passphrase empty, run the change again and choose a non-empty one."
+KEY_UNCHANGED = "the passphrase was not changed: your key file is as it was. Run the change again"
+CHANGE_NOT_SAVED = (
+    "The new passphrase was not saved: your key file still has its current passphrase. Run the "
+    "change again and choose a non-empty passphrase."
 )
 
 
+def _replace_key(key: Path, content: bytes) -> None:
+    """Put `content` at `key` as a new file: a fresh 0600 file in ~/.ssh, written and synced,
+    then renamed over the key, so the old inode is replaced, never edited in place."""
+
+    check_key_location(key)
+    parent = os.open(key.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        name = f".{key.name}.{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                             dir_fd=parent)
+        try:
+            try:
+                view = memoryview(content)
+                while view:
+                    view = view[os.write(descriptor, view):]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(name, key.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=parent)
+            raise AttestError(f"the key file could not be saved, so {KEY_UNCHANGED}") from exc
+    finally:
+        os.close(parent)
+
+
 def change_passphrase(state_root: Path) -> None:
-    """Hand the terminal to ssh-keygen -p for the configured owner key, then re-verify it."""
+    """Change the configured owner key's passphrase on a private copy, check the copy with the
+    new passphrase, then replace the key file with it."""
 
     check_trusted_state(state_root)
     configured = configured_public_key(state_root)
@@ -1238,32 +1331,37 @@ def change_passphrase(state_root: Path) -> None:
         raise AttestError("no owner key is configured yet; run the billing attestation first")
     print(f"Owner key: {describe_key(*configured)}")
     key = locate_key_file(configured)
-    print("First, ssh-keygen checks that this file is the owner key. Enter the current passphrase.")
-    if derive_public(key) != configured:
-        raise AttestError("that private key does not match the configured owner key")
-    print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
-    while True:
-        check_key_location(key)  # again at every use, right before ssh-keygen opens it
-        result = ssh(["-p", "-f", str(key)], stderr=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            break
-        # A wrong current passphrase fails before anything is written, so retrying is safe.
-        if wrong_passphrase(result, key, "change"):
-            if offer_retry():
-                continue
-            raise AttestError("the passphrase was not changed")
-        # Any other failure may have come after ssh-keygen began writing: never retry it.
-        raise AttestError(
-            "ssh-keygen stopped before it finished, so the passphrase may or may not have "
-            "changed. Run the change again; the passphrase that unlocks the key is the current one"
-        )
-    try:
-        validate_private_key(key)  # still encrypted, still safe
-        print("Checking the key with the new passphrase. Enter it when asked.")
-        if derive_public(key) != configured:
-            raise AttestError("that private key no longer matches the configured owner key")
-    except AttestError as exc:
-        raise AttestError(f"{exc}. {CHANGE_UNSURE}") from exc
+    with key_snapshot(key) as copy:
+        validate_private_key(key, copy)
+        print("First, ssh-keygen checks that this file is the owner key. Enter the current passphrase.")
+        if derive_public(key, copy) != configured:
+            raise AttestError("that private key does not match the configured owner key")
+        print("Now ssh-keygen will ask for the current passphrase, then the new one twice.")
+        while True:
+            result = ssh(["-p", "-f", str(copy)], stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                break
+            if wrong_passphrase(result, copy, "change"):
+                if offer_retry():
+                    continue
+                raise AttestError("the passphrase was not changed")
+            # ssh-keygen worked on the private copy only, so the key file is untouched.
+            raise AttestError(f"ssh-keygen stopped before it finished, so {KEY_UNCHANGED}")
+        try:
+            validate_private_key(key, copy)  # still encrypted, still safe
+            print("Checking the key with the new passphrase. Enter it when asked.")
+            if derive_public(key, copy) != configured:
+                raise AttestError("that private key no longer matches the configured owner key")
+        except AttestError as exc:
+            raise AttestError(f"{exc}. {CHANGE_NOT_SAVED}") from exc
+        try:
+            with open(copy, "rb") as handle:
+                changed = handle.read(MAX_KEY_BYTES + 1)
+        except OSError as exc:
+            raise AttestError(f"the changed key could not be read, so {KEY_UNCHANGED}") from exc
+        if len(changed) > MAX_KEY_BYTES:
+            raise AttestError(f"the changed key is too large, so {KEY_UNCHANGED}")
+        _replace_key(key, changed)
     print("Passphrase changed. The owner key is unchanged.")
 
 
@@ -1401,14 +1499,17 @@ def attest_provider(target: Path, key: Path, provider: str, cli_state: Path | No
 SIGNATURE_HEAD = b"-----BEGIN SSH SIGNATURE-----"
 
 
-def sign_in_memory(key: Path, payload: bytes) -> bytes:
-    """Sign the approved bytes with ssh-keygen: they go in on stdin, the signature comes back on
-    stdout, and ssh-keygen asks for the passphrase on the terminal. Nothing touches disk."""
+def sign_in_memory(key: Path, payload: bytes, snapshot: Path | None = None) -> bytes:
+    """Sign the approved bytes with ssh-keygen from the operation's copy of the key: they go in
+    on stdin, the signature comes back on stdout, and ssh-keygen asks for the passphrase on
+    the terminal. Neither the payload nor the signature touches disk."""
 
+    if snapshot is None:
+        with key_snapshot(key) as copy:
+            return sign_in_memory(key, payload, copy)
     print("Now sign the statement. Enter your key's passphrase when asked.")
     while True:
-        check_key_location(key)  # again at every use, right before ssh-keygen opens it
-        signed = ssh(["-Y", "sign", "-f", str(key), "-n", NAMESPACE], input=payload,
+        signed = ssh(["-Y", "sign", "-f", str(snapshot), "-n", NAMESPACE], input=payload,
                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         errors = signed.stderr or b""
         result = subprocess.CompletedProcess(
@@ -1416,7 +1517,7 @@ def sign_in_memory(key: Path, payload: bytes) -> bytes:
             errors.decode("utf-8", "replace") if isinstance(errors, bytes) else errors)
         if signed.returncode == 0 and (signed.stdout or b"").startswith(SIGNATURE_HEAD):
             return signed.stdout
-        if wrong_passphrase(result, key, "load"):
+        if wrong_passphrase(result, snapshot, "load"):
             if offer_retry():
                 continue
             raise AttestError("stopped: the passphrase did not unlock the key")
