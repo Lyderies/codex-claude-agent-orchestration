@@ -35,6 +35,32 @@ PROJECT_CONFIG = {
 }
 
 
+def hook_python() -> str | None:
+    """A Python the Codex package installer, a subprocess, may name in the learning hooks.
+
+    The package installer renders .codex/hooks.json with the interpreter it runs under, and
+    refuses one outside the trusted installation folders, such as CI's toolcache Python; a
+    mock in this process cannot reach it, so a system or Homebrew Python is looked for.
+    """
+
+    check = ("import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path\n"
+             "if sys.version_info < (3, 11): sys.exit(2)\n"
+             "from codex_agents.host_commands import interpreter_path\n"
+             "from codex_agents.hook_config import interpreter_problem\n"
+             "sys.exit(1 if interpreter_problem(Path(interpreter_path()), Path('/nonexistent-project')) else 0)")
+    for candidate in (sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/usr/bin/python3"):
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and subprocess.run(
+                [real, "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null", "-c", check, str(installer.ORCHESTRATION)],
+                capture_output=True, stdin=subprocess.DEVNULL, check=False).returncode == 0:
+            return real
+    return None
+
+
+HOOK_PYTHON = hook_python()
+
+
 def outside_temporary_folders() -> Path | None:
     """An existing folder outside every temporary root (the Codex rule step refuses those)."""
 
@@ -132,6 +158,13 @@ def isolate_home(test: unittest.TestCase, home: Path) -> None:
         trusted = mock.patch.object(installer.attest.host_paths, "install_location_problem", return_value=None)
         trusted.start()
         test.addCleanup(trusted.stop)
+    # The package installers run in a Python the learning hooks may name (hook_python).
+    if HOOK_PYTHON is None:
+        test.skipTest("no Python here may be named in the learning hooks")
+    if HOOK_PYTHON != os.path.realpath(sys.executable):
+        python = mock.patch.object(installer, "_python", lambda: HOOK_PYTHON)
+        python.start()
+        test.addCleanup(python.stop)
 
 
 class UmbrellaInstallTests(unittest.TestCase):
@@ -290,10 +323,9 @@ class UmbrellaInstallTests(unittest.TestCase):
 
         with mock.patch.object(installer.subprocess, "run", spy):
             self.install()
-        pythons = [command for command in seen if command[0] == os.path.realpath(sys.executable)]
+        pythons = [command for command in seen if command[0] == installer._python()]
         self.assertEqual(len(pythons), 2)
         for command in pythons:
-            self.assertEqual(command[0], os.path.realpath(sys.executable))
             self.assertEqual(command[1:6], ["-I", "-B", "-S", "-X", "pycache_prefix=/dev/null"])
         trusted = installer.git_executable([self.target])
         gits = [command for command in seen if os.path.basename(command[0]) == "git"]
@@ -419,6 +451,41 @@ class UmbrellaInstallTests(unittest.TestCase):
         # The user's own staged change is still staged, and the committed path is clean.
         self.assertEqual(git(self.target, "status", "--porcelain").stdout.splitlines(), ["M  README.md"])
         self.assertEqual(installer.commit_paths(self.target, "Again", "x", [".codex/a"]), "nothing")
+
+    def test_checkout_local_hooks_are_never_committed_and_an_old_tracked_copy_is_untracked(self) -> None:
+        installed = self.install(apply=True)
+        self.assertTrue(installed["ok"], installed)
+        self.assertEqual(installed["codex"]["local_files"], sorted(installer.LOCAL_ONLY))
+        hooks = self.target / ".codex" / "hooks.json"
+        rendered = hooks.read_bytes()
+        self.assertIn(b"/usr/bin/env xcrun_nocache=1", rendered)
+        self.assertNotIn(b"git rev-parse", rendered)
+        # The rendered hooks and their record are ignored, so they are never a change.
+        changed = installer.project_changes(self.target, list(installer.MANAGED_PATHS))
+        self.assertNotIn(".codex/hooks.json", changed)
+        self.assertNotIn(".codex/orchestration/local-install.json", changed)
+        self.assertEqual(installer.commit_paths(self.target, "Install", "x", changed), "committed")
+        self.assertEqual(git(self.target, "ls-files", "--", *installer.LOCAL_ONLY).stdout, "")
+        self.assertEqual(installer.project_changes(self.target, list(installer.MANAGED_PATHS)), [])
+        # Even a missing .gitignore never makes an untracked local file a change.
+        (self.target / ".codex" / ".gitignore").rename(self.base / "gitignore")
+        self.assertEqual(installer.project_changes(self.target, [".codex/hooks.json"]), [])
+        (self.base / "gitignore").rename(self.target / ".codex" / ".gitignore")
+        # 0.8.x committed a static hooks file: unchanged, it is no change; once rendered over,
+        # the commit takes it out of the index and leaves the file in place.
+        hooks.write_text("static\n")
+        git(self.target, "add", "-f", ".codex/hooks.json")
+        git(self.target, "commit", "-qm", "an earlier release's static hooks")
+        self.assertEqual(installer.project_changes(self.target, [".codex/hooks.json"]), [])
+        hooks.write_bytes(rendered)
+        self.assertEqual(installer.project_changes(self.target, [".codex/hooks.json"]), [".codex/hooks.json"])
+        self.assertEqual(installer.commit_paths(self.target, "Untrack", "x", [".codex/hooks.json"]), "committed")
+        self.assertEqual(git(self.target, "ls-files", "--", ".codex/hooks.json").stdout, "")
+        self.assertEqual(git(self.target, "show", "--name-status", "--format=", "HEAD").stdout.split(),
+                         ["D", ".codex/hooks.json"])
+        self.assertEqual(hooks.read_bytes(), rendered)
+        self.assertEqual(installer.project_changes(self.target, list(installer.MANAGED_PATHS)), [])
+        self.assertEqual(git(self.target, "status", "--porcelain").stdout, "")
 
     def test_a_plumbing_commit_refuses_when_the_branch_moved(self) -> None:
         (self.target / ".codex").mkdir()

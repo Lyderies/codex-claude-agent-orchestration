@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +13,19 @@ import tomllib
 
 from .catalog import CatalogError, discover, load_discovery_policy
 from .contracts import ContractError
+from .hook_config import (
+    ASYNC_HOOK_EVENTS,
+    HOOK_EVENTS,
+    HOOK_TIMEOUT,
+    HOOKS_RELATIVE,
+    LEGACY_HOOK_COMMAND,
+    LOCAL_MANIFEST_RELATIVE,
+    MAX_LOCAL_BYTES,
+    HookConfigError,
+    interpreter_problem,
+    parse_local_manifest,
+    render_hooks,
+)
 from .learning_adapters import load_client_capabilities
 from .learning_contracts import (
     CANARY_REPORT_FIELDS,
@@ -72,31 +88,7 @@ EXPECTED_EVALUATION_FAMILIES = {
     "security",
     "verification",
 }
-EXPECTED_HOOK_EVENTS = {
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-    "Stop",
-    "Interrupt",
-    "SubagentStart",
-    "SubagentStop",
-    "PreToolUse",
-    "PostToolUse",
-}
-# Isolated like every other launch, so a hook neither writes bytecode into
-# `.codex/orchestration` (which the protected runtime copy refuses) nor reads any.
-EXPECTED_HOOK_COMMAND = (
-    "python3 -I -B -S -X pycache_prefix=/dev/null "
-    '"$(git rev-parse --show-toplevel)/.codex/orchestration/learning_hook.py" '
-    "--client-version codex-hooks-v1"
-)
-ASYNC_HOOK_EVENTS = {
-    "SessionStart",
-    "UserPromptSubmit",
-    "SubagentStart",
-    "PreToolUse",
-    "PostToolUse",
-}
+EXPECTED_HOOK_EVENTS = set(HOOK_EVENTS)
 
 
 def _validate_evaluation(
@@ -504,11 +496,57 @@ def _validate_learning_releases(root: Path, errors: list[str]) -> None:
         errors.append(str(exc))
 
 
-def _validate_learning_hooks(root: Path, errors: list[str]) -> None:
-    path = root / ".codex" / "hooks.json"
+HOOKS_SETUP_ADVICE = "run ./setup.sh and choose to update the install"
+
+
+def _read_regular(root: Path, relative: str, limit: int) -> bytes | None:
+    """`relative` under `root` as bytes, never through a symlink; None when absent."""
+
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            except FileNotFoundError:
+                return None
+            os.close(descriptor)
+            descriptor = child
+        try:
+            handle = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        except FileNotFoundError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(handle).st_mode):
+                raise OSError("not a regular file")
+            content = os.read(handle, limit + 1)
+        finally:
+            os.close(handle)
+        if len(content) > limit:
+            raise OSError("too large")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _validate_learning_hooks(root: Path, errors: list[str]) -> None:
+    """The checkout's rendered hooks: the closed shape, and exactly the installer's bytes.
+
+    The file is local to this checkout (never committed), so every problem is a project
+    error and the fix is always the installer (./setup.sh).
+    """
+
+    try:
+        raw = _read_regular(root, HOOKS_RELATIVE, MAX_LOCAL_BYTES)
+    except OSError:
+        errors.append(f"learning hook configuration is not a regular file; {HOOKS_SETUP_ADVICE}")
+        return
+    if raw is None:
+        errors.append(f"learning hooks are not installed in this checkout; {HOOKS_SETUP_ADVICE}")
+        return
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         errors.append(f"cannot load learning hook configuration: {exc}")
         return
     if not isinstance(data, dict) or set(data) != {"description", "hooks"}:
@@ -518,6 +556,8 @@ def _validate_learning_hooks(root: Path, errors: list[str]) -> None:
     if not isinstance(hooks, dict) or set(hooks) != EXPECTED_HOOK_EVENTS:
         errors.append("learning hook event set is incomplete or over-broad")
         return
+    structural = len(errors)
+    legacy = False
     for event, groups in hooks.items():
         if not isinstance(groups, list) or len(groups) != 1:
             errors.append(f"learning hook must have one group: {event}")
@@ -534,12 +574,44 @@ def _validate_learning_hooks(root: Path, errors: list[str]) -> None:
         if not isinstance(command, dict) or set(command) != expected_fields:
             errors.append(f"learning hook command fields are invalid: {event}")
             continue
-        if command.get("type") != "command" or command.get("timeout") != 3:
+        if command.get("type") != "command" or command.get("timeout") != HOOK_TIMEOUT:
             errors.append(f"learning hook bounds are invalid: {event}")
-        if command.get("command") != EXPECTED_HOOK_COMMAND:
-            errors.append(f"learning hook command target is invalid: {event}")
         if event in ASYNC_HOOK_EVENTS and command.get("async") is not True:
             errors.append(f"learning hook must be asynchronous: {event}")
+        legacy = legacy or command.get("command") == LEGACY_HOOK_COMMAND
+    if legacy:
+        errors.append(
+            "learning hooks still use the old form, which runs python3 from PATH and finds "
+            f"the hook through git; {HOOKS_SETUP_ADVICE}"
+        )
+        return
+    if len(errors) != structural:
+        return
+    try:
+        record = _read_regular(root, LOCAL_MANIFEST_RELATIVE, MAX_LOCAL_BYTES)
+        if record is None:
+            raise HookConfigError("the local install record is missing")
+        interpreter, files = parse_local_manifest(record)
+    except (OSError, HookConfigError) as exc:
+        detail = str(exc) if isinstance(exc, HookConfigError) else "the local install record is unreadable"
+        errors.append(f"learning hooks cannot be checked: {detail}; {HOOKS_SETUP_ADVICE}")
+        return
+    problem = interpreter_problem(interpreter, root)
+    if problem is not None:
+        errors.append(
+            f"the learning hooks' Python interpreter cannot be trusted: {problem}; {HOOKS_SETUP_ADVICE}"
+        )
+        return
+    try:
+        expected = render_hooks(interpreter, root)
+    except HookConfigError as exc:
+        errors.append(f"{exc}; {HOOKS_SETUP_ADVICE}")
+        return
+    if raw != expected or files[HOOKS_RELATIVE] != hashlib.sha256(raw).hexdigest():
+        errors.append(
+            "learning hook configuration differs from what the installer renders for this "
+            f"checkout (edited, or the project moved); {HOOKS_SETUP_ADVICE}"
+        )
 
 
 def _validate_learning_overhead(root: Path, errors: list[str]) -> None:
@@ -598,10 +670,10 @@ def validate_package(root: Path) -> dict[str, Any]:
     _validate_learning_producers(root, package_errors)
     _validate_learning_clients(root, package_errors)
     _validate_learning_releases(root, package_errors)
-    _validate_learning_hooks(root, package_errors)
     _validate_learning_overhead(root, package_errors)
     _validate_evaluation(root, policy, package_errors)
 
+    _validate_learning_hooks(root, project_errors)
     mapping_path = orchestration / "project-agent-routing.json"
     if mapping_path.is_symlink():
         project_errors.append("project agent routing configuration is not a regular file")

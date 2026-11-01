@@ -358,8 +358,8 @@ def cli_command(project: Path, args: list[str]) -> list[str]:
 
 # The project's own configuration files the installer and setup write beside the runtime
 # (runtime_files.PROJECT_FILES; a test keeps them equal).
-PROJECT_FILES = ("install-manifest.json", "operational-checks.json", "project-agent-routing.json",
-                 "provider-routing.json")
+PROJECT_FILES = ("install-manifest.json", "local-install.json", "operational-checks.json",
+                 "project-agent-routing.json", "provider-routing.json")
 
 
 def _runtime_bundle() -> dict[str, bytes]:

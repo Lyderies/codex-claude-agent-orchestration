@@ -467,11 +467,17 @@ elif op in ("plan", "planpaths", "paths"):
                 out.append(("KEEP", rel))
             else:
                 out.append(("UPDATE", rel))
+        # Written for this checkout only and never committed (the rendered learning hooks);
+        # a copy an earlier release committed is taken out of Git, and the file stays.
+        local = [rel for rel in (codex.get("local_files") or []) if isinstance(rel, str)]
+        for rel in local:
+            out.append(("UNSAFE", None) if unsafe(rel) else ("LOCAL", rel))
         manifest = load(os.path.join(target, ".codex", "orchestration", "install-manifest.json"))
         old = (manifest or {}).get("files") if isinstance(manifest, dict) else None
         if isinstance(old, dict):
             for rel in sorted(set(old) - set(f for f in files if isinstance(f, str))):
-                out.append(("UNSAFE", None) if unsafe(rel) else ("REMOVE", rel))
+                kind = "UNTRACK" if rel in local else "REMOVE"
+                out.append(("UNSAFE", None) if unsafe(rel) else (kind, rel))
         settings = data.get("claude_settings") or {}
         for rel in (claude.get("changed_paths") or []) + (settings.get("changed_paths") or []):
             if unsafe(rel):
@@ -489,7 +495,7 @@ elif op in ("plan", "planpaths", "paths"):
         found = entries(sys.argv[2], sys.argv[3], sys.argv[4])
         if any(kind == "UNSAFE" for kind, _ in found):
             sys.exit(3)
-        for rel in sorted(set(r for k, r in found if k in ("ADD", "UPDATE", "REMOVE"))):
+        for rel in sorted(set(r for k, r in found if k in ("ADD", "UPDATE", "REMOVE", "UNTRACK"))):
             sys.stdout.buffer.write(rel.encode("utf-8") + b"\0")
     else:
         data = load(sys.argv[2]) or {}
@@ -1240,6 +1246,10 @@ explain_installer() {
   local label=$1 manual=$2 raw msg
   raw=$(pj raw "$LAST_OUT")
   case "$raw" in
+    *"cannot install the learning hooks"*)
+      msg="The learning hooks could not be written: the project's folder path holds a quote, a backslash or a control character, or this Python is not in a trusted installation folder. Move the project, or run setup with a Python from Homebrew, python.org or the system.";;
+    *"learning hook"*)
+      msg="The project's learning hooks are missing, from an older release or edited by hand (Codex runs them outside its sandbox). Update the install (choose 'Update the install and walk through every step').";;
     *"merge"*"progress"*|*"rebase"*"progress"*|*"cherry-pick"*"progress"*|*"revert"*"progress"*|*"bisect"*"progress"*|*unmerged*)
       msg="A Git operation (merge, rebase, cherry-pick or similar) is unfinished in the project. Finish or abort it first.";;
     *"managed paths"*|*"uncommitted"*)
@@ -1790,6 +1800,11 @@ show_plan() {
     [ "$n" -gt "$shown" ] && list_sub "... and $((n - shown)) more"
   done
   list_add info "Files unchanged: $(printf '%s\n' "$PLAN_TEXT" | grep -c '^KEEP ')"
+  n=$(printf '%s\n' "$PLAN_TEXT" | grep -c '^LOCAL ')
+  [ "$n" -gt 0 ] && list_add info "Learning hooks: written for this checkout only, never committed ($n files)"
+  while IFS= read -r line; do
+    list_sub "Taken out of Git (now written for this checkout only): ${line#UNTRACK }"
+  done < <(printf '%s\n' "$PLAN_TEXT" | grep '^UNTRACK ')
   while IFS= read -r line; do
     list_add info "Project config: ${line#CONFIG }"
   done < <(printf '%s\n' "$PLAN_TEXT" | grep '^CONFIG ')
@@ -1808,7 +1823,7 @@ view_plan() {
   if [ "$#" -gt 0 ]; then
     text=$1
   else
-    text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE) ')
+    text=$(printf '%s\n' "$PLAN_TEXT" | grep -E '^(ADD|UPDATE|REMOVE|UNTRACK) ')
   fi
   hide_cursor
   while :; do
@@ -1890,6 +1905,8 @@ step_install() {
   fi
   screen_reset; begin_step 4
   list_add ok "Packages installed"
+  # Codex trusts each hook by its hash, and the installer never writes that trust.
+  list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
   if [ "$ROUTING_WRITE" -eq 1 ]; then
     if write_project_routing "$PROJECT" "$ROUTING_CONTENT" 2>"$LOGDIR/routing.err"; then
       list_add ok "Wrote .codex/orchestration/provider-routing.json"
@@ -1976,6 +1993,13 @@ step_install() {
     COMMIT_STATE=failed
   else
     body "Next: commit the installed files in the project. Only these $n_paths paths are committed, nothing is pushed. Setup commits with Git's plumbing commands only (hash-object, update-index, write-tree, commit-tree, update-ref), which start no hook, filter, signing program, pager or maintenance whatever the project's Git settings say, and with every network transport off. To commit them yourself instead, these are the commands; choose 'Show every path' for the full list."
+    while IFS= read -r line; do
+      for path in "${COMMIT_PATHS[@]}"; do
+        if [ "$path" = "${line#UNTRACK }" ]; then
+          list_cmd "git -C $q_project --literal-pathspecs rm --cached -q -- $(printf '%q' "$path")   # first; leave it out of the add below"
+        fi
+      done
+    done < <(printf '%s\n' "$PLAN_TEXT" | grep '^UNTRACK ')
     list_cmd "git -C $q_project --literal-pathspecs add -A -- <the $n_paths paths below>"
     list_cmd "git -C $q_project --literal-pathspecs commit -m \"$COMMIT_MSG_1\" -m \"$COMMIT_MSG_2\" -- <the same paths>"
     shown=0
@@ -1992,6 +2016,7 @@ step_install() {
     done
     screen_reset; begin_step 4
     list_add ok "Packages installed"
+    list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
     COMMIT_STATE=not_committed
     if [ "$MENU_IDX" -eq 0 ]; then
       render

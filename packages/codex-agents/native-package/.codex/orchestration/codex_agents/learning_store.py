@@ -9468,7 +9468,9 @@ def _start_collector_locked(
         stderr=subprocess.DEVNULL,
         cwd="/",
         close_fds=True,
-        env={"PATH": os.defpath},
+        # No inherited environment; macOS developer tools skip the xcrun lookup cache
+        # under $TMPDIR, which a sandboxed session can write.
+        env={"PATH": os.defpath, "xcrun_nocache": "1"},
         start_new_session=True,
     )
     deadline = time.monotonic() + timeout

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -10,8 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.support import REPOSITORY_ROOT, MACOS_SANDBOX_ONLY, TEMP_ROOT
+from tests.support import REPOSITORY_ROOT, MACOS_SANDBOX_ONLY, TEMP_ROOT, trusted_hook_interpreter
 
+from codex_agents import hook_config, host_paths, validation
 from codex_agents.learning_store import CollectorClient, CollectorError, LearningState
 
 SPEC = importlib.util.spec_from_file_location(
@@ -20,9 +22,43 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 installer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(installer)
+REAL_HOOK_INTERPRETER = installer.hook_interpreter
+
+
+def trust_hook_python(test: unittest.TestCase) -> Path:
+    """The interpreter installs in this test render into the hooks.
+
+    The installer names the Python it runs under. CI's toolcache Python is outside the
+    trusted installation folders (hook_config tests cover that check), so a trusted one is
+    named instead; with none on the machine, this test's own counts, in this process only.
+    """
+
+    own = Path(os.path.realpath(sys.executable))
+    real = trusted_hook_interpreter()
+    if real == own:
+        return own
+    patchers = [patch.object(installer, "hook_interpreter", lambda target: real or own)]
+    if real is None:
+        original = validation.interpreter_problem
+        patchers.append(patch.object(
+            validation, "interpreter_problem",
+            lambda interpreter, root: None if interpreter == own else original(interpreter, root)))
+    for patcher in patchers:
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    return real or own
+
+
+def hook_errors(target: Path) -> list[str]:
+    errors: list[str] = []
+    validation._validate_learning_hooks(target.resolve(), errors)
+    return errors
 
 
 class InstallerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.hook_python = trust_hook_python(self)
+
     def empty_target(self, directory: str) -> Path:
         target = Path(directory) / "target"
         target.mkdir()
@@ -625,6 +661,166 @@ class InstallerTests(unittest.TestCase):
                     update=True,
                     project_agent_routing=changed,
                 )
+
+
+class RenderedHookTests(unittest.TestCase):
+    """The installer renders .codex/hooks.json per checkout and tracks it locally."""
+
+    def setUp(self) -> None:
+        self.hook_python = trust_hook_python(self)
+        self.directory = tempfile.mkdtemp(dir=TEMP_ROOT)
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.directory], check=False)
+        self.target = InstallerTests.target(self, self.directory)
+        self.inputs = InstallerTests.project_inputs(self, self.directory)
+        self.root = self.target.resolve()
+
+    def install(self, **options) -> dict:
+        return installer.install(self.target, apply=True, **self.inputs, **options)
+
+    def rewrite_hooks(self, interpreter: Path, *, content: bytes | None = None) -> None:
+        """Write hooks (rendered for `interpreter` unless `content`) and a matching record."""
+
+        hooks = content if content is not None else hook_config.render_hooks(interpreter, self.root)
+        (self.root / hook_config.HOOKS_RELATIVE).write_bytes(hooks)
+        (self.root / hook_config.LOCAL_MANIFEST_RELATIVE).write_bytes(
+            hook_config.render_local_manifest(interpreter, hooks))
+
+    def legacy_hooks(self) -> bytes:
+        handler = {"type": "command", "command": hook_config.LEGACY_HOOK_COMMAND, "timeout": 3}
+        hooks = {
+            event: [{"hooks": [{**handler, **({"async": True} if event in hook_config.ASYNC_HOOK_EVENTS else {})}]}]
+            for event in hook_config.HOOK_EVENTS
+        }
+        return (json.dumps({"description": "Observational, redacted codex-agents learning telemetry.",
+                            "hooks": hooks}, indent=2) + "\n").encode()
+
+    def test_install_writes_rendered_hooks_the_local_record_tracks(self) -> None:
+        report = self.install()
+        self.assertEqual(report["local_files"], sorted(hook_config.LOCAL_FILES))
+        hooks = (self.root / hook_config.HOOKS_RELATIVE).read_bytes()
+        self.assertEqual(hooks, hook_config.render_hooks(self.hook_python, self.root))
+        interpreter, files = hook_config.parse_local_manifest(
+            (self.root / hook_config.LOCAL_MANIFEST_RELATIVE).read_bytes())
+        self.assertEqual(interpreter, self.hook_python)
+        self.assertEqual(files[hook_config.HOOKS_RELATIVE], hashlib.sha256(hooks).hexdigest())
+        manifest = json.loads((self.root / installer.MANIFEST_PATH).read_text())
+        self.assertNotIn(hook_config.HOOKS_RELATIVE, manifest["files"])
+        self.assertNotIn(hook_config.LOCAL_MANIFEST_RELATIVE, manifest["files"])
+        self.assertIn(".codex/.gitignore", manifest["files"])
+        # Both stay out of Git, in every clone, through the committed .codex/.gitignore.
+        ignored = subprocess.run(
+            ["git", "-C", str(self.root), "check-ignore", *hook_config.LOCAL_FILES],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(ignored.stdout.split(), list(hook_config.LOCAL_FILES))
+        self.assertEqual(hook_errors(self.target), [])
+        self.assertFalse(any("hook" in item for item in installer.verify(self.target)["errors"]))
+        # An unchanged update keeps the same bytes.
+        self.install(update=True)
+        self.assertEqual(hooks, (self.root / hook_config.HOOKS_RELATIVE).read_bytes())
+
+    def test_remove_takes_the_hooks_and_record_and_refuses_edited_hooks(self) -> None:
+        self.install()
+        hooks = self.root / hook_config.HOOKS_RELATIVE
+        original = hooks.read_bytes()
+        hooks.write_bytes(original.replace(b"-I -B", b"-B"))
+        with self.assertRaisesRegex(installer.InstallError, "refusing to remove"):
+            installer.remove(self.target, apply=True)
+        with self.assertRaisesRegex(installer.InstallError, "modified installed file: .codex/hooks.json"):
+            self.install(update=True)
+        hooks.write_bytes(original)
+        report = installer.remove(self.target, apply=True)
+        self.assertEqual(report["local_files"], sorted(hook_config.LOCAL_FILES))
+        for relative in hook_config.LOCAL_FILES:
+            self.assertFalse((self.root / relative).exists(), relative)
+
+    def test_update_replaces_the_static_hooks_of_an_earlier_release(self) -> None:
+        self.install()
+        # What 0.8.x left: the static, committed hooks file owned by the install manifest,
+        # and no local record.
+        legacy = self.legacy_hooks()
+        (self.root / hook_config.HOOKS_RELATIVE).write_bytes(legacy)
+        (self.root / hook_config.LOCAL_MANIFEST_RELATIVE).unlink()
+        manifest_path = self.root / installer.MANIFEST_PATH
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"][hook_config.HOOKS_RELATIVE] = hashlib.sha256(legacy).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertTrue(any("old form" in item and "./setup.sh" in item for item in hook_errors(self.target)))
+        report = self.install(update=True)
+        self.assertEqual(report["local_files"], sorted(hook_config.LOCAL_FILES))
+        self.assertEqual((self.root / hook_config.HOOKS_RELATIVE).read_bytes(),
+                         hook_config.render_hooks(self.hook_python, self.root))
+        manifest = json.loads(manifest_path.read_text())
+        self.assertNotIn(hook_config.HOOKS_RELATIVE, manifest["files"])
+        self.assertEqual(hook_errors(self.target), [])
+
+    def test_an_edited_static_file_of_an_earlier_release_is_not_replaced(self) -> None:
+        self.install()
+        legacy = self.legacy_hooks()
+        manifest_path = self.root / installer.MANIFEST_PATH
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"][hook_config.HOOKS_RELATIVE] = hashlib.sha256(legacy).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        (self.root / hook_config.LOCAL_MANIFEST_RELATIVE).unlink()
+        (self.root / hook_config.HOOKS_RELATIVE).write_bytes(legacy + b" ")
+        with self.assertRaisesRegex(installer.InstallError, "modified obsolete file: .codex/hooks.json"):
+            self.install(update=True)
+
+    def test_verify_fails_on_old_edited_and_untrusted_hooks(self) -> None:
+        self.install()
+        hooks = self.root / hook_config.HOOKS_RELATIVE
+        rendered = hooks.read_bytes()
+        # The old $(git rev-parse) form, even though structurally valid.
+        self.rewrite_hooks(self.hook_python, content=self.legacy_hooks())
+        self.assertTrue(any("old form" in item for item in hook_errors(self.target)))
+        # A hand-edited command, with the record updated to match its digest.
+        self.rewrite_hooks(self.hook_python, content=rendered.replace(b"-I -B", b"-B", 1))
+        self.assertTrue(any("differs from what the installer renders" in item
+                            for item in hook_errors(self.target)))
+        # The project moved: the rendered paths no longer name this checkout.
+        hooks.write_bytes(rendered)
+        (self.root / hook_config.LOCAL_MANIFEST_RELATIVE).write_bytes(
+            hook_config.render_local_manifest(self.hook_python, rendered))
+        self.assertEqual(hook_errors(self.target), [])
+        # An interpreter in a temporary folder (a session can write it).
+        planted = Path(os.path.realpath(self.directory)) / "python3"
+        planted.write_text("#!/bin/sh\n")
+        self.rewrite_hooks(planted)
+        self.assertTrue(any("cannot be trusted" in item and "temporary" in item
+                            for item in hook_errors(self.target)))
+        # An interpreter outside every trusted installation folder.
+        self.rewrite_hooks(self.hook_python)
+        with patch.object(host_paths, "TRUSTED_INSTALL_ROOTS", ()), \
+                patch.object(host_paths, "trusted_location_problem", lambda path, untrusted: None), \
+                patch.object(host_paths, "account_home", lambda: Path("/nonexistent-home")), \
+                patch.object(validation, "interpreter_problem", hook_config.interpreter_problem):
+            self.assertTrue(any("trusted installation folder" in item for item in hook_errors(self.target)))
+        # macOS's /usr/bin/python3 xcrun shim.
+        self.rewrite_hooks(Path("/usr/bin/python3"))
+        with patch.object(sys, "platform", "darwin"), \
+                patch.object(validation, "interpreter_problem", hook_config.interpreter_problem):
+            self.assertTrue(any("xcrun shim" in item for item in hook_errors(self.target)))
+        # No record at all.
+        hooks.write_bytes(rendered)
+        (self.root / hook_config.LOCAL_MANIFEST_RELATIVE).unlink()
+        self.assertTrue(any("record is missing" in item for item in hook_errors(self.target)))
+        hooks.unlink()
+        self.assertTrue(any("not installed in this checkout" in item for item in hook_errors(self.target)))
+
+    def test_install_refuses_an_untrusted_interpreter_or_an_unquotable_project(self) -> None:
+        planted = Path(os.path.realpath(self.directory)) / "python3"
+        planted.write_text("#!/bin/sh\n")
+        with patch.object(installer, "hook_interpreter", REAL_HOOK_INTERPRETER), \
+                patch.object(installer, "interpreter_path", lambda project_root: str(planted)):
+            with self.assertRaisesRegex(installer.InstallError, "cannot install the learning hooks"):
+                installer.install(self.target, apply=False, **self.inputs)
+        self.assertFalse((self.root / hook_config.HOOKS_RELATIVE).exists())
+        quoted = Path(self.directory) / "it's"
+        quoted.mkdir()
+        target = InstallerTests.target(self, str(quoted))
+        inputs = InstallerTests.project_inputs(self, str(quoted))
+        with self.assertRaisesRegex(installer.InstallError, "cannot install the learning hooks.*quote"):
+            installer.install(target, apply=True, **inputs)
+        self.assertFalse((target / installer.MANIFEST_PATH).exists())
 
 
 if __name__ == "__main__":

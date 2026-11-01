@@ -28,7 +28,10 @@ private log, shown only if something fails. `NO_COLOR=1` gives plain output. Pat
    says "Nothing to commit" and skips the question). The commit uses Git plumbing only and is never
    pushed. The summary says `committed`, `nothing to commit`, `not committed (you chose to commit
    yourself)` or `commit failed`, and lists anything left uncommitted, including files `.gitignore` hides.
-   Then it verifies the install.
+   The learning hooks (`.codex/hooks.json`, which Codex runs outside its sandbox) are rendered for this
+   checkout with the trusted Python and absolute paths, and are never committed; an older committed copy
+   is taken out of Git. The step says "In Codex, open /hooks and trust the orchestrator's learning hooks",
+   because Codex trusts hooks by hash and setup never writes that trust. Then it verifies the install.
 5. **Collector.** Registers the project with the one local learning collector shared by every project on
    the machine, and starts it. Your orchestrator records (the ledger, the owner key record and the
    collector's files) live in `~/.local/state/codex-agents` (or `$XDG_STATE_HOME/codex-agents`); on macOS

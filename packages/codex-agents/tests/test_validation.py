@@ -45,18 +45,20 @@ class PackageValidationTests(unittest.TestCase):
         self.assertFalse(report["project_ready"])
         self.assertFalse(report["ready"])
 
-    def test_installed_hooks_use_surface_identity_without_binary_version(self) -> None:
-        hooks = json.loads((BUNDLE_ROOT / ".codex" / "hooks.json").read_text())[
-            "hooks"
-        ]
-        commands = [
-            group["hooks"][0]["command"]
-            for groups in hooks.values()
-            for group in groups
-        ]
-        self.assertEqual(9, len(commands))
-        self.assertTrue(all("--client-version codex-hooks-v1" in item for item in commands))
-        self.assertTrue(all("codex-cli-0.153.0" not in item for item in commands))
+    def test_package_ships_no_hooks_file_and_ignores_the_rendered_one(self) -> None:
+        # The installer renders .codex/hooks.json for each checkout (hook_config); the
+        # package ships only the .gitignore that keeps it and its record out of Git.
+        self.assertFalse((BUNDLE_ROOT / ".codex" / "hooks.json").exists())
+        ignored = (BUNDLE_ROOT / ".codex" / ".gitignore").read_text().splitlines()
+        self.assertIn("/hooks.json", ignored)
+        self.assertIn("/orchestration/local-install.json", ignored)
+        report = validate_package(BUNDLE_ROOT)
+        self.assertIn(
+            "learning hooks are not installed in this checkout; run ./setup.sh and choose "
+            "to update the install",
+            report["project_errors"],
+        )
+        self.assertFalse(any("hook" in item for item in report["package_errors"]))
 
     def test_every_package_agent_requires_literal_result_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

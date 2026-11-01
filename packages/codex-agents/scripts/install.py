@@ -25,7 +25,9 @@ OPERATIONAL_CHECKS_PATH = Path(".codex/orchestration/operational-checks.json")
 ORCHESTRATION_ROOT = BUNDLE_ROOT / ".codex" / "orchestration"
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
-from codex_agents.learning_engine import (  # noqa: E402 - source-tree bootstrap above
+from codex_agents import hook_config  # noqa: E402 - source-tree bootstrap above
+from codex_agents.host_commands import HostCommandError, interpreter_path  # noqa: E402
+from codex_agents.learning_engine import (  # noqa: E402
     validate_operational_check_configuration_input,
 )
 from codex_agents.routing import validate_project_agent_mapping  # noqa: E402
@@ -345,6 +347,74 @@ def _target_root(path: Path) -> TargetRoot:
         raise
 
 
+def hook_interpreter(target: TargetRoot) -> Path:
+    """The interpreter the rendered hooks name: the vetted one this installer runs under.
+
+    ./setup.sh and scripts/install.py start this installer with the Python setup.sh
+    selected (attest.trusted_python), so the hooks run that same interpreter.
+    """
+
+    try:
+        interpreter = Path(interpreter_path(project_root=target.path))
+    except HostCommandError as exc:
+        raise InstallError(f"cannot install the learning hooks: {exc}") from None
+    problem = hook_config.interpreter_problem(interpreter, target.path)
+    if problem is not None:
+        raise InstallError(
+            f"cannot install the learning hooks: this Python cannot be named in them ({problem}); "
+            "run setup with a Python from a trusted installation folder"
+        )
+    return interpreter
+
+
+def _render_local(target: TargetRoot) -> dict[str, bytes]:
+    """This checkout's rendered hooks and the local record that names their interpreter."""
+
+    interpreter = hook_interpreter(target)
+    try:
+        hooks = hook_config.render_hooks(interpreter, target.path)
+    except hook_config.HookConfigError as exc:
+        raise InstallError(f"cannot install the learning hooks: {exc}; move the project") from None
+    return {
+        hook_config.HOOKS_RELATIVE: hooks,
+        hook_config.LOCAL_MANIFEST_RELATIVE: hook_config.render_local_manifest(interpreter, hooks),
+    }
+
+
+def _load_local_manifest(target: Target) -> dict[str, str] | None:
+    """The digests the local install record owns, or None when there is none."""
+
+    raw = _read_managed_bytes(target, hook_config.LOCAL_MANIFEST_RELATIVE)
+    if raw is None:
+        return None
+    try:
+        _interpreter, files = hook_config.parse_local_manifest(raw)
+    except hook_config.HookConfigError as exc:
+        raise InstallError(f"{exc}: {hook_config.LOCAL_MANIFEST_RELATIVE}") from None
+    return {**files, hook_config.LOCAL_MANIFEST_RELATIVE: hashlib.sha256(raw).hexdigest()}
+
+
+def _local_conflicts(target: Target, manifest: dict | None) -> list[str]:
+    """Conflicts at the checkout-local paths: only files the installer wrote are replaced.
+
+    A hooks file is the installer's when the local record (or, for a 0.8.x install that
+    committed the static file, the install manifest) holds its current digest.
+    """
+
+    owned = _load_local_manifest(target) or {}
+    committed = {} if manifest is None else manifest["files"]
+    conflicts = []
+    for relative in hook_config.LOCAL_FILES:
+        current = _managed_digest(target, relative)
+        if current is None or relative in committed:
+            continue  # a file the install manifest owns is checked as an obsolete file
+        if relative not in owned:
+            conflicts.append(f"existing unmanaged file: {relative}")
+        elif current != owned[relative]:
+            conflicts.append(f"modified installed file: {relative}")
+    return conflicts
+
+
 def _plan_install(target: Target, update: bool) -> tuple[dict[str, Path], dict | None]:
     files = _bundle_files()
     manifest = _load_manifest(target)
@@ -372,6 +442,7 @@ def _plan_install(target: Target, update: bool) -> tuple[dict[str, Path], dict |
             current = _managed_digest(target, relative)
             if current is not None and current != old_digest:
                 conflicts.append(f"modified obsolete file: {relative}")
+    conflicts.extend(_local_conflicts(target, manifest))
     if conflicts:
         raise InstallError("install conflicts:\n- " + "\n- ".join(sorted(conflicts)))
     return files, manifest
@@ -486,12 +557,14 @@ def install(
             replace_project_config=replace_project_config,
         )
         files, manifest = _plan_install(target, update)
+        local = _render_local(target)
         action = "update" if update else "install"
         report = {
             "action": action,
             "apply": apply,
             "target": str(target.path),
             "files": sorted(files),
+            "local_files": sorted(local),
             "project_configuration": configuration_actions,
         }
         if not apply:
@@ -509,6 +582,17 @@ def install(
                 if relative in files:
                     continue
                 _unlink_managed(target, relative, expected_digest=old_digest)
+        # Rendered for this checkout after the old static hooks file (0.8.x) is gone; the
+        # local record goes last, so it only ever names hooks that are in place.
+        _atomic_write_managed(
+            target, hook_config.HOOKS_RELATIVE, local[hook_config.HOOKS_RELATIVE], mode=0o644
+        )
+        _atomic_write_managed(
+            target,
+            hook_config.LOCAL_MANIFEST_RELATIVE,
+            local[hook_config.LOCAL_MANIFEST_RELATIVE],
+            mode=0o600,
+        )
         for relative, content in project_configuration.items():
             if configuration_actions[relative] in {"create", "replace"}:
                 _atomic_write_managed(target, relative, content, mode=0o600)
@@ -518,6 +602,7 @@ def install(
         report["action"] = action
         report["apply"] = True
         report["project_configuration"] = configuration_actions
+        report["local_files"] = sorted(local)
         return report
     finally:
         target.close()
@@ -591,6 +676,18 @@ def remove(target_path: Path, apply: bool) -> dict:
                 removable.append(relative)
             else:
                 modified.append(relative)
+        local_owned = _load_local_manifest(target) or {}
+        local_removable: dict[str, str] = {}
+        for relative, expected in local_owned.items():
+            if relative in manifest["files"]:
+                continue
+            current = _managed_digest(target, relative)
+            if current is None:
+                continue
+            if current == expected:
+                local_removable[relative] = expected
+            else:
+                modified.append(relative)
         if modified:
             raise InstallError(
                 "refusing to remove modified installed files:\n- "
@@ -601,6 +698,7 @@ def remove(target_path: Path, apply: bool) -> dict:
             "apply": apply,
             "target": str(target.path),
             "files": sorted(removable),
+            "local_files": sorted(local_removable),
         }
         if not apply:
             return report
@@ -614,6 +712,9 @@ def remove(target_path: Path, apply: bool) -> dict:
             _unlink_managed(
                 target, relative, expected_digest=manifest["files"][relative]
             )
+        # The hooks first, the record that owns them last.
+        for relative in sorted(local_removable, key=hook_config.LOCAL_FILES.index):
+            _unlink_managed(target, relative, expected_digest=local_removable[relative])
         manifest_directory = MANIFEST_PATH.parent
         while manifest_directory != Path("."):
             directories.add(manifest_directory)

@@ -9,7 +9,13 @@ the package's own files.
 
 Paths are relative to `.codex/orchestration/`. Signed release data
 (`config/learning-releases.json`) and the hook script are package files but not
-runtime code: a protected copy reads release data from its project.
+runtime code: a protected copy reads release data from its project, and Codex
+runs the project's own `learning_hook.py` (named absolutely by the checkout's
+rendered `.codex/hooks.json`), never the copy's. That file sits in the project's
+`.codex`, which Codex keeps read-only for a session opened on the project and the
+session guard refuses for one opened above it, exactly like `hooks.json` itself.
+`hook_config.py` renders and checks that file; validation imports it, so it is
+runtime code.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ RUNTIME_FILES = (
     "codex_agents/contracts.py",
     "codex_agents/evaluation.py",
     "codex_agents/git_plumbing.py",
+    "codex_agents/hook_config.py",
     "codex_agents/host_commands.py",
     "codex_agents/host_paths.py",
     "codex_agents/hosts.py",
@@ -75,8 +82,11 @@ RUNTIME_FILES = (
 # Package files under `.codex/orchestration/` that are not runtime code.
 PACKAGE_DATA_FILES = ("config/learning-releases.json", "learning_hook.py")
 # Files the installer or setup writes there for the project itself.
+# `local-install.json` is this checkout's own (the interpreter its hooks name), never
+# committed.
 PROJECT_FILES = (
     "install-manifest.json",
+    "local-install.json",
     "operational-checks.json",
     "project-agent-routing.json",
     "provider-routing.json",

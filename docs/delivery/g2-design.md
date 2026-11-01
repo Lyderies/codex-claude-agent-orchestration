@@ -677,6 +677,49 @@ safety comes from redundant layers.
     between that comparison and the rename is overwritten (accepted). When the state folder
     is on another file system, the file is staged beside the destination under a random
     name instead.
+- **Learning hooks rendered per checkout.** Codex 0.164 runs every hook command on the host,
+  outside the sandbox, as `<session shell> -c "<command>"` (zsh, bash or sh; `$SHELL -lc` or
+  `/bin/sh -lc` when no shell is known), in the session's working directory, which may be a
+  subfolder, with no project-root variable for project hooks
+  (`codex-rs/hooks/src/engine/command_runner.rs` `build_command`;
+  `core/src/session/mod.rs` `build_hooks_config`). The static file ran `python3` from `PATH`
+  and found the hook with `git rev-parse`.
+  - The installer renders `.codex/hooks.json` (`hook_config.render_hooks`): the same nine
+    events, async set and timeout 3, each running
+    `/usr/bin/env xcrun_nocache=1 '<interpreter>' -I -B -S -X pycache_prefix=/dev/null
+    '<root>/.codex/orchestration/learning_hook.py' --client-version codex-hooks-v1`. The
+    interpreter is the one the installer runs under, which `./setup.sh` selected, checked as
+    for the rule (`interpreter_path`, `executable_location_problem`, not the xcrun shim). Each
+    path is single-quoted and may not hold a quote, a backslash or a control character, so
+    sh, bash, zsh and fish read the same words.
+  - The file holds absolute paths, which would leak a home path into a pushed project and
+    break every other clone, so it is never committed. No documented project-root variable
+    exists (option a), so the package's committed `.codex/.gitignore` ignores it and
+    `.codex/orchestration/local-install.json` (the recorded interpreter and the file's digest)
+    in every clone, without writing into `.git`. The installer owns both through that local
+    record: update and remove replace or delete them only at the recorded digest, and an
+    update replaces 0.8.x's committed static file, whose deletion the wizard's plumbing commit
+    records while the rendered file stays. `project_changes` never reports an untracked one.
+  - Linked worktrees: Codex 0.164 loads a linked worktree's hooks from the matching folder
+    of its main checkout (`config/src/loader/mod.rs` `root_checkout_hooks_folder_for_dir`),
+    so a session in `.worktrees/<name>` runs the main checkout's rendered hooks and its
+    protected `learning_hook.py`, never code from the worktree, which a session on the main
+    project can write. The hook binds the payload's `cwd`; an unregistered worktree is a
+    silent no-op. A separate clone gets its own file when the wizard installs it there.
+  - Verify (`validation._validate_learning_hooks`, a project error) keeps every structural
+    check, then requires the local record, re-checks the recorded interpreter, and compares
+    the file byte for byte with `render_hooks(interpreter, root)`; the old `$(git rev-parse)`
+    form, an edited command, a moved project or an untrusted interpreter says to run
+    `./setup.sh`. Codex trusts each hook by its hash, so after an install or update the
+    wizard says "In Codex, open /hooks and trust the orchestrator's learning hooks"; the
+    installer never writes trust.
+  - `hook_config.py` is runtime code (validation imports it). `learning_hook.py` stays
+    package data: hooks run the project's installed hook, not the copy. The project's
+    `.codex/orchestration` is exactly as protected as `hooks.json` itself, since Codex keeps
+    `<project>/.codex` read-only for a session opened on the project and the guard refuses
+    sessions that could write it from above. Nothing on the hook's path uses `PATH` or git;
+    `ensure_collector` starts the collector with `sys.executable` (the trusted interpreter)
+    and `xcrun_nocache=1`.
 - **Native admission (accepted residual).** A Claude primary's native children run in the
   primary's own session and allowance; admission for them is accounting and policy, not
   a spend boundary, and the native tool consumes no admission capability. A primary that
@@ -702,9 +745,12 @@ safety comes from redundant layers.
     `.codex` (its hooks and `config.toml`, which Codex runs outside the sandbox when the
     project is trusted), `.codex/orchestration/**` and `.git/config` directly, and no
     package code can stop that. The wizard warns about recent ones, and the documentation
-    says to open Codex on the project itself. The learning hooks' command
-    (`.codex/hooks.json`) runs `python3` from `PATH` and the project's `learning_hook.py`
-    through `git rev-parse`; rendering it with the trusted interpreter is a follow-up.
+    says to open Codex on the project itself.
+  - The learning hooks run the project's installed `learning_hook.py` (and the modules it
+    imports), not the protected copy, and a rendered hooks file names the interpreter's
+    realpath: a Python upgrade that moves it breaks the hooks until `./setup.sh` runs again
+    (verify reports it). Codex re-trusts hooks only by hash, so the owner must re-trust them
+    after each render.
   - A session that could write the old macOS state folder before the owner's collector
     step moved it could have changed that state; the move carries it over as it is.
   - The scan is a warning: it follows only records from the last 14 days, and the set-up

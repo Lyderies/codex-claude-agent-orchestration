@@ -2,6 +2,29 @@
 
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1 candidate, Codex package 0.8.9)
 
+- **G2 v1 final hooks (0.8.9).** Codex runs the learning hooks outside its sandbox, and the
+  static `.codex/hooks.json` ran `python3` from `PATH` (on macOS the `/usr/bin` xcrun shim,
+  which reads a cache a session can write) and found the hook through `git rev-parse`
+  (which follows `.git` and `core.worktree`).
+  - The installer now renders the file per checkout (`codex_agents/hook_config.py`): every
+    hook runs `/usr/bin/env xcrun_nocache=1 '<interpreter>' -I -B -S -X pycache_prefix=/dev/null
+    '<project>/.codex/orchestration/learning_hook.py' --client-version codex-hooks-v1`, with
+    the trusted interpreter the installer runs under (the same checks as the Codex rule) and
+    no PATH lookup or git. Paths holding a quote, a backslash or a control character are
+    refused.
+  - The file holds this checkout's absolute paths, so it is never committed: the package's
+    `.codex/.gitignore` keeps it and `.codex/orchestration/local-install.json` (the
+    interpreter and the file's digest, which verify, update and remove use) out of Git. An
+    update replaces 0.8.x's committed static file, and the wizard's commit takes it out of
+    the index; a linked worktree uses its main checkout's hooks (Codex 0.164 behaviour).
+  - Verify compares the file byte for byte with a fresh render and re-checks the recorded
+    interpreter; the old form, an edited command or an untrusted interpreter is a project
+    error that says to run `./setup.sh`.
+  - Codex trusts hooks by hash: after an install or update, open `/hooks` in Codex and trust
+    the orchestrator's learning hooks (the wizard says so; the installer never writes trust).
+  - The hook's collector start gets `xcrun_nocache=1`; an unusable state location is a
+    silent no-op like an unregistered project. The 0.8.9 runtime digest is recomputed.
+
 - **G2 v1 final runtime fixes (0.8.9).** From the final whole-release review.
   - **Learning state location.** On macOS the default learning state was
     `~/Library/Application Support/codex-agents`, which a Codex session opened on `~/Library`

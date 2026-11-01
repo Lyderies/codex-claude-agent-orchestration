@@ -103,7 +103,6 @@ HISTORICAL_OWNER_ONLY = (
     "learning-attach-grant-signature", "host-command", "install-codex-rule", "remove-codex-rule",
 )
 HISTORICAL_PROTECTED_EDITS = (*PROTECTED_EDITS, "/" + LEGACY_RECORD)
-
 _ATTEST_SPEC = importlib.util.spec_from_file_location("agent_orchestration_attest",
                                                       ROOT / "scripts" / "attest.py")
 attest = importlib.util.module_from_spec(_ATTEST_SPEC)
@@ -111,6 +110,11 @@ _ATTEST_SPEC.loader.exec_module(attest)
 # This repository's own runtime decides which git binary is real and trusted.
 sys.path.insert(0, str(ORCHESTRATION))
 from codex_agents.git_plumbing import git_executable, repository_layout_problem  # noqa: E402
+# Files the Codex installer writes for one checkout only: the rendered learning hooks hold
+# absolute paths to this checkout and its trusted Python. They are never committed: an
+# untracked one is never a change, and a commit takes a tracked one (0.8.x committed the
+# static hooks file) out of the index while the file itself stays.
+from codex_agents.hook_config import LOCAL_FILES as LOCAL_ONLY  # noqa: E402
 
 
 class InstallRefused(RuntimeError):
@@ -234,7 +238,7 @@ def project_changes(target: Path, paths: list[str] | tuple[str, ...]) -> list[st
     untracked = _git_run(target, "ls-files", "-z", "--others", "--exclude-standard", "--", *paths, text=False)
     if staged.returncode != 0 or untracked.returncode != 0:
         raise InstallRefused("Git could not read the project's index")
-    changed: set[str] = set(_records(untracked.stdout))
+    changed: set[str] = {path for path in _records(untracked.stdout) if path not in LOCAL_ONLY}
     index: dict[str, tuple[str, str]] = {}
     for record in _records(staged.stdout):
         meta, path = record.split("\t", 1)
@@ -266,6 +270,7 @@ def project_changes(target: Path, paths: list[str] | tuple[str, ...]) -> list[st
 def commit_paths(target: Path, message: str, detail: str, paths: list[str]) -> str:
     """Commit exactly `paths` as they are in the working tree, with plumbing only.
 
+    A LOCAL_ONLY path is always committed as removed from the index; its file stays.
     Blobs are written with ``hash-object -w --no-filters``, a private index built from HEAD
     gets them with ``update-index --index-info``, then ``write-tree``, ``commit-tree``
     (never signed) and ``update-ref`` with the old value, so a branch that moved meanwhile
@@ -297,7 +302,7 @@ def commit_paths(target: Path, message: str, detail: str, paths: list[str]) -> s
         root_fd = os.open(os.path.realpath(target), os.O_RDONLY | os.O_DIRECTORY)
         try:
             for path in paths:
-                entry = _worktree_entry(root_fd, path)
+                entry = None if path in LOCAL_ONLY else _worktree_entry(root_fd, path)
                 if entry is None:
                     records.append(f"0 {zero}\t{path}\0")
                     continue

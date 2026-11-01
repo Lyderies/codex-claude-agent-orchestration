@@ -65,6 +65,13 @@ is migrated to your orchestrator records and deleted). If you commit by hand, sk
 `git -c core.hooksPath=/dev/null -c core.fsmonitor=false commit ...`. The wizard itself commits with Git
 plumbing only, and stops when the project's settings name a program Git would start.
 
+The installer also writes `.codex/hooks.json` (the learning hooks, rendered with absolute paths to this
+checkout and to the Python that ran the installer) and `.codex/orchestration/local-install.json`. Never
+commit them: the installed `.codex/.gitignore` ignores both, and each clone gets its own when you install
+there. An update from 0.8.x replaces the old committed hooks file; take it out of Git with
+`git rm --cached .codex/hooks.json` before you commit. Codex trusts hooks by their hash, so after every
+install or update open `/hooks` in Codex and trust the orchestrator's learning hooks.
+
 ## 2. Enable providers
 
 Commit `.codex/orchestration/provider-routing.json` in the project. It says which providers and Claude

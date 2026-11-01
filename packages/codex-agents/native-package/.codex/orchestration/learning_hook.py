@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Observational Codex hook: normalize metadata, enqueue it, and never steer."""
+"""Observational Codex hook: normalize metadata, enqueue it, and never steer.
+
+Codex runs it outside the sandbox through the checkout's rendered `.codex/hooks.json`
+(`codex_agents.hook_config`): the installer's trusted interpreter, isolated, and this
+file by its absolute path. Nothing here looks up a program on PATH or runs git; the
+only child is the collector, started with this same interpreter (`sys.executable`),
+a fixed environment and `xcrun_nocache=1`.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ ORCHESTRATION_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
 from codex_agents.contracts import ContractError  # noqa: E402
+from codex_agents.host_paths import HostPathError  # noqa: E402
 from codex_agents.learning_adapters import normalize_hook  # noqa: E402
 from codex_agents.learning_contracts import parse_bounded_json  # noqa: E402
 from codex_agents.learning_store import (  # noqa: E402
@@ -96,8 +104,9 @@ def main() -> int:
                 client_health_increment(state, project_root, "collector_unavailable")
             except (StateError, OSError):
                 pass
-    except (ContractError, StateError, OSError, json.JSONDecodeError):
-        # Hook input stays out of storage unless it passes the closed normalizer.
+    except (ContractError, StateError, HostPathError, OSError, json.JSONDecodeError):
+        # Hook input stays out of storage unless it passes the closed normalizer. An
+        # unusable state location (HostPathError) is as quiet as an unregistered project.
         pass
     if quiet_json:
         print("{}")
