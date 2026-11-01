@@ -1,9 +1,10 @@
 # G2 design: cross-provider read-only routing
 
-- **Status:** revision 4. The first cross-provider review found eight blockers and proposed a
-  simpler design, which is adopted. The second review confirmed seven fixed and raised three more,
-  addressed below. Reviews are capped at two rounds; the S4 security review checks the result.
-  Two whole-release reviews of the v1 candidate returned NO-GO; S6 records the runtime fixes.
+- **Status:** revision 4, plus S6. The first cross-provider review found eight blockers and
+  proposed a simpler design, which is adopted. The second review confirmed seven fixed and raised
+  three more, addressed below. Reviews are capped at two rounds; the S4 security review checks the
+  result. Two whole-release reviews of the v1 candidate returned NO-GO; S6 records the fixes, and the
+  result is the release candidate for dogfood toolchain v1 (release 0.2.0, Codex package 0.8.9).
 - **Goal:** the G2 exit in [the plan](plan.md).
 - **Evidence:** the [routing table](../routing-table.md) and the dispatch spikes on `staging`.
 
@@ -44,8 +45,9 @@ Each slice is a feature branch with tests and a cross-provider review.
   - Effort and model still come only from policy.
 - **Primary identity:** taken from the trusted host client recorded by the lifecycle (`codex-host-v1`
   or a new `claude-host-v1`), never from the task. A task that names a primary must match it.
-- **Codex-to-Claude dispatch:** allowed only when the project configuration marks it enabled. That
-  depends on the owner's sandbox decision below.
+- **Codex-to-Claude dispatch:** allowed only when the project configuration marks it enabled (setup
+  step 3). The Codex session then needs sandbox network, which the opt-in orchestrator profile gives
+  (setup step 7); see "Codex primary network" below.
 - **Project configuration:** `.codex/orchestration/provider-routing.json` (version 1) lists enabled
   providers, allowed models per provider, and `codex_primary_may_bridge_to_claude`. It is
   size-capped, has closed keys, and must be committed and clean. Its bytes are digest-bound into the
@@ -119,7 +121,8 @@ The Codex skill (`.agents/skills/orchestrate-agents`) and a new Claude skill
 (`.claude/skills/agent-orchestration`) both:
 
 - route normally;
-- spawn natively when `dispatch` is `native`, and call the bridge when it is `bridge`;
+- spawn natively when `dispatch` is `native`, and call the bridge when it is `bridge` (since S6,
+  only a Claude primary's Claude children are native);
 - keep the existing lifecycle: open, admission, bind, validate, verify, operational QA, record.
 
 Built with these rules:
@@ -280,7 +283,8 @@ build.
 - **Rule.** With the owner's consent, the wizard's Commands step writes one Codex command
   rule per project: a `prefix_rule` with `decision = "allow"`, which runs a matching
   command outside the sandbox without a prompt. The pattern is the absolute base interpreter,
-  the isolation flags `-I -B -S`, the absolute `cli.py` (since S6, that of the owner-only
+  the isolation flags `-I -B -S` (since S6, `-I -B -S -X pycache_prefix=/dev/null`), the
+  absolute `cli.py` (since S6, that of the owner-only
   runtime copy, not `<root>/.codex/orchestration/cli.py`), then one allowlisted
   subcommand. The file carries `match` and `not_match` examples that Codex
   checks when it loads it: an owner command, the relative forms and the form without the
@@ -324,7 +328,8 @@ build.
   admin members can already administer the machine. `-I` ignores the environment and user
   site-packages and keeps the script directory off the path, `-S` skips site-packages
   entirely (no `.pth` file or `sitecustomize` runs; the CLI needs only the standard
-  library and its own package), and `-B` writes no bytecode into `.codex`. The collector
+  library and its own package), and `-B` writes no bytecode into `.codex`; since S6,
+  `-X pycache_prefix=/dev/null` also stops Python reading cached bytecode. The collector
   the CLI starts or restarts, and the bridge's deadline watchdog, get the same flags.
 - **Project.** The generator refuses a project in a temporary directory, which a session
   can rewrite wholesale (including `cli.py`), and a CLI path with a symlink or a component
@@ -406,13 +411,17 @@ build.
     `provider-observe`, because only the default state is accepted.
   - Native Codex children that a Codex primary spawned shared its session, so the rule
     applied to them too. Since S6 a Codex primary spawns no native children.
-  - The Claude primary's permission rules are a separate follow-up.
+  - The Claude primary's permission deny rules shipped with the owner-side v1 hardening (see
+    the CHANGELOG). They are a policy layer on Claude Code's tools, not a sandbox: a command
+    spelled another way (`bash -c`, or a script that starts the CLI) is not matched.
 
 ### S6: v1 hardening
 
 Two independent whole-release reviews of the v1 candidate returned NO-GO, and focused
-reviews of the runtime boundary and of the bridge and ledger followed. This is the runtime
-half of the fixes; the owner-side half (setup, attestation, the installer) is separate.
+reviews of the runtime boundary and of the bridge and ledger followed. This records the
+runtime fixes and the owner-tool rules they depend on; the full owner-side list (setup,
+attestation, the installer) is in the CHANGELOG under "Owner-side hardening", "Owner-side review
+fixes" and "Owner-side round 2".
 The owner's standing rule holds: the orchestrator runs without per-command approvals, and
 safety comes from redundant layers.
 
@@ -643,6 +652,8 @@ safety comes from redundant layers.
   - Raw worker results stay on disk for the orchestration's life (at most seven days, and
     up to a minute past that until the collector's sweep), owner-only but readable by any
     sandboxed session, as all host files are.
+  - Native Claude children run with the primary's permissions, so their reads are advisory
+    (S3); Codex reads are not contained until G3 (S2).
 
 ## Deferred to G4
 
@@ -652,12 +663,16 @@ safety comes from redundant layers.
 
 G2 records the headroom data these will need.
 
-## Owner decision required before the G2 exit
+## Codex primary network
 
-A Codex primary can only launch a Claude child if its sandbox allows network. Options:
+A Codex primary can only launch a Claude child if its sandbox allows network. The options were:
 
 - **(a)** Enable network for the pilot project's Codex sandbox.
 - **(b)** Keep network off and have an exec-policy rule auto-approve an escalation for the bridge
-  command only. This needs testing in an interactive Codex session.
+  command only.
 
-Until the owner decides, `codex_primary_may_bridge_to_claude` stays false.
+What ships is a scoped form of (a). A project opts in with `codex_primary_may_bridge_to_claude`
+(setup step 3, off by default), and only sessions started with `codex -p orchestrator` get sandbox
+network, from `~/.codex/orchestrator.config.toml` (`sandbox_mode = "workspace-write"`,
+`network_access = true`; setup step 7). Ordinary sessions keep network off, and the user's main
+`config.toml` is never edited.
