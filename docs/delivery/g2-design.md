@@ -441,11 +441,19 @@ safety comes from redundant layers.
     or any record shape it does not know (the format is pinned to Codex 0.164 and fails
     closed on change);
   - any writable folder (every `path` entry with write access, `slash_tmp` as `/tmp`,
-    `tmpdir` as the command's `TMPDIR`, every runtime workspace root) whose real path is
-    `/`, the account home or a folder above it, or that equals, contains or lies inside
-    `~/.codex` (and so the copy), the orchestrator clone that installed the copy (recorded
-    in its binding, format 2), a trusted installation folder or any hidden top-level home
-    folder; and a writable `special` root or home entry, or one it cannot place.
+    `tmpdir` as the command's `TMPDIR`, and, except in a read-only session, every runtime
+    workspace root) that is `/`, the account home or a folder above it, or that equals,
+    contains or lies inside `~/.codex` (and so the copy), the orchestrator clone that
+    installed the copy (recorded in its binding, format 2), a trusted installation folder
+    or any hidden top-level home folder; and a writable `special` root or home entry, or
+    one it cannot place.
+  - Containment is decided component by component, for each path both as written (no
+    symlink followed) and as it resolves now: two components are the same folder when
+    their file-system identities (device and inode) match, and a component that does not
+    exist is compared by name ignoring case. So a protected folder renamed and replaced by
+    a symlink still protects its recorded path (and its new target), and a different
+    spelling on a case-insensitive volume (`~/work` for `~/Work`) is the same folder; when
+    unsure, the guard refuses.
   `host-command` reports the verdict as `session_guard` (`ok` or the reason) without
   changing `ready` or `codex_rule`, and the Codex skill stops on anything but `ok`. The
   wizard's first screen runs `codex-session-scan` from the clone, with the same parsing:

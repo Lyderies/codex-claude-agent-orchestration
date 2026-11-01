@@ -37,7 +37,6 @@ from .host_paths import (
     _component_problem,
     _open_verified_directory,
     account_home,
-    within,
 )
 
 THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -244,8 +243,10 @@ def _turn_context(line: bytes) -> dict | None:
 
 
 def _absolute(value: object) -> Path:
+    """A recorded absolute path, kept as written (normalised, no symlink followed)."""
+
     _shape(isinstance(value, str) and os.path.isabs(value) and "\x00" not in value)
-    return Path(os.path.realpath(value))
+    return Path(os.path.normpath(value))
 
 
 def _read_session(folder: int, name: str, thread_id: str, day: str) -> SessionRecord:
@@ -261,12 +262,15 @@ def _read_session(folder: int, name: str, thread_id: str, day: str) -> SessionRe
     _absolute(payload.get("cwd"))
     roots = payload.get("runtime_workspace_roots")
     _shape(isinstance(roots, list))
-    writable = [_absolute(root) for root in roots]
+    workspace_roots = [_absolute(root) for root in roots]
     special: list[str] = []
     turn = context["payload"]
     policy = turn.get("sandbox_policy")
     _shape(isinstance(policy, dict) and isinstance(policy.get("type"), str))
     sandbox_type = policy["type"]
+    # A workspace root is writable in every mode but read-only, where only the
+    # policy's explicit write entries count.
+    writable = [] if sandbox_type == "read-only" else list(workspace_roots)
     files = turn.get("file_system_sandbox_policy")
     _shape(isinstance(files, dict) and isinstance(files.get("entries"), list))
     for entry in files["entries"]:
@@ -282,9 +286,9 @@ def _read_session(folder: int, name: str, thread_id: str, day: str) -> SessionRe
         kind = target["value"].get("kind")
         _shape(isinstance(kind, str))
         if kind == "slash_tmp":
-            writable.append(Path(os.path.realpath(SLASH_TMP)))
+            writable.append(Path(os.path.normpath(SLASH_TMP)))
         elif kind == "tmpdir":
-            writable.append(Path(os.path.realpath(
+            writable.append(Path(os.path.normpath(
                 os.environ.get("TMPDIR") or tempfile.gettempdir()
             )))
         else:
@@ -324,39 +328,105 @@ def find_session(thread_id: str | None) -> SessionRecord:
     return matches[0]
 
 
-def protected_folders(copy: Path | None, clone: Path | None) -> list[tuple[str, Path]]:
-    """The folders no session may write, inside or around, with their reason keys."""
+# One path component: its file-system identity (device, inode) when it exists, and its
+# case-folded name.
+Component = tuple[tuple[int, int] | None, str]
+Chain = list[Component]
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _chain(path: Path) -> Chain:
+    """Every component of an absolute path from `/` down, with its identity."""
+
+    current = Path(path.anchor)
+    chain: Chain = [(_identity(current), "")]
+    for part in path.parts[1:]:
+        current = current / part
+        chain.append((_identity(current), part.casefold()))
+    return chain
+
+
+def _same(left: Component, right: Component) -> bool:
+    """One folder, judged by identity when both exist, else by case-folded name.
+
+    A case-insensitive volume gives `Work` and `work` one identity, and a
+    missing component is compared by name ignoring case: when unsure, the
+    components count as the same, so the guard refuses.
+    """
+
+    if left[0] is not None and right[0] is not None:
+        return left[0] == right[0]
+    return left[1] == right[1]
+
+
+def _prefix(short: Chain, long: Chain) -> bool:
+    return len(short) <= len(long) and all(map(_same, short, long))
+
+
+def _forms(path: Path) -> list[Chain]:
+    """The path as written (no symlink followed) and, when it differs, as it resolves now.
+
+    A protected path is protected under both: a folder renamed and replaced by
+    a symlink still blocks a session on the folder that held it.
+    """
+
+    lexical = Path(os.path.normpath(path))
+    real = Path(os.path.realpath(lexical))
+    return [_chain(lexical)] + ([_chain(real)] if real != lexical else [])
+
+
+def protected_folders(copy: Path | None, clone: Path | None) -> list[tuple[str, list[Chain]]]:
+    """The folders no session may write, inside or around, with their reason keys.
+
+    The copy and the clone are taken as recorded at install (lexically) and as
+    they resolve now.
+    """
 
     home = account_home()
-    folders = [("codex_home", home / ".codex")]
+    folders = [("codex_home", _forms(home / ".codex"))]
     if copy is not None:
-        folders.append(("copy", Path(os.path.realpath(copy))))
+        folders.append(("copy", _forms(copy)))
     if clone is not None:
-        folders.append(("clone", Path(os.path.realpath(clone))))
-    folders.extend(("tools", Path(os.path.realpath(root))) for root in TRUSTED_INSTALL_ROOTS)
+        folders.append(("clone", _forms(clone)))
+    folders.extend(("tools", _forms(Path(root))) for root in TRUSTED_INSTALL_ROOTS)
     return folders
 
 
-def writable_problem(path: Path, protected: list[tuple[str, Path]]) -> str | None:
-    """The reason key when a session able to write `path` defeats the rule, or None."""
+def writable_problem(path: Path, protected: list[tuple[str, list[Chain]]]) -> str | None:
+    """The reason key when a session able to write `path` defeats the rule, or None.
 
-    home = account_home()
-    if path == Path("/"):
-        return "root"
-    if path == home:
-        return "home"
-    if within(home, path):
-        return "above_home"
-    if within(path, home) and path.relative_to(home).parts[0].startswith("."):
-        # Inside a hidden top-level folder: ~/.codex or an installation such as ~/.local.
-        return "codex_home" if within(path, home / ".codex") else "tools"
-    for key, folder in protected:
-        if within(path, folder) or within(folder, path):
-            return key
+    Containment is decided component by component on file-system identity and
+    case-folded names, for the path as written and as it resolves, so neither
+    a symlink nor a different spelling on a case-insensitive volume hides it.
+    """
+
+    homes = _forms(account_home())
+    for written in _forms(path):
+        if len(written) == 1:
+            return "root"
+        for home in homes:
+            if _prefix(written, home):
+                return "home" if len(written) == len(home) else "above_home"
+        for home in homes:
+            if _prefix(home, written) and written[len(home)][1].startswith("."):
+                # Inside a hidden top-level folder: ~/.codex or an installation
+                # such as ~/.local.
+                return "codex_home" if written[len(home)][1] == ".codex" else "tools"
+        for key, chains in protected:
+            for folder in chains:
+                if _prefix(written, folder) or _prefix(folder, written):
+                    return key
     return None
 
 
-def check_record(record: SessionRecord, protected: list[tuple[str, Path]]) -> None:
+def check_record(record: SessionRecord, protected: list[tuple[str, list[Chain]]]) -> None:
     """Refuse unless the session is sandboxed and can write none of the protected folders."""
 
     if record.sandbox_type in UNSANDBOXED_TYPES:
@@ -405,9 +475,10 @@ def scan_recent_sessions(
     """
 
     now = time.time() if now is None else now
-    clone = Path(os.path.realpath(clone))
-    # The folders Codex uses here, and the account's own home besides.
-    homes = {Path(os.path.realpath(home)), account_home()}
+    # The home Codex uses here, and the account's own home besides; both as written
+    # and as they resolve, compared like the guard compares them.
+    homes = [*_forms(home), *_forms(account_home())]
+    clones = _forms(clone)
     findings: list[dict[str, str]] = []
     try:
         sessions = _sessions_folder(Path(os.path.realpath(codex_home)) / "sessions")
@@ -433,16 +504,20 @@ def scan_recent_sessions(
                     continue
                 found: list[dict[str, str]] = []
                 for path in record.writable:
-                    if any(within(folder, path) for folder in homes):
+                    forms = _forms(path)
+                    if any(_prefix(written, held) for written in forms for held in homes):
                         kind = "home"
-                    elif within(clone, path) or within(path, clone):
+                    elif any(
+                        _prefix(written, held) or _prefix(held, written)
+                        for written in forms for held in clones
+                    ):
                         kind = "clone"
                     else:
                         continue
                     found.append({"date": record.day, "folder": str(path), "holds": kind})
                 if any(kind in {"root", "home"} for kind in record.special_writes):
                     found.append({
-                        "date": record.day, "folder": str(Path(os.path.realpath(home))),
+                        "date": record.day, "folder": str(Path(os.path.normpath(home))),
                         "holds": "home",
                     })
                 # The workspace is both an entry and a runtime root: one line each.

@@ -24,6 +24,9 @@
     without a record (`--ephemeral`), with several or a shape it does not know, or able to
     write `/`, the home folder or a folder above it, `~/.codex`, the copy, the clone that
     installed it (now recorded in the copy's binding) or a trusted installation folder.
+    Paths are compared by file-system identity and case-folded name, as recorded and as
+    they resolve, so a symlink swap or a case variant cannot hide a protected folder; a
+    read-only session's workspace roots are not counted as writable.
     `host-command` reports the verdict as `session_guard`, and the wizard's first screen warns
     about a recent session that could write the clone or the home folder.
   - The interpreter the rule names, provider clients and git must come from a trusted

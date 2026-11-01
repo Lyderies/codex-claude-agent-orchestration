@@ -195,6 +195,68 @@ class SessionGuardTests(GuardTestCase):
         )
         self.assert_refused("not in the format")
 
+    def test_a_clone_swapped_for_a_symlink_stays_protected(self) -> None:
+        # A session on ~/Work holds the clone; the model renames the clone and leaves a
+        # symlink to an unrelated folder at its recorded path.
+        work_clone = self.home / "Work" / "orchestrator"
+        work_clone.mkdir()
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        work_clone.rename(self.home / "Work" / "moved")
+        work_clone.symlink_to(elsewhere)
+        self.sessions.write(self.home / "Work")
+        with self.assertRaisesRegex(SessionRefused, "orchestrator's setup folder"):
+            check_current_session(self.copy, work_clone)
+        # The folder the recorded path now resolves to is protected as well.
+        self.sessions.write(elsewhere)
+        with self.assertRaisesRegex(SessionRefused, "orchestrator's setup folder"):
+            check_current_session(self.copy, work_clone)
+        # A session on the project folder alone still passes.
+        self.sessions.write(self.project)
+        check_current_session(self.copy, work_clone)
+
+    def test_a_different_spelling_of_a_protected_folder_is_refused(self) -> None:
+        # On a case-insensitive volume `work` and `Work` are one folder; elsewhere the
+        # spelling is compared ignoring case, so the guard refuses when unsure.
+        clone = self.home / "Work" / "orchestrator"
+        clone.mkdir()
+        self.sessions.write(self.home / "work")
+        with self.assertRaisesRegex(SessionRefused, "orchestrator's setup folder"):
+            check_current_session(self.copy, clone)
+        for variant, reason in (
+            (self.home / ".LOCAL" / "bin", "trusted tools are installed"),
+            (self.home / ".Codex", "~/.codex"),
+            (Path("/OPT/HOMEBREW"), "trusted tools are installed"),
+            (Path(str(self.home).upper()), "home folder"),
+        ):
+            with self.subTest(variant=variant):
+                self.sessions.write(
+                    self.project, entries=workspace_entries(self.project, path_entry(variant))
+                )
+                self.assert_refused(reason)
+
+    def test_read_only_workspace_roots_are_not_writable(self) -> None:
+        # A read-only session reviewing the clone lists it as a workspace root but
+        # cannot write it: only explicit write entries count.
+        self.sessions.write(
+            self.clone, sandbox="read-only", entries=[
+                special_entry("root", "read"), path_entry(self.clone, "read"),
+            ],
+        )
+        self.check()
+        self.assertEqual([], scan_recent_sessions(self.clone, self.home / ".codex", self.home))
+        # An explicit write entry still counts in read-only mode.
+        self.sessions.write(
+            self.clone, sandbox="read-only",
+            entries=[special_entry("root", "read"), path_entry(self.home)],
+        )
+        self.assert_refused("your home folder")
+        # And in workspace-write mode a workspace root counts as writable.
+        self.sessions.write(
+            self.project, entries=workspace_entries(self.project), roots=[str(self.clone)],
+        )
+        self.assert_refused("orchestrator's setup folder")
+
     def test_danger_full_access_is_refused(self) -> None:
         self.sessions.write(self.project, sandbox="danger-full-access", entries=[])
         self.assert_refused("danger-full-access")
