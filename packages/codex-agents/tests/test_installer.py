@@ -806,6 +806,36 @@ class RenderedHookTests(unittest.TestCase):
         hooks.unlink()
         self.assertTrue(any("not installed in this checkout" in item for item in hook_errors(self.target)))
 
+    def test_files_planted_in_the_orchestration_folder_refuse_before_any_write(self) -> None:
+        orchestration = self.root / ".codex" / "orchestration"
+        orchestration.mkdir(parents=True)
+        (orchestration / "socket.py").write_text("raise SystemExit('planted')\n")
+        (orchestration / "evil\x1b[31m.py").write_text("")
+        (orchestration / "codex_agents" / "__pycache__").mkdir(parents=True)
+        before = sorted(str(path) for path in self.root.rglob("*") if ".git" not in path.parts)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                with self.assertRaises(installer.InstallError) as caught:
+                    installer.install(self.target, apply=apply, **self.inputs)
+                message = str(caught.exception)
+                self.assertIn(".codex/orchestration holds files the orchestrator does not install", message)
+                self.assertIn("socket.py", message)
+                self.assertIn("codex_agents", message)
+                self.assertIn("evil[31m.py", message)  # control characters stripped
+                self.assertNotIn("\x1b", message)
+                self.assertIn("remove them and run ./setup.sh again", message)
+        self.assertEqual(before, sorted(str(path) for path in self.root.rglob("*") if ".git" not in path.parts))
+        # On an installed project, update refuses as well, and verify reports it.
+        for path in ((orchestration / "socket.py"), (orchestration / "evil\x1b[31m.py")):
+            path.unlink()
+        (orchestration / "codex_agents" / "__pycache__").rmdir()
+        (orchestration / "codex_agents").rmdir()
+        self.install()
+        (orchestration / "secrets.py").write_text("")
+        with self.assertRaisesRegex(installer.InstallError, "secrets.py; remove them"):
+            self.install(update=True)
+        self.assertTrue(any("secrets.py; remove them" in error for error in installer.verify(self.target)["errors"]))
+
     def test_install_refuses_an_untrusted_interpreter_or_an_unquotable_project(self) -> None:
         planted = Path(os.path.realpath(self.directory)) / "python3"
         planted.write_text("#!/bin/sh\n")

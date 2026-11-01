@@ -1246,6 +1246,8 @@ explain_installer() {
   local label=$1 manual=$2 raw msg
   raw=$(pj raw "$LAST_OUT")
   case "$raw" in
+    *"holds files the orchestrator does not install"*)
+      msg="The project's .codex/orchestration holds files the orchestrator does not install, which code running outside Codex's sandbox could load (a Codex session may have planted them). Remove them, then run setup again. The installer names them: $manual";;
     *"xdg_state_home must be inside a hidden folder"*)
       msg="XDG_STATE_HOME must be inside a hidden folder in your home, such as ~/.local/state. Unset it or move it, then run setup again.";;
     *"a folder above the learning state"*)
@@ -1879,11 +1881,23 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
   return 1
 }
 
+# hooks_trust_line OK : after an install, tell the owner to trust the learning hooks in Codex
+# only when check-runtime passed (OK=1); otherwise say not to, with its plain reason.
+hooks_trust_line() {
+  if [ "$1" -eq 1 ]; then
+    list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
+  else
+    list_add warn "Do not trust the orchestrator's learning hooks in Codex yet: $RUNTIME_WHY"
+  fi
+}
+
 step_install() {
   local routing_path line commit_done=0 verify_ok=0 q_project plan_paths path shown n_paths base
   local commit_note paths_ok paths_rc nothing_to_commit candidates ignored_n=0 ignored_fail=0
+  local hooks_trust rc_before
   q_project=$(printf '%q' "$PROJECT")
   begin_step 4
+  body "Close every Codex session in this project first."
   body "Install into: $PROJECT"
   show_plan
   body "This adds or updates files under .codex, .agents and .claude, then writes .codex/orchestration/provider-routing.json. Nothing outside the project is touched."
@@ -1909,8 +1923,13 @@ step_install() {
   fi
   screen_reset; begin_step 4
   list_add ok "Packages installed"
-  # Codex trusts each hook by its hash, and the installer never writes that trust.
-  list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
+  # Codex trusts each hook by its hash, and the installer never writes that trust. The hooks
+  # run the project's installed code, so the owner is told to trust them only once that code
+  # is this release, byte for byte, with nothing extra beside it (check-runtime).
+  hooks_trust=0 rc_before=$LAST_RC
+  if runtime_matches; then hooks_trust=1; fi
+  LAST_RC=$rc_before
+  hooks_trust_line "$hooks_trust"
   if [ "$ROUTING_WRITE" -eq 1 ]; then
     if write_project_routing "$PROJECT" "$ROUTING_CONTENT" 2>"$LOGDIR/routing.err"; then
       list_add ok "Wrote .codex/orchestration/provider-routing.json"
@@ -2020,7 +2039,7 @@ step_install() {
     done
     screen_reset; begin_step 4
     list_add ok "Packages installed"
-    list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
+    hooks_trust_line "$hooks_trust"
     COMMIT_STATE=not_committed
     if [ "$MENU_IDX" -eq 0 ]; then
       render
@@ -2123,6 +2142,47 @@ version_hint() {
   esac
 }
 
+# review_legacy_state : on a Mac whose orchestrator records are still in the old
+# ~/Library/Application Support folder, show when that folder was created, the owner key its
+# signer file names and whether that is the owner's ~/.ssh/codex-agents-owner.pub, and ask
+# before moving it (a session opened on ~/Library could have created it). Sets LEGACY_ARGS to
+# the approval learning-register needs; returns 1 when the owner declines or it cannot be read.
+LEGACY_ARGS=()
+review_legacy_state() {
+  local report="$LOGDIR/legacy.json" present created signer current match digest
+  LEGACY_ARGS=()
+  owner_tool legacy-state >"$report" 2>"$LOGDIR/legacy.err" || :
+  present=$(pj get "$report" present)
+  [ "$present" = true ] || return 0
+  created=$(pj get "$report" created); created=${created//[[:cntrl:]]/}
+  signer=$(pj get "$report" signer_key); signer=${signer//[[:cntrl:]]/}
+  current=$(pj get "$report" current_key); current=${current//[[:cntrl:]]/}
+  match=$(pj get "$report" match)
+  digest=$(pj get "$report" signers_sha256)
+  if [ "$(pj get "$report" usable)" != true ] || ! [[ "$digest" =~ ^([0-9a-f]{64}|none)$ ]]; then
+    list_add fail "Your old orchestrator records (~/Library/Application Support/codex-agents) cannot be checked safely, so they are not moved."
+    list_sub "Move that folder out of the way yourself if it is not yours, then run setup again."
+    return 1
+  fi
+  list_add warn "Your orchestrator records are still in the old folder ~/Library/Application Support/codex-agents (created ${created:-at an unknown time})."
+  list_sub "Owner key in those records: ${signer:-none}"
+  list_sub "Your owner key file ~/.ssh/codex-agents-owner.pub: ${current:-not found}"
+  case $match in
+    true) list_add ok "They match: these records name your owner key.";;
+    false) list_add warn "They do not match: these records may not be yours. Choose No unless you know why.";;
+    *) list_add info "Setup cannot compare them; check the owner key above yourself.";;
+  esac
+  body "Move these records to the protected folder? [Y/n]"
+  menu 0 "Yes, move them" "No, leave them where they are"
+  screen_reset; begin_step 5
+  if [ "$MENU_IDX" -ne 0 ]; then
+    list_add skip "The old records were not moved, so the collector was not registered."
+    return 1
+  fi
+  LEGACY_ARGS=(--move-legacy-state "$digest")
+  return 0
+}
+
 step_collector() {
   local cli ready moved
   begin_step 5
@@ -2145,8 +2205,13 @@ step_collector() {
     mark_step 5 fail "orchestrator differs from this setup"
     pause; return 1
   fi
+  if ! review_legacy_state; then
+    mark_step 5 skip "old records not moved"
+    pause; return 0
+  fi
   render
-  run_owner_cli "Registering the collector" learning-register --project-root "$PROJECT"
+  run_owner_cli "Registering the collector" learning-register --project-root "$PROJECT" \
+    ${LEGACY_ARGS[@]+"${LEGACY_ARGS[@]}"}
   if [ "$?" -ne 0 ]; then
     failure_detail "Collector registration failed"
     version_hint

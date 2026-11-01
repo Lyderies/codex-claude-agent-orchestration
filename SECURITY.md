@@ -40,8 +40,11 @@ Accepted limits are listed in the README under "Does not protect against" and in
 risks of [the G2 design](docs/delivery/g2-design.md) (S4c, S5b and S6). The supported setup
 assumes no Codex session is opened on the home folder, a folder above it or `/`, and that this
 repository sits outside every folder opened in Codex. The learning hooks name a fixed trusted
-interpreter and an absolute path, but they run the project's installed hook code: that code is as
-protected as `.codex/hooks.json` itself (Codex keeps `<project>/.codex` read-only for a session
-opened on the project, and the session guard refuses sessions that can write it from above),
-not by a separate copy. A report that shows one of these limits is
-worse than documented is welcome.
+interpreter and an absolute path, but they run the project's installed hook code, not a separate
+copy. Once installed, that code is protected like `.codex/hooks.json` itself (Codex keeps
+`<project>/.codex` read-only for a session opened on the project, and the session guard refuses
+sessions that can write it from above), but not from a process that was already writing the
+project before the install, when `.codex` did not exist: close every Codex session in the project
+before installing or updating. A Codex session in the project can also rewrite
+`.claude/settings*.json` and `.claude/skills/**`, which Claude Code runs on the host. A report that
+shows one of these limits is worse than documented is welcome.

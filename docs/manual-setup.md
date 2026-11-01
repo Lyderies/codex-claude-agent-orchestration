@@ -106,7 +106,9 @@ One collector is shared by every project on the machine. Your orchestrator recor
 live in `~/.local/state/codex-agents`, or `$XDG_STATE_HOME/codex-agents`; on macOS, the first
 `learning-register` after this update moves them there from `~/Library/Application Support/codex-agents`
 and reports the old copy's path as `"state_moved"` (null otherwise); delete that old copy once you are
-happy.
+happy. Because a session opened on `~/Library` could have created that old folder, it moves only with
+`--move-legacy-state <sha256 of its owner-allowed-signers file, or none>` after you have checked that the
+owner key it names is yours; the wizard shows it and asks first.
 
 ## 4. Attest billing
 

@@ -64,7 +64,10 @@ if os.path.lexists(RUNTIME_BINDING) and not _copy_holds_only_its_runtime():
         "to run ./setup.sh (Codex commands step)",
     }, indent=2, sort_keys=True))
     raise SystemExit(2)
-sys.path.insert(0, str(ORCHESTRATION_ROOT))
+# Appended, never first: run isolated (-I), the script's folder is not on the path, so a
+# module planted beside this file (a `socket.py`) can never shadow the standard library,
+# in the project's copy (which the hooks' collector runs) as in the protected one.
+sys.path.append(str(ORCHESTRATION_ROOT))
 
 from codex_agents.bridge import BridgeRefused  # noqa: E402
 from codex_agents.bridge import signal_guard as bridge_signal_guard  # noqa: E402
@@ -781,6 +784,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     learning_register.add_argument("--state-root", type=Path)
     learning_register.add_argument("--project-root", required=True, type=Path)
+    learning_register.add_argument(
+        "--move-legacy-state",
+        help="approve moving the pre-0.8.9 macOS state: the SHA-256 of its "
+        "owner-allowed-signers file as reviewed, or 'none'",
+    )
 
     learning_serve = subparsers.add_parser(
         "learning-serve", help="run the single-writer local collector"
@@ -1519,7 +1527,11 @@ def main() -> int:
             # default location first (once) and renames the old one aside; nothing
             # else does. `state_moved` names the old copy, which the owner may delete.
             moved_aside = (
-                migrate_legacy_state(ORCHESTRATION_ROOT / "cli.py", args.project_root)
+                migrate_legacy_state(
+                    ORCHESTRATION_ROOT / "cli.py",
+                    args.project_root,
+                    approved_signers=args.move_legacy_state,
+                )
                 if args.state_root is None
                 else None
             )

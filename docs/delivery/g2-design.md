@@ -527,7 +527,15 @@ safety comes from redundant layers.
     copy and the move): `ssh-keygen` reads the whole file, so a valid-looking over-long
     first line must not hide a second key behind the part that was checked.
   - **One-time move.** Only the owner's `learning-register` (the wizard's collector step,
-    run from the clone) moves the old folder, and only while it is the only one. It checks
+    run from the clone) moves the old folder, only while it is the only one, and only with
+    the owner's approval: `--move-legacy-state <sha256 of the old owner-allowed-signers, or
+    none>`. A session opened on `~/Library` could have created the old folder where none
+    existed, so the wizard first shows (attest.py `legacy-state`) when it was created, the
+    owner key its signer file names and whether that is the key in
+    `~/.ssh/codex-agents-owner.pub`, asks "Move these records to the protected folder?",
+    and passes the digest it showed. Without the flag the move refuses; the digest is
+    checked against the old file and again against the fresh staged copy before anything
+    is renamed, so a file changed after the review refuses. It checks
     it (owner-only, no symlink, outside Git), refuses if the new socket path would exceed
     the AF_UNIX limit (103 bytes on macOS, 107 on Linux) and prepares the new parent
     folders as above. Then, with the collector stopped and its maintenance lock held
@@ -771,12 +779,27 @@ safety comes from redundant layers.
     wizard says "In Codex, open /hooks and trust the orchestrator's learning hooks"; the
     installer never writes trust.
   - `hook_config.py` is runtime code (validation imports it). `learning_hook.py` stays
-    package data: hooks run the project's installed hook, not the copy. The project's
-    `.codex/orchestration` is exactly as protected as `hooks.json` itself, since Codex keeps
-    `<project>/.codex` read-only for a session opened on the project and the guard refuses
-    sessions that could write it from above. Nothing on the hook's path uses `PATH` or git;
+    package data: hooks run the project's installed hook, not the copy. Once installed, the
+    project's `.codex/orchestration` is protected like `hooks.json` itself (Codex keeps
+    `<project>/.codex` read-only for a session opened on the project, and the guard refuses
+    sessions that could write it from above), except from a process that was already
+    writing the project before the install, when `.codex` did not yet exist and so was not
+    excluded (see the residual risks). Nothing on the hook's path uses `PATH` or git;
     `ensure_collector` starts the collector with `sys.executable` (the trusted interpreter)
     and `xcrun_nocache=1`.
+  - Planted modules: the installer (install and update) refuses before writing anything,
+    and verify reports it, when `.codex/orchestration` holds any entry other than this
+    package's runtime and data files, the project's own files and files the install
+    manifest owns ("<project>/.codex/orchestration holds files the orchestrator does not
+    install: …; remove them and run ./setup.sh again"). The hook and the project's
+    `cli.py` append their folder to `sys.path` instead of putting it first: run with `-I`,
+    the script's folder is not on the path, so a planted `socket.py` can never shadow the
+    standard library. The wizard tells the owner to trust the hooks in Codex only after
+    `check-runtime` passes (the installed runtime is this release, byte for byte, with
+    nothing extra), and reminds them at the start of the install step to close every Codex
+    session in the project first.
+  - **v1.1 candidate:** run the hooks from a guard-protected owner copy (as the rule runs
+    the CLI) rather than from the project's installed code.
 - **Native admission (accepted residual).** A Claude primary's native children run in the
   primary's own session and allowance; admission for them is accounting and policy, not
   a spend boundary, and the native tool consumes no admission capability. A primary that
@@ -804,13 +827,23 @@ safety comes from redundant layers.
     package code can stop that. The wizard warns about recent ones, and the documentation
     says to open Codex on the project itself.
   - The learning hooks run the project's installed `learning_hook.py` (and the modules it
-    imports), not the protected copy, and a rendered hooks file names the interpreter's
+    imports), not the protected copy. Close every Codex session in the project before
+    installing or updating: a process started in a sandbox before the install, when
+    `.codex` did not yet exist and so was not excluded from its writable root, can still
+    rewrite that code afterwards, and nothing in the package can detect a change made after
+    the last check. A rendered hooks file names the interpreter's
     realpath: a Python upgrade that moves it breaks the hooks until `./setup.sh` runs again
     (verify reports it). Codex re-trusts hooks only by hash, so the owner must re-trust them
     after each render.
   - A session that could write the old macOS state folder before the owner's collector
-    step moved it could have changed that state; the move carries the contents over as
-    they are (in fresh files, so no link or descriptor it kept reaches them).
+    step moved it could have changed that state, or created it where none existed; the
+    owner reviews its creation time and owner key before approving the move, which then
+    carries the contents over as they are (in fresh files, so no link or descriptor it kept
+    reaches them).
+  - A workspace-write Codex session in the project can rewrite `.claude/settings*.json`
+    (its hooks and deny rules) and `.claude/skills/**`, which Claude Code loads and runs on
+    the host; the installer's deny rules are not a boundary against that session. Verify
+    warns when `.claude/settings.json` defines hooks, which the installer never writes.
   - The old copy (`codex-agents.moved-<time>`, including the old digest key, which is the
     one the new state keeps using) stays readable where it was until the owner deletes
     it; the wizard should say so.

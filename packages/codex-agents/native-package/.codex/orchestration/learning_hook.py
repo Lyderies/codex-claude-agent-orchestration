@@ -93,7 +93,9 @@ def main() -> int:
 def _record(args: argparse.Namespace, raw: bytes, checkout_root: Path | None) -> None:
     """Normalize the event and hand it to the collector; every failure stays quiet."""
 
-    sys.path.insert(0, str(ORCHESTRATION_ROOT))
+    # Appended, never first: with -I the script's folder is not on the path, so a module
+    # planted beside this file (a `socket.py`) can never shadow the standard library.
+    sys.path.append(str(ORCHESTRATION_ROOT))
     from codex_agents.contracts import ContractError
     from codex_agents.host_paths import HostPathError
     from codex_agents.learning_adapters import normalize_hook

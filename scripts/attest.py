@@ -583,6 +583,83 @@ def client_status(name: str, project: Path | None = None) -> tuple[int, bytes]:
     return (0 if process.returncode == 0 else CLIENT_SIGNED_OUT), output
 
 
+KEY_TYPE = re.compile(r"[a-z0-9@.-]{1,40}")
+LEGACY_READ_LIMIT = 65_536
+
+
+def _read_small(path: Path) -> bytes | None:
+    """A small regular file through a no-follow descriptor; None when absent or unusable."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        content = os.read(descriptor, LEGACY_READ_LIMIT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return content if len(content) <= LEGACY_READ_LIMIT else None
+
+
+def _shown_key(fields: list[str]) -> tuple[tuple[str, str] | None, str | None]:
+    """((type, blob), "type SHA256:...") for a public key's fields, or (None, None)."""
+
+    if len(fields) < 2 or KEY_TYPE.fullmatch(fields[0]) is None:
+        return None, None
+    try:
+        return (fields[0], fields[1]), describe_key(fields[0], fields[1])
+    except AttestError:
+        return None, None
+
+
+def legacy_state_report() -> dict:
+    """What the wizard shows before the one-time move of the pre-0.8.9 macOS state.
+
+    The old folder sits where a Codex session opened on ~/Library could have created it, so
+    the owner sees when it was created, the owner key its signer file names and whether that
+    is the key in ~/.ssh/codex-agents-owner.pub, and approves the move by the signer file's
+    SHA-256 (learning-register --move-legacy-state), which the runtime checks again on its
+    fresh copy. Only fixed text, a date, key types and fingerprints are printed.
+    """
+
+    legacy = host_paths.legacy_state_root()
+    try:
+        default = host_paths.default_state_root()
+    except host_paths.HostPathError as exc:
+        raise AttestError(str(exc)) from None
+    if legacy is None or not os.path.lexists(legacy) or os.path.lexists(default):
+        return {"present": False}
+    try:
+        info = os.lstat(legacy)
+    except OSError:
+        return {"present": True, "usable": False}
+    created = getattr(info, "st_birthtime", None) or info.st_ctime
+    signers = _read_small(legacy / "owner-allowed-signers")
+    signer_key, signer_shown = (None, None)
+    if signers is not None:
+        first = signers.decode("utf-8", "replace").splitlines()[:1]
+        signer_key, signer_shown = _shown_key(first[0].split()[1:] if first else [])
+    current = _read_small(ssh_folder() / "codex-agents-owner.pub")
+    current_key, current_shown = (None, None)
+    if current is not None:
+        current_key, current_shown = _shown_key(current.decode("utf-8", "replace").split())
+    usable = stat.S_ISDIR(info.st_mode) and (signers is not None or not os.path.lexists(
+        legacy / "owner-allowed-signers"))
+    return {
+        "present": True,
+        "usable": usable,
+        "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(created)),
+        "signers_sha256": hashlib.sha256(signers).hexdigest() if signers is not None else "none",
+        "signer_key": signer_shown,
+        "current_key": current_shown,
+        "match": (signer_key == current_key) if signer_key and current_key else None,
+    }
+
+
 def owner_tool(argv: list[str]) -> int:
     """Non-interactive owner checks that ./setup.sh runs; prints only fixed text or a path.
 
@@ -591,7 +668,7 @@ def owner_tool(argv: list[str]) -> int:
     copy; ``copy-input SOURCE DESTINATION`` snapshots an owner-chosen input file;
     ``client-status codex|claude [PROJECT]`` runs that client's sign-in status command as the
     runtime would (client_status) and exits with its code, printing Claude's JSON for the
-    wizard to parse and nothing for Codex.
+    wizard to parse and nothing for Codex; ``legacy-state`` prints legacy_state_report as JSON.
     """
 
     try:
@@ -603,6 +680,9 @@ def owner_tool(argv: list[str]) -> int:
             return 0
         if len(argv) == 3 and argv[0] == "copy-input":
             copy_input(Path(argv[1]), Path(argv[2]))
+            return 0
+        if argv == ["legacy-state"]:
+            print(json.dumps(legacy_state_report(), sort_keys=True))
             return 0
         if len(argv) in (2, 3) and argv[0] == "client-status" and argv[1] in CLIENT_COMMANDS:
             code, output = client_status(argv[1], Path(argv[2]) if len(argv) == 3 else None)

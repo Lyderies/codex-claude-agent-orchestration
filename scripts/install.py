@@ -918,6 +918,13 @@ def verify_settings(target: Path, *, orchestration: Path = ORCHESTRATION) -> dic
     deny = ((data or {}).get("permissions") or {}).get("deny") or []
     missing = [rule for rule in deny_rules(orchestration) if rule not in deny]
     report = {"ready": data is not None and not missing, "settings": CLAUDE_SETTINGS, "missing": missing}
+    if isinstance(data, dict) and "hooks" in data:
+        # The installer never writes hooks; Claude Code runs them on the host. A Codex session
+        # that can write the project could have added them, so the owner is told to look.
+        report["warnings"] = [
+            ".claude/settings.json defines hooks, which the installer did not write and Claude "
+            "Code runs outside any sandbox; check that you added them yourself"
+        ]
     if not report["ready"]:
         report["required_action"] = (
             "the Claude Code permission rules that keep owner commands away from a Claude primary "

@@ -1441,6 +1441,43 @@ class StateRootTests(unittest.TestCase):
             with self.assertRaisesRegex(attest.AttestError, "a folder above the learning state"):
                 attest.default_state_root()
 
+    @unittest.skipUnless(os.path.exists("/usr/bin/ssh-keygen"), "needs ssh-keygen")
+    def test_the_legacy_report_shows_the_signer_key_and_whether_it_is_yours(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "codex-agents"
+        environment = {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / ".local" / "state")}
+        with mock.patch.dict(os.environ, environment), \
+                mock.patch.object(attest.host_paths, "legacy_state_root", lambda: legacy), \
+                mock.patch.object(attest, "ACCOUNT_HOME", str(self.home)):
+            self.assertEqual(attest.legacy_state_report(), {"present": False})
+            legacy.mkdir(parents=True, mode=0o700)
+            keys = {}
+            for name in ("owner", "other"):
+                subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f",
+                                str(self.home / name)], check=True, capture_output=True)
+                keys[name] = (self.home / f"{name}.pub").read_text().split()
+            signers = f"codex-agents-owner {keys['owner'][0]} {keys['owner'][1]}\n".encode()
+            (legacy / "owner-allowed-signers").write_bytes(signers)
+            report = attest.legacy_state_report()
+            self.assertEqual(report["signers_sha256"], hashlib.sha256(signers).hexdigest())
+            self.assertRegex(report["signer_key"], r"^ssh-ed25519 SHA256:[A-Za-z0-9+/]+$")
+            self.assertRegex(report["created"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+            self.assertIsNone(report["current_key"])
+            self.assertIsNone(report["match"])
+            (self.home / ".ssh").mkdir(mode=0o700)
+            pub = self.home / ".ssh" / "codex-agents-owner.pub"
+            pub.write_text(" ".join(keys["owner"]) + "\n")
+            self.assertTrue(attest.legacy_state_report()["match"])
+            pub.write_text(" ".join(keys["other"]) + "\n")
+            self.assertFalse(attest.legacy_state_report()["match"])
+            # A planted type field is never echoed; no signer file approves "none".
+            (legacy / "owner-allowed-signers").write_bytes(b"codex-agents-owner \x1b[31mevil AAAA\n")
+            self.assertIsNone(attest.legacy_state_report()["signer_key"])
+            (legacy / "owner-allowed-signers").unlink()
+            self.assertEqual(attest.legacy_state_report()["signers_sha256"], "none")
+            # Once the new folder exists there is nothing to move.
+            (self.home / ".local" / "state" / "codex-agents").mkdir(parents=True)
+            self.assertEqual(attest.legacy_state_report(), {"present": False})
+
     def test_the_scratch_container_is_the_one_the_guard_protects(self) -> None:
         self.assertEqual(attest.SCRATCH_CONTAINER, attest.host_paths.OWNER_SCRATCH_CONTAINER)
 

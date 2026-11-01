@@ -151,5 +151,50 @@ class PlantedPathTests(unittest.TestCase):
                     self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
 
+class PlantedModuleTests(unittest.TestCase):
+    """A module planted beside learning_hook.py never shadows the standard library."""
+
+    def test_a_planted_socket_or_secrets_module_is_never_imported(self) -> None:
+        interpreter = Path(os.path.realpath(sys.executable))
+        payload = json.loads(FIXTURE.read_text())
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            base = Path(os.path.realpath(directory))
+            checkout = base / "checkout"
+            (checkout / ".git").mkdir(parents=True)
+            orchestration = checkout / ".codex" / "orchestration"
+            shutil.copytree(BUNDLE_ROOT / ".codex" / "orchestration", orchestration,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copy(BUNDLE_ROOT / "VERSION", checkout / "VERSION")  # the version an install manifest would give
+            marker = base / "planted-imported"
+            for name in ("socket", "secrets", "json", "hashlib"):
+                (orchestration / f"{name}.py").write_text(
+                    f"open({str(marker)!r}, 'a').write({name!r} + '\\n')\n")
+            home = base / "home"
+            (home / ".local" / "state").mkdir(parents=True)
+            payload.update(cwd=str(checkout), hook_event_name="Stop")
+            completed = subprocess.run(
+                ["/bin/sh", "-c", hook_command(interpreter, checkout)],
+                input=json.dumps(payload), text=True, capture_output=True, cwd=checkout,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(home),
+                     "XDG_STATE_HOME": str(home / ".local" / "state")},
+                check=False, timeout=60)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("{}\n", completed.stdout)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+            # Nor by the project's CLI, which the hook's collector start runs, isolated alike.
+            cli = subprocess.run(
+                [str(interpreter), "-I", "-B", "-S", "-X", "pycache_prefix=/dev/null",
+                 str(orchestration / "cli.py"), "--help"],
+                capture_output=True, text=True, cwd=checkout, check=False, timeout=60)
+            self.assertEqual(0, cli.returncode, cli.stderr)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+            # The same run without -I's protection would have imported them: the test is live.
+            probe = subprocess.run(
+                [str(interpreter), "-B", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import secrets",
+                 str(orchestration)], capture_output=True, check=False, timeout=60)
+            self.assertEqual(0, probe.returncode)
+            self.assertIn("secrets", marker.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -821,6 +821,16 @@ class UmbrellaInstallTests(unittest.TestCase):
         self.assert_refused_before_any_write(summary, before)
         self.assertEqual(elsewhere.read_text(), "{}")
 
+    def test_verify_warns_about_hooks_in_the_claude_settings(self) -> None:
+        self.assertTrue(self.install(apply=True)["ok"])
+        settings = self.target / ".claude" / "settings.json"
+        self.assertNotIn("warnings", installer.verify_settings(self.target))
+        data = json.loads(settings.read_text())
+        data["hooks"] = {"PreToolUse": [{"hooks": [{"type": "command", "command": "true"}]}]}
+        settings.write_text(json.dumps(data))
+        report = installer.verify_settings(self.target)
+        self.assertIn("defines hooks, which the installer did not write", report["warnings"][0])
+
     def test_verify_reports_missing_deny_rules(self) -> None:
         self.assertTrue(self.install(apply=True)["ok"])
         data = self.settings()

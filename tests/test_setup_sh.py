@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import pwd
 import re
@@ -1067,7 +1068,8 @@ class WizardTerminalTests(unittest.TestCase):
             'if [ -n "$FAKE_SCAN" ]; then case "$*" in *"cli.py codex-session-scan "*)'
             ' echo "$FAKE_SCAN"; exit 0;; esac; fi\n'
             'if [ -n "$FAKE_REGISTER" ]; then case "$*" in *"cli.py learning-register "*)'
-            ' echo "$FAKE_REGISTER"; exit 0;; *"cli.py learning-status "*)'
+            f' printf "%s\\n" "$*" >> "{self.base / "register.log"}"; echo "$FAKE_REGISTER"; exit 0;;'
+            ' *"cli.py learning-status "*)'
             ' echo \'{"ready": true, "collector_runtime_version": "0.0.0"}\'; exit 0;; esac; fi\n'
             'case "$*" in *"attest.py scratch setup-"*)'
             f' out=$("{TRUSTED_PY}" "$@"); rc=$?; printf "%s\\n" "$out" >> "{self.scratch_log}";'
@@ -1411,6 +1413,54 @@ class WizardTerminalTests(unittest.TestCase):
                       "deleted once you're happy.", plain)
         self.assertNotIn("\x7f", self.screen)  # control characters are removed
         self.assertNotIn("/elsewhere", plain)  # the state root itself is never shown
+
+    def plant_legacy_records(self) -> str:
+        """An old-format records folder in the test home, as a session on ~/Library could make."""
+
+        legacy = self.home / "Library" / "Application Support" / "codex-agents"
+        legacy.mkdir(parents=True, mode=0o700)
+        subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.base / "k")],
+                       check=True, capture_output=True)
+        fields = (self.base / "k.pub").read_text().split()
+        signers = f"codex-agents-owner {fields[0]} {fields[1]}\n".encode()
+        (legacy / "owner-allowed-signers").write_bytes(signers)
+        return hashlib.sha256(signers).hexdigest()
+
+    def drive_to_legacy_question(self) -> None:
+        project, checks = self.make_project()
+        moved = '{"ready": true, "state_moved": "/somewhere/old copy", "state_root": "/x"}'
+        self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": moved})
+        self.send("\r")
+        self.expect("Continue")
+        self.send("\r")
+        self.expect("Register now")
+        self.send("\r")
+        self.expect("Move these records to the protected folder?")
+        self.expect("No, leave them where they are")
+        self.settle()
+
+    @unittest.skipUnless(sys.platform == "darwin", "the old records folder was macOS's")
+    def test_old_records_are_shown_and_moved_only_when_approved(self) -> None:
+        digest = self.plant_legacy_records()
+        self.drive_to_legacy_question()
+        last = self.screen.split("\x1b[2J")[-1]
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", last))
+        self.assertIn("still in the old folder ~/Library/Application Support/codex-agents (created 2", plain)
+        self.assertRegex(plain, r"Owner key in those records: ssh-ed25519 SHA256:[A-Za-z0-9+/]+")
+        self.assertIn("Your owner key file ~/.ssh/codex-agents-owner.pub:", plain)
+        self.assertTrue(any(line in plain for line in ("They match", "They do not match", "cannot compare")))
+        self.send("\r")  # Yes, move them
+        self.expect("Collector status: ready")
+        registered = (self.base / "register.log").read_text()
+        self.assertIn(f"--move-legacy-state {digest}", registered)
+
+    @unittest.skipUnless(sys.platform == "darwin", "the old records folder was macOS's")
+    def test_declining_the_move_registers_nothing(self) -> None:
+        self.plant_legacy_records()
+        self.drive_to_legacy_question()
+        self.send("\x1b[B\r")  # No
+        self.expect("The old records were not moved")
+        self.assertFalse((self.base / "register.log").exists())
 
     def test_no_move_no_records_sentence(self) -> None:
         project, checks = self.make_project()
@@ -2048,6 +2098,49 @@ class WizardTerminalTests(unittest.TestCase):
         status = subprocess.run(["git", "-C", str(project), "status", "--porcelain"],
                                 capture_output=True, text=True, env=self.env).stdout
         self.assertNotEqual(status, "")
+
+    def test_the_hooks_are_offered_for_trust_only_after_the_runtime_check(self) -> None:
+        project, checks = self.make_project()
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        for wait in ("fresh install is possible", "Codex children", "Looks right"):
+            self.expect(wait)
+            self.send("\r")
+        self.expect("Close every Codex session in this project first.")
+        self.expect("Install now")
+        self.send("\r")
+        self.expect("Commit now")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertIn("In Codex, open /hooks and trust the orchestrator's learning hooks", plain)
+        self.assertNotIn("Do not trust", plain)
+        self.send("\x1b[B\r")
+        self.finish_after_install()
+
+    def test_a_file_planted_in_the_orchestration_folder_stops_the_install(self) -> None:
+        project, checks = self.make_project()
+        planted = project / ".codex" / "orchestration"
+        planted.mkdir(parents=True)
+        (planted / "socket.py").write_text("raise SystemExit(1)\n")
+        # Committed, as a session could have done before the install: the tree is clean.
+        subprocess.run(["git", "-C", str(project), "add", "-f", ".codex"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(project), "commit", "-qm", "planted"], check=True, env=self.env)
+        self.start(project)
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Path to operational-checks.json")
+        self.send(f"{checks}\r")
+        self.expect("holds files the orchestrator does not install")
+        plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
+        self.assertNotIn("open /hooks", plain)
+        self.assertFalse((project / ".codex" / "hooks.json").exists())
+        self.assertFalse((project / ".codex" / "orchestration" / "install-manifest.json").exists())
 
     def test_a_failed_path_helper_stages_and_commits_nothing(self) -> None:
         project, checks = self.make_project()

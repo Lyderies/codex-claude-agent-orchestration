@@ -74,6 +74,22 @@
     used for Codex routes"), and a route denied for that reason says so.
   - The 0.8.9 runtime digest is recomputed.
 
+- **Final review (0.8.9).**
+  - The package installer refuses, before writing anything, when the project's
+    `.codex/orchestration` holds files it does not install (a `socket.py` planted by a
+    session that ran before the install, bytecode, a package), and verify reports it. The
+    hook and the project's `cli.py` append their folder to `sys.path` instead of putting it
+    first, so with `-I` a planted module never shadows the standard library. The wizard says
+    to trust the hooks in Codex only after `check-runtime` passes, and the install step
+    starts with "Close every Codex session in this project first".
+  - The one-time move of the old macOS state needs the owner's approval
+    (`learning-register --move-legacy-state <signer file SHA-256 or none>`): the wizard shows
+    the old folder's creation time, the owner key it names and whether that is
+    `~/.ssh/codex-agents-owner.pub`, asks, and the runtime checks the digest on its fresh copy.
+  - Verify warns when `.claude/settings.json` defines hooks; the README, SECURITY.md and S6
+    list the residuals (sessions running during an install; Claude settings and skills a
+    Codex session can rewrite). The 0.8.9 runtime digest is recomputed.
+
 - **Owner key links and client output (owner review).** `attest.py` refuses an owner private
   key whose file has another hard link ("This key file has another link elsewhere; make a fresh
   copy in ~/.ssh (cp, not mv) and remove the old one"), at every use and again on the file it

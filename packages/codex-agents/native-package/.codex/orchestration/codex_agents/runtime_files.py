@@ -13,7 +13,10 @@ runtime code: a protected copy reads release data from its project, and Codex
 runs the project's own `learning_hook.py` (named absolutely by the checkout's
 rendered `.codex/hooks.json`), never the copy's. That file sits in the project's
 `.codex`, which Codex keeps read-only for a session opened on the project and the
-session guard refuses for one opened above it, exactly like `hooks.json` itself.
+session guard refuses for one opened above it, like `hooks.json` itself; a process
+already writing the project before the install (when `.codex` did not exist) is the
+exception, which is why the installer refuses extra files there and the owner closes
+every Codex session first.
 `hook_config.py` renders and checks that file; validation imports it, so it is
 runtime code.
 """

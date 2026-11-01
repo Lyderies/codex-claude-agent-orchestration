@@ -122,6 +122,11 @@ In words: a request meets these layers in order, and a failure at any layer stop
   so `bash -c` is not matched; a process that double-forks between snapshots can outlive cleanup.
 - **Prompt content and a modified package.** Repository text reaches every child's prompt as instructions;
   the protected copy is checked against this package, not against a signature.
+- **Sessions running during an install.** The learning hooks run the project's installed code outside the
+  sandbox. Close every Codex session in the project before installing or updating: one started before the
+  install, when `.codex` did not exist yet, can still rewrite that code.
+- **Claude settings and skills.** A Codex session in the project can rewrite `.claude/settings*.json` (hooks,
+  deny rules) and `.claude/skills/`, which Claude Code loads on the host; verify warns about hooks there.
 
 > [!WARNING]
 > The attestation is your own statement about your billing settings. Admission also checks what the clients

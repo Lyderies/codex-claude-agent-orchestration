@@ -8,6 +8,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -26,7 +27,11 @@ ORCHESTRATION_ROOT = BUNDLE_ROOT / ".codex" / "orchestration"
 sys.path.insert(0, str(ORCHESTRATION_ROOT))
 
 from codex_agents import hook_config  # noqa: E402 - source-tree bootstrap above
-from codex_agents.host_commands import HostCommandError, interpreter_path  # noqa: E402
+from codex_agents.host_commands import (  # noqa: E402
+    HostCommandError,
+    interpreter_path,
+    project_extra_files,
+)
 from codex_agents.learning_engine import (  # noqa: E402
     validate_operational_check_configuration_input,
 )
@@ -415,6 +420,35 @@ def _local_conflicts(target: Target, manifest: dict | None) -> list[str]:
     return conflicts
 
 
+ORCHESTRATION_PREFIX = ".codex/orchestration/"
+
+
+def orchestration_extras(target: TargetRoot, manifest: dict | None) -> list[str]:
+    """Entries in the project's `.codex/orchestration` that no install puts there.
+
+    Allowed: this package's runtime and data files, the project's own files, and files
+    the existing install manifest owns (an update removes the obsolete ones). Anything
+    else (a planted `socket.py`, bytecode, a package) would be imported by code that
+    runs outside the sandbox, so the installer refuses before it writes anything.
+    """
+
+    owned = {
+        relative.removeprefix(ORCHESTRATION_PREFIX)
+        for relative in (manifest or {}).get("files", {})
+        if relative.startswith(ORCHESTRATION_PREFIX)
+    }
+    return project_extra_files(target.path, owned)
+
+
+def extras_message(target: TargetRoot, extras: list[str]) -> str:
+    shown = [re.sub(r"[\x00-\x1f\x7f-\x9f]", "", name)[:120] for name in extras[:5]]
+    more = " and more" if len(extras) > 5 else ""
+    return (
+        f"{target.path}/.codex/orchestration holds files the orchestrator does not install: "
+        f"{', '.join(shown)}{more}; remove them and run ./setup.sh again"
+    )
+
+
 def _plan_install(target: Target, update: bool) -> tuple[dict[str, Path], dict | None]:
     files = _bundle_files()
     manifest = _load_manifest(target)
@@ -557,6 +591,9 @@ def install(
             replace_project_config=replace_project_config,
         )
         files, manifest = _plan_install(target, update)
+        extras = orchestration_extras(target, manifest)
+        if extras:
+            raise InstallError(extras_message(target, extras))
         local = _render_local(target)
         action = "update" if update else "install"
         report = {
@@ -623,6 +660,7 @@ def verify(target_path: Path) -> dict:
             elif current != expected:
                 modified.append(relative)
         unknown_package_files = sorted(set(_bundle_files()) - set(manifest["files"]))
+        extras = orchestration_extras(target, manifest)
         runtime = validate_package(target.path)
         manifest_errors = [
             *(f"missing managed file: {item}" for item in missing),
@@ -631,6 +669,7 @@ def verify(target_path: Path) -> dict:
                 f"package file absent from manifest: {item}"
                 for item in unknown_package_files
             ),
+            *([extras_message(target, extras)] if extras else []),
         ]
         package_errors = [*manifest_errors, *runtime["package_errors"]]
         project_errors = list(runtime["project_errors"])

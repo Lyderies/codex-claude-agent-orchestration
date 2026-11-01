@@ -724,6 +724,16 @@ STATE_COPY_INVALID = (
     "integrity); the old folder was not changed. Run ./setup.sh (collector step) again, "
     "and report it if it repeats"
 )
+LEGACY_NOT_REVIEWED = (
+    "the learning state is still in its old macOS folder "
+    "(~/Library/Application Support/codex-agents), and it is moved only after you have "
+    "reviewed it: run ./setup.sh (collector step), which shows its owner key and asks first"
+)
+LEGACY_CHANGED = (
+    "the owner key record in the old macOS learning state folder is not the one you "
+    "reviewed (it changed, or something else was approved); nothing was moved. Run "
+    "./setup.sh (collector step) again and check it before moving"
+)
 STATE_SOCKET_TOO_LONG = (
     "the new learning state folder's path is too long for the collector's local socket; "
     "set XDG_STATE_HOME to a shorter folder, or unset it, then run ./setup.sh "
@@ -875,7 +885,37 @@ def _validate_staged_state(staged: Path) -> None:
         raise StateError(STATE_COPY_INVALID) from exc
 
 
-def migrate_legacy_state(cli_path: Path, project_root: Path) -> Path | None:
+LEGACY_SIGNERS_READ_LIMIT = 65_536
+
+
+def legacy_signers_digest(root: Path) -> str:
+    """SHA-256 of `<root>/owner-allowed-signers` as the owner reviewed it, or "none".
+
+    Read through a no-follow descriptor, bounded; anything but a regular file refuses.
+    """
+
+    try:
+        descriptor = os.open(root / "owner-allowed-signers", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "none"
+    except OSError as exc:
+        raise StateError(LEGACY_CHANGED) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise StateError(LEGACY_CHANGED)
+        # Bounded well above a valid record, so an oversized one still fails the copy's
+        # own checks (with their message) rather than this one.
+        content = os.read(descriptor, LEGACY_SIGNERS_READ_LIMIT + 1)
+    finally:
+        os.close(descriptor)
+    if len(content) > LEGACY_SIGNERS_READ_LIMIT:
+        raise StateError(LEGACY_CHANGED)
+    return hashlib.sha256(content).hexdigest()
+
+
+def migrate_legacy_state(
+    cli_path: Path, project_root: Path, approved_signers: str | None = None
+) -> Path | None:
     """Copy the pre-0.8.9 macOS learning state to the default folder, once (owner).
 
     Only the owner's `learning-register` calls this, and only while the old
@@ -890,6 +930,12 @@ def migrate_legacy_state(cli_path: Path, project_root: Path) -> Path | None:
     inert. On any failure the staging folder is removed and the old folder is
     left as it was. Returns the old copy's new path, or None when nothing was
     moved; both folders present refuses.
+
+    The old folder sits where a session opened on `~/Library` could have created
+    it, so it moves only with the owner's approval: `approved_signers` is the
+    SHA-256 of its `owner-allowed-signers` (or "none") that the wizard showed the
+    owner with that key's fingerprint. Without it the move refuses, and the staged
+    copy's signer file must match it before anything is renamed.
     """
 
     from .host_paths import (
@@ -905,6 +951,14 @@ def migrate_legacy_state(cli_path: Path, project_root: Path) -> Path | None:
     target = default_state_root()
     if os.path.lexists(target):
         raise StateError(BOTH_STATES)
+    if approved_signers is None:
+        raise StateError(LEGACY_NOT_REVIEWED)
+    if approved_signers != "none" and (
+        len(approved_signers) != 64 or any(ch not in "0123456789abcdef" for ch in approved_signers)
+    ):
+        raise StateError(LEGACY_CHANGED)
+    if legacy_signers_digest(legacy) != approved_signers:
+        raise StateError(LEGACY_CHANGED)
     if len(os.fsencode(str(target / "collector.sock"))) > UNIX_SOCKET_PATH_MAX:
         raise StateError(STATE_SOCKET_TOO_LONG)
     old = LearningState(legacy, create=False)
@@ -953,6 +1007,9 @@ def migrate_legacy_state(cli_path: Path, project_root: Path) -> Path | None:
                 finally:
                     os.close(source)
                 _backup_state_database(old, staged)
+                # The fresh copy, which nothing else can reach, is what the owner approved.
+                if legacy_signers_digest(staged) != approved_signers:
+                    raise StateError(LEGACY_CHANGED)
                 _validate_staged_state(staged)
                 os.rename(staging_name, target.name, src_dir_fd=parent, dst_dir_fd=parent)
                 try:

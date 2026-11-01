@@ -38,6 +38,9 @@ from codex_agents.learning_store import (
     authorize_collector_runtime,
     default_state_root,
     ensure_collector,
+    LEGACY_CHANGED,
+    LEGACY_NOT_REVIEWED,
+    legacy_signers_digest,
     migrate_legacy_state,
     registered_project_roots,
 )
@@ -279,6 +282,11 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.assertEqual(expected, code, stdout.getvalue())
         return json.loads(stdout.getvalue())
 
+    def approval(self) -> str:
+        """What the wizard passes once the owner approved the old folder's signer file."""
+
+        return legacy_signers_digest(self.legacy)
+
     def moved_aside(self) -> list[Path]:
         return sorted(self.legacy.parent.glob("codex-agents.moved-*"))
 
@@ -321,7 +329,8 @@ class LegacyStateMoveTests(unittest.TestCase):
             return real_backup(old, staged)
 
         with mock.patch.object(learning_store, "_backup_state_database", checking_backup):
-            report = self.run_cli("learning-register", "--project-root", str(self.project))
+            report = self.run_cli("learning-register", "--project-root", str(self.project),
+                                  "--move-legacy-state", self.approval())
         self.assertEqual([True], stopped)
         self.assertTrue(report["ready"])
         # The old folder is renamed aside, inert, and the report names it.
@@ -349,11 +358,45 @@ class LegacyStateMoveTests(unittest.TestCase):
         again = self.run_cli("learning-register", "--project-root", str(self.project))
         self.assertIsNone(again["state_moved"])
 
+    def test_the_old_folder_moves_only_with_the_reviewed_signer_digest(self) -> None:
+        # A session opened on ~/Library could have created the old folder where none existed.
+        self.old_state(register=False)
+        with self.assertRaises(StateError) as caught:
+            migrate_legacy_state(CLI, self.project)
+        self.assertEqual(LEGACY_NOT_REVIEWED, str(caught.exception))
+        refused = self.run_cli("learning-register", "--project-root", str(self.project), expected=2)
+        self.assertEqual(LEGACY_NOT_REVIEWED, refused["error"])
+        for approved in ("none", "0" * 64, "not-a-digest"):
+            with self.subTest(approved=approved):
+                with self.assertRaises(StateError) as caught:
+                    migrate_legacy_state(CLI, self.project, approved_signers=approved)
+                self.assertEqual(LEGACY_CHANGED, str(caught.exception))
+        self.assert_nothing_staged()
+        self.assertTrue(os.path.lexists(self.legacy))
+        # A signer file rewritten after the review, while the move copies, is caught on the
+        # fresh copy: nothing is published and the old folder stays.
+        approved = self.approval()
+        real_copy = learning_store._copy_state_tree
+
+        def rewrite_then_copy(source, staging, *, top=False):
+            if top:
+                (self.legacy / "owner-allowed-signers").write_bytes(
+                    b"codex-agents-owner ssh-ed25519 AAAAattacker\n")
+            return real_copy(source, staging, top=top)
+
+        with mock.patch.object(learning_store, "_copy_state_tree", rewrite_then_copy):
+            with self.assertRaises(StateError) as caught:
+                migrate_legacy_state(CLI, self.project, approved_signers=approved)
+        self.assertEqual(LEGACY_CHANGED, str(caught.exception))
+        self.assert_nothing_staged()
+        self.assertTrue(os.path.lexists(self.legacy))
+        self.assertEqual([], self.moved_aside())
+
     def test_a_descriptor_held_before_the_move_cannot_change_the_new_signer(self) -> None:
         self.old_state(register=False)
         held = os.open(self.legacy / "owner-allowed-signers", os.O_WRONLY)
         self.addCleanup(os.close, held)
-        aside = migrate_legacy_state(CLI, self.project)
+        aside = migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         before = (self.target / "owner-allowed-signers").read_bytes()
         os.lseek(held, 0, os.SEEK_SET)
         os.write(held, b"codex-agents-owner ssh-ed25519 AAAAattacker\n")
@@ -367,7 +410,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         planted = self.base / "project-link"
         os.link(self.legacy / "owner-allowed-signers", planted)
         with self.assertRaises(StateError) as caught:
-            migrate_legacy_state(CLI, self.project)
+            migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assertEqual(LINKED_STATE, str(caught.exception))
         self.assert_nothing_staged()
         self.assertTrue(os.path.lexists(self.legacy))
@@ -376,7 +419,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         # A symlink or a special file in the old folder refuses the same way.
         (self.legacy / "artifacts" / "planted").symlink_to(self.base / "elsewhere")
         with self.assertRaisesRegex(StateError, "second hard link, a symbolic link"):
-            migrate_legacy_state(CLI, self.project)
+            migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assert_nothing_staged()
 
     def test_an_old_signer_with_an_over_long_first_line_is_not_copied(self) -> None:
@@ -386,7 +429,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         _key, public = generate_test_owner_key(attacker)
         state.allowed_signers_path.write_bytes(OversizedSignerTests.oversized(public))
         with self.assertRaisesRegex(StateError, "did not pass its checks"):
-            migrate_legacy_state(CLI, self.project)
+            migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assert_nothing_staged()
         self.assertTrue(os.path.lexists(self.legacy))
         self.assertEqual([], self.moved_aside())
@@ -401,7 +444,7 @@ class LegacyStateMoveTests(unittest.TestCase):
             with self.subTest(step=patched), \
                     mock.patch.object(learning_store, patched, disk_full):
                 with self.assertRaises(StateError) as caught:
-                    migrate_legacy_state(CLI, self.project)
+                    migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
                 self.assertEqual(STATE_MOVE_FAILED, str(caught.exception))
                 self.assert_nothing_staged()
                 self.assertTrue(os.path.lexists(self.legacy))
@@ -412,7 +455,7 @@ class LegacyStateMoveTests(unittest.TestCase):
             side_effect=StateError("owner allowed-signers must name exactly one owner key"),
         ):
             with self.assertRaisesRegex(StateError, "did not pass its checks"):
-                migrate_legacy_state(CLI, self.project)
+                migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assert_nothing_staged()
         # Setting the old folder aside fails: the published copy is taken back.
         real_rename = os.rename
@@ -424,11 +467,11 @@ class LegacyStateMoveTests(unittest.TestCase):
 
         with mock.patch.object(learning_store.os, "rename", refuse_aside):
             with self.assertRaises(StateError):
-                migrate_legacy_state(CLI, self.project)
+                migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assert_nothing_staged()
         self.assertTrue(os.path.lexists(self.legacy))
         # And afterwards the move still works.
-        self.assertIsNotNone(migrate_legacy_state(CLI, self.project))
+        self.assertIsNotNone(migrate_legacy_state(CLI, self.project, approved_signers=self.approval()))
         ledger = sqlite3.connect(self.target / "learning.sqlite3")
         try:
             self.assertEqual("ok", ledger.execute("PRAGMA integrity_check").fetchone()[0])
@@ -439,7 +482,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.old_state()
         LearningState(self.target)
         with self.assertRaisesRegex(StateError, "both in its old macOS folder"):
-            migrate_legacy_state(CLI, self.project)
+            migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         refused = self.run_cli(
             "learning-register", "--project-root", str(self.project), expected=2
         )
@@ -450,7 +493,7 @@ class LegacyStateMoveTests(unittest.TestCase):
 
     def test_only_the_new_folder_is_normal(self) -> None:
         LearningState(self.target)
-        self.assertIsNone(migrate_legacy_state(CLI, self.project))
+        self.assertIsNone(migrate_legacy_state(CLI, self.project, approved_signers=self.approval()))
         self.assertEqual(self.target, LearningState(create=False).root)
         report = self.run_cli("learning-register", "--project-root", str(self.project))
         self.assertEqual((True, None), (report["ready"], report["state_moved"]))
@@ -459,7 +502,7 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.old_state(register=False)
         with mock.patch.object(learning_store, "UNIX_SOCKET_PATH_MAX", 20):
             with self.assertRaises(StateError) as caught:
-                migrate_legacy_state(CLI, self.project)
+                migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assertEqual(STATE_SOCKET_TOO_LONG, str(caught.exception))
         self.assertTrue(os.path.lexists(self.legacy))
 
@@ -467,11 +510,11 @@ class LegacyStateMoveTests(unittest.TestCase):
         self.old_state(register=False)
         os.chmod(self.legacy, 0o755)
         with self.assertRaisesRegex(StateError, "unsafe permissions"):
-            migrate_legacy_state(CLI, self.project)
+            migrate_legacy_state(CLI, self.project, approved_signers=self.approval())
         self.assertFalse(os.path.lexists(self.target))
 
     def test_no_old_folder_moves_nothing(self) -> None:
-        self.assertIsNone(migrate_legacy_state(CLI, self.project))
+        self.assertIsNone(migrate_legacy_state(CLI, self.project, approved_signers=self.approval()))
         self.assertFalse(os.path.lexists(self.target))
 
 
