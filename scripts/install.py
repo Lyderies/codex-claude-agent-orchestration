@@ -644,7 +644,10 @@ class OwnerState:
 
     def __init__(self, *, create: bool) -> None:
         self.fd: int | None = None
-        base = attest.default_state_root()
+        try:
+            base = attest.default_state_root()  # refuses a bad XDG_STATE_HOME or an unsafe ~/.local
+        except attest.AttestError as exc:
+            raise InstallRefused(str(exc)) from None
         try:
             if create:
                 base.mkdir(mode=0o700, parents=True, exist_ok=True)

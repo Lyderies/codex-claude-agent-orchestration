@@ -1027,7 +1027,8 @@ class WizardTerminalTests(unittest.TestCase):
         (self.fakes / "fake_rule.py").write_text(FAKE_RULE)
         (self.fakes / "fake_client_tool.py").write_text(CLIENT_TOOL)
         self.rule_log = self.base / "rule.log"
-        self.home = self.base / "home"
+        # Canonical, as the runtime requires of XDG_STATE_HOME (macOS /var is /private/var).
+        self.home = Path(os.path.realpath(self.base / "home"))
         self.home.mkdir()
         self.tmpdir = self.base / "tmp"
         self.tmpdir.mkdir()
@@ -1394,7 +1395,9 @@ class WizardTerminalTests(unittest.TestCase):
 
     def test_the_one_time_move_of_the_records_is_explained(self) -> None:
         project, checks = self.make_project()
-        moved = '{"ready": true, "state_moved": true, "state_root": "/somewhere/codex-agents"}'
+        # The old copy's path, with a DEL byte (a control character JSON allows unescaped).
+        moved = ('{"ready": true, "state_moved": "/somewhere/old\x7f copy", '
+                 '"state_root": "/elsewhere/codex-agents"}')
         self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": moved})
         self.send("\r")
         self.expect("Continue")
@@ -1404,12 +1407,14 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Collector status: ready")
         plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
         self.assertIn("Moved your orchestrator records once to a protected folder, "
-                      "~/.local/state/codex-agents.", plain)
-        self.assertNotIn("/somewhere", plain)  # only the fixed sentence, never the reported path
+                      "~/.local/state/codex-agents. The old copy at /somewhere/old copy can be "
+                      "deleted once you're happy.", plain)
+        self.assertNotIn("\x7f", self.screen)  # control characters are removed
+        self.assertNotIn("/elsewhere", plain)  # the state root itself is never shown
 
     def test_no_move_no_records_sentence(self) -> None:
         project, checks = self.make_project()
-        self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": '{"ready": true, "state_moved": false}'})
+        self.drive_to_commit_menu(project, checks, {"FAKE_REGISTER": '{"ready": true, "state_moved": null}'})
         self.send("\r")
         self.expect("Continue")
         self.send("\r")

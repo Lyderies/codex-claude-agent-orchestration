@@ -1246,6 +1246,10 @@ explain_installer() {
   local label=$1 manual=$2 raw msg
   raw=$(pj raw "$LAST_OUT")
   case "$raw" in
+    *"xdg_state_home must be inside a hidden folder"*)
+      msg="XDG_STATE_HOME must be inside a hidden folder in your home, such as ~/.local/state. Unset it or move it, then run setup again.";;
+    *"a folder above the learning state"*)
+      msg="A folder above your orchestrator records (such as ~/.local or ~/.local/state) is a symbolic link, is not a folder, belongs to another user or can be changed by other users. Fix it, or set XDG_STATE_HOME to another hidden folder in your home, then run setup again.";;
     *"cannot install the learning hooks"*)
       msg="The learning hooks could not be written: the project's folder path holds a quote, a backslash or a control character, or this Python is not in a trusted installation folder. Move the project, or run setup with a Python from Homebrew, python.org or the system.";;
     *"learning hook"*)
@@ -2120,7 +2124,7 @@ version_hint() {
 }
 
 step_collector() {
-  local cli ready
+  local cli ready moved
   begin_step 5
   cli="$PROJECT/.codex/orchestration/cli.py"
   if [ ! -f "$cli" ]; then
@@ -2150,10 +2154,13 @@ step_collector() {
     pause; return 1
   fi
   list_add ok "Collector registered"
-  # learning-register reports "state_moved": true when it has just moved the learning state
-  # from its old macOS folder (once); one fixed sentence says so.
-  if [ "$(pj get "$LAST_OUT" state_moved)" = true ]; then
-    list_add info "Moved your orchestrator records once to a protected folder, ~/.local/state/codex-agents."
+  # learning-register reports "state_moved": the old copy's path when it has just copied the
+  # learning state from its old macOS folder (once), else null. One fixed sentence says so and
+  # names that path, with control characters removed, so it cannot drive the terminal.
+  moved=$(pj get "$LAST_OUT" state_moved)
+  moved=${moved//[[:cntrl:]]/}
+  if [ "${moved:0:1}" = / ]; then
+    list_add info "Moved your orchestrator records once to a protected folder, ~/.local/state/codex-agents. The old copy at $moved can be deleted once you're happy."
   fi
   render
   run_owner_cli "Checking collector status" learning-status --project-root "$PROJECT"

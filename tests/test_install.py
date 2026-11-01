@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -143,6 +145,9 @@ def isolate_home(test: unittest.TestCase, home: Path) -> None:
     runtime may place by the account's own home folder unless XDG_STATE_HOME names one."""
 
     home.mkdir(mode=0o700, exist_ok=True)
+    # Both canonical: the runtime refuses an XDG_STATE_HOME that is not, and on macOS a temporary
+    # folder under /var is really under /private/var.
+    home = Path(os.path.realpath(home))
     environment = {key: value for key, value in os.environ.items() if key not in ("CODEX_HOME", "XDG_STATE_HOME")}
     # The installer's plumbing commit needs an identity; CI runners have no Git identity.
     identity = {"GIT_AUTHOR_NAME": "Tests", "GIT_AUTHOR_EMAIL": "tests@example.invalid",
@@ -451,6 +456,20 @@ class UmbrellaInstallTests(unittest.TestCase):
         # The user's own staged change is still staged, and the committed path is clean.
         self.assertEqual(git(self.target, "status", "--porcelain").stdout.splitlines(), ["M  README.md"])
         self.assertEqual(installer.commit_paths(self.target, "Again", "x", [".codex/a"]), "nothing")
+
+    def test_an_unusable_state_location_refuses_with_its_plain_message(self) -> None:
+        outside = str(Path(os.path.realpath(self.base)) / "elsewhere")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": outside}):
+            summary = self.install()
+            self.assertFalse(summary["ok"])
+            self.assertIn("XDG_STATE_HOME must be inside a hidden folder", summary["claude_settings"]["error"])
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                code = installer.main(["install", "--target", str(self.target), *self.codex_options])
+            self.assertEqual(code, 2)
+            report = json.loads(printed.getvalue())
+            self.assertIn("XDG_STATE_HOME must be inside a hidden folder", report["claude_settings"]["error"])
+            self.assertNotIn(outside, printed.getvalue())
 
     def test_checkout_local_hooks_are_never_committed_and_an_old_tracked_copy_is_untracked(self) -> None:
         installed = self.install(apply=True)

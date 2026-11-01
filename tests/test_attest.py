@@ -1246,7 +1246,8 @@ class StateRootTests(unittest.TestCase):
     """The owner tools follow the runtime's learning state folder, never a path of their own."""
 
     def setUp(self) -> None:
-        self.home = Path(tempfile.mkdtemp(prefix="attest-state-")).resolve()
+        # Canonical: the runtime refuses a non-canonical XDG_STATE_HOME (/var is /private/var).
+        self.home = Path(os.path.realpath(tempfile.mkdtemp(prefix="attest-state-")))
         self.addCleanup(shutil.rmtree, self.home, True)
 
     def test_the_state_root_is_the_runtimes_owner_state_root(self) -> None:
@@ -1273,6 +1274,32 @@ class StateRootTests(unittest.TestCase):
             self.assertEqual(attest.default_state_root(), old)
             new.mkdir(parents=True, mode=0o700)
             self.assertEqual(attest.default_state_root(), new)
+
+    def test_an_unusable_state_location_is_refused_with_its_plain_message(self) -> None:
+        cases = {
+            "outside HOME": (str(self.home.parent / "elsewhere"), "XDG_STATE_HOME must be inside a hidden folder"),
+            "not hidden": (str(self.home / "state"), "XDG_STATE_HOME must be inside a hidden folder"),
+            "through a link": (str(self.home / ".linked" / "state"), "XDG_STATE_HOME must be inside a hidden folder"),
+        }
+        (self.home / ".real").mkdir()
+        (self.home / ".linked").symlink_to(self.home / ".real")
+        for label, (value, message) in cases.items():
+            with self.subTest(label), mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": value}):
+                with self.assertRaises(attest.AttestError) as caught:
+                    attest.default_state_root()
+                self.assertIn(message, str(caught.exception))
+                self.assertNotIn(str(self.home), str(caught.exception))
+        # ~/.local a symbolic link: the folders above the state must be real and the owner's.
+        (self.home / "real-local").mkdir()
+        (self.home / ".local").symlink_to(self.home / "real-local")
+        with mock.patch.dict(os.environ, {"HOME": str(self.home),
+                                          "XDG_STATE_HOME": str(self.home / ".config" / "state")}):
+            self.assertEqual(attest.default_state_root(), self.home / ".config" / "state" / "codex-agents")
+        environ = {key: value for key, value in os.environ.items() if key != "XDG_STATE_HOME"}
+        with mock.patch.dict(os.environ, {**environ, "HOME": str(self.home)}, clear=True), \
+                mock.patch.object(attest.host_paths, "account_home", lambda: self.home):
+            with self.assertRaisesRegex(attest.AttestError, "a folder above the learning state"):
+                attest.default_state_root()
 
     def test_the_scratch_container_is_the_one_the_guard_protects(self) -> None:
         self.assertEqual(attest.SCRATCH_CONTAINER, attest.host_paths.OWNER_SCRATCH_CONTAINER)
@@ -1742,7 +1769,8 @@ class RealTerminalTests(unittest.TestCase):
                        check=True, capture_output=True)
         fields = (root / "throwaway.pub").read_text().split()
         (state / "owner-allowed-signers").write_text(f"codex-agents-owner {fields[0]} {fields[1]}\n")
-        env = dict(os.environ, HOME=str(home))
+        real_home = os.path.realpath(home)
+        env = dict(os.environ, HOME=real_home, XDG_STATE_HOME=os.path.join(real_home, ".local", "state"))
         env.pop("SSH_AUTH_SOCK", None)
         args = ["--target", str(project), "--state-root", str(state)]
         command = [sys.executable, "-I", "-B", "-S", "-c", RUNNER, str(_SCRIPT), str(bundle),
@@ -1843,7 +1871,8 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         import select
         import time
 
-        env = dict(os.environ, HOME=str(self.home))
+        real_home = os.path.realpath(self.home)
+        env = dict(os.environ, HOME=real_home, XDG_STATE_HOME=os.path.join(real_home, ".local", "state"))
         env.pop("SSH_AUTH_SOCK", None)
         pid, fd = pty.fork()
         if pid == 0:

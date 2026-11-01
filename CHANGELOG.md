@@ -68,6 +68,13 @@
     used for Codex routes"), and a route denied for that reason says so.
   - The 0.8.9 runtime digest is recomputed.
 
+- **Owner tools follow the state rules.** `scripts/attest.py` and `scripts/install.py` show the
+  runtime's plain refusal when the learning state location is unusable (an `XDG_STATE_HOME`
+  outside a hidden home folder or not canonical, or an unsafe `~/.local`), and the wizard maps
+  it to a fixed message. The collector step's one sentence about the move now names the old
+  copy (`state_moved`, control characters removed) and says it can be deleted once you're
+  happy. Tests set a canonical `HOME` and `XDG_STATE_HOME`.
+
 - **Owner-side final fixes (whole-release review).**
   - `setup.sh` no longer runs `codex` or `claude` from the inherited `PATH`, where an earlier
     folder a Codex session can write could hold a planted program. The sign-in checks go

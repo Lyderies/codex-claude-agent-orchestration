@@ -703,6 +703,9 @@ def default_state_root() -> Path:
 
     try:
         return Path(host_paths.owner_state_root())
+    except host_paths.HostPathError as exc:
+        # A plain message (a bad XDG_STATE_HOME, an unsafe ~/.local); it never names a path.
+        raise AttestError(str(exc)) from None
     except Exception as exc:
         raise AttestError("the learning state folder cannot be found") from exc
 
@@ -1419,7 +1422,11 @@ def main(argv: list[str] | None = None) -> int:
         print("This is a human step: run it yourself in an interactive terminal. "
               "It will not run from a script, pipe or agent.", file=sys.stderr)
         return 2
-    state_root = (args.state_root or default_state_root()).expanduser()
+    try:
+        state_root = (args.state_root or default_state_root()).expanduser()
+    except AttestError as exc:
+        print(f"Stopped: {exc}", file=sys.stderr)
+        return 1
     if args.change_passphrase:
         previous = _install_handlers()
         try:

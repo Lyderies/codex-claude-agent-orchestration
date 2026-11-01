@@ -105,7 +105,8 @@ python3 -I -B -S -X pycache_prefix=/dev/null "$CLI" learning-status --project-ro
 One collector is shared by every project on the machine. Your orchestrator records (the learning state)
 live in `~/.local/state/codex-agents`, or `$XDG_STATE_HOME/codex-agents`; on macOS, the first
 `learning-register` after this update moves them there from `~/Library/Application Support/codex-agents`
-and reports `"state_moved": true`.
+and reports the old copy's path as `"state_moved"` (null otherwise); delete that old copy once you are
+happy.
 
 ## 4. Attest billing
 
