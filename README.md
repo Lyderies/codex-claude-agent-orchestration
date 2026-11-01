@@ -8,7 +8,7 @@ This branch shares no history with them and is never merged into them.
 | Folder | Contents |
 |---|---|
 | `delivery/` | The delivery plan (`plan.md`) and the goal design documents (`g2-design.md`) |
-| `research/` | Research reports and dispatch and containment spikes, copied from `staging` |
+| `research/` | Research reports and dispatch and containment spikes, copied from `staging` (now retired) |
 
 User and contributor documentation stays on `main`: the README, `docs/` (including the security model
 and how it works), `CONTRIBUTING.md`, `SECURITY.md` and the CHANGELOG.

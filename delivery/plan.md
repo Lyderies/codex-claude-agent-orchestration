@@ -89,9 +89,9 @@ The work is mostly integration. The genuinely new pieces are:
   - **Features:** each work item is built on a `feature/<name>` branch cut from the version
     branch. It merges back only after its tests, Ruff, the identifier scan and any required
     review pass.
-  - **Research:** reports live only on `staging`, which is the version branch plus research.
-    The version branch is merged into `staging` regularly; `staging` never merges into a
-    version branch or `main`.
+  - **Planning and research:** the plan, design working documents, research and run records
+    live only on the orphan `planning` branch, checked out as a worktree. It never merges into a
+    version branch or `main`; user and contributor documentation stays in `docs/` on `main`.
 - **Portability:** add no new POSIX-only code. CI runs on Linux and macOS; Windows support is
   parked (see the parking lot).
 
