@@ -317,6 +317,31 @@ class CliTestCase(BridgeTestCase):
         return str(path)
 
 
+class FailingFieldCliTests(CliTestCase):
+    """A primary's own input mistakes, as `learning-route` reports them."""
+
+    def test_a_refusal_names_the_field_and_never_its_value(self) -> None:
+        canary = "CANARY-do-not-echo"
+        for change, field in (
+            ({"family": canary}, "task.family"),
+            ({canary: 1}, "task"),
+        ):
+            with self.subTest(field):
+                refused = self.cli(
+                    "learning-route", "--task", self.write("bad.json", {**self.task(), **change}),
+                    expected=2,
+                )
+                self.assertEqual(
+                    {"ready": False, "error": "input validation failed", "field": field}, refused
+                )
+
+    def test_a_file_reference_as_routing_evidence_says_what_it_must_be(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "must be a typed host outcome digest"):
+            self.ledger.trusted_routing_evidence_refs(
+                self.project_id, {**self.task(), "routing_evidence_refs": ["docs/using-it.md"]}
+            )
+
+
 class ClaudeBridgeTests(BridgeTestCase):
     def test_happy_path_returns_the_result_and_usage(self) -> None:
         route, assigned, handle = self.claude_run()

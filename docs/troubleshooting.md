@@ -24,6 +24,13 @@ The command ran inside Codex's sandbox. Run `./setup.sh`, choose "Update the ins
 step", and allow the rule in step 8 (Commands): the default there is "No, not now", so press Down once to
 "Yes, allow these commands" before Enter. Then start a new Codex session in the project's folder.
 
+## "input validation failed"
+
+A task, assignment or parent grant was refused. The `field` beside the error names where to look, such as
+`task.family`; the value is never printed. A `field` naming a whole object (`task`, `assignment`) means it
+has a key the contract does not allow. The worked example in the orchestrate-agents skill's
+`references/contracts.md` shows valid forms.
+
 ## The Codex rule is "stale" after a Python or package upgrade
 
 The rule names the exact Python build and runtime copy. Run `./setup.sh`, choose "Update the install and

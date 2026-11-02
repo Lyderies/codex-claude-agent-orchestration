@@ -135,7 +135,9 @@ the project's. A project in a temporary directory never gets a rule. Owner comma
 (registration, attestation, owner keys, grants, backups, canaries, promotion, rollback,
 upgrade reconciliation, `install-codex-rule` and `remove-codex-rule`) are not listed and
 stay sandboxed. `host-command --project-root <exact-root>` reads only and needs no
-collector. It prints `argv_prefix` (naming the copy), `runtime_copy` and `codex_rule`:
+collector. It prints `argv_prefix` (naming the copy), `runtime_copy`, `codex_rule` and,
+once the rule is installed, `command_prefix` and `next_command`, the same prefix as text to
+run as printed, since the rule does not match a command whose words were all quoted:
 `installed` only when the rule, the copy and the project's installed runtime all match;
 `missing` without a rule file; `unsupported` for a Codex home other than the real
 `~/.codex`; `stale` otherwise, as after a Python or package change, for a rule that names

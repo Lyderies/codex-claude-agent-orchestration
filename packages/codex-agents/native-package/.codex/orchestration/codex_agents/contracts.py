@@ -102,7 +102,16 @@ BOUND_FIELDS = {
 
 
 class ContractError(ValueError):
-    """Raised when a contract is missing or contains unsupported data."""
+    """Raised when a contract is missing or contains unsupported data.
+
+    `field`, when set, is what the CLI prints. It is built only from names in this
+    code and list indexes, never from a key or value in the input; the message may
+    hold either and is not printed.
+    """
+
+    def __init__(self, *args: object, field: str | None = None) -> None:
+        super().__init__(*args)
+        self.field = field
 
 
 class ResultContractError(ContractError):
@@ -118,22 +127,25 @@ class ResultContractError(ContractError):
 def _required(data: dict[str, Any], keys: set[str], label: str) -> None:
     missing = sorted(keys - data.keys())
     if missing:
-        raise ContractError(f"{label} missing required fields: {', '.join(missing)}")
+        raise ContractError(
+            f"{label} missing required fields: {', '.join(missing)}",
+            field=f"{label}.{missing[0]}",
+        )
 
 
-def _nonempty_string(value: Any, field: str) -> None:
+def _nonempty_string(value: Any, field: str, reported: str | None = None) -> None:
     if not isinstance(value, str) or not value.strip():
-        raise ContractError(f"{field} must be a non-empty string")
+        raise ContractError(f"{field} must be a non-empty string", field=reported)
 
 
 def _validate_permissions(data: Any, label: str) -> dict[str, Any]:
     fields = {"tools", "filesystem", "network", "mcps", "external_effects"}
     if not isinstance(data, dict):
-        raise ContractError(f"{label} must be an object")
+        raise ContractError(f"{label} must be an object", field=label)
     _required(data, fields, label)
     unknown = sorted(data.keys() - fields)
     if unknown:
-        raise ContractError(f"{label} has unknown fields: {', '.join(unknown)}")
+        raise ContractError(f"{label} has unknown fields: {', '.join(unknown)}", field=label)
     for field in ("tools", "filesystem", "mcps"):
         value = data[field]
         if (
@@ -141,13 +153,17 @@ def _validate_permissions(data: Any, label: str) -> dict[str, Any]:
             or not all(isinstance(item, str) and item for item in value)
             or len(value) != len(set(value))
         ):
-            raise ContractError(f"{label}.{field} must be an array of unique strings")
+            raise ContractError(
+                f"{label}.{field} must be an array of unique strings",
+                field=f"{label}.{field}",
+            )
     for field in ("network", "external_effects"):
         if not isinstance(data[field], bool):
-            raise ContractError(f"{label}.{field} must be boolean")
+            raise ContractError(f"{label}.{field} must be boolean", field=f"{label}.{field}")
     if data["mcps"]:
         raise ContractError(
-            f"{label}.mcps must be empty in version 1; pinned MCP identity is unavailable"
+            f"{label}.mcps must be empty in version 1; pinned MCP identity is unavailable",
+            field=f"{label}.mcps",
         )
     return data
 
@@ -160,7 +176,7 @@ def validate_parent_grant(data: Any) -> dict[str, Any]:
 
 def validate_task(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
-        raise ContractError("task must be an object")
+        raise ContractError("task must be an object", field="task")
     required = {
         "id",
         "objective",
@@ -190,55 +206,68 @@ def validate_task(data: Any) -> dict[str, Any]:
     _required(data, required, "task")
     unknown = sorted(data.keys() - allowed)
     if unknown:
-        raise ContractError(f"task has unknown fields: {', '.join(unknown)}")
-    _nonempty_string(data["id"], "id")
-    _nonempty_string(data["objective"], "objective")
+        raise ContractError(f"task has unknown fields: {', '.join(unknown)}", field="task")
+    _nonempty_string(data["id"], "id", "task.id")
+    _nonempty_string(data["objective"], "objective", "task.objective")
     if not isinstance(data["family"], str) or data["family"] not in TASK_FAMILIES:
-        raise ContractError(f"unsupported family: {data['family']}")
+        raise ContractError(f"unsupported family: {data['family']}", field="task.family")
     verification_for_family = data.get("verification_for_family")
     if verification_for_family is not None:
         if data["family"] != "verification":
             raise ContractError(
-                "verification_for_family is valid only for verification tasks"
+                "verification_for_family is valid only for verification tasks",
+                field="task.verification_for_family",
             )
         if (
             not isinstance(verification_for_family, str)
             or verification_for_family not in TASK_FAMILIES - {"verification"}
         ):
-            raise ContractError("verification_for_family is unsupported")
+            raise ContractError(
+                "verification_for_family is unsupported",
+                field="task.verification_for_family",
+            )
     verification_for_provider = data.get("verification_for_provider")
     if verification_for_provider is not None:
         if data["family"] != "verification":
             raise ContractError(
-                "verification_for_provider is valid only for verification tasks"
+                "verification_for_provider is valid only for verification tasks",
+                field="task.verification_for_provider",
             )
         if not isinstance(verification_for_provider, str) or (
             verification_for_provider not in {"codex", "claude"}
         ):
-            raise ContractError("verification_for_provider is unsupported")
+            raise ContractError(
+                "verification_for_provider is unsupported",
+                field="task.verification_for_provider",
+            )
     verification_for_outcome = data.get("verification_for_outcome")
     if verification_for_outcome is not None:
         # The worker's host outcome digest, exactly as learning-record-host-result
         # prints it; the ledger resolves it, so the task only names it.
         if data["family"] != "verification":
             raise ContractError(
-                "verification_for_outcome is valid only for verification tasks"
+                "verification_for_outcome is valid only for verification tasks",
+                field="task.verification_for_outcome",
             )
         if not isinstance(verification_for_outcome, str) or not HOST_OUTCOME_DIGEST.fullmatch(
             verification_for_outcome
         ):
             raise ContractError(
-                "verification_for_outcome must be a host_outcome_digest"
+                "verification_for_outcome must be a host_outcome_digest",
+                field="task.verification_for_outcome",
             )
         if verification_for_family is None or verification_for_provider is None:
             raise ContractError(
                 "verification_for_outcome requires verification_for_family "
-                "and verification_for_provider"
+                "and verification_for_provider",
+                field="task.verification_for_outcome",
             )
     if not isinstance(data["complexity"], str) or data["complexity"] not in COMPLEXITIES:
-        raise ContractError(f"unsupported complexity: {data['complexity']}")
+        raise ContractError(
+            f"unsupported complexity: {data['complexity']}", field="task.complexity"
+        )
     if not isinstance(data["risk"], str) or data["risk"] not in RISKS:
-        raise ContractError(f"unsupported risk: {data['risk']}")
+        raise ContractError(f"unsupported risk: {data['risk']}", field="task.risk")
     for field, supported in (
         ("operation", OPERATIONS),
         ("ambiguity", AMBIGUITIES),
@@ -246,7 +275,7 @@ def validate_task(data: Any) -> dict[str, Any]:
         ("acceptance_strength", ACCEPTANCE_STRENGTHS),
     ):
         if not isinstance(data[field], str) or data[field] not in supported:
-            raise ContractError(f"unsupported {field}: {data[field]}")
+            raise ContractError(f"unsupported {field}: {data[field]}", field=f"task.{field}")
     routing_evidence_refs = data["routing_evidence_refs"]
     if (
         not isinstance(routing_evidence_refs, list)
@@ -258,32 +287,42 @@ def validate_task(data: Any) -> dict[str, Any]:
         or len(routing_evidence_refs) != len(set(routing_evidence_refs))
     ):
         raise ContractError(
-            "routing_evidence_refs must be at most 16 unique safe references"
+            "routing_evidence_refs must be at most 16 unique safe references",
+            field="task.routing_evidence_refs",
         )
     for field in ("meaningful", "deterministic_validation", "parallel_safe"):
         if not isinstance(data[field], bool):
-            raise ContractError(f"{field} must be boolean")
+            raise ContractError(f"{field} must be boolean", field=f"task.{field}")
     if (
         data["acceptance_strength"] == "deterministic"
         and not data["deterministic_validation"]
     ):
         raise ContractError(
-            "deterministic acceptance requires deterministic_validation"
+            "deterministic acceptance requires deterministic_validation",
+            field="task.deterministic_validation",
         )
     if data["risk"] in {"high", "critical"} and not data["meaningful"]:
-        raise ContractError("high and critical risk tasks must be meaningful")
+        raise ContractError(
+            "high and critical risk tasks must be meaningful", field="task.meaningful"
+        )
     if not isinstance(data["independent_parts"], int) or data["independent_parts"] < 1:
-        raise ContractError("independent_parts must be an integer of at least 1")
+        raise ContractError(
+            "independent_parts must be an integer of at least 1",
+            field="task.independent_parts",
+        )
     if not isinstance(data["failed_attempts"], int) or not 0 <= data["failed_attempts"] <= 2:
-        raise ContractError("failed_attempts must be an integer from 0 to 2")
+        raise ContractError(
+            "failed_attempts must be an integer from 0 to 2", field="task.failed_attempts"
+        )
     failure_events = data["failure_events"]
     if not isinstance(failure_events, list):
-        raise ContractError("failure_events must be an array")
+        raise ContractError("failure_events must be an array", field="task.failure_events")
     minimum_events = data["failed_attempts"]
     maximum_events = data["failed_attempts"] * 2
     if not minimum_events <= len(failure_events) <= maximum_events:
         raise ContractError(
-            "failure_events must contain one or two events per failed attempt"
+            "failure_events must contain one or two events per failed attempt",
+            field="task.failure_events",
         )
     seen_events: set[tuple[int, str, tuple[str, ...]]] = set()
     seen_reasoning_references: set[str] = set()
@@ -295,7 +334,8 @@ def validate_task(data: Any) -> dict[str, Any]:
             "evidence_refs",
         }:
             raise ContractError(
-                f"failure_events[{index}] must contain exactly attempt, reason, and evidence_refs"
+                f"failure_events[{index}] must contain exactly attempt, reason, and evidence_refs",
+                field=f"task.failure_events[{index}]",
             )
         attempt = event["attempt"]
         if (
@@ -303,11 +343,17 @@ def validate_task(data: Any) -> dict[str, Any]:
             or isinstance(attempt, bool)
             or not 1 <= attempt <= data["failed_attempts"]
         ):
-            raise ContractError(f"failure_events[{index}].attempt is invalid")
+            raise ContractError(
+                f"failure_events[{index}].attempt is invalid",
+                field=f"task.failure_events[{index}].attempt",
+            )
         event_attempts.append(attempt)
         reason = event["reason"]
         if not isinstance(reason, str) or reason not in FAILURE_REASONS:
-            raise ContractError(f"failure_events[{index}].reason is unsupported")
+            raise ContractError(
+                f"failure_events[{index}].reason is unsupported",
+                field=f"task.failure_events[{index}].reason",
+            )
         evidence_refs = event["evidence_refs"]
         if (
             not isinstance(evidence_refs, list)
@@ -320,11 +366,15 @@ def validate_task(data: Any) -> dict[str, Any]:
             or len(evidence_refs) != len(set(evidence_refs))
         ):
             raise ContractError(
-                f"failure_events[{index}].evidence_refs must be one to 16 unique safe references"
+                f"failure_events[{index}].evidence_refs must be one to 16 unique safe references",
+                field=f"task.failure_events[{index}].evidence_refs",
             )
         event_key = (attempt, reason, tuple(sorted(evidence_refs)))
         if event_key in seen_events:
-            raise ContractError("failure_events must not repeat the same event")
+            raise ContractError(
+                "failure_events must not repeat the same event",
+                field=f"task.failure_events[{index}]",
+            )
         seen_events.add(event_key)
         if reason in {"semantic", "reasoning"}:
             if not all(
@@ -332,26 +382,29 @@ def validate_task(data: Any) -> dict[str, Any]:
                 for reference in evidence_refs
             ):
                 raise ContractError(
-                    "semantic and reasoning failures require verification record digests"
+                    "semantic and reasoning failures require verification record digests",
+                    field=f"task.failure_events[{index}].evidence_refs",
                 )
             reused = seen_reasoning_references.intersection(evidence_refs)
             if reused:
                 raise ContractError(
-                    "semantic and reasoning failures need distinct evidence references"
+                    "semantic and reasoning failures need distinct evidence references",
+                    field=f"task.failure_events[{index}].evidence_refs",
                 )
             seen_reasoning_references.update(evidence_refs)
     if set(event_attempts) != set(range(1, data["failed_attempts"] + 1)) or any(
         event_attempts.count(attempt) > 2 for attempt in set(event_attempts)
     ):
         raise ContractError(
-            "failure_events must contain one or two events for each failed attempt"
+            "failure_events must contain one or two events for each failed attempt",
+            field="task.failure_events",
         )
     for field in ("owned_paths", "required_capabilities", "prohibited_actions"):
         if field in data and (
             not isinstance(data[field], list)
             or not all(isinstance(item, str) for item in data[field])
         ):
-            raise ContractError(f"{field} must be an array of strings")
+            raise ContractError(f"{field} must be an array of strings", field=f"task.{field}")
     return data
 
 
@@ -393,7 +446,7 @@ def validate_assignment_shape(data: Any) -> dict[str, Any]:
     """Validate the closed assignment contract without granting any authority."""
 
     if not isinstance(data, dict):
-        raise ContractError("assignment must be an object")
+        raise ContractError("assignment must be an object", field="assignment")
     required = {
         "assignment_id",
         "task_id",
@@ -416,7 +469,9 @@ def validate_assignment_shape(data: Any) -> dict[str, Any]:
     _required(data, required, "assignment")
     unknown = sorted(data.keys() - required - {"retry_of_assignment_id"})
     if unknown:
-        raise ContractError(f"assignment has unknown fields: {', '.join(unknown)}")
+        raise ContractError(
+            f"assignment has unknown fields: {', '.join(unknown)}", field="assignment"
+        )
     for field in (
         "assignment_id",
         "task_id",
@@ -426,19 +481,25 @@ def validate_assignment_shape(data: Any) -> dict[str, Any]:
         "effort",
         "expected_output",
     ):
-        _nonempty_string(data[field], field)
+        _nonempty_string(data[field], field, f"assignment.{field}")
     if not isinstance(data["attempt"], int) or data["attempt"] < 1:
-        raise ContractError("attempt must be a positive integer")
+        raise ContractError("attempt must be a positive integer", field="assignment.attempt")
     retry_of = data.get("retry_of_assignment_id")
     if data["attempt"] == 1 and retry_of is not None:
-        raise ContractError("first assignment attempt cannot have a retry predecessor")
+        raise ContractError(
+            "first assignment attempt cannot have a retry predecessor",
+            field="assignment.retry_of_assignment_id",
+        )
     if data["attempt"] > 1 and (
         not isinstance(retry_of, str) or not retry_of.strip()
     ):
-        raise ContractError("retry assignment requires its predecessor identifier")
+        raise ContractError(
+            "retry assignment requires its predecessor identifier",
+            field="assignment.retry_of_assignment_id",
+        )
     for field in ("meaningful", "verification_required"):
         if not isinstance(data[field], bool):
-            raise ContractError(f"{field} must be boolean")
+            raise ContractError(f"{field} must be boolean", field=f"assignment.{field}")
     for field in (
         "owned_paths",
         "context",
@@ -448,35 +509,50 @@ def validate_assignment_shape(data: Any) -> dict[str, Any]:
         if not isinstance(data[field], list) or not all(
             isinstance(item, str) for item in data[field]
         ):
-            raise ContractError(f"{field} must be an array of strings")
+            raise ContractError(
+                f"{field} must be an array of strings", field=f"assignment.{field}"
+            )
     required_evidence = data["required_evidence"]
     if not isinstance(required_evidence, list) or not required_evidence:
-        raise ContractError("required_evidence must be a non-empty array")
+        raise ContractError(
+            "required_evidence must be a non-empty array", field="assignment.required_evidence"
+        )
     evidence_ids: set[str] = set()
     for index, criterion in enumerate(required_evidence):
         if not isinstance(criterion, dict) or set(criterion) != {"id", "description"}:
             raise ContractError(
-                f"required_evidence[{index}] must contain exactly id and description"
+                f"required_evidence[{index}] must contain exactly id and description",
+                field=f"assignment.required_evidence[{index}]",
             )
-        _nonempty_string(criterion["id"], f"required_evidence[{index}].id")
+        reported = f"assignment.required_evidence[{index}]"
+        _nonempty_string(criterion["id"], f"required_evidence[{index}].id", f"{reported}.id")
         _nonempty_string(
-            criterion["description"], f"required_evidence[{index}].description"
+            criterion["description"],
+            f"required_evidence[{index}].description",
+            f"{reported}.description",
         )
         if criterion["id"] in evidence_ids:
-            raise ContractError(f"duplicate required evidence id: {criterion['id']}")
+            raise ContractError(
+                f"duplicate required evidence id: {criterion['id']}", field=f"{reported}.id"
+            )
         evidence_ids.add(criterion["id"])
-    _validate_permissions(data["permissions"], "permissions")
+    _validate_permissions(data["permissions"], "assignment.permissions")
     bounds = data["bounds"]
     if not isinstance(bounds, dict):
-        raise ContractError("bounds must be an object")
-    _required(bounds, BOUND_FIELDS, "bounds")
+        raise ContractError("bounds must be an object", field="assignment.bounds")
+    _required(bounds, BOUND_FIELDS, "assignment.bounds")
     bounds_unknown = sorted(bounds.keys() - BOUND_FIELDS)
     if bounds_unknown:
-        raise ContractError(f"bounds has unknown fields: {', '.join(bounds_unknown)}")
+        raise ContractError(
+            f"bounds has unknown fields: {', '.join(bounds_unknown)}", field="assignment.bounds"
+        )
     for field in BOUND_FIELDS:
         minimum = 0 if field in {"max_steers_per_attempt", "max_tool_calls"} else 1
         if not isinstance(bounds[field], int) or bounds[field] < minimum:
-            raise ContractError(f"bounds.{field} must be an integer of at least {minimum}")
+            raise ContractError(
+                f"bounds.{field} must be an integer of at least {minimum}",
+                field=f"assignment.bounds.{field}",
+            )
     return data
 
 
@@ -492,23 +568,30 @@ def validate_assignment(
     parent = validate_parent_grant(parent_grant)
     checked_task = validate_task(task)
     if not isinstance(route, dict):
-        raise ContractError("route must be an object")
+        raise ContractError("route must be an object", field="route")
     for field in ("tools", "filesystem", "mcps"):
         excess = sorted(set(permissions[field]) - set(parent[field]))
         if excess:
             raise ContractError(
-                f"permissions.{field} exceeds parent grant: {', '.join(excess)}"
+                f"permissions.{field} exceeds parent grant: {', '.join(excess)}",
+                field=f"assignment.permissions.{field}",
             )
     for field in ("network", "external_effects"):
         if permissions[field] and not parent[field]:
-            raise ContractError(f"permissions.{field} exceeds parent grant")
+            raise ContractError(
+                f"permissions.{field} exceeds parent grant",
+                field=f"assignment.permissions.{field}",
+            )
     invalid_filesystem = [
         item
         for item in permissions["filesystem"]
         if not item.endswith(":read") and not item.endswith(":write")
     ]
     if invalid_filesystem:
-        raise ContractError("version 1 child filesystem permissions are invalid")
+        raise ContractError(
+            "version 1 child filesystem permissions are invalid",
+            field="assignment.permissions.filesystem",
+        )
     write_requested = any(
         item.endswith(":write") for item in permissions["filesystem"]
     )
@@ -519,14 +602,21 @@ def validate_assignment(
     ):
         raise ContractError(
             "version 1 child filesystem writes require an explicitly mapped "
-            "workspace-write coding or verification route"
+            "workspace-write coding or verification route",
+            field="assignment.permissions.filesystem",
         )
     if permissions["network"] or permissions["external_effects"]:
-        raise ContractError("version 1 child network and external effects must be false")
+        raise ContractError(
+            "version 1 child network and external effects must be false",
+            field=(
+                "assignment.permissions.network" if permissions["network"]
+                else "assignment.permissions.external_effects"
+            ),
+        )
     bounds = data["bounds"]
     for field in ("task_id", "role", "model", "effort", "verification_required", "bounds"):
         if field not in route:
-            raise ContractError(f"route missing required field: {field}")
+            raise ContractError(f"route missing required field: {field}", field=f"route.{field}")
     exact = {
         "task_id": checked_task["id"],
         "role": route["role"],
@@ -537,24 +627,34 @@ def validate_assignment(
     }
     for field, expected in exact.items():
         if data[field] != expected:
-            raise ContractError(f"assignment {field} does not match routed value")
+            raise ContractError(
+                f"assignment {field} does not match routed value", field=f"assignment.{field}"
+            )
     expected_attempt = checked_task["failed_attempts"] + 1
     if data["attempt"] != expected_attempt:
-        raise ContractError("assignment attempt does not match task failure history")
+        raise ContractError(
+            "assignment attempt does not match task failure history", field="assignment.attempt"
+        )
     if data["attempt"] > bounds["max_attempts"]:
-        raise ContractError("attempt exceeds assignment max_attempts")
+        raise ContractError(
+            "attempt exceeds assignment max_attempts", field="assignment.bounds.max_attempts"
+        )
     route_bounds = route["bounds"]
     if not isinstance(route_bounds, dict) or set(route_bounds) != BOUND_FIELDS:
-        raise ContractError("route bounds are invalid")
+        raise ContractError("route bounds are invalid", field="route.bounds")
     for field in BOUND_FIELDS:
         if bounds[field] > route_bounds[field]:
-            raise ContractError(f"bounds.{field} exceeds routed policy bound")
+            raise ContractError(
+                f"bounds.{field} exceeds routed policy bound", field=f"assignment.bounds.{field}"
+            )
     task_paths = set(checked_task.get("owned_paths", []))
     if not set(data["owned_paths"]).issubset(task_paths):
-        raise ContractError("owned_paths exceed task ownership")
+        raise ContractError("owned_paths exceed task ownership", field="assignment.owned_paths")
     required_prohibitions = set(checked_task.get("prohibited_actions", []))
     if not required_prohibitions.issubset(data["prohibited_actions"]):
-        raise ContractError("assignment omits task prohibited actions")
+        raise ContractError(
+            "assignment omits task prohibited actions", field="assignment.prohibited_actions"
+        )
     return data
 
 

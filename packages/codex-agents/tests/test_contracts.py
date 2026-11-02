@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -9,13 +10,14 @@ from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
-from tests.support import ORCHESTRATION_ROOT, TEMP_ROOT
+from tests.support import BUNDLE_ROOT, ORCHESTRATION_ROOT, TEMP_ROOT
 
 from codex_agents.contracts import (
     EVIDENCE_OUTCOME_SEVERITY,
     EVIDENCE_OUTCOMES,
     ContractError,
     ResultContractError,
+    TASK_FAMILIES,
     model_selection_slice,
     routing_task_slice,
     result_preflight,
@@ -25,6 +27,7 @@ from codex_agents.contracts import (
     validate_task,
 )
 from codex_agents import routing
+from codex_agents.bridge import BridgeRefused, assignment_read_paths
 from codex_agents.routing import load_effective_policy, load_policy, route_task
 
 
@@ -757,6 +760,114 @@ class ContractTests(unittest.TestCase):
         result["evidence"].append(dict(result["evidence"][0]))
         with self.assertRaisesRegex(ContractError, "duplicate evidence criterion_id"):
             validate_result(result, assignment=self.assignment())
+
+
+CONTRACTS_REFERENCE = (
+    BUNDLE_ROOT / ".agents" / "skills" / "orchestrate-agents" / "references" / "contracts.md"
+)
+# Stands in for anything a caller might put in an input; it must never be printed.
+CANARY = "CANARY-do-not-echo"
+
+
+class WorkedExampleTests(unittest.TestCase):
+    """The skill's example must keep validating, so a primary can copy it."""
+
+    def setUp(self) -> None:
+        blocks = re.findall(r"```json\n(.*?)```", CONTRACTS_REFERENCE.read_text(), re.DOTALL)
+        self.assertEqual(3, len(blocks))
+        self.task, self.assignment, self.grant = (json.loads(block) for block in blocks)
+        self.route = route_task(
+            self.task, load_policy(ORCHESTRATION_ROOT / "config" / "routing-policy.json")
+        )
+        for field in ("role", "model", "effort", "verification_required"):
+            self.assertEqual(f"<route {field}>", self.assignment[field])
+            self.assignment[field] = self.route[field]
+
+    def check(self) -> dict:
+        return validate_assignment(
+            self.assignment, task=self.task, route=self.route, parent_grant=self.grant
+        )
+
+    def test_the_example_validates_and_exports_its_paths(self) -> None:
+        self.assertEqual(self.route["bounds"], self.assignment["bounds"])
+        self.check()
+        self.assertEqual(["docs/using-it.md"], assignment_read_paths(self.assignment))
+
+    def test_the_prose_lists_every_family(self) -> None:
+        text = CONTRACTS_REFERENCE.read_text()
+        for family in TASK_FAMILIES:
+            self.assertIn(f"`{family}`", text)
+
+    def test_prose_in_context_is_the_failure_the_example_warns_of(self) -> None:
+        self.assignment["context"] = ["Read the docs and report the subcommands."]
+        self.check()
+        with self.assertRaisesRegex(BridgeRefused, "export_path_not_granted"):
+            assignment_read_paths(self.assignment)
+
+
+class FailingFieldTests(WorkedExampleTests):
+    """A failure names its field from this code's own names, never from the input."""
+
+    def assert_field(self, expected: str) -> None:
+        with self.assertRaises(ContractError) as caught:
+            self.check()
+        self.assertEqual(expected, caught.exception.field)
+        self.assertNotIn(CANARY, caught.exception.field)
+
+    def test_each_input_mistake_names_its_field(self) -> None:
+        for name, target, change, expected in (
+            ("family", "task", {"family": CANARY}, "task.family"),
+            ("family type", "task", {"family": [CANARY]}, "task.family"),
+            ("operation", "task", {"operation": CANARY}, "task.operation"),
+            ("refs", "task", {"routing_evidence_refs": [f"{CANARY} !"]},
+             "task.routing_evidence_refs"),
+            ("event", "task", {"failed_attempts": 1, "failure_events": [
+                {"attempt": 1, "reason": CANARY, "evidence_refs": ["ref"]}
+            ]}, "task.failure_events[0].reason"),
+            ("unknown task key", "task", {CANARY: 1}, "task"),
+            ("unknown assignment key", "assignment", {CANARY: 1}, "assignment"),
+            ("role", "assignment", {"role": CANARY}, "assignment.role"),
+            ("context type", "assignment", {"context": CANARY}, "assignment.context"),
+            ("owned", "assignment", {"owned_paths": [CANARY]}, "assignment.owned_paths"),
+            ("tools", "assignment", {"permissions": {
+                **self.assignment["permissions"], "tools": [CANARY],
+            }}, "assignment.permissions.tools"),
+            ("unknown permission", "assignment", {"permissions": {
+                **self.assignment["permissions"], CANARY: 1,
+            }}, "assignment.permissions"),
+            ("bound", "assignment", {"bounds": {
+                **self.assignment["bounds"], "wait_seconds": 10**9,
+            }}, "assignment.bounds.wait_seconds"),
+            ("unknown bound", "assignment", {"bounds": {
+                **self.assignment["bounds"], CANARY: 1,
+            }}, "assignment.bounds"),
+            ("duplicate evidence", "assignment", {"required_evidence": [
+                {"id": CANARY, "description": "one"}, {"id": CANARY, "description": "two"},
+            ]}, "assignment.required_evidence[1].id"),
+            ("grant", "grant", {"tools": CANARY}, "parent_grant.tools"),
+            ("unknown grant key", "grant", {CANARY: 1}, "parent_grant"),
+        ):
+            with self.subTest(name):
+                saved = (self.task, self.assignment, self.grant)
+                setattr(self, target, {**getattr(self, target), **change})
+                self.assert_field(expected)
+                self.task, self.assignment, self.grant = saved
+
+    def test_a_missing_field_is_named(self) -> None:
+        del self.task["family"]
+        self.assert_field("task.family")
+
+    def test_a_failure_without_a_field_prints_none(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            path = Path(directory) / "task.json"
+            path.write_text(f'{{"id": "{CANARY}"')
+            completed = subprocess.run(
+                [sys.executable, str(ORCHESTRATION_ROOT / "cli.py"), "route", "--task", str(path)],
+                capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
+            )
+        self.assertEqual(2, completed.returncode, completed.stderr)
+        self.assertNotIn("field", json.loads(completed.stdout))
+        self.assertNotIn(CANARY, completed.stdout + completed.stderr)
 
 
 if __name__ == "__main__":

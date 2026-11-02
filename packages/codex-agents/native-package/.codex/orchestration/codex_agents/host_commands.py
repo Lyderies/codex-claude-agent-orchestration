@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import stat
 import sys
 import unicodedata
@@ -670,6 +671,12 @@ def argv_prefix(
     python = interpreter_path(interpreter, project_root=root)
     copy = runtime_copy_root(root, environ)
     return [python, *PYTHON_FLAGS, str(copy / CLI_RELATIVE)]
+
+
+def shell_command(argv: list[str]) -> str:
+    """`argv` as one line of shell, quoting only a word that cannot run without it."""
+
+    return shlex.join(argv)
 
 
 def rule_file_name(project_root: Path) -> str:

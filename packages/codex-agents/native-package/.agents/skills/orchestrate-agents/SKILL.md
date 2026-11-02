@@ -24,12 +24,13 @@ orchestrator's setup folder, a tool folder, the learning state, the orchestrator
 working folders, a folder that contains this project, or this project's `.codex`,
 `.agents` or `.git` as a folder of its own, or that runs without its sandbox or with
 `--ephemeral`, and only reopening Codex on the project folder fixes it. Otherwise run every later CLI command
-as exactly its `argv_prefix` (the absolute base interpreter, the isolation flags
+as exactly its `command_prefix` (the absolute base interpreter, the isolation flags
 `-I -B -S -X pycache_prefix=/dev/null`, then the absolute `cli.py` of the protected copy
 in `~/.codex`, never the project's own `.codex/orchestration/cli.py`) followed by the
 subcommand and its arguments: one command per call, with no shell compounds (`&&`, `;`,
-pipes, redirections or substitutions) and no environment-variable prefixes. Any other form
-stays sandboxed and fails. Below, every command, named alone or as `cli.py <command>`,
+pipes, redirections or substitutions) and no environment-variable prefixes. Copy that text
+as printed and add no quotes around its words: `next_command` is the full form, ready to
+run. Any other form stays sandboxed and fails. Below, every command, named alone or as `cli.py <command>`,
 runs with that prefix. A failure whose `hint` names the Codex sandbox means the prefix was
 not used exactly; one saying the installed runtime differs from its protected copy means
 the owner must run `./setup.sh` again. Lifecycle commands belong to the primary. Every
@@ -193,7 +194,9 @@ says `dispatch: native`, stop and report it.
     reports model, effort, agent, QA, repairs, no-progress events, and durations, and
     keeps any unsupported per-child usage as `null`/unknown.
 
-Do not pre-read every reference. Read [routing.md](references/routing.md) only when the
-router output needs explanation, [contracts.md](references/contracts.md) when a
-contract fails validation, and [supervision.md](references/supervision.md) when an agent
-stalls, fails, or needs steering.
+Do not pre-read every reference. Read the worked example in
+[contracts.md](references/contracts.md) before writing your first task, assignment and
+parent grant, and that file again when a contract fails validation (`field` in the
+failure names where to look); [routing.md](references/routing.md) only when the
+router output needs explanation; and [supervision.md](references/supervision.md) when an
+agent stalls, fails, or needs steering.
