@@ -2,9 +2,10 @@
 
 - **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
   0.1.0). G2 is delivered as dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10),
-  tagged at the G2 exit. Next: v1.1 child liveness, then v1.2 Codex plan loop, then G3. Scope changes are listed under
-  "Decisions and open questions".
-- **Updated:** 2026-11-01.
+  tagged `v0.2.0` on `main` on 2026-11-02 and installed in the pilot project. Next: v1.1 (Codex
+  skill input forms first, then child liveness), then v1.2 Codex plan loop, then G3. Scope changes
+  are listed under "Decisions and open questions".
+- **Updated:** 2026-11-02.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
   sub-tasks to Codex or Claude child agents.
 
@@ -204,7 +205,33 @@ Effort is an estimate in focused working sessions.
 **Dogfooding:** from here on, read-only sub-tasks go through toolchain v1: research, plan review,
 code review and verification. That applies both in this repository and in the pilot project.
 
-## v1.1: Child liveness
+## v1.1: Codex primary usability, then child liveness
+
+Planned, not yet designed or estimated. Order of work:
+
+1. **Codex skill input forms (first).** The v1 exit checks ran a Codex primary on the pilot many times.
+   Every boundary held, but the primary kept failing on its own inputs:
+   - an invalid task family (valid: inventory, research, planning, coding, security, verification);
+   - a file reference in `routing_evidence_refs`, which takes typed host outcome digests;
+   - prose in an assignment's `context`, which the bridge exports as repository paths, giving
+     `export_path_not_granted`;
+   - every command word single-quoted, so the execpolicy rule did not match and the command ran
+     sandboxed.
+
+   Fix: a worked task and assignment example in the Codex skill; `host-command` prints a ready-to-run
+   unquoted command; `input validation failed` names the failing field without echoing its value.
+2. **Child liveness** (below).
+3. **Smaller items:**
+   - A Claude Haiku 5.5 inventory child returned `invalid_result`; check result-contract reliability,
+     or route inventory to Sonnet.
+   - Wizard step 8 text should also name the clone and folders that contain a set-up project.
+   - The /hooks trust line should say it matters only on a main checkout.
+   - The `tests/test_attest.py` `_finish_child` helper should close the pty before its blocking wait.
+   - Owner-key rotation ("replace a lost owner key").
+   - A Homebrew Python upgrade changes the interpreter's real path and so stales the rule and hooks
+     until setup runs again; consider a stable path that is still trusted.
+
+### Child liveness
 
 Planned, not yet designed or estimated. In v1 a bridged child is bounded only by its hard deadline,
 however long it stays silent. v1.1 judges liveness from the client's real events:
