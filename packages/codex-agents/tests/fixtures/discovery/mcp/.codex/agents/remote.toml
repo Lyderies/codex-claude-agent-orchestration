@@ -1,0 +1,7 @@
+name = "remote"
+description = "Uses an explicitly configured documentation MCP."
+developer_instructions = "Read documentation only."
+sandbox_mode = "read-only"
+
+[mcp_servers."docs-server"]
+url = "https://docs.example.invalid/mcp"

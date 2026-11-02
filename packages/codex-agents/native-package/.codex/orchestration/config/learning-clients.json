@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "clients": {
+    "codex-cli-0.153.0": {
+      "producers": ["app_server"],
+      "hook_coverage": "lifecycle_partial",
+      "app_server_coverage": "root_turn_complete",
+      "root_lifecycle": true,
+      "child_lifecycle": true,
+      "tool_lifecycle": true,
+      "root_usage": true,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "codex-cli-0.155.0": {
+      "producers": ["app_server"],
+      "hook_coverage": "lifecycle_partial",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": false,
+      "child_lifecycle": false,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "codex-cli-0.156.1": {
+      "producers": ["app_server"],
+      "hook_coverage": "lifecycle_partial",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": false,
+      "child_lifecycle": false,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "codex-vscode-0.153.0": {
+      "producers": ["app_server"],
+      "hook_coverage": "lifecycle_partial",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": false,
+      "child_lifecycle": false,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "codex-vscode-0.154.0-alpha.6.2": {
+      "producers": ["app_server"],
+      "hook_coverage": "lifecycle_partial",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": false,
+      "child_lifecycle": false,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "codex-hooks-v1": {
+      "producers": ["hook"],
+      "hook_coverage": "lifecycle_partial",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": true,
+      "child_lifecycle": true,
+      "tool_lifecycle": true,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "codex-host-v1": {
+      "producers": ["host"],
+      "hook_coverage": "handshake_only",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": false,
+      "child_lifecycle": true,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "claude-host-v1": {
+      "producers": ["host"],
+      "hook_coverage": "unknown",
+      "app_server_coverage": "unknown",
+      "root_lifecycle": false,
+      "child_lifecycle": true,
+      "tool_lifecycle": false,
+      "root_usage": false,
+      "child_usage": false,
+      "ordering_proven": false
+    },
+    "bridge-v1": {
+      "producers": ["host"],
+      "hook_coverage": "handshake_only",
+      "app_server_coverage": "handshake_only",
+      "root_lifecycle": true,
+      "child_lifecycle": false,
+      "tool_lifecycle": true,
+      "root_usage": true,
+      "child_usage": false,
+      "ordering_proven": false
+    }
+  }
+}

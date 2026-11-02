@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "project",
+      "kind": "project",
+      "root": "."
+    }
+  ],
+  "duplicate_policy": "error",
+  "resolutions": {},
+  "allowed_mcp_servers": {},
+  "allowed_legacy_tools": [
+    "read",
+    "search",
+    "shell",
+    "write",
+    "web"
+  ]
+}

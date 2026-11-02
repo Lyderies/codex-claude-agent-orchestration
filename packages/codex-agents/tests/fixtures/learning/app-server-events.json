@@ -1,0 +1,65 @@
+[
+  {
+    "method": "turn/started",
+    "params": {
+      "threadId": "fixture-thread",
+      "turn": {
+        "id": "fixture-turn",
+        "status": "inProgress",
+        "items": []
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "fixture-thread",
+      "turnId": "fixture-turn",
+      "item": {
+        "id": "fixture-item",
+        "type": "agentMessage",
+        "status": "completed",
+        "text": "TEST_SECRET_MODEL_OUTPUT"
+      }
+    }
+  },
+  {
+    "method": "thread/tokenUsage/updated",
+    "params": {
+      "threadId": "fixture-thread",
+      "turnId": "fixture-turn",
+      "tokenUsage": {
+        "total": {
+          "inputTokens": 120,
+          "cachedInputTokens": 20,
+          "outputTokens": 30,
+          "reasoningOutputTokens": 10,
+          "totalTokens": 150
+        },
+        "last": {
+          "inputTokens": 120,
+          "cachedInputTokens": 20,
+          "outputTokens": 30,
+          "reasoningOutputTokens": 10,
+          "totalTokens": 150
+        }
+      }
+    }
+  },
+  {
+    "method": "turn/completed",
+    "params": {
+      "threadId": "fixture-thread",
+      "turn": {
+        "id": "fixture-turn",
+        "status": "completed",
+        "items": [
+          {
+            "type": "agentMessage",
+            "text": "TEST_SECRET_FINAL_OUTPUT"
+          }
+        ]
+      }
+    }
+  }
+]

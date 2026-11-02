@@ -1,0 +1,4 @@
+# Written by the codex-agents installer for this checkout only (absolute paths to its
+# trusted Python and this folder); never commit them.
+/hooks.json
+/orchestration/local-install.json

@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning host observation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "allOf": [{
+    "oneOf": [
+      {"required": ["run_id", "client_version", "result_attempts"]},
+      {"required": ["run_handle", "result_attempts"]}
+    ]
+  }],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"
+    },
+    "run_handle": {
+      "type": "string",
+      "pattern": "^hrn_[0-9a-f]{48}$"
+    },
+    "client_version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"
+    },
+    "terminal_state": {
+      "enum": ["completed", "failed", "timed_out", "interrupted", "cancelled", "invalid"]
+    },
+    "result_attempts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "result_attempts": {
+          "minItems": 1,
+          "maxItems": 1,
+          "prefixItems": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason_code", "receipt_id"],
+              "properties": {
+                "status": {"const": "accepted"},
+                "reason_code": {"type": "null"},
+                "receipt_id": {"type": "null"}
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "result_attempts": {
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason_code", "receipt_id"],
+              "properties": {
+                "status": {"const": "rejected"},
+                "reason_code": {
+                  "enum": [
+                    "assignment_mismatch",
+                    "duplicate_criterion",
+                    "failed_completed_evidence",
+                    "invalid_evidence",
+                    "invalid_shape",
+                    "invalid_status",
+                    "invalid_usage",
+                    "missing_evidence",
+                    "missing_required_evidence",
+                    "missing_required_fields",
+                    "unknown_criterion",
+                    "unknown_fields",
+                    "inconsistent_axes"
+                  ]
+                },
+                "receipt_id": {
+                  "type": "string",
+                  "pattern": "^rpr_[0-9a-f]{48}$"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason_code", "receipt_id"],
+              "properties": {
+                "status": {"const": "accepted"},
+                "reason_code": {"type": "null"},
+                "receipt_id": {"type": "null"}
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

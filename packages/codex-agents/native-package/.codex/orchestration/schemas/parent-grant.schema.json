@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/parent-grant.schema.json",
+  "title": "Maximum child authority declared by the parent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tools", "filesystem", "network", "mcps", "external_effects"],
+  "properties": {
+    "tools": {"type": "array", "items": {"type": "string"}},
+    "filesystem": {"type": "array", "items": {"type": "string"}},
+    "network": {"type": "boolean"},
+    "mcps": {"type": "array", "items": {"type": "string"}},
+    "external_effects": {"type": "boolean"}
+  }
+}

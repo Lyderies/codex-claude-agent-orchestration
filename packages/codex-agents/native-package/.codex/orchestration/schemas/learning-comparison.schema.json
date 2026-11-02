@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning comparison v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "candidate_digest", "champion_digest", "task_slice", "case_ids", "case_set_digest", "case_digests", "trial_digests", "client_version", "client_digest", "grader_digest", "decision", "reasons", "metrics", "independent_review_digest", "evaluation_assignment_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "comparison"},
+    "record_id": {"type": "string", "pattern": "^comparison:[0-9a-f]{64}$"},
+    "candidate_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "champion_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_slice": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "case_ids": {"type": "array", "maxItems": 10000, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"}},
+    "case_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "case_digests": {"type": "array", "maxItems": 10000, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "trial_digests": {"type": "array", "maxItems": 20000, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "client_version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "client_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "grader_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "decision": {"enum": ["promote", "reject", "insufficient_evidence"]},
+    "reasons": {"type": "array", "uniqueItems": true, "items": {"enum": ["absolute_quality", "case_criterion_regression", "case_quality_regression", "client_coverage", "configuration_mismatch", "corpus_leakage", "coverage", "deterministic", "duplicate_case", "duplicate_trial", "grader_calibration", "holdout_invalid", "matched_population", "material_improvement", "mean_quality", "minimum_cases", "paired_confidence", "population_incomplete", "repair_rate", "required_criteria", "security", "task_slice_mismatch", "terminal_failure", "usage_missing", "usage_regression"]}},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["champion_tokens", "candidate_tokens", "champion_model_calls", "candidate_model_calls", "token_ratio_micros", "model_call_ratio_micros", "proven_improvements"],
+      "properties": {
+        "champion_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "candidate_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "champion_model_calls": {"type": ["integer", "null"], "minimum": 0},
+        "candidate_model_calls": {"type": ["integer", "null"], "minimum": 0},
+        "token_ratio_micros": {"type": ["integer", "null"], "minimum": 0},
+        "model_call_ratio_micros": {"type": ["integer", "null"], "minimum": 0},
+        "proven_improvements": {"type": "array", "uniqueItems": true, "items": {"enum": ["tokens", "model_calls"]}}
+      }
+    },
+    "independent_review_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    ,"evaluation_assignment_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

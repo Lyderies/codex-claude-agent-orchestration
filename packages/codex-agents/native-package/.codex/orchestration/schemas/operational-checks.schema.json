@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/operational-checks.schema.json",
+  "title": "Project-approved operational QA checks",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "deterministic_checks", "security_checks"],
+  "properties": {
+    "version": {"const": 1},
+    "deterministic_checks": {"$ref": "#/$defs/checks"},
+    "security_checks": {"$ref": "#/$defs/checks"}
+  },
+  "$defs": {
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/check"}
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "driver", "argv", "executable_sha256", "interpreter_sha256", "runtime_tree", "timeout_seconds"],
+      "properties": {
+        "check_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$"
+        },
+        "driver": {"enum": ["python-wrapper", "ruff"]},
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1024}
+        },
+        "executable_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "interpreter_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "runtime_tree": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/runtime_tree"}
+          ]
+        },
+        "runtime_libraries": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "load_name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9._+-]{1,128}\\.dylib$"
+              }
+            }
+          }
+        },
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800}
+      }
+    },
+    "runtime_tree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {"const": "python-site-packages"},
+        "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

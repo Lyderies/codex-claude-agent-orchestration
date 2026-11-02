@@ -1,0 +1,4 @@
+name = "reviewer"
+description = "First reviewer definition."
+sandbox_mode = "read-only"
+developer_instructions = "Review source A."

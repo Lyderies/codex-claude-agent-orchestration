@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning feedback v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "run_id", "observed_at_ms", "label", "reason_code", "correction_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "feedback"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "observed_at_ms": {"type": "integer", "minimum": 0},
+    "label": {"enum": ["accepted", "rejected", "corrected"]},
+    "reason_code": {"enum": ["quality", "incorrect", "incomplete", "unsafe", "usage", "scope", "other"]},
+    "correction_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+  }
+}

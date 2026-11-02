@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning QA evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "evaluation_assignment_digest", "trial_id", "case_digest", "host_outcome_digest", "evaluator_assignment_digest", "evaluator_result_digest", "verifier_host_outcome_digest", "verifier_assignment_digest", "verifier_result_digest", "deterministic_checks", "security_checks", "deterministic_check_digests", "security_check_digests", "deterministic_pass", "security_pass", "required_criteria_total", "required_criteria_passed", "verifier_disagreement", "accepted", "observed_at_ms"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "qa_evidence"},
+    "record_id": {"type": "string", "pattern": "^qa_evidence:[0-9a-f]{64}$"},
+    "evaluation_assignment_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "trial_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "case_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "host_outcome_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evaluator_assignment_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evaluator_result_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "verifier_host_outcome_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "verifier_assignment_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "verifier_result_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "deterministic_checks": {"$ref": "#/$defs/checks"},
+    "security_checks": {"$ref": "#/$defs/checks"},
+    "deterministic_check_digests": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "security_check_digests": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "deterministic_pass": {"type": "boolean"},
+    "security_pass": {"type": "boolean"},
+    "required_criteria_total": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "required_criteria_passed": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "verifier_disagreement": {"type": "boolean"},
+    "accepted": {"type": "boolean"},
+    "execution_state": {"enum": ["completed", "failed", "timed_out", "interrupted", "cancelled", "invalid"]},
+    "semantic_verdict": {"enum": ["pass", "ready", "ready-with-corrections", "not-ready", "blocked", "reject", "not-applicable"]},
+    "observed_at_ms": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["check_id", "passed", "evidence_digest"],
+        "properties": {
+          "check_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+          "passed": {"type": "boolean"},
+          "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

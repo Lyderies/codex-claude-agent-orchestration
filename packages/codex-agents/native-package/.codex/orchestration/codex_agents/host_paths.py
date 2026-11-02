@@ -1,0 +1,516 @@
+"""Host-side locations that a sandboxed Codex session cannot reach.
+
+A command the owner's Codex rule runs outside the sandbox must not execute or load
+anything from a location the sandboxed model can write, and must not write
+something there that it later trusts or hands to a child. On Codex 0.164 the
+workspace-write sandbox can write the workspace (except its top-level `.git`,
+`.codex` and `.agents`), `/tmp` and `$TMPDIR`; the per-user cache directory, the
+learning state and the rest of the home directory stay read-only to it.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import pwd
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# The flags every Python launched outside the sandbox gets: isolated mode (no
+# environment variables, user site-packages or script directory on the path), no
+# bytecode written, no site-packages at all, so no `.pth` or `sitecustomize`
+# runs, and no bytecode read: `-B` only stops writing, and CPython still loads a
+# planted timestamp `.pyc` from `__pycache__`, so the cache moves to a prefix
+# that can never hold one. The runtime needs only the standard library and its
+# own package.
+PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S", "-X", "pycache_prefix=/dev/null")
+# Group members may write these on macOS by design (Homebrew, python.org); the group
+# is the administrators, who can already change anything on the machine.
+MACOS_ADMIN_GROUP = 80
+GETCONF = "/usr/bin/getconf"
+# The only places a program the rule's commands run (the interpreter, provider
+# clients, git) may be installed, besides a hidden top-level folder of the
+# account's home folder (`~/.local`, `~/.pyenv`, `~/.codex`). Codex sessions may
+# be opened on any folder but the home folder, its parent and `/`, so an
+# installation anywhere else (`~/Work/tools`, `/srv/work/tools`) could sit in a
+# session's workspace. One list, imported by the owner tools too.
+TRUSTED_INSTALL_ROOTS = (
+    "/usr/bin",
+    "/bin",
+    "/usr/libexec",
+    "/usr/local",
+    "/opt/homebrew",
+    # Linuxbrew's shared default prefix, split so the public repository's
+    # identifier guard (it flags per-user home paths) does not mistake it for one.
+    "/home" "/linuxbrew/.linuxbrew",
+    "/Library/Frameworks/Python.framework",
+    "/Library/Developer/CommandLineTools",
+    "/Applications",
+    "/nix/store",
+)
+
+
+class HostPathError(RuntimeError):
+    """A host path is unsafe or unavailable; messages never carry the path."""
+
+
+def within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def darwin_directory(name: str) -> str | None:
+    """A per-user Darwin directory from getconf, or None."""
+
+    try:
+        info = os.lstat(GETCONF)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
+            return None
+        completed = subprocess.run(
+            [GETCONF, name], env={"PATH": os.defpath}, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and os.path.isabs(value) else None
+
+
+def temp_roots() -> set[Path]:
+    """Every temporary directory a sandboxed session may write, resolved."""
+
+    candidates = ["/tmp", "/var/tmp", tempfile.gettempdir(), os.environ.get("TMPDIR") or ""]
+    if sys.platform == "darwin":
+        candidates.append(darwin_directory("DARWIN_USER_TEMP_DIR") or "")
+    return {Path(os.path.realpath(item)) for item in candidates if os.path.isabs(item)}
+
+
+def _component_problem(info: os.stat_result) -> str | None:
+    uid = os.geteuid()
+    if info.st_uid not in (0, uid):
+        return "a path component belongs to another user"
+    if stat.S_ISLNK(info.st_mode):
+        return None
+    writable_by_others = info.st_mode & stat.S_IWOTH
+    writable_by_group = info.st_mode & stat.S_IWGRP and not (
+        sys.platform == "darwin" and info.st_gid == MACOS_ADMIN_GROUP
+    )
+    if (writable_by_others or writable_by_group) and not (
+        stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX and info.st_uid == 0
+    ):
+        return "a path component is writable by other users"
+    return None
+
+
+def trusted_location_problem(path: Path, untrusted: list[Path]) -> str | None:
+    """Why `path` may not be trusted to run outside the sandbox, or None.
+
+    The path must be canonical, so no symlink anywhere on it can later be
+    retargeted: callers pin ``os.path.realpath`` and check that. Every
+    component must belong to this user or root and be writable by no one else,
+    and the path may not lie inside an untrusted root (the project, temp roots).
+    """
+
+    if not path.is_absolute():
+        return "the path is not absolute"
+    if Path(os.path.realpath(path)) != path:
+        return "the path is not canonical"
+    roots = [Path(os.path.realpath(root)) for root in untrusted]
+    if any(within(path, root) for root in roots):
+        return "the path lies inside the project or a temporary directory"
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return "a path component is unavailable"
+        if stat.S_ISLNK(info.st_mode):
+            return "a path component is a symbolic link"
+        problem = _component_problem(info)
+        if problem is not None:
+            return problem
+    return None
+
+
+def account_home() -> Path:
+    """This account's home folder from the system account database, never from HOME."""
+
+    return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+
+
+# The owner's learning state (ledger, digest key, collector authorization, the
+# owner's allowed signer, installer records, `scratch`) lives in this folder.
+STATE_FOLDER = "codex-agents"
+# Host-private scratch: the bridge's container and the owner tools' container
+# (scripts/attest.py SCRATCH_CONTAINER), both under host_scratch_base().
+BRIDGE_SCRATCH_CONTAINER = "codex-agents-scratch"
+OWNER_SCRATCH_CONTAINER = "agent-orchestration-owner"
+
+
+XDG_STATE_REFUSED = (
+    "XDG_STATE_HOME must be inside a hidden folder in your home, such as ~/.local/state; "
+    "unset it or move it"
+)
+STATE_PARENT_UNSAFE = (
+    "a folder above the learning state (such as ~/.local or ~/.local/state) is a symbolic "
+    "link, is not a folder, belongs to another user or can be changed by other users; fix "
+    "it, or set XDG_STATE_HOME to another hidden folder in your home"
+)
+
+
+def _state_location(home: Path | None) -> tuple[Path, Path]:
+    """(state root, the home folder it must lie under), unchecked beyond XDG_STATE_HOME.
+
+    An absolute XDG_STATE_HOME counts only when it is canonical as written (no
+    symbolic link anywhere on it) and lies strictly inside a hidden top-level
+    folder of HOME (such as `~/.local/state`); any other absolute value refuses.
+    HOME, not the account database, anchors that check: the variable is the
+    owner's own environment, which no model sets for a rule-matched command, a
+    hook or an owner tool, and tests isolate a scratch home through both. A
+    relative value is ignored, as the XDG specification says. Without it the
+    state is `~/.local/state/codex-agents` in the account database's home
+    folder (or `home`), never HOME's.
+    """
+
+    base = os.environ.get("XDG_STATE_HOME")
+    if base and os.path.isabs(base):
+        environment_home = os.environ.get("HOME")
+        written = Path(os.path.normpath(base))
+        if (
+            not environment_home
+            or not os.path.isabs(environment_home)
+            or Path(os.path.realpath(written)) != written
+        ):
+            raise HostPathError(XDG_STATE_REFUSED)
+        anchor = Path(os.path.realpath(environment_home))
+        try:
+            parts = written.relative_to(anchor).parts
+        except ValueError:
+            raise HostPathError(XDG_STATE_REFUSED) from None
+        if len(parts) < 2 or not parts[0].startswith(".") or parts[0] in {".", ".."}:
+            raise HostPathError(XDG_STATE_REFUSED)
+        return written / STATE_FOLDER, anchor
+    anchor = home if home is not None else account_home()
+    return anchor / ".local" / "state" / STATE_FOLDER, anchor
+
+
+def _state_parent_unsafe(info: os.stat_result) -> bool:
+    return (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or bool(info.st_mode & 0o022)
+    )
+
+
+def default_state_root(home: Path | None = None) -> Path:
+    """The owner's learning state: `$XDG_STATE_HOME/codex-agents` (see
+    _state_location), else `~/.local/state/codex-agents`, on every platform.
+
+    A hidden top-level home folder is where no supported Codex session is
+    opened, and the session guard also protects this folder. Every existing
+    folder between the home folder and the state (`~/.local`, `~/.local/state`)
+    must be a real folder, the owner's, writable by no one else. Until 0.8.10
+    macOS used `~/Library/Application Support/codex-agents`, a non-hidden home
+    folder that a session opened on `~/Library` could write; see
+    legacy_state_root. Raises HostPathError with a plain message.
+    """
+
+    root, anchor = _state_location(home)
+    current = anchor
+    for part in root.relative_to(anchor).parts[:-1]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError:
+            raise HostPathError(STATE_PARENT_UNSAFE) from None
+        if _state_parent_unsafe(info):
+            raise HostPathError(STATE_PARENT_UNSAFE)
+    return root
+
+
+def prepare_default_state_root() -> Path:
+    """The default state root, after creating each missing folder above it
+    owner-only (0700) and checking every one (default_state_root's rules)."""
+
+    root, anchor = _state_location(None)
+    default_state_root()
+    current = anchor
+    for part in root.relative_to(anchor).parts[:-1]:
+        current = current / part
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise HostPathError(STATE_PARENT_UNSAFE) from None
+        try:
+            info = os.lstat(current)
+        except OSError:
+            raise HostPathError(STATE_PARENT_UNSAFE) from None
+        if _state_parent_unsafe(info):
+            raise HostPathError(STATE_PARENT_UNSAFE)
+    return root
+
+
+def legacy_state_root() -> Path | None:
+    """Where macOS kept the learning state before 0.8.10, else None.
+
+    Found where that code put it (HOME's `Library/Application Support`), so it is
+    only ever moved by the owner's `learning-register` and otherwise refuses.
+    """
+
+    if sys.platform != "darwin":
+        return None
+    home = os.environ.get("HOME")
+    base = Path(home) if home and os.path.isabs(home) else account_home()
+    return base / "Library" / "Application Support" / STATE_FOLDER
+
+
+def owner_state_root() -> Path:
+    """The folder that holds the owner's state now, for the owner tools.
+
+    The pre-0.8.10 macOS folder while it is the only one (the wizard's collector
+    step moves it), else the default; so an earlier wizard step never creates
+    the new folder beside the old one.
+    """
+
+    legacy = legacy_state_root()
+    default = default_state_root()
+    if legacy is not None and os.path.lexists(legacy) and not os.path.lexists(default):
+        return legacy
+    return default
+
+
+def host_scratch_base() -> str | None:
+    """The per-user cache folder on macOS, `$XDG_RUNTIME_DIR` elsewhere, or None.
+
+    Neither is writable from Codex's workspace-write sandbox; host-private
+    scratch (bridge exports and control files, the owner tools' working files)
+    lives in a container there.
+    """
+
+    if sys.platform == "darwin":
+        value = darwin_directory("DARWIN_USER_CACHE_DIR")
+    else:
+        value = os.environ.get("XDG_RUNTIME_DIR")
+    return value if value and os.path.isabs(value) else None
+
+
+def install_location_problem(path: Path) -> str | None:
+    """Why a program at `path` is not in a trusted installation folder, or None.
+
+    It must lie under one of TRUSTED_INSTALL_ROOTS or in a hidden top-level
+    folder of the account's home folder (from the account database, never
+    HOME), where no Codex session is opened.
+    """
+
+    if any(within(path, Path(root)) for root in TRUSTED_INSTALL_ROOTS):
+        return None
+    home = account_home()
+    if within(path, home) and path != home and path.relative_to(home).parts[0].startswith("."):
+        return None
+    return (
+        "it is not in a trusted installation folder (a system folder, Homebrew, "
+        "python.org, Xcode, Nix, or a hidden folder in the home folder)"
+    )
+
+
+def executable_location_problem(path: Path, untrusted: list[Path]) -> str | None:
+    """Why a program the rule's commands run may not be trusted, or None.
+
+    `trusted_location_problem` (canonical, owned by this user or root, writable
+    by no one else, outside the project and temporary directories) and
+    `install_location_problem`: the interpreter, provider clients and git all
+    pass both.
+    """
+
+    return trusted_location_problem(path, untrusted) or install_location_problem(path)
+
+
+def overlaps_untrusted(path: Path, untrusted: list[Path]) -> bool:
+    """Whether `path` is inside an untrusted root, or contains one."""
+
+    resolved = Path(os.path.realpath(path))
+    for root in untrusted:
+        root = Path(os.path.realpath(root))
+        if within(resolved, root) or within(root, resolved):
+            return True
+    return False
+
+
+def _open_verified_directory(path: Path) -> tuple[int, Path]:
+    """Open an existing directory by descriptors, never following a symlink.
+
+    Root-owned system links (such as /var on macOS) are resolved first; any
+    other symlink refuses. Every component must pass the ownership and
+    writability rules. Returns the descriptor and the canonical path.
+    """
+
+    full = Path(os.path.abspath(path))
+    for _ in range(40):
+        current = Path(full.anchor)
+        for index, part in enumerate(full.parts[1:]):
+            current = current / part
+            try:
+                info = os.lstat(current)
+            except OSError as exc:
+                raise HostPathError("a host directory is unavailable") from exc
+            if stat.S_ISLNK(info.st_mode):
+                if info.st_uid != 0:
+                    raise HostPathError("a host directory path passes through a symlink")
+                full = Path(os.path.realpath(current), *full.parts[index + 2:])
+                break
+        else:
+            break
+    else:
+        raise HostPathError("a host directory path has too many symbolic links")
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in full.parts[1:]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = child
+            problem = _component_problem(os.fstat(descriptor))
+            if problem is not None:
+                raise HostPathError(problem)
+    except OSError as exc:
+        os.close(descriptor)
+        raise HostPathError("a host directory path passes through a symlink") from exc
+    except HostPathError:
+        os.close(descriptor)
+        raise
+    return descriptor, full
+
+
+def _private_child(parent: int, name: str, *, create: bool) -> int:
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    info = os.fstat(descriptor)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        os.close(descriptor)
+        raise HostPathError("a private host directory is not owner-only")
+    return descriptor
+
+
+def private_directory(base: Path, container: str, prefix: str) -> Path:
+    """Create a fresh owner-only directory at `<base>/<container>/<prefix><random>`.
+
+    `base` must already exist; it and its ancestors are verified by directory
+    descriptors with no-follow opens, and the container and the new directory
+    are created and checked through those descriptors. Only the caller's
+    process writes inside it, and it is never a sandbox-writable location when
+    `base` is the learning state or the per-user cache directory.
+    """
+
+    try:
+        base_fd, canonical = _open_verified_directory(base)
+    except OSError as exc:
+        raise HostPathError("a host directory is unavailable") from exc
+    try:
+        try:
+            container_fd = _private_child(base_fd, container, create=True)
+        except OSError as exc:
+            raise HostPathError("a private host directory is unavailable") from exc
+        try:
+            for _ in range(64):
+                name = f"{prefix}{secrets.token_hex(4)}"
+                try:
+                    os.mkdir(name, 0o700, dir_fd=container_fd)
+                except FileExistsError:
+                    continue
+                os.close(_private_child(container_fd, name, create=False))
+                return canonical / container / name
+            raise HostPathError("a private host directory could not be created")
+        finally:
+            os.close(container_fd)
+    finally:
+        os.close(base_fd)
+
+
+def open_private_directories(base: Path, names: tuple[str, ...], *, create: bool) -> int | None:
+    """Open `<base>/<names...>` by descriptors, each level owner-only; None when absent.
+
+    `base` and its ancestors are verified like `private_directory`'s base, and
+    each named level is created (with `create`) and opened with no-follow
+    opens, so a planted symlink or a directory another user could change
+    refuses. The caller closes the returned descriptor.
+    """
+
+    try:
+        descriptor, _canonical = _open_verified_directory(base)
+    except OSError as exc:
+        raise HostPathError("a host directory is unavailable") from exc
+    try:
+        for name in names:
+            if not name or name in {".", ".."} or "/" in name:
+                raise HostPathError("a private host directory name is invalid")
+            try:
+                child = _private_child(descriptor, name, create=create)
+            except FileNotFoundError:
+                if create:
+                    raise HostPathError("a private host directory is unavailable") from None
+                os.close(descriptor)
+                return None
+            except OSError as exc:
+                raise HostPathError("a private host directory is unavailable") from exc
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    return descriptor
+
+
+def remove_tree_at(parent: int, name: str) -> bool:
+    """Remove `name` inside the directory `parent` without following any symlink.
+
+    A symlink or file at `name` is unlinked itself; a directory is emptied
+    through descriptors first. Returns whether anything was there.
+    """
+
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent)
+        return True
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        with os.scandir(descriptor) as entries:
+            children = [entry.name for entry in entries]
+        for child in children:
+            remove_tree_at(descriptor, child)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent)
+    return True
+
+
+def remove_private_directory(path: Path) -> None:
+    """Remove a private directory, including read-only directories inside it."""
+
+    for current, directories, _files in os.walk(path, followlinks=False):
+        for name in directories:
+            child = os.path.join(current, name)
+            if not os.path.islink(child):
+                try:
+                    os.chmod(child, 0o700)
+                except OSError:
+                    pass
+    shutil.rmtree(path, ignore_errors=True)

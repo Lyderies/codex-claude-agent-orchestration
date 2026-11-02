@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/project-agent-routing.schema.json",
+  "title": "Explicit project agent routing",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "roles"],
+  "properties": {
+    "version": {"const": 1},
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inventory": {"$ref": "#/$defs/agentName"},
+        "research": {"$ref": "#/$defs/agentName"},
+        "planning": {"$ref": "#/$defs/agentName"},
+        "coding": {"$ref": "#/$defs/agentName"},
+        "security": {"$ref": "#/$defs/agentName"},
+        "verification": {"$ref": "#/$defs/agentName"}
+      }
+    },
+    "verifiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inventory": {"$ref": "#/$defs/agentName"},
+        "research": {"$ref": "#/$defs/agentName"},
+        "planning": {"$ref": "#/$defs/agentName"},
+        "coding": {"$ref": "#/$defs/agentName"},
+        "security": {"$ref": "#/$defs/agentName"}
+      }
+    }
+  },
+  "$defs": {
+    "agentName": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "maxLength": 160
+    }
+  }
+}

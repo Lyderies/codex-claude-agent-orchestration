@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/result.schema.json",
+  "title": "Agent result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "assignment_id",
+    "status",
+    "summary",
+    "artifacts",
+    "evidence",
+    "unverified_claims",
+    "remaining_risks"
+  ],
+  "properties": {
+    "assignment_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["completed", "failed", "blocked", "interrupted", "cancelled"]},
+    "execution_state": {"enum": ["completed", "failed", "timed_out", "interrupted", "cancelled", "invalid"]},
+    "semantic_verdict": {"enum": ["pass", "ready", "ready-with-corrections", "not-ready", "blocked", "reject", "not-applicable"]},
+    "admission_state": {"enum": ["unverified", "accepted", "rejected", "pending"]},
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt", "retry_of_assignment_id"],
+      "properties": {
+        "attempt": {"type": "integer", "minimum": 1},
+        "retry_of_assignment_id": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "summary": {"type": "string"},
+    "artifacts": {"type": "array", "items": {"type": "string"}},
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion_id", "type", "reference", "outcome", "details"],
+        "properties": {
+          "criterion_id": {"type": "string", "minLength": 1},
+          "type": {"enum": ["command", "source", "artifact", "review", "observation"]},
+          "reference": {"type": "string", "minLength": 1},
+          "outcome": {"enum": ["pass", "fail", "observed", "not_run"]},
+          "details": {"type": "string"}
+        }
+      }
+    },
+    "unverified_claims": {"type": "array", "items": {"type": "string"}},
+    "remaining_risks": {"type": "array", "items": {"type": "string"}},
+    "usage": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cached_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "tool_calls": {"type": ["integer", "null"], "minimum": 0},
+        "latency_ms": {"type": ["integer", "null"], "minimum": 0},
+        "cost": {"type": ["number", "null"], "minimum": 0}
+      }
+    }
+  }
+}

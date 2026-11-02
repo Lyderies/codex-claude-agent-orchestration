@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning promotion v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "record_id", "candidate_digest", "champion_digest", "action", "observed_at_ms", "grant_id", "evidence_digest", "canary_case_digests"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "promotion"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "candidate_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "champion_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "action": {"enum": ["evaluated", "rejected", "canary_started", "canary_passed", "canary_failed", "promoted", "reverted", "drift_detected"]},
+    "observed_at_ms": {"type": "integer", "minimum": 0},
+    "grant_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "canary_case_digests": {"type": "array", "maxItems": 64, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "uniqueItems": true}
+  }
+}

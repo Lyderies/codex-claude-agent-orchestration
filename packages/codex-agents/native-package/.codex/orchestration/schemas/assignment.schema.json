@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-agents.local/schemas/assignment.schema.json",
+  "title": "Bounded subagent assignment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "assignment_id",
+    "task_id",
+    "objective",
+    "role",
+    "model",
+    "effort",
+    "attempt",
+    "meaningful",
+    "owned_paths",
+    "context",
+    "permissions",
+    "expected_output",
+    "required_evidence",
+    "verification_required",
+    "bounds",
+    "stopping_conditions",
+    "prohibited_actions"
+  ],
+  "properties": {
+    "assignment_id": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "minLength": 1},
+    "objective": {"type": "string", "minLength": 1},
+    "role": {"type": "string", "minLength": 1},
+    "model": {"type": "string", "minLength": 1},
+    "effort": {"type": "string", "minLength": 1},
+    "attempt": {"type": "integer", "minimum": 1},
+    "retry_of_assignment_id": {"type": ["string", "null"], "minLength": 1},
+    "meaningful": {"type": "boolean"},
+    "owned_paths": {"type": "array", "items": {"type": "string"}},
+    "context": {"type": "array", "items": {"type": "string"}},
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools", "filesystem", "network", "mcps", "external_effects"],
+      "properties": {
+        "tools": {"type": "array", "items": {"type": "string"}},
+        "filesystem": {"type": "array", "items": {"type": "string"}},
+        "network": {"type": "boolean"},
+        "mcps": {"type": "array", "items": {"type": "string"}},
+        "external_effects": {"type": "boolean"}
+      }
+    },
+    "expected_output": {"type": "string", "minLength": 1},
+    "required_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "verification_required": {"type": "boolean"},
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "max_steers_per_attempt", "max_no_progress_events", "wait_seconds", "timeout_seconds", "max_tool_calls"],
+      "properties": {
+        "max_attempts": {"type": "integer", "minimum": 1},
+        "max_steers_per_attempt": {"type": "integer", "minimum": 0},
+        "max_no_progress_events": {"type": "integer", "minimum": 1},
+        "wait_seconds": {"type": "integer", "minimum": 1},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "max_tool_calls": {"type": "integer", "minimum": 0}
+      }
+    },
+    "stopping_conditions": {"type": "array", "items": {"type": "string"}},
+    "prohibited_actions": {"type": "array", "items": {"type": "string"}}
+  }
+}
