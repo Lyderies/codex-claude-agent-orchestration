@@ -2,9 +2,10 @@
 
 - **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
   0.1.0). G2 is delivered as dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10),
-  tagged `v0.2.0` on `main` on 2026-11-02 and installed in the pilot project. Next: v1.1 (Codex
-  skill input forms first, then child liveness), then v1.2 Codex plan loop, then G3. Scope changes
-  are listed under "Decisions and open questions".
+  tagged `v0.2.0` on `main` on 2026-11-02 and installed in the pilot project. In progress: v1.1,
+  with release 0.2.1 (input forms and owner key replacement) ready on `version/0.2.1` and awaiting
+  the owner's approval for `main`. Next: release 0.2.2 (diagnostics), child liveness, then v1.2
+  Codex plan loop, then G3. Scope changes are listed under "Decisions and open questions".
 - **Updated:** 2026-11-02.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
   sub-tasks to Codex or Claude child agents.
@@ -245,6 +246,17 @@ Planned, not yet designed or estimated. Order of work:
    - **Visible:** `learning-status` and the wizard show when the key was last replaced.
    - **Documented residual:** without the old key nothing proves cryptographically who replaced it,
      as at first setup, and an unsandboxed program under the same user could tamper with the ledger.
+   - **Moved to a later security release (owner decision, 2026-11-02),** so 0.2.1 can ship and work can
+     move onto the toolchain. Not yet scheduled:
+     - A guard outside the user account, such as an operating system prompt for each key change, so a
+       Claude primary with no sandbox cannot swap the key or edit the ledger under the owner's user.
+     - Try the replacement from real Codex and Claude primaries, and check that Claude Code enforces
+       the new deny rules, including for a custom `XDG_STATE_HOME`, which they do not name.
+     - A native Claude child opened before a replacement can still start.
+     - An independent re-check of the second review round's fixes (strict key parser, damaged signer
+       files, docs), which were tested but not reviewed a third time.
+     - Wizard: with both `.pub` files deleted it picks the old key and refuses it. Running the
+       replacement again gets out of this, at the cost of signing every project again.
 3. **Readiness and hook diagnostics,** from the local-routing first-run report (ORCH-1 to ORCH-4).
    Release 0.2.2, Codex package 0.8.12, built with the toolchain from a temp copy, which also gives
    input forms their first real Codex primary run:
