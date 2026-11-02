@@ -33,7 +33,6 @@ from codex_agents.host_commands import (
     CodexHomeUnsupported,
     HostCommandError,
     argv_prefix,
-    shell_command,
     bound_project_root,
     install_rule,
     interpreter_path,
@@ -45,6 +44,7 @@ from codex_agents.host_commands import (
     rule_status,
     runtime_copy_problem,
     runtime_copy_root,
+    shell_command,
     write_rule,
 )
 from codex_agents import session_guard
@@ -905,13 +905,18 @@ class HostCommandCliTests(unittest.TestCase):
         report = self.run_cli("host-command")
         self.assertEqual(("installed", True), (report["codex_rule"], report["ready"]))
         self.assertEqual(str(Path(written["runtime_copy"]) / CLI_RELATIVE), report["argv_prefix"][-1])
-        # The text the primary runs is the same words, with none of them quoted.
-        self.assertNotIn("'", report["next_command"])
-        self.assertEqual(" ".join(report["argv_prefix"]), report["command_prefix"])
-        self.assertEqual(
-            [*report["argv_prefix"], "learning-status", "--project-root", str(self.project.resolve())],
-            shlex.split(report["next_command"]),
-        )
+        # The text the primary runs is the same words, also from a link to the project.
+        self.assertEqual(shell_command(report["argv_prefix"]), report["command_prefix"])
+        link = self.base / "project-link"
+        link.symlink_to(self.project)
+        for root in (self.project, link):
+            with self.subTest(root=root):
+                report = self.run_cli("host-command", "--project-root", str(root), own_project=False)
+                self.assertEqual(
+                    [*report["argv_prefix"], "learning-status", "--project-root",
+                     str(self.project.resolve())],
+                    shlex.split(report["next_command"]),
+                )
         # The binding records the installing clone (this source tree's repository).
         binding = json.loads((Path(written["runtime_copy"]) / BINDING_RELATIVE).read_text())
         self.assertEqual(str(Path(os.path.realpath(BUNDLE_ROOT)).parents[2]), binding["clone_root"])
@@ -1125,7 +1130,14 @@ class ShellCommandTests(unittest.TestCase):
                  "learning-status"]
             ),
         )
-        self.assertEqual("/a/cli.py '/b c'", shell_command(["/a/cli.py", "/b c"]))
+        for word in ("/b c", "/b'c", "/b$c", "/b;c", "~/b", "#b", ""):
+            with self.subTest(word=word):
+                line = shell_command(["/a/cli.py", word])
+                self.assertNotEqual(f"/a/cli.py {word}", line)
+                self.assertEqual(["/a/cli.py", word], shlex.split(line))
+        for word in ("/opt/jos\u00e9/x", "/a~b", "/a#b", "/a+b,c@d%e"):
+            with self.subTest(word=word):
+                self.assertEqual(f"/a/cli.py {word}", shell_command(["/a/cli.py", word]))
 
 
 class SandboxHintTests(unittest.TestCase):

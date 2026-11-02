@@ -6,11 +6,14 @@
   - `references/contracts.md` opens with a worked task, assignment and parent grant, and the skill says to
     read it before writing the first one. A test runs the example through the real validators.
   - `host-command` also prints `command_prefix` and `next_command`, once the rule is installed: the command
-    as text to run as printed, because the rule does not match a command whose words were all quoted. A word
-    is quoted only if it cannot run otherwise, such as a path holding a space.
-  - `input validation failed` now carries `field` for a task, assignment or parent grant, such as
+    as text to run as printed, because the rule did not match a command with every word quoted. A word is
+    quoted only if it cannot run otherwise, such as a path holding a space; whether the rule matches such a
+    path has not been tested.
+  - `input validation failed` now carries `field` for a task, assignment, parent grant or route, such as
     `task.family`. It is built only from the contract's own names and list indexes, so an input's values and
     unknown keys are never printed.
+- **Attestation scope in the docs.** Troubleshooting and the security model now say attestations are kept per
+  project, so a project not yet attested cannot run children without a new signature.
 
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1, Codex package 0.8.10)
 

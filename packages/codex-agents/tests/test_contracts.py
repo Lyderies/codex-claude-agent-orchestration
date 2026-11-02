@@ -769,9 +769,7 @@ CONTRACTS_REFERENCE = (
 CANARY = "CANARY-do-not-echo"
 
 
-class WorkedExampleTests(unittest.TestCase):
-    """The skill's example must keep validating, so a primary can copy it."""
-
+class WorkedExampleCase(unittest.TestCase):
     def setUp(self) -> None:
         blocks = re.findall(r"```json\n(.*?)```", CONTRACTS_REFERENCE.read_text(), re.DOTALL)
         self.assertEqual(3, len(blocks))
@@ -787,6 +785,10 @@ class WorkedExampleTests(unittest.TestCase):
         return validate_assignment(
             self.assignment, task=self.task, route=self.route, parent_grant=self.grant
         )
+
+
+class WorkedExampleTests(WorkedExampleCase):
+    """The skill's example must keep validating, so a primary can copy it."""
 
     def test_the_example_validates_and_exports_its_paths(self) -> None:
         self.assertEqual(self.route["bounds"], self.assignment["bounds"])
@@ -805,7 +807,7 @@ class WorkedExampleTests(unittest.TestCase):
             assignment_read_paths(self.assignment)
 
 
-class FailingFieldTests(WorkedExampleTests):
+class FailingFieldTests(WorkedExampleCase):
     """A failure names its field from this code's own names, never from the input."""
 
     def assert_field(self, expected: str) -> None:
@@ -853,6 +855,20 @@ class FailingFieldTests(WorkedExampleTests):
                 self.assert_field(expected)
                 self.task, self.assignment, self.grant = saved
 
+    def test_a_verification_task_names_the_field_it_lacks(self) -> None:
+        self.task.update(family="verification", verification_for_outcome="a" * 64)
+        self.assert_field("task.verification_for_family")
+        self.task["verification_for_family"] = "research"
+        self.assert_field("task.verification_for_provider")
+
+    def test_exhausted_attempts_name_the_task_not_a_bound_that_cannot_rise(self) -> None:
+        self.task.update(failed_attempts=2, failure_events=[
+            {"attempt": attempt, "reason": "transient", "evidence_refs": ["ref"]}
+            for attempt in (1, 2)
+        ])
+        self.assignment.update(attempt=3, retry_of_assignment_id="docs-inventory-1-a2")
+        self.assert_field("task.failed_attempts")
+
     def test_a_missing_field_is_named(self) -> None:
         del self.task["family"]
         self.assert_field("task.family")
@@ -866,7 +882,9 @@ class FailingFieldTests(WorkedExampleTests):
                 capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
             )
         self.assertEqual(2, completed.returncode, completed.stderr)
-        self.assertNotIn("field", json.loads(completed.stdout))
+        self.assertEqual(
+            {"ready": False, "error": "input validation failed"}, json.loads(completed.stdout)
+        )
         self.assertNotIn(CANARY, completed.stdout + completed.stderr)
 
 

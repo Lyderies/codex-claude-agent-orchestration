@@ -260,7 +260,10 @@ def validate_task(data: Any) -> dict[str, Any]:
             raise ContractError(
                 "verification_for_outcome requires verification_for_family "
                 "and verification_for_provider",
-                field="task.verification_for_outcome",
+                field=(
+                    "task.verification_for_family" if verification_for_family is None
+                    else "task.verification_for_provider"
+                ),
             )
     if not isinstance(data["complexity"], str) or data["complexity"] not in COMPLEXITIES:
         raise ContractError(
@@ -637,7 +640,7 @@ def validate_assignment(
         )
     if data["attempt"] > bounds["max_attempts"]:
         raise ContractError(
-            "attempt exceeds assignment max_attempts", field="assignment.bounds.max_attempts"
+            "attempt exceeds assignment max_attempts", field="task.failed_attempts"
         )
     route_bounds = route["bounds"]
     if not isinstance(route_bounds, dict) or set(route_bounds) != BOUND_FIELDS:

@@ -135,13 +135,15 @@ the project's. A project in a temporary directory never gets a rule. Owner comma
 (registration, attestation, owner keys, grants, backups, canaries, promotion, rollback,
 upgrade reconciliation, `install-codex-rule` and `remove-codex-rule`) are not listed and
 stay sandboxed. `host-command --project-root <exact-root>` reads only and needs no
-collector. It prints `argv_prefix` (naming the copy), `runtime_copy`, `codex_rule` and,
-once the rule is installed, `command_prefix` and `next_command`, the same prefix as text to
-run as printed, since the rule does not match a command whose words were all quoted:
+collector. It prints `argv_prefix` (naming the copy), `runtime_copy` and `codex_rule`:
 `installed` only when the rule, the copy and the project's installed runtime all match;
 `missing` without a rule file; `unsupported` for a Codex home other than the real
 `~/.codex`; `stale` otherwise, as after a Python or package change, for a rule that names
-the project's own `cli.py`, without an install manifest, or for a symlink. The rule is
+the project's own `cli.py`, without an install manifest, or for a symlink. Once the rule is
+installed it also prints `command_prefix` and `next_command`, the same prefix as text to run
+as printed, since the rule did not match a command with every word quoted. A word is quoted
+only when it cannot run otherwise, such as a path holding a space; whether the rule matches
+such a path has not been tested. The rule is
 safe only while every Codex session is opened on a project itself: never on a folder that
 contains a set-up project, the orchestrator clone, the home folder, its parent or `/`, and
 never with `~` or `~/.codex` added by `--add-dir`. Such a session could write `~/.codex`

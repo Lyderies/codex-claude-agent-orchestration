@@ -33,10 +33,12 @@ file path.
 }
 ```
 
-The assignment. Its `context` holds repository paths and nothing else: `dispatch` exports each
-entry as a file, so a sentence there fails with `export_path_not_granted`. Put every instruction
-in `objective`. Every path in `context` and `owned_paths` needs a `<path>:read` entry in
-`permissions.filesystem`, and `owned_paths` must also be in the task's.
+The assignment. Its `context` holds repository paths and no prose: `dispatch` exports each entry,
+so a sentence there is refused, usually with `export_path_not_granted`. Put every instruction in
+`objective`. The one exception is a verifier bound to a worker outcome, whose `context` is exactly
+`["<worker host_outcome_digest>"]`. Every path in `context` and `owned_paths` needs a `<path>:read`
+entry in `permissions.filesystem`, on the path or a folder above it, and `owned_paths` must also be
+in the task's.
 
 ```json
 {
@@ -92,9 +94,11 @@ The parent grant, which is the most the child may have:
 
 When validation prints `input validation failed` with a `field`, that names where to look, such
 as `task.family` or `assignment.bounds.wait_seconds`; the value is never printed. A `field` that
-names a whole object (`task`, `assignment`, `assignment.bounds`) means that object is not an
-object or has a key the contract does not allow. No `field` means the input was not valid JSON,
-or the failure is in another contract.
+names a whole object (such as `task`, `assignment`, `parent_grant` or `assignment.bounds`) means it
+is not an object or has a key the contract does not allow. A `route` field means the route you
+passed is not the one `learning-route` returned. No `field` means the failure is not in one of these
+contracts: the input may be unreadable or not valid JSON, or the check may depend on this machine
+or project, so report it instead of rewriting your input.
 
 ## The contracts
 

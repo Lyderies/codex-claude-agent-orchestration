@@ -47,7 +47,7 @@ and tools installed under your home folder, which the rule then runs.
   version, an identity reading over 30 minutes old, a non-subscription plan, a missing attestation,
   unknown or paid-usage billing, exhausted headroom (90% of a window) or a run cap, and re-checks at
   launch.
-- **Owner-signed attestation.** Per account, you sign that extra usage and credit purchases are off, with
+- **Owner-signed attestation.** Per account in each project, you sign that extra usage and credit purchases are off, with
   your one passphrase-protected owner key. `attest.py` signs only the bytes it rebuilt from your answers,
   keys without a passphrase are refused, and signing runs without `ssh-agent`, so no program, an AI
   agent included, can sign in your name.
