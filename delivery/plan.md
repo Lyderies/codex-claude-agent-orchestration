@@ -3,8 +3,8 @@
 - **Status:** in execution since the owner started it on 2026-10-31. G1 is delivered (release
   0.1.0). G2 is delivered as dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10),
   tagged `v0.2.0` on `main` on 2026-11-02 and installed in the pilot project. In progress: v1.1,
-  with release 0.2.1 (input forms and owner key replacement) ready on `version/0.2.1` and awaiting
-  the owner's approval for `main`. Next: release 0.2.2 (diagnostics), child liveness, then v1.2
+  with release 0.2.1 (input forms and owner key replacement, Codex package 0.8.11) tagged `v0.2.1`
+  on `main` on 2026-11-02. Next: release 0.2.2 (diagnostics), child liveness, then v1.2
   Codex plan loop, then G3. Scope changes are listed under "Decisions and open questions".
 - **Updated:** 2026-11-02.
 - **Scope:** development-time orchestration. A primary Codex or Claude session delegates bounded
