@@ -269,6 +269,9 @@ Planned, not yet designed or estimated. Order of work:
      patch workflow.
    - The checks recipe warns about bytecode. The `qa_pytest.py` silent exit, bytecode handling and
      coding mapping belong to the project itself: hand them over as a note.
+   - **New release rule in `CONTRIBUTING.md` (owner decision, 2026-11-02):** try each release on a real
+     install from its `version/*` branch before opening the pull request to `main`. 0.2.1 reached
+     `main` before this had been done.
 4. **Child liveness** (below).
 5. **Smaller items:**
    - A Claude Haiku 5.5 inventory child returned `invalid_result`; check result-contract reliability,
