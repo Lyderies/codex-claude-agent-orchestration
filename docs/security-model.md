@@ -1,6 +1,6 @@
 # Security model
 
-This page explains what dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10) protects, how,
+This page explains what dogfood toolchain v1 (release 0.2.1, Codex package 0.8.11) protects, how,
 and what it does not protect against. It is for users deciding whether to run it and for
 contributors changing it. To report a vulnerability, follow [SECURITY.md](../SECURITY.md).
 
@@ -50,7 +50,8 @@ and tools installed under your home folder, which the rule then runs.
 - **Owner-signed attestation.** Per account in each project, you sign that extra usage and credit purchases are off, with
   your one passphrase-protected owner key. `attest.py` signs only the bytes it rebuilt from your answers,
   keys without a passphrase are refused, and signing runs without `ssh-agent`, so no program, an AI
-  agent included, can sign in your name.
+  agent included, can use your key to sign in your name. See
+  [what the owner key does not stop](#what-the-owner-key-does-not-stop).
 - **Read-only children in a private export.** A bridged child sees only the committed bytes of its granted
   paths, under a hard deadline. Claude children get `Read`, `Glob` and `Grep` only. Codex children run
   `codex exec` read-only and ephemeral, without user config, execpolicy rules, approvals or connectors.
@@ -63,6 +64,28 @@ and tools installed under your home folder, which the rule then runs.
   rules for every owner-only CLI subcommand to the project's `.claude/settings.json`, plus `Edit` rules for
   `.codex/**`, `.agents/**`, `.claude/settings*.json` and `.git/**`. These are a policy layer on Claude
   Code's tools, not a sandbox.
+
+## What the owner key does not stop
+
+The passphrase protects your key; it cannot stop a program swapping in a different key. The ledger records
+the enrolled key, and a signer file that does not match is refused: nothing is signed, and every billing
+statement stops counting, because each signature is checked against the current key. That applies when a run
+opens and when a bridged child launches; a native Claude child opened before the change can still start. A
+replaced key cannot be made current again.
+
+- "Replace a lost owner key" cannot ask for the old key, since that is what was lost. Nothing proves
+  cryptographically who replaced it, as at first setup. The new key's date shows in the wizard's menu and in
+  `learning-status`, so a replacement you did not make can be seen.
+- Replacing a key cancels billing statements and grants not yet used. QA, calibrations and promotions the
+  old key approved stay in force, so after a stolen key review those yourself.
+- A sandboxed Codex session cannot write your records (see the session guard). A Claude primary has no
+  sandbox: deny rules cover the commands, edits to `~/.local/state/codex-agents` and shell commands naming
+  it, but they are a policy layer that another spelling can miss, and they name only that default folder, not
+  an `XDG_STATE_HOME` one. A program running as your user with no sandbox could edit the ledger and the
+  signer file together, or run the replacement itself, and a ledger whose key history was emptied enrols
+  whatever the signer file then holds. Nothing in your user account can prevent that.
+- The record starts from the signer file the first time a ledger opens after a key is enrolled, or after
+  updating to this version, so it cannot catch a change made before then.
 
 ## The protected copy and the Codex rule
 

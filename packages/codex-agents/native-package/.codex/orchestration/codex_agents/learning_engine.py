@@ -3677,10 +3677,21 @@ OWNER_GRANT_REQUEST_FIELDS = {
 class OwnerGrantAuthority:
     """Verify detached owner signatures using public keys only."""
 
-    def __init__(self, allowed_signers: Path) -> None:
+    def __init__(self, allowed_signers: Path, *, signer_line: bytes | None = None) -> None:
         self.allowed_signers = allowed_signers
+        self.signer_line = signer_line
         if allowed_signers.is_symlink() or not allowed_signers.is_file():
             raise ContractError("owner allowed-signers file is unavailable")
+
+    @classmethod
+    def for_state(cls, state: Any) -> "OwnerGrantAuthority":
+        """An authority over the signer line the state checked against its record.
+
+        It verifies with those bytes, so a file swapped after the check changes nothing.
+        """
+
+        line = state.owner_signer_line()
+        return cls(state.allowed_signers_path, signer_line=line)
 
     def request(
         self,
@@ -3786,9 +3797,18 @@ class OwnerGrantAuthority:
                 handle.write(signature)
                 signature_path = Path(handle.name)
             signature_path.chmod(0o600)
+            signers = self.allowed_signers
+            if self.signer_line is not None:
+                with tempfile.NamedTemporaryFile(
+                    dir=self.allowed_signers.parent, prefix="owner-signers-", delete=False
+                ) as handle:
+                    handle.write(self.signer_line)
+                    signers_copy = Path(handle.name)
+                signers_copy.chmod(0o600)
+                signers = signers_copy
             completed = subprocess.run(
                 [
-                    str(executable), "-Y", "verify", "-f", str(self.allowed_signers),
+                    str(executable), "-Y", "verify", "-f", str(signers),
                     "-I", OWNER_SIGNER_IDENTITY, "-n", namespace,
                     "-s", str(signature_path),
                 ],
@@ -3804,6 +3824,8 @@ class OwnerGrantAuthority:
         finally:
             if "signature_path" in locals():
                 signature_path.unlink(missing_ok=True)
+            if "signers_copy" in locals():
+                signers_copy.unlink(missing_ok=True)
 
     @staticmethod
     def owner_record_payload(project_id: str, record: dict[str, Any]) -> bytes:

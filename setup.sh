@@ -1610,11 +1610,13 @@ step_project() {
     if [ -f "$dir/.codex/orchestration/install-manifest.json" ]; then
       INSTALL_EXISTS=1
       list_add ok "Project: $dir"
+      owner_key_notice
       body "An existing install was found in this project. Choose what to do."
       menu 0 "Update the install and walk through every step" \
              "Verify the install only" \
              "Re-run the billing attestation only" \
              "Change the owner key passphrase" \
+             "Replace a lost owner key" \
              "Choose another path" \
              "Quit"
       case $MENU_IDX in
@@ -1622,8 +1624,9 @@ step_project() {
         1) MODE=verify;;
         2) MODE=attest;;
         3) MODE=passphrase;;
-        4) default=$dir; continue;;
-        5) echo "Stopped."; exit 0;;
+        4) MODE=replace;;
+        5) default=$dir; continue;;
+        6) echo "Stopped."; exit 0;;
       esac
       screen_reset; begin_step 2
     fi
@@ -2299,6 +2302,68 @@ step_billing() {
   pause
 }
 
+# owner_key_notice : warn on the menu when the owner key changed or no longer matches its record.
+owner_key_notice() {
+  local line
+  line=$(owner_tool owner-key 2>/dev/null | "$PY" "${PYF[@]}" -c '
+import datetime, json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+if report.get("state") == "mismatch":
+    print("mismatch")
+elif report.get("replacements"):
+    when = datetime.datetime.fromtimestamp(report["last_replaced_at_ms"] / 1000)
+    print(when.strftime("%Y-%m-%d %H:%M"))')
+  case $line in
+    "") ;;
+    mismatch)
+      list_add warn "The owner key file does not match its record, so nothing can be signed or run."
+      list_sub "If you did not change it, a program may have. Choose Replace a lost owner key.";;
+    *) list_add info "Owner key last replaced: $line. If that was not you, replace it again.";;
+  esac
+}
+
+# Existing-install menu: replace a lost owner key, then sign for this project.
+step_replace_key() {
+  local rc
+  begin_step 6
+  if [ ! -f "$PROJECT/.codex/orchestration/cli.py" ]; then
+    list_add skip "The project CLI is not installed, so the key cannot be replaced from here."
+    mark_step 6 skip "no installed CLI"
+    pause; return 0
+  fi
+  body "Use this only if you can no longer unlock your owner key. It creates a new key with a new passphrase. Billing statements signed with the old key stop counting in every project, so each project needs signing again before its children run. This project is signed straight after."
+  menu 0 "Replace the owner key" "Back to the main menu" "Quit"
+  case $MENU_IDX in
+    1) GO_BACK=1; return 0;;
+    2) echo "Stopped."; exit 0;;
+  esac
+  if ! runtime_matches; then
+    screen_reset; begin_step 6
+    runtime_refusal
+    mark_step 6 fail "orchestrator differs from this setup"
+    pause; return 0
+  fi
+  show_cursor
+  printf '\033[H\033[2J'
+  "$PY" "${PYF[@]}" "$ROOT_DIR/scripts/attest.py" --target "$PROJECT" --replace-owner-key
+  rc=$?
+  printf '\n  attest.py finished (exit code %s). Press Enter to continue. ' "$rc"
+  IFS= read -r _ || true
+  screen_reset; begin_step 6
+  if [ "$rc" -eq 0 ]; then
+    list_add ok "The owner key was replaced and this project was signed."
+    mark_step 6 ok "owner key replaced; project signed"
+  else
+    list_add fail "This did not finish cleanly (exit code $rc, see its message)"
+    list_sub "If the key was replaced, choose Re-run the billing attestation only. If not, choose this option again."
+    mark_step 6 fail "owner key replacement incomplete"
+  fi
+  pause
+}
+
 # Existing-install menu: change the owner key passphrase (hands the terminal to attest.py).
 step_passphrase() {
   local rc
@@ -2772,6 +2837,8 @@ main() {
         step_billing;;
       passphrase)
         step_passphrase;;
+      replace)
+        step_replace_key;;
     esac
     [ "$GO_BACK" -eq 1 ] && continue
     step_done

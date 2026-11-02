@@ -382,7 +382,7 @@ class LearningStoreTests(unittest.TestCase):
         replacement_root = Path(self.temporary.name) / "replacement"
         replacement_root.mkdir()
         _, replacement = generate_test_owner_key(replacement_root)
-        with self.assertRaisesRegex(StateError, "key rotation"):
+        with self.assertRaisesRegex(StateError, "Replace a lost owner key"):
             self.state.install_owner_public_key(replacement)
 
     def test_allowed_signers_must_name_exactly_one_owner_key(self) -> None:

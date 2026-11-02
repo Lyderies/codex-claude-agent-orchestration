@@ -66,7 +66,7 @@ installs `{"version": 1, "roles": {}, "verifiers": {}}`.
 | Path | Purpose |
 |---|---|
 | `~/.local/state/codex-agents` | Your orchestrator records: the ledger, the owner key record and the collector's files. Never committed |
-| `~/.ssh/codex-agents-owner` | The passphrase-protected owner key that signs billing attestations; `attest.py` creates it if you have none |
+| `~/.ssh/codex-agents-owner` | The passphrase-protected owner key that signs billing attestations; `attest.py` creates it if you have none, and a replacement creates `codex-agents-owner-2` or the next free number |
 | `~/.codex/orchestrator.config.toml` | The optional Codex profile with sandbox network on, for `codex -p orchestrator` (step 7) |
 | `~/.codex/rules/agent-orchestration-<digest>.rules` | The optional Codex commands rule (step 8) |
 | `~/.codex/agent-orchestration/<project digest>/<runtime digest>/` | The owner-only protected copy of the orchestrator that the rule runs |

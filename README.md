@@ -5,7 +5,7 @@
 
 Let a Claude Code or Codex session hand bounded sub-tasks to Codex or Claude child agents, on subscription logins only.
 
-**Status:** dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10). Children are read-only.
+**Status:** dogfood toolchain v1 (release 0.2.1, Codex package 0.8.11). Children are read-only.
 macOS first, Linux partly untested, no Windows. Subscription logins only, never metered APIs.
 
 ```mermaid
