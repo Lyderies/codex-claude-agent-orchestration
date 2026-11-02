@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Learning candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "x-runtime-invariants": ["digests match canonical values", "verification checks only grow", "bounds only narrow", "candidate and base digests match exact configurations"],
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "modelEffort": {"type": "object", "additionalProperties": false, "required": ["model", "effort"], "properties": {"model": {"enum": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]}, "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]}}},
+    "digestArray": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/digest"}},
+    "identifierArray": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}},
+    "bounds": {"type": "object", "minProperties": 1, "additionalProperties": false, "properties": {"max_attempts": {"type": "integer", "minimum": 0, "maximum": 1000000}, "max_steers_per_attempt": {"type": "integer", "minimum": 0, "maximum": 1000000}, "max_no_progress_events": {"type": "integer", "minimum": 0, "maximum": 1000000}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 1000000}, "timeout_seconds": {"type": "integer", "minimum": 0, "maximum": 1000000}, "max_tool_calls": {"type": "integer", "minimum": 0, "maximum": 1000000}}},
+    "executionConfiguration": {"type": "object", "additionalProperties": false, "required": ["model", "effort", "role", "topology", "max_parallel", "verification_required", "verifier_digest", "bounds_digest", "package_digest", "policy_digest", "agent_digest", "skill_digests", "prompt_digest", "client_digest"], "properties": {"model": {"enum": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]}, "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]}, "role": {"enum": ["codex_agents_researcher", "codex_agents_planner", "codex_agents_implementation_worker", "codex_agents_security_reviewer", "codex_agents_verification_worker", "claude_agents_researcher", "claude_agents_planner", "claude_agents_implementation_worker", "claude_agents_security_reviewer", "claude_agents_verification_worker"]}, "topology": {"enum": ["single", "delegated", "parallel"]}, "max_parallel": {"type": "integer", "minimum": 1, "maximum": 64}, "verification_required": {"type": "boolean"}, "verifier_digest": {"anyOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "bounds_digest": {"$ref": "#/$defs/digest"}, "package_digest": {"$ref": "#/$defs/digest"}, "policy_digest": {"$ref": "#/$defs/digest"}, "agent_digest": {"$ref": "#/$defs/digest"}, "skill_digests": {"$ref": "#/$defs/digestArray"}, "prompt_digest": {"$ref": "#/$defs/digest"}, "client_digest": {"$ref": "#/$defs/digest"}}}
+  },
+  "allOf": [
+    {"if": {"properties": {"target": {"const": "routing"}}}, "then": {"properties": {"change_manifest": {"items": {"properties": {"path_code": {"const": "routing.selection"}}}}}}},
+    {"if": {"properties": {"target": {"const": "model_effort"}}}, "then": {"properties": {"change_manifest": {"items": {"properties": {"path_code": {"const": "routing.model_effort"}}}}}}},
+    {"if": {"properties": {"target": {"const": "topology"}}}, "then": {"properties": {"change_manifest": {"items": {"properties": {"path_code": {"const": "orchestration.topology"}}}}}}},
+    {"if": {"properties": {"target": {"const": "skill"}}}, "then": {"properties": {"change_manifest": {"items": {"properties": {"path_code": {"const": "skills.selection"}}}}}}},
+    {"if": {"properties": {"target": {"const": "prompt"}}}, "then": {"properties": {"change_manifest": {"items": {"properties": {"path_code": {"const": "prompts.template_digest"}}}}}}},
+    {"if": {"properties": {"target": {"const": "context"}}}, "then": {"properties": {"change_manifest": {"items": {"properties": {"path_code": {"const": "context.selection"}}}}}}},
+    {"if": {"properties": {"target": {"const": "verification"}}}, "then": {"properties": {"effect": {"const": "strengthen"}, "change_manifest": {"items": {"properties": {"path_code": {"const": "verification.additional_checks"}}}}}}},
+    {"if": {"properties": {"target": {"const": "bounds"}}}, "then": {"properties": {"effect": {"const": "narrow"}, "change_manifest": {"items": {"properties": {"path_code": {"const": "bounds.limits"}}}}}}}
+  ],
+  "required": ["schema_version", "record_type", "record_id", "candidate_digest", "scope", "task_slice", "target", "effect", "base_digest", "patch_digest", "evidence_digests", "status", "change_manifest", "champion_configuration", "candidate_configuration"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "candidate"},
+    "record_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "candidate_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scope": {"enum": ["general", "project"]},
+    "task_slice": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "target": {"enum": ["routing", "model_effort", "topology", "skill", "prompt", "context", "verification", "bounds"]},
+    "effect": {"enum": ["optimize", "narrow", "strengthen"]},
+    "base_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "patch_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_digests": {"type": "array", "maxItems": 64, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "uniqueItems": true},
+    "status": {"enum": ["proposed", "evaluated", "rejected", "canary_approved", "canary_failed", "canary_passed", "promoted", "reverted"]},
+    "champion_configuration": {"$ref": "#/$defs/executionConfiguration"},
+    "candidate_configuration": {"$ref": "#/$defs/executionConfiguration"},
+    "eligibility_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_slice", "evidence_set_digest", "independent_case_count", "usage_complete", "version_unconfounded", "task_mix_matched", "retry_deduplicated", "verifier_evidence_complete"],
+      "properties": {
+        "task_slice": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+        "evidence_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "independent_case_count": {"type": "integer", "minimum": 20},
+        "usage_complete": {"const": true},
+        "version_unconfounded": {"const": true},
+        "task_mix_matched": {"const": true},
+        "retry_deduplicated": {"const": true},
+        "verifier_evidence_complete": {"const": true}
+      }
+    },
+    "change_manifest": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path_code", "before_digest", "after_digest", "before_value", "after_value"],
+        "allOf": [
+          {"if": {"properties": {"path_code": {"const": "routing.selection"}}}, "then": {"properties": {"before_value": {"$ref": "#/$defs/identifier"}, "after_value": {"$ref": "#/$defs/identifier"}}}},
+          {"if": {"properties": {"path_code": {"const": "routing.model_effort"}}}, "then": {"properties": {"before_value": {"$ref": "#/$defs/modelEffort"}, "after_value": {"$ref": "#/$defs/modelEffort"}}}},
+          {"if": {"properties": {"path_code": {"const": "orchestration.topology"}}}, "then": {"properties": {"before_value": {"enum": ["single", "delegated", "parallel"]}, "after_value": {"enum": ["single", "delegated", "parallel"]}}}},
+          {"if": {"properties": {"path_code": {"enum": ["skills.selection", "context.selection"]}}}, "then": {"properties": {"before_value": {"$ref": "#/$defs/digestArray"}, "after_value": {"$ref": "#/$defs/digestArray"}}}},
+          {"if": {"properties": {"path_code": {"const": "prompts.template_digest"}}}, "then": {"properties": {"before_value": {"$ref": "#/$defs/digest"}, "after_value": {"$ref": "#/$defs/digest"}}}},
+          {"if": {"properties": {"path_code": {"const": "verification.additional_checks"}}}, "then": {"properties": {"before_value": {"$ref": "#/$defs/identifierArray"}, "after_value": {"$ref": "#/$defs/identifierArray"}}}},
+          {"if": {"properties": {"path_code": {"const": "bounds.limits"}}}, "then": {"properties": {"before_value": {"$ref": "#/$defs/bounds"}, "after_value": {"$ref": "#/$defs/bounds"}}}}
+        ],
+        "properties": {
+          "path_code": {"enum": ["routing.selection", "routing.model_effort", "orchestration.topology", "skills.selection", "prompts.template_digest", "context.selection", "verification.additional_checks", "bounds.limits"]},
+          "before_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "after_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "before_value": {"anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 160},
+            {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 160}},
+            {"type": "object", "additionalProperties": false, "required": ["model", "effort"], "properties": {"model": {"enum": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]}, "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]}}},
+            {"type": "object", "minProperties": 1, "maxProperties": 7, "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 1000000}}
+          ]},
+          "after_value": {"anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 160},
+            {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 160}},
+            {"type": "object", "additionalProperties": false, "required": ["model", "effort"], "properties": {"model": {"enum": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]}, "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]}}},
+            {"type": "object", "minProperties": 1, "maxProperties": 7, "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 1000000}}
+          ]}
+        }
+      }
+    }
+  }
+}

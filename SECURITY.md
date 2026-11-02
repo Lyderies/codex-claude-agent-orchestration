@@ -1,14 +1,56 @@
 # Security policy
 
+## Reporting a vulnerability
+
 Report a vulnerability privately through GitHub's
 [private vulnerability reporting](../../security/advisories/new) for this repository. Please do
-not open a public issue for security problems.
+not open a public issue for security problems. Include the release and Codex package version
+(from `CHANGELOG.md` and `packages/codex-agents/runtime-releases.json`), the steps to reproduce,
+and what an attacker gains.
+
+## Current status
+
+The current release is dogfood toolchain v1 (release 0.2.0, Codex
+package 0.8.10): read-only children, macOS first, Linux partly untested. Fixes go into the next
+release; there are no maintained older releases. Changes to authority, containment or billing
+logic get an independent security review before release, recorded in the CHANGELOG.
+
+## Scope
 
 Areas of particular interest:
 
 - a child agent gaining more authority than its parent's grant;
-- escape from a child's sandbox or worktree;
+- escape from a child's sandbox, private export or (from G3) worktree;
+- a Codex session reaching owner authority: billing attestation, owner keys, collector
+  registration, the Codex command rule or its protected runtime copy in `~/.codex`;
+- a command the rule allows running or loading anything a sandboxed session can write;
+- the project's learning hooks (which Codex runs outside its sandbox) running anything but the
+  installer's trusted interpreter and the checkout's own `learning_hook.py`;
+- a session opened on a project folder getting past the session workspace guard;
+- a bridged child loading execpolicy rules, connectors, MCP servers or hooks;
+- the owner tools (`setup.sh`, `scripts/attest.py`, `scripts/install.py`) running project code,
+  signing anything other than the statement the owner approved, or starting a program the
+  project's Git settings name;
 - any path that could cause metered billing;
 - identifiers or run records leaking into the repository.
 
-The project is pre-alpha, so no released versions are supported yet.
+## Known limits
+
+Accepted limits, with the threat model behind them, are listed in
+[the security model](docs/security-model.md#what-it-does-not-protect-against). The supported setup
+assumes every Codex session is opened on a project itself: never on a folder that contains a
+set-up project, the home folder, a folder above it or `/`, and that this repository sits outside
+every folder opened in Codex. A session that already writes `~/.codex` can forge its own session
+record, the rule and the protected copy; the session guard stops the ordinary mistake, not that.
+The learning hooks name a fixed trusted interpreter and an absolute path, but they run the
+project's installed hook code, not a separate copy. Once installed, that code is protected like
+`.codex/hooks.json` itself (Codex keeps `<project>/.codex` read-only for a session opened on the
+project, and the session guard refuses sessions that can write it from above), but not from a
+process that was already writing the project before the install, when `.codex` did not exist:
+close every Codex session in the project before installing or updating. A Codex session in the
+project can also rewrite `.claude/settings*.json` and `.claude/skills/**`, which Claude Code
+runs on the host. On macOS, a session that could write `~/Library` could have changed the old
+records folder before the owner approved its one-time move, and the old copy
+(`codex-agents.moved-<time>`, with the digest key) stays readable until the owner deletes it.
+Codex children can still read outside their export until G3. A report that shows one of these
+limits is worse than documented is welcome.

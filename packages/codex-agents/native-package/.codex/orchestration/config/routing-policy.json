@@ -1,0 +1,330 @@
+{
+  "version": 5,
+  "status": "accepted",
+  "validated_client": "codex-cli 0.164.0",
+  "evaluation": {
+    "date": "2026-09-23",
+    "evidence": "config/evaluation-summary.json",
+    "record_count": 30,
+    "tasks_per_family": 2,
+    "baseline_model": "gpt-6-astra",
+    "scope": "historical version 1 smoke matrix plus owner-directed GPT-6 migration; matched GPT-6 promotion evidence remains gated"
+  },
+  "quality_first": true,
+  "selection_policy": "deterministic_task_shape_v4",
+  "max_parallel": 4,
+  "bounds": {
+    "max_attempts": 2,
+    "max_steers_per_attempt": 1,
+    "max_no_progress_events": 2,
+    "wait_seconds": 60,
+    "timeout_seconds": 21600,
+    "max_tool_calls": 30
+  },
+  "observation_deadlines": {
+    "inventory": 21600,
+    "research": 21600,
+    "planning": 10800,
+    "coding": 10800,
+    "security": 21600,
+    "verification": 21600
+  },
+  "models": {
+    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-6-luna": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-6-sol": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-6.1-sol": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-6-astra": ["low", "medium", "high", "xhigh", "max"]
+  },
+  "legacy_fallback": {"model": "gpt-5.6-sol", "effort": "high"},
+  "roles": {
+    "inventory": "codex_agents_researcher",
+    "research": "codex_agents_researcher",
+    "planning": "codex_agents_planner",
+    "coding": "codex_agents_implementation_worker",
+    "security": "codex_agents_security_reviewer",
+    "verification": "codex_agents_verification_worker"
+  },
+  "routes": {
+    "reconnaissance": {
+      "model": "gpt-6-luna",
+      "effort": "high",
+      "reason": "routing_facts_incomplete",
+      "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+    },
+    "hard_end_to_end": {
+      "model": "gpt-6-astra",
+      "effort": "medium",
+      "reason": "hard_end_to_end_evidence",
+      "alternatives": [
+        {"model": "gpt-6.1-sol", "effort": "high"},
+        {"model": "gpt-5.6-sol", "effort": "high"}
+      ]
+    },
+    "families": {
+      "inventory": {
+        "bounded": {
+          "model": "gpt-6-luna", "effort": "high",
+          "reason": "bounded_executable_work",
+          "alternatives": [
+            {"model": "gpt-6.1-sol", "effort": "medium"},
+            {"model": "gpt-5.6-sol", "effort": "high"}
+          ]
+        },
+        "exploratory": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "exploratory_read_heavy_work",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "judgment": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "diagnosis_or_judgment",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "synthesis": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "cross_system_synthesis",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "default": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "ordinary_unbounded_work",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        }
+      },
+      "research": {
+        "bounded": {
+          "model": "gpt-6-luna", "effort": "high",
+          "reason": "bounded_executable_work",
+          "alternatives": [
+            {"model": "gpt-6.1-sol", "effort": "medium"},
+            {"model": "gpt-5.6-sol", "effort": "high"}
+          ]
+        },
+        "exploratory": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "exploratory_read_heavy_work",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "judgment": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "diagnosis_or_judgment",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "synthesis": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "cross_system_synthesis",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "default": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "ordinary_unbounded_work",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        }
+      },
+      "planning": {
+        "synthesis": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "ambiguous_cross_system_planning",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "default": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "bounded_planning",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        }
+      },
+      "coding": {
+        "bounded": {
+          "model": "gpt-6-luna", "effort": "high",
+          "reason": "bounded_executable_work",
+          "alternatives": [
+            {"model": "gpt-6.1-sol", "effort": "medium"},
+            {"model": "gpt-5.6-sol", "effort": "high"}
+          ]
+        },
+        "exploratory": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "exploratory_read_heavy_work",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "judgment": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "diagnosis_or_judgment",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "synthesis": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "cross_system_synthesis",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        },
+        "default": {
+          "model": "gpt-6.1-sol", "effort": "medium",
+          "reason": "ordinary_unbounded_work",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        }
+      },
+      "security": {
+        "default": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "security_judgment",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        }
+      },
+      "verification": {
+        "bounded": {
+          "model": "gpt-6-luna", "effort": "high",
+          "reason": "bounded_deterministic_verification",
+          "alternatives": [
+            {"model": "gpt-6.1-sol", "effort": "medium"},
+            {"model": "gpt-5.6-sol", "effort": "high"}
+          ]
+        },
+        "default": {
+          "model": "gpt-6.1-sol", "effort": "high",
+          "reason": "independent_verification",
+          "alternatives": [{"model": "gpt-5.6-sol", "effort": "high"}]
+        }
+      }
+    }
+  },
+  "providers": {
+    "claude": {
+      "models": {
+        "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+        "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],
+        "claude-haiku-5-5": ["low", "medium", "high"]
+      },
+      "roles": {
+        "inventory": "claude_agents_researcher",
+        "research": "claude_agents_researcher",
+        "planning": "claude_agents_planner",
+        "coding": "claude_agents_implementation_worker",
+        "security": "claude_agents_security_reviewer",
+        "verification": "claude_agents_verification_worker"
+      },
+      "verifier": {"model": "claude-opus-5-5", "effort": "high"},
+      "client_versions": {"minimum": "2.1.0", "maximum_exclusive": "2.2.0"},
+      "max_admissions_per_window": 40
+    },
+    "codex": {
+      "client_versions": {"minimum": "0.164.0", "maximum_exclusive": "0.164.1"},
+      "max_admissions_per_window": 60
+    }
+  },
+  "provider_candidates": {
+    "inventory": {
+      "bounded": [
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
+      "exploratory": [
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
+      "judgment": [
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
+      "synthesis": [
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
+      "default": [
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ]
+    },
+    "research": {
+      "bounded": [
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+        ],
+      "exploratory": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
+      "judgment": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
+      "synthesis": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
+      "default": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ]
+    },
+    "planning": {
+      "synthesis": [
+        {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+        {"provider": "codex", "route": "codex_policy"}
+      ],
+      "default": [
+        {"provider": "codex", "route": "codex_policy"},
+        {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"}
+      ]
+    },
+    "coding": {
+      "bounded": [
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "medium"},
+          {"provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium"},
+          {"provider": "claude", "model": "claude-haiku-5-5", "effort": "high"}
+        ],
+      "exploratory": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
+      "judgment": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
+      "synthesis": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ],
+      "default": [
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        ]
+    },
+    "security": {
+      "default": [
+        {"provider": "codex", "model": "gpt-6-astra", "effort": "high"},
+        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"}
+      ]
+    },
+    "verification": {
+      "bounded": [
+          {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"},
+          {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"}
+        ],
+      "default": [
+        {"provider": "codex", "route": "codex_policy"},
+        {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"}
+      ]
+    },
+    "reconnaissance": [
+      {"provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+      {"provider": "codex", "model": "gpt-6.1-sol", "effort": "low"}
+    ],
+    "hard_end_to_end": [
+      {"provider": "claude", "model": "claude-opus-5-5", "effort": "high"},
+      {"provider": "codex", "model": "gpt-6-astra", "effort": "high"}
+    ]
+  },
+  "verification": {
+    "mode": "all_meaningful",
+    "role": "codex_agents_verification_worker",
+    "model": "gpt-6.1-sol",
+    "effort": "high"
+  },
+  "quality_thresholds": {
+    "minimum_score": 0.9,
+    "maximum_repair_rate": 0.1,
+    "minimum_trials_per_family": 2,
+    "required_families": ["research", "planning", "coding", "security", "verification"]
+  }
+}

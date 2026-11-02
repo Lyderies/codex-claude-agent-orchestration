@@ -1,0 +1,13 @@
+{
+  "accountId": "fixture-account-5c2e08",
+  "rateLimits": {
+    "limitId": "codex",
+    "limitName": null,
+    "primary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1793500000},
+    "secondary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1793450000},
+    "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
+    "planType": "plus"
+  },
+  "rateLimitsByLimitId": null,
+  "ordinaryUsageAllowed": true
+}
