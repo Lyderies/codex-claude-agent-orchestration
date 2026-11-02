@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1: Codex primary usability (in development; Codex package 0.8.11)
+## 0.2.1: Codex primary usability and owner key replacement (Codex package 0.8.11)
 
 - **Codex skill input forms.** A Codex primary kept failing on its own inputs, so:
   - `references/contracts.md` opens with a worked task, assignment and parent grant, and the skill says to

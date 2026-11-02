@@ -1,6 +1,6 @@
 # Security model
 
-This page explains what dogfood toolchain v1 (release 0.2.0, Codex package 0.8.10) protects, how,
+This page explains what dogfood toolchain v1 (release 0.2.1, Codex package 0.8.11) protects, how,
 and what it does not protect against. It is for users deciding whether to run it and for
 contributors changing it. To report a vulnerability, follow [SECURITY.md](../SECURITY.md).
 
