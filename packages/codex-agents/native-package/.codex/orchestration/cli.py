@@ -157,6 +157,7 @@ from codex_agents.host_commands import (  # noqa: E402
     configured_codex_home,
     install_rule as install_codex_rule,
     installer_root,
+    project_cli,
     remove_rule as remove_codex_rule,
     render_rule as render_codex_rule,
     rule_path as codex_rule_path,
@@ -164,6 +165,7 @@ from codex_agents.host_commands import (  # noqa: E402
     runtime_binding,
     runtime_copy_problem,
     runtime_copy_root,
+    shell_command,
 )
 from codex_agents.claude_host import (  # noqa: E402
     ClaudeHostDenied,
@@ -243,7 +245,7 @@ def _restore_lifecycle(
         candidate=candidate,
         champion_digest=candidate["base_digest"],
         project_id=project_id,
-        authority=OwnerGrantAuthority(ledger.state.owner_allowed_signers()),
+        authority=OwnerGrantAuthority.for_state(ledger.state),
         digest_key=ledger.state.digest_key(),
         promotions=promotions,
     )
@@ -661,9 +663,7 @@ def _trusted_host_route(
     selection_slice = model_selection_slice(task)
     released = load_released_candidate_digests(
         RELEASES_PATH,
-        verify_signature=lambda payload, signature: OwnerGrantAuthority(
-            ledger.state.owner_allowed_signers()
-        ).verify_release_signature(payload, signature),
+        verify_signature=lambda payload, signature: OwnerGrantAuthority.for_state(ledger.state).verify_release_signature(payload, signature),
     )
     applied = []
     for candidate in ledger.routing_candidates(
@@ -1222,6 +1222,12 @@ def build_parser() -> argparse.ArgumentParser:
     learning_owner_key.add_argument("--state-root", type=Path)
     learning_owner_key.add_argument("--public-key", required=True, type=Path)
 
+    learning_replace_owner_key = subparsers.add_parser(
+        "learning-replace-owner-key", help="replace a lost owner public SSH key"
+    )
+    _add_learning_project(learning_replace_owner_key)
+    learning_replace_owner_key.add_argument("--public-key", required=True, type=Path)
+
     learning_grant_request = subparsers.add_parser(
         "learning-create-grant-request", help="create exact bytes for detached owner signing"
     )
@@ -1355,9 +1361,7 @@ def main() -> int:
                 )
                 released = load_released_candidate_digests(
                     RELEASES_PATH,
-                    verify_signature=lambda payload, signature: OwnerGrantAuthority(
-                        ledger.state.owner_allowed_signers()
-                    ).verify_release_signature(payload, signature),
+                    verify_signature=lambda payload, signature: OwnerGrantAuthority.for_state(ledger.state).verify_release_signature(payload, signature),
                 )
                 applied = []
                 report = dict(base_route)
@@ -1615,6 +1619,7 @@ def main() -> int:
                     "collector_health": health.get("collector_health", {}),
                     "client_failures": client_failures,
                     "ingestion": health["ingestion"],
+                    "owner_key": state.owner_key_report(),
                 }
             except CollectorError as exc:
                 client_failures = client_health_snapshot(state, args.project_root)
@@ -1626,6 +1631,7 @@ def main() -> int:
                     "ingestion": empty_ingestion_snapshot(
                         registered=exc.code != "project_unregistered"
                     ),
+                    "owner_key": state.owner_key_report(),
                 })
         elif args.command == "learning-backup-project":
             if args.expires_in_seconds < 60:
@@ -1890,7 +1896,7 @@ def main() -> int:
                 record = billing_attestation_record(_json_input(args.grant))
                 if record["provider"] != args.provider:
                     raise ContractError("billing grant provider does not match")
-                authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+                authority = OwnerGrantAuthority.for_state(ledger.state)
                 payload = authority.owner_record_payload(project_id, record)
                 if args.signature is None:
                     report = {
@@ -2232,9 +2238,7 @@ def main() -> int:
                 else:
                     released = load_released_candidate_digests(
                         RELEASES_PATH,
-                        verify_signature=lambda payload, signature: OwnerGrantAuthority(
-                            ledger.state.owner_allowed_signers()
-                        ).verify_release_signature(payload, signature),
+                        verify_signature=lambda payload, signature: OwnerGrantAuthority.for_state(ledger.state).verify_release_signature(payload, signature),
                     )
                     for candidate in ledger.routing_candidates(
                         project_id,
@@ -2331,9 +2335,7 @@ def main() -> int:
                         project_id,
                         **inputs,
                     )
-                    authority = OwnerGrantAuthority(
-                        ledger.state.owner_allowed_signers()
-                    )
+                    authority = OwnerGrantAuthority.for_state(ledger.state)
                     report = {
                         "ready": True,
                         "qa_evidence": qa,
@@ -2742,7 +2744,7 @@ def main() -> int:
                     configuration=configuration,
                     observed_at_ms=args.observed_at_ms,
                 )
-                authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+                authority = OwnerGrantAuthority.for_state(ledger.state)
                 payload = authority.owner_record_payload(project_id, record)
                 if args.signature is None:
                     report = {
@@ -2777,7 +2779,7 @@ def main() -> int:
                     correction=correction,
                     observed_at_ms=args.observed_at_ms,
                 )
-                authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+                authority = OwnerGrantAuthority.for_state(ledger.state)
                 payload = authority.owner_record_payload(project_id, record)
                 if args.signature is None:
                     report = {
@@ -2953,10 +2955,17 @@ def main() -> int:
             state = LearningState(args.state_root)
             path = state.install_owner_public_key(args.public_key.read_text())
             report = {"ready": True, "allowed_signers": path.name}
+        elif args.command == "learning-replace-owner-key":
+            ledger, _project_id = _learning_ledger(args)
+            try:
+                owner_key = ledger.replace_owner_key(args.public_key.read_text())
+                report = {"ready": owner_key["state"] == "ok", "owner_key": owner_key}
+            finally:
+                _close_ledger(ledger)
         elif args.command == "learning-create-grant-request":
             ledger, project_id = _learning_ledger(args)
             try:
-                authority = OwnerGrantAuthority(ledger.state.owner_allowed_signers())
+                authority = OwnerGrantAuthority.for_state(ledger.state)
                 request = authority.request(
                     digest_key=ledger.state.digest_key(),
                     kind=args.kind,
@@ -2980,7 +2989,7 @@ def main() -> int:
                 _close_ledger(ledger)
         elif args.command == "learning-attach-grant-signature":
             state = LearningState(args.state_root, create=False)
-            authority = OwnerGrantAuthority(state.owner_allowed_signers())
+            authority = OwnerGrantAuthority.for_state(state)
             request = _bounded_json_input(args.request)
             record = authority.attach_signature(
                 request, args.signature.read_bytes()
@@ -2992,7 +3001,8 @@ def main() -> int:
             except CodexHomeUnsupported as exc:
                 # The rule and its copy live only in the real ~/.codex.
                 report = {
-                    "ready": False, "argv_prefix": None, "codex_rule": "unsupported",
+                    "ready": False, "argv_prefix": None, "command_prefix": None,
+                    "next_command": None, "codex_rule": "unsupported",
                     "reason": str(exc), "rule_file": None, "runtime_copy": None,
                 }
             else:
@@ -3012,9 +3022,16 @@ def main() -> int:
                         )
                     except (HostCommandError, TypeError):
                         clone = None  # no copy yet: nothing recorded to protect
+                # Text to run as printed: the rule does not match quoted command words.
+                runnable = status == "installed" and prefix is not None
                 report = {
                     "ready": status == "installed",
                     "argv_prefix": prefix,
+                    "command_prefix": shell_command(prefix) if runnable else None,
+                    "next_command": shell_command([
+                        *prefix, "learning-status",
+                        "--project-root", str(project_cli(args.project_root)[0]),
+                    ]) if runnable else None,
                     "codex_rule": status,
                     "rule_file": str(codex_rule_path(args.project_root)),
                     "runtime_copy": runtime_copy,
@@ -3094,8 +3111,12 @@ def main() -> int:
             "reason_code": exc.reason_code,
         })
         return 2
-    except ContractError:
-        _print({"ready": False, "error": "input validation failed"})
+    except ContractError as exc:
+        # Only the field's name is printed: the message can hold the input's values.
+        report = {"ready": False, "error": "input validation failed"}
+        if exc.field is not None:
+            report["field"] = exc.field
+        _print(report)
         return 2
     except (
         CatalogError,

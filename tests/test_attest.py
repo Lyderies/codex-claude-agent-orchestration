@@ -95,6 +95,8 @@ RUNNER = (
     "attest.SCRATCH_BASE = sys.argv[3]\n"
     "import os\n"
     "attest.ACCOUNT_HOME = os.environ['HOME']  # the test's home stands in for the account's\n"
+    "if os.environ.get('ATTEST_TEST_STATE_IS_PRIVATE'):\n"
+    "    attest._in_temp_root = lambda path: False  # the test's state stands in for the real one\n"
     "if sys.argv[4].endswith('+trust'):\n"
     "    attest.host_paths.install_location_problem = lambda path: None\n"
     "if sys.argv[4].startswith('break-echo'):\n"
@@ -212,12 +214,13 @@ class FakeWorld:
         args = command[2 + len(attest.PYTHON_FLAGS):]
         name = args[0]
         option = lambda flag: args[args.index(flag) + 1]  # noqa: E731
-        if name == "learning-configure-owner-key":
+        if name in ("learning-configure-owner-key", "learning-replace-owner-key"):
             public_path = Path(option("--public-key"))
             self.handed_over.append(str(public_path))
             pub = public_path.read_text().split()
             state = Path(option("--state-root"))
             enrolled = self.enrol_as or f"{pub[0]} {pub[1]}"
+            (state / "owner-allowed-signers").unlink(missing_ok=True)  # replaced, not written through
             (state / "owner-allowed-signers").write_text(f"codex-agents-owner {enrolled}\n")
             report = {"ready": True}
         elif name == "provider-observe":
@@ -352,7 +355,7 @@ class AttestHarness(unittest.TestCase):
         return key
 
     def run_main(self, answers: list[str], *, terminal: bool = True, change: bool = False,
-                 trust_temp: bool = True):
+                 trust_temp: bool = True, replace: bool = False):
         out, err = io.StringIO(), io.StringIO()
         prompts: list[str] = []
 
@@ -369,6 +372,7 @@ class AttestHarness(unittest.TestCase):
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             argv = ["--state-root", str(self.state)]
             argv += ["--change-passphrase"] if change else ["--target", str(self.target)]
+            argv += ["--replace-owner-key"] if replace else []
             code = attest.main(argv)
         self.output = out.getvalue() + err.getvalue() + "".join(prompts)
         self.prompts = prompts
@@ -424,6 +428,97 @@ class AttestTests(AttestHarness):
         self.assertEqual(self.world.recorded, ["codex"])
         self.assertEqual(self.world.signed_names, ["codex-agents-owner-v1"])
         self.assertEqual((self.home / ".ssh").stat().st_mode & 0o777, 0o700)
+
+    # replacing a lost key
+
+    def configure_old_key(self) -> Path:
+        key = self.ssh_dir() / "codex-agents-owner"
+        write_key(key)
+        Path(f"{key}.pub").write_text("ssh-ed25519 AAAAold\n")
+        (self.state / "owner-allowed-signers").write_text("codex-agents-owner ssh-ed25519 AAAAold\n")
+        return key
+
+    def test_replacing_a_lost_key_creates_a_new_file_and_signs_this_project(self) -> None:
+        self.set_providers(codex=True)
+        old = self.configure_old_key()
+        before = old.read_bytes()
+        code = self.run_main(["REPLACE", "y", "n", "y"], replace=True)  # buy off; balance not off; sign
+        self.assertEqual(code, 0)
+        keygen = [c for c in self.world.calls if c[:2] == ["/usr/bin/ssh-keygen", "-t"]]
+        self.assertEqual(keygen[0][4], str(self.home / ".ssh/codex-agents-owner-2"))
+        self.assertEqual(old.read_bytes(), before)
+        self.assertTrue(any("learning-replace-owner-key" in c for c in self.world.calls))
+        self.assertFalse(any("learning-configure-owner-key" in c for c in self.world.calls))
+        self.assertEqual((self.state / "owner-allowed-signers").read_text(),
+                         "codex-agents-owner ssh-ed25519 AAAAkey\n")
+        self.assertEqual(self.world.recorded, ["codex"])
+        self.assertIn("stops counting", self.output)
+
+    def test_replacing_needs_the_typed_word(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_old_key()
+        for answer in ("", "y", "replace"):
+            self.assertEqual(self.run_main([answer], replace=True), 1)
+        self.assertIn("nothing was changed", self.output)
+        self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
+        self.assertFalse(any("learning-replace-owner-key" in c for c in self.world.calls))
+
+    def test_replacing_works_when_the_signer_file_was_tampered_with(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_old_key()
+        (self.state / "owner-allowed-signers").write_text("two\nlines\n")
+        self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        self.assertIn("Owner key now: unreadable", self.output)
+
+    def test_replacing_with_no_key_anywhere_creates_nothing(self) -> None:
+        self.set_providers(codex=True)
+        self.state.chmod(0o700)
+        attest.clone_module("learning_store").LearningState(self.state)  # a real, empty state
+        self.assertEqual(self.run_main([], replace=True), 1)
+        self.assertIn("nothing to replace", self.output)
+        self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
+
+    def test_a_symlinked_signer_file_does_not_block_a_replacement(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_old_key()
+        signers = self.state / "owner-allowed-signers"
+        planted = self.root / "planted"
+        planted.write_text("codex-agents-owner ssh-ed25519 AAAAold\n")
+        signers.unlink()
+        signers.symlink_to(planted)
+        self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        self.assertFalse(signers.is_symlink())
+        self.assertEqual(planted.read_text(), "codex-agents-owner ssh-ed25519 AAAAold\n")
+
+    def test_replacing_when_the_state_folder_is_missing_stops_cleanly(self) -> None:
+        self.set_providers(codex=True)
+        shutil.rmtree(self.state)
+        self.assertEqual(self.run_main([], replace=True), 1)
+        self.assertIn("nothing to replace", self.output)
+
+    def test_a_signer_file_ssh_keygen_cannot_read_does_not_block_a_replacement(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_old_key()
+        with mock.patch.object(attest, "describe_key",
+                               side_effect=[attest.AttestError("unreadable"), "new", "new"]):
+            self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        self.assertIn("Owner key now: unreadable", self.output)
+
+    def test_a_key_with_no_public_file_loses_to_one_that_matches(self) -> None:
+        self.set_providers(codex=True)
+        old = self.configure_old_key()
+        self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        Path(f"{old}.pub").unlink()
+        self.assertEqual(self.run_main(["y", "n", "y"]), 0)
+        self.assertIn(f"Using the owner key file at {self.home / '.ssh/codex-agents-owner-2'}", self.output)
+
+    def test_a_replaced_key_is_found_again_at_its_numbered_location(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_old_key()
+        self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        self.world.key_files.clear()
+        self.assertEqual(self.run_main(["y", "n", "y"]), 0)
+        self.assertIn(f"Using the owner key file at {self.home / '.ssh/codex-agents-owner-2'}", self.output)
 
     def test_new_key_with_empty_passphrase_is_refused(self) -> None:
         self.set_providers(codex=True)
@@ -2046,8 +2141,14 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         (self.home / ".ssh").mkdir(parents=True, mode=0o700)
         self.state.mkdir(mode=0o755)
         # Every CLI call reports a logged-out provider, so a success ends with "not logged in".
-        self.bundle = stub_install(self.root, self.project,
-                                   "import json\nprint(json.dumps({'ready': True, 'records': []}))\n")
+        self.bundle = stub_install(self.root, self.project, (
+            "import json, os, sys\n"
+            "a = sys.argv\n"
+            "if 'learning-replace-owner-key' in a:\n"
+            "    pub = open(a[a.index('--public-key') + 1]).read().split()\n"
+            "    path = os.path.join(a[a.index('--state-root') + 1], 'owner-allowed-signers')\n"
+            "    open(path, 'w').write(f'codex-agents-owner {pub[0]} {pub[1]}\\n')\n"
+            "print(json.dumps({'ready': True, 'records': []}))\n"))
         self.scratch = private_base(self)
         # Throwaway keys for these tests only; they never sign anything real.
         self.key = self.home / ".ssh" / "codex-agents-owner"
@@ -2064,7 +2165,7 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
                              check=True, capture_output=True, text=True).stdout.split()
         (self.state / "owner-allowed-signers").write_text(f"codex-agents-owner {pub[0]} {pub[1]}\n")
 
-    def drive(self, script: list[tuple[str, str]]) -> tuple[str, int]:
+    def drive(self, script: list[tuple[str, str]], *extra: str) -> tuple[str, int]:
         import pty
         import select
         import time
@@ -2072,11 +2173,13 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
         real_home = os.path.realpath(self.home)
         env = dict(os.environ, HOME=real_home, XDG_STATE_HOME=os.path.join(real_home, ".local", "state"))
         env.pop("SSH_AUTH_SOCK", None)
+        if extra:
+            env["ATTEST_TEST_STATE_IS_PRIVATE"] = "1"
         pid, fd = pty.fork()
         if pid == 0:
             os.execve(sys.executable, [sys.executable, "-I", "-B", "-S", "-c", RUNNER, str(_SCRIPT),
                                        str(self.bundle), str(self.scratch), "normal" + TRUST,
-                                       "--target", str(self.project), "--state-root", str(self.state)], env)
+                                       "--target", str(self.project), "--state-root", str(self.state), *extra], env)
         finish = _child_finisher(pid, fd)
         self.addCleanup(finish)
         transcript = buffer = ""
@@ -2106,6 +2209,28 @@ class PassphraseRetryTerminalTests(unittest.TestCase):
     def no_passphrase_in(self, transcript: str) -> None:
         for text in (self.WRONG, self.RIGHT):
             self.assertNotIn(text, transcript)
+
+    def test_replacing_a_lost_key_with_the_real_ssh_keygen(self) -> None:
+        new_passphrase = "New-Horse-3"
+        before = self.key.read_bytes()
+        old_line = (self.state / "owner-allowed-signers").read_text()
+        transcript, code = self.drive([
+            ("Type REPLACE to continue", "REPLACE"),
+            ("empty for no passphrase", new_passphrase),
+            ("same passphrase again", new_passphrase),
+            ("Enter passphrase", new_passphrase)], "--replace-owner-key")
+        self.assertIn("The owner key was replaced.", transcript)
+        self.assertIn("is not logged in", transcript)  # signing started for this project
+        self.assertEqual(code, 1)  # nothing was attested, as no provider is logged in
+        self.assertNotIn(new_passphrase, transcript)
+        self.no_passphrase_in(transcript)
+        self.assertEqual(self.key.read_bytes(), before)
+        new_key = self.home / ".ssh" / "codex-agents-owner-2"
+        public = subprocess.run(["/usr/bin/ssh-keygen", "-y", "-P", new_passphrase, "-f", str(new_key)],
+                                check=True, capture_output=True, text=True).stdout.split()
+        line = (self.state / "owner-allowed-signers").read_text()
+        self.assertEqual(line, f"codex-agents-owner {public[0]} {public[1]}\n")
+        self.assertNotEqual(line, old_line)
 
     def test_wrong_passphrase_then_try_again_succeeds(self) -> None:
         transcript, code = self.drive([

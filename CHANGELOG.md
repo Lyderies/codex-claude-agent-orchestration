@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.1: Codex primary usability and owner key replacement (Codex package 0.8.11)
+
+- **Codex skill input forms.** A Codex primary kept failing on its own inputs, so:
+  - `references/contracts.md` opens with a worked task, assignment and parent grant, and the skill says to
+    read it before writing the first one. A test runs the example through the real validators.
+  - `host-command` also prints `command_prefix` and `next_command`, once the rule is installed: the command
+    as text to run as printed, because the rule did not match a command with every word quoted. A word is
+    quoted only if it cannot run otherwise, such as a path holding a space; whether the rule matches such a
+    path has not been tested.
+  - `input validation failed` now carries `field` for a task, assignment, parent grant or route, such as
+    `task.family`. It is built only from the contract's own names and list indexes, so an input's values and
+    unknown keys are never printed.
+- **Attestation scope in the docs.** Troubleshooting and the security model now say attestations are kept per
+  project, so a project not yet attested cannot run children without a new signature.
+- **Replace a lost owner key.** A new wizard option (`attest.py --replace-owner-key`, CLI
+  `learning-replace-owner-key`) creates a new passphrase-protected key, records it and signs for the project.
+  It cancels billing statements and unused grants the old key signed, when a run opens and when a bridged
+  child launches; QA, calibrations and promotions stay in force, and a replaced key cannot be made current
+  again, in any encoding.
+- **Owner key tampering closed at the ledger level.** An emptied or edited signer file used to accept any
+  new key, even one with no passphrase, and billing statements kept counting after a swap. The ledger now
+  records the enrolled key (`owner_key_history`, append-only), a signer file that differs is refused, and
+  admission checks each statement's signature against the current key, using the checked bytes rather than
+  re-reading the file. `learning-status` reports `owner_key`. Claude deny rules now cover the default records
+  folder. The security model's new section lists what this cannot stop.
+- **Independent security review of the owner key change.** Two rounds, each by Codex (`gpt-6-astra`) and
+  Claude (Opus), reading the code by hand because the toolchain cannot run children until this ships. Both
+  rounds returned NO-GO. Neither found a way to get a statement counted without the current key's signature,
+  short of same-user tampering. Round one found a run still launching after a replacement, the signer file
+  being re-read after its check, and overclaiming docs. Round two found a replaced RSA key returning in
+  another encoding and malformed keys being recorded. All were fixed; the round two fixes (the strict key
+  parser, damaged signer files, the docs) have tests and were not reviewed a third time.
+
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1, Codex package 0.8.10)
 
 - **Codex package 0.8.10.** The final v1 fixes below get their own package version: a collector

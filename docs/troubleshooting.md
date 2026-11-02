@@ -15,14 +15,42 @@ If it then says the key file has another link elsewhere, make a fresh copy in `~
 
 ## I lost my owner key passphrase
 
-Signed attestations stay valid (admission uses the latest per account), but you cannot sign new ones: owner
-key rotation is not available yet. To stop a provider's children, disable it in `provider-routing.json`.
+Run `./setup.sh`, pick the project and choose "Replace a lost owner key". It creates a new key with a new
+passphrase, then signs for that project. If the wizard says the project's orchestrator differs from this
+setup, choose "Update the install and walk through every step" first and skip the attestation step.
+
+Replacing the key cancels every billing statement the old key signed, in every project, so each project's
+children are refused with `billing_attestation_missing` until you choose "Re-run the billing attestation
+only" there. A bridged child opened before the replacement is refused at launch too; a native Claude child
+is checked only when its run opens, so one opened earlier can still start. The old key file stays in
+`~/.ssh`; the new one is `codex-agents-owner-2` (or the next free number).
+
+Only billing statements and grants not yet used are cancelled. QA, calibrations and promotions the old key
+approved stay in force, so if the key may have been stolen rather than lost, review those too. A signed
+learning release registry stops routing with `learning release registry signature is invalid`, because its
+signature is the old key's: release those candidates again, or empty the registry, which is unsigned.
+
+## "owner allowed-signers is not the owner key on record"
+
+The owner key file in your records no longer matches the key the ledger recorded, so nothing can be signed
+and billing statements stop counting. If you did not change it, a program may have, so find out what ran
+before going further. To go on, choose "Replace a lost owner key" in `./setup.sh`.
 
 ## Codex reports the collector unreachable or "filesystem operation failed"
 
 The command ran inside Codex's sandbox. Run `./setup.sh`, choose "Update the install and walk through every
 step", and allow the rule in step 8 (Commands): the default there is "No, not now", so press Down once to
 "Yes, allow these commands" before Enter. Then start a new Codex session in the project's folder.
+
+## "input validation failed"
+
+With a `field` beside it, a task, assignment, parent grant or route was refused. The `field` names where to
+look, such as `task.family`; the value is never printed. A `field` naming a whole object (`task`,
+`assignment`) means it is not an object or has a key the contract does not allow. The worked example in the
+orchestrate-agents skill's `references/contracts.md` shows valid forms.
+
+Without a `field`, the cause is something else: an unreadable or invalid input file, or a check that depends
+on this machine or project.
 
 ## The Codex rule is "stale" after a Python or package upgrade
 

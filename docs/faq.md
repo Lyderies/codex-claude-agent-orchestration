@@ -49,7 +49,7 @@ Codex primary's session and its command rule, so every Codex child goes through 
 
 ## I lost my owner key passphrase. What now?
 
-Signed attestations stay valid, but you cannot sign new ones yet. See
+Choose "Replace a lost owner key" in `./setup.sh`. You then sign again in each project. See
 [troubleshooting](troubleshooting.md#i-lost-my-owner-key-passphrase).
 
 ## How do I remove it?

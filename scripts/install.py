@@ -82,7 +82,13 @@ REVERSE = {"install": "remove", "remove": "install"}
 # Owner commands a Claude primary may never run, whatever this checkout's parser lists.
 ALWAYS_OWNER_ONLY = ("install-codex-rule", "remove-codex-rule")
 # Paths a Claude primary may never edit with its file tools or recognised shell writes.
-PROTECTED_EDITS = ("/.codex/**", "/.agents/**", "/.claude/settings*.json", "/.git/**")
+PROTECTED_EDITS = (
+    "/.codex/**", "/.agents/**", "/.claude/settings*.json", "/.git/**",
+    "~/.local/state/codex-agents/**",
+)
+# Shell commands a Claude primary may never run: any that names the owner's records, or
+# replaces the owner key through the human step.
+PROTECTED_SHELL = ("*.local/state/codex-agents*", "*attest.py*--replace-owner-key*")
 CLI_PATTERN = "*.codex/orchestration/cli.py"
 MAX_SETTINGS_BYTES = 1024 * 1024
 # Every owner-only command an earlier release's installer denied (0.8.8 and 0.8.9). A recorded
@@ -477,7 +483,10 @@ def deny_rules(orchestration: Path = ORCHESTRATION) -> list[str]:
     starts the CLI itself, is not matched.
     """
 
-    return _rules_for(owner_only_commands(orchestration), PROTECTED_EDITS)
+    return [
+        *_rules_for(owner_only_commands(orchestration), PROTECTED_EDITS),
+        *(f"Bash({pattern})" for pattern in PROTECTED_SHELL),
+    ]
 
 
 def _rules_for(commands, edits) -> list[str]:

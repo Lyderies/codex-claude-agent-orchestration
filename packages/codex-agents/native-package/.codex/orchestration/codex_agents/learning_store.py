@@ -97,6 +97,7 @@ PACKAGE_VERSION = _package_version()
 COLLECTOR_AUTHORIZATION_SCHEMA_VERSION = 1
 # The one line `install_owner_public_key` writes; the allowed-signers file holds nothing else.
 # The owner's allowed-signers file is read whole up to this size; anything longer refuses.
+OWNER_KEY_REPLACE_HINT = "run ./setup.sh and choose Replace a lost owner key"
 OWNER_SIGNERS_MAX_BYTES = 4096
 OWNER_SIGNER_LINE = re.compile(
     rb"codex-agents-owner (?:ssh-ed25519|sk-ssh-ed25519@openssh\.com|ssh-rsa|"
@@ -1074,6 +1075,80 @@ def _check_owner_mode(path: Path, *, directory: bool) -> None:
         raise StateError("state file has another hard link")
 
 
+def _ssh_key_parts(blob: bytes) -> list[bytes]:
+    """The length-prefixed fields of a public key blob; nothing may be left over."""
+
+    parts: list[bytes] = []
+    position = 0
+    while position < len(blob):
+        length = int.from_bytes(blob[position:position + 4], "big")
+        end = position + 4 + length
+        if position + 4 > len(blob) or end > len(blob):
+            raise ValueError("truncated public key")
+        parts.append(blob[position + 4:end])
+        position = end
+    return parts
+
+
+def _require_canonical_key(key_type: str, parts: list[bytes]) -> None:
+    """Refuse a blob that is not its key type's one encoding of a usable key.
+
+    One key must have one spelling: `ssh-keygen` treats a padded RSA integer as the same
+    key, so a second spelling could bring back a key the history has retired.
+    """
+
+    if not parts or parts[0] != key_type.encode("ascii"):
+        raise ValueError("wrong public key type")
+    if key_type == "ssh-ed25519":
+        valid = len(parts) == 2 and len(parts[1]) == 32
+    elif key_type == "sk-ssh-ed25519@openssh.com":
+        valid = len(parts) == 3 and len(parts[1]) == 32 and bool(parts[2])
+    elif key_type == "ssh-rsa":
+        valid = (
+            len(parts) == 3
+            and all(_is_minimal_positive_integer(part) for part in parts[1:])
+            and len(parts[2].lstrip(b"\0")) >= 128
+        )
+    elif key_type in {"ecdsa-sha2-nistp256", "sk-ecdsa-sha2-nistp256@openssh.com"}:
+        valid = (
+            len(parts) == (3 if key_type.startswith("ecdsa") else 4)
+            and parts[1] == b"nistp256"
+            and len(parts[2]) == 65
+            and parts[2][0] == 4
+            and all(parts[3:])
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("malformed public key")
+
+
+def _is_minimal_positive_integer(value: bytes) -> bool:
+    if not value or value[0] & 0x80 or not any(value):
+        return False
+    return value[0] != 0 or bool(value[1] & 0x80)
+
+
+def _owner_key_identity(signer_line: bytes) -> bytes:
+    """What makes two signer lines the same key, whichever way an older one was encoded."""
+
+    fields = signer_line.split()
+    try:
+        parts = _ssh_key_parts(base64.b64decode(fields[2]))
+    except (ValueError, IndexError):
+        return signer_line
+    if fields[1] == b"ssh-rsa":
+        parts = [parts[0], *(part.lstrip(b"\0") for part in parts[1:])]
+    return b"\0".join(len(part).to_bytes(4, "big") + part for part in parts)
+
+
+def _signer_fingerprint(signer_line: bytes) -> str:
+    """The SHA256 fingerprint `ssh-keygen -l` prints for a canonical signer line."""
+
+    blob = base64.b64decode(signer_line.split()[2])
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+
+
 class LearningState:
     """Validated paths and the local keyed-digest secret."""
 
@@ -1180,8 +1255,9 @@ class LearningState:
             raise StateError(f"{label} key has an invalid length")
         return key
 
-    def install_owner_public_key(self, public_key: str) -> Path:
-        """Install one public SSH key; private signing material never enters state."""
+    @staticmethod
+    def _owner_signer_content(public_key: str) -> bytes:
+        """The one canonical signer line for a public SSH key."""
 
         fields = public_key.strip().split()
         allowed_types = {
@@ -1196,15 +1272,43 @@ class LearningState:
             or "PRIVATE" in public_key
         ):
             raise StateError("owner public key is invalid")
-        content = f"codex-agents-owner {fields[0]} {fields[1]}\n".encode("ascii")
+        try:
+            blob = base64.b64decode(fields[1], validate=True)
+            parts = _ssh_key_parts(blob)
+            _require_canonical_key(fields[0], parts)
+        except ValueError as exc:
+            raise StateError("owner public key is invalid") from exc
+        if base64.b64encode(blob).decode("ascii") != fields[1]:
+            raise StateError("owner public key is invalid")
+        return f"codex-agents-owner {fields[0]} {fields[1]}\n".encode("ascii")
+
+    def install_owner_public_key(self, public_key: str) -> Path:
+        """Install one public SSH key; private signing material never enters state.
+
+        Only the first key: once the ledger has recorded one, an emptied file does not
+        open the door to another, and the same key may only be put back.
+        """
+
+        content = self._owner_signer_content(public_key)
         existing = self.allowed_signers_path.read_bytes()
         if existing:
             if existing == content:
                 return self.allowed_signers_path
             raise StateError(
-                "owner public key is already configured; key rotation requires a reviewed action"
+                f"owner public key is already configured; to change it, {OWNER_KEY_REPLACE_HINT}"
             )
+        recorded = self.recorded_owner_key()
+        if recorded is not None and recorded["signer_line"] != content:
+            raise StateError(
+                f"an owner key is already on record; to change it, {OWNER_KEY_REPLACE_HINT}"
+            )
+        return self._write_owner_signers(content)
+
+    def _write_owner_signers(self, content: bytes) -> Path:
         temporary = self.root / ".owner-allowed-signers.tmp"
+        # A leftover from an interrupted write would otherwise block every later one.
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -1224,7 +1328,13 @@ class LearningState:
         return self.allowed_signers_path
 
     def owner_allowed_signers(self) -> Path:
-        """The allowed-signers file, only while it names exactly one owner key.
+        """The allowed-signers file, only while it passes `owner_signer_line`."""
+
+        self.owner_signer_line()
+        return self.allowed_signers_path
+
+    def owner_signer_line(self) -> bytes:
+        """The allowed-signers bytes, only while they name exactly one owner key.
 
         It must be exactly the single canonical line `install_owner_public_key` writes:
         `ssh-keygen -Y verify` accepts a signature from any key the file lists, so a second
@@ -1249,7 +1359,76 @@ class LearningState:
         # key after an over-long first line would otherwise go unchecked.
         if len(content) > OWNER_SIGNERS_MAX_BYTES or OWNER_SIGNER_LINE.fullmatch(content) is None:
             raise StateError("owner allowed-signers must name exactly one owner key")
-        return self.allowed_signers_path
+        recorded = self.recorded_owner_key()
+        if recorded is not None and recorded["signer_line"] != content:
+            raise StateError(
+                f"owner allowed-signers is not the owner key on record; {OWNER_KEY_REPLACE_HINT}"
+            )
+        return content
+
+    def recorded_owner_key(self) -> dict[str, Any] | None:
+        """The owner key the ledger last recorded, or None before one is recorded.
+
+        Read fresh every time, so a long-running collector sees what the file is checked
+        against now. A ledger that cannot be read fails closed.
+        """
+
+        if self.database.is_symlink():
+            raise StateError("database path is unsafe")
+        if not self.database.is_file() or self.database.stat().st_size == 0:
+            return None
+        try:
+            connection = sqlite3.connect(f"{self.database.as_uri()}?mode=ro", uri=True, timeout=1)
+            try:
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_key_history'"
+                ).fetchone() is None:
+                    return None
+                row = connection.execute(
+                    "SELECT signer_line,recorded_at_ms FROM owner_key_history "
+                    "ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()
+                replaced = connection.execute(
+                    "SELECT COUNT(*),MAX(recorded_at_ms) FROM owner_key_history "
+                    "WHERE reason='replaced'"
+                ).fetchone()
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            raise StateError("the owner key record could not be read") from exc
+        if row is None:
+            return None
+        return {
+            "signer_line": bytes(row[0]),
+            "recorded_at_ms": int(row[1]),
+            "replacements": int(replaced[0]),
+            "last_replaced_at_ms": replaced[1],
+        }
+
+    def owner_key_report(self) -> dict[str, Any]:
+        """Which owner key is in force and when it last changed; public material only."""
+
+        report: dict[str, Any] = {
+            "state": "not_configured", "fingerprint": None,
+            "replacements": 0, "last_replaced_at_ms": None,
+        }
+        recorded = None
+        try:
+            recorded = self.recorded_owner_key()
+            if recorded is not None:
+                report.update(
+                    fingerprint=_signer_fingerprint(recorded["signer_line"]),
+                    replacements=recorded["replacements"],
+                    last_replaced_at_ms=recorded["last_replaced_at_ms"],
+                )
+            self.owner_allowed_signers()
+            report["state"] = "ok"
+        except (StateError, OSError, ValueError) as exc:
+            not_configured = recorded is None and (
+                isinstance(exc, FileNotFoundError) or "not configured" in str(exc)
+            )
+            report["state"] = "not_configured" if not_configured else "mismatch"
+        return report
 
     def harden_database_files(self) -> None:
         for suffix in ("", "-wal", "-shm", "-journal"):
@@ -1660,6 +1839,7 @@ class LearningLedger:
         try:
             self._connection = self._connect()
             self._migrate()
+            self._record_first_owner_key()
             self._reconcile_managed_files()
         except Exception:
             connection = getattr(self, "_connection", None)
@@ -1689,6 +1869,94 @@ class LearningLedger:
         connection.execute("PRAGMA busy_timeout = 5000")
         self.state.harden_database_files()
         return connection
+
+    def _record_first_owner_key(self) -> None:
+        """Record the key in force the first time a ledger sees one.
+
+        From then on the signer file must match this record. The history only grows.
+        """
+
+        with self._lock, self._connection:
+            self._connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS owner_key_history (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signer_line BLOB NOT NULL,
+                    reason TEXT NOT NULL CHECK(reason IN ('enrolled','replaced')),
+                    recorded_at_ms INTEGER NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS owner_key_history_no_update
+                BEFORE UPDATE ON owner_key_history
+                BEGIN SELECT RAISE(ABORT,'owner key history is append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS owner_key_history_no_delete
+                BEFORE DELETE ON owner_key_history
+                BEGIN SELECT RAISE(ABORT,'owner key history is append-only'); END;
+                """
+            )
+            if self._connection.execute(
+                "SELECT 1 FROM owner_key_history LIMIT 1"
+            ).fetchone() is not None:
+                return
+            path = self.state.allowed_signers_path
+            if path.is_symlink() or not path.is_file():
+                return
+            try:
+                content = path.read_bytes()[: OWNER_SIGNERS_MAX_BYTES + 1]
+            except OSError:
+                return  # opening the ledger must not depend on a damaged signer file
+            if OWNER_SIGNER_LINE.fullmatch(content) is None:
+                return
+            self._connection.execute(
+                "INSERT INTO owner_key_history(signer_line,reason,recorded_at_ms) "
+                "VALUES(?,'enrolled',?)",
+                (content, time.time_ns() // 1_000_000),
+            )
+
+    def replace_owner_key(self, public_key: str, *, now_ms: int | None = None) -> dict[str, Any]:
+        """Make a new key the owner key, for an owner who cannot use the old one.
+
+        The old key is not asked for, since it is what was lost. The record is committed
+        first and the signer file follows: an interruption between them fails closed until
+        the same replacement is run again, and that run finishes it. Billing statements the
+        old key signed stop counting, because admission checks them against the current key,
+        and a key once replaced cannot come back, which would revive them. With no record
+        yet, a signer file that holds anything can be replaced; an empty one is first setup.
+        """
+
+        content = self.state._owner_signer_content(public_key)
+        timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
+        path = self.state.allowed_signers_path
+        damaged = path.is_dir() and not path.is_symlink()
+        if damaged:
+            os.rmdir(path)  # refuses a non-empty one, before anything is recorded
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT signer_line FROM owner_key_history ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            if row is None and not (
+                damaged
+                or path.is_symlink()
+                or (path.exists() and (not path.is_file() or path.stat().st_size > 0))
+            ):
+                raise LedgerError("no owner key is on record, so there is nothing to replace")
+            if row is None or bytes(row["signer_line"]) != content:
+                identity = _owner_key_identity(content)
+                if any(
+                    _owner_key_identity(bytes(earlier["signer_line"])) == identity
+                    for earlier in self._connection.execute(
+                        "SELECT signer_line FROM owner_key_history"
+                    ).fetchall()
+                ):
+                    raise LedgerError("that key was replaced earlier; use a new key")
+                self._connection.execute(
+                    "INSERT INTO owner_key_history(signer_line,reason,recorded_at_ms) "
+                    "VALUES(?,'replaced',?)",
+                    (content, timestamp),
+                )
+        self.state._write_owner_signers(content)
+        self.state.harden_database_files()
+        return self.state.owner_key_report()
 
     def _expire_worker_results_locked(self, now: int) -> list[tuple[str, str]]:
         """Mark the worker results that may no longer be kept; return them.
@@ -3441,7 +3709,7 @@ class LearningLedger:
             raise LedgerError("upgrade reconciliation request has expired")
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if not authority.verify_upgrade_reconciliation_signature(request, signature):
             raise LedgerError("upgrade reconciliation owner signature is invalid")
         with self._lock, self._connection:
@@ -4764,18 +5032,35 @@ class LearningLedger:
         result = []
         for row in rows:
             record = json.loads(bytes(row["content"]))
-            # Attestations count only when an owner signature was verified.
+            # Attestations count only while the current owner key verifies their signature,
+            # so replacing or swapping the key cancels what the earlier key signed.
             if record_type == "billing_attestation" and (
                 row["source"] != "owner"
-                or self._connection.execute(
-                    "SELECT 1 FROM owner_attestations "
-                    "WHERE project_id=? AND subject_record_id=?",
-                    (project_id, record["record_id"]),
-                ).fetchone() is None
+                or not self._attestation_signed_by_owner_locked(project_id, record)
             ):
                 continue
             result.append((record, str(row["content_digest"])))
         return result
+
+    def _attestation_signed_by_owner_locked(
+        self, project_id: str, record: dict[str, Any]
+    ) -> bool:
+        from .learning_engine import OwnerGrantAuthority
+
+        receipt = self._connection.execute(
+            "SELECT signature FROM owner_attestations "
+            "WHERE project_id=? AND subject_record_id=?",
+            (project_id, record["record_id"]),
+        ).fetchone()
+        if receipt is None:
+            return False
+        try:
+            authority = OwnerGrantAuthority.for_state(self.state)
+            return authority.verify_owner_record(
+                project_id, record, bytes(receipt["signature"])
+            )
+        except (StateError, ContractError, OSError):
+            return False
 
     def _admission_settings(self, provider: str) -> dict[str, Any] | None:
         """The provider's committed admission settings; None if they cannot be read."""
@@ -6332,7 +6617,7 @@ class LearningLedger:
         )
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if not authority.verify_qa_attestation(project_id, qa, signature):
             raise LedgerError("verified QA attestation is invalid")
         timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
@@ -6464,7 +6749,7 @@ class LearningLedger:
             raise LedgerError("authenticated owner record type is unsupported")
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if not authority.verify_owner_record(project_id, checked, signature):
             raise LedgerError("owner record signature is invalid")
         timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
@@ -7578,7 +7863,7 @@ class LearningLedger:
         authorization_timestamp = time.time_ns() // 1_000_000
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if (
             not authority.verify(checked_grant)
             or not checked_grant["issued_at_ms"]
@@ -8037,7 +8322,7 @@ class LearningLedger:
             json.loads(bytes(row["content"])) for row in promotion_rows
         ]
         active: list[tuple[int, dict[str, Any]]] = []
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         for row in candidate_rows:
             candidate = json.loads(bytes(row["content"]))
             parts = candidate["task_slice"].split("-")
@@ -8138,7 +8423,7 @@ class LearningLedger:
             (json.loads(bytes(row["content"])), int(row["source_sequence"]))
             for row in outcome_rows
         ]
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         active: list[dict[str, Any]] = []
         for row in candidate_rows:
             candidate = json.loads(bytes(row["content"]))

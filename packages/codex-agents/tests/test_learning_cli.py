@@ -397,6 +397,29 @@ class LearningCliTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail("collector did not stop")
 
+    def test_replacing_the_owner_key_through_the_cli(self) -> None:
+        try:
+            before = self._run("learning-status")["owner_key"]
+            self.assertEqual((before["state"], before["replacements"]), ("ok", 0))
+            directory = Path(self.temporary.name) / "replacement"
+            directory.mkdir()
+            key, public = generate_test_owner_key(directory)
+            self.assertNotEqual(before["fingerprint"], None)
+            replaced = self._run(
+                "learning-replace-owner-key", "--public-key", f"{key}.pub"
+            )["owner_key"]
+            self.assertEqual((replaced["state"], replaced["replacements"]), ("ok", 1))
+            self.assertNotEqual(replaced["fingerprint"], before["fingerprint"])
+            after = self._run("learning-status")["owner_key"]
+            self.assertEqual(after, replaced)
+            fields = public.split()
+            self.assertEqual(
+                (self.state_root / "owner-allowed-signers").read_text(),
+                f"codex-agents-owner {fields[0]} {fields[1]}\n",
+            )
+        finally:
+            self._stop_collector()
+
     def test_status_recovers_collector_and_direct_command_restarts_it(self) -> None:
         try:
             first = self._run("learning-status")

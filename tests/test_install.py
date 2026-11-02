@@ -556,8 +556,13 @@ class UmbrellaInstallTests(unittest.TestCase):
             self.assertFalse(any(rule.startswith(f"Bash(*.codex/orchestration/cli.py {name}")
                                  and rule[len(f"Bash(*.codex/orchestration/cli.py {name}"):][:1] in (")", " ")
                                  for rule in rules), name)
-        for path in ("/.codex/**", "/.agents/**", "/.claude/settings*.json", "/.git/**"):
+        for path in ("/.codex/**", "/.agents/**", "/.claude/settings*.json", "/.git/**",
+                     "~/.local/state/codex-agents/**"):
             self.assertIn(f"Edit({path})", rules)
+        self.assertIn("Bash(*.local/state/codex-agents*)", rules)
+        self.assertIn("Bash(*attest.py*--replace-owner-key*)", rules)
+        self.assertIn("learning-replace-owner-key", owner)
+        self.assertNotIn("learning-replace-owner-key", primary)
 
     def settings(self) -> dict:
         return json.loads((self.target / ".claude" / "settings.json").read_text(encoding="utf-8"))

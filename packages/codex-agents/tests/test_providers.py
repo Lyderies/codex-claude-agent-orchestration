@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import functools
 import hashlib
+import base64
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,11 +30,16 @@ from codex_agents.learning_contracts import (
     validate_learning_record,
 )
 from codex_agents.routing import load_policy
+from codex_agents.learning_engine import OwnerGrantAuthority
 from codex_agents.learning_store import (
     PRODUCER_AUTHORITY,
     LearningLedger,
     LearningState,
     LedgerError,
+    OWNER_SIGNER_LINE,
+    StateError,
+    _owner_key_identity,
+    _ssh_key_parts,
     authorize_collector_runtime,
 )
 from codex_agents.providers import (
@@ -1113,6 +1120,302 @@ class AdmissionTests(unittest.TestCase):
                 "no_paid_overage": False, "no_usage_credits": True, "issued_at": 5,
             })
         self.assert_denied("billing_attestation_missing")
+
+    # Replacing a lost owner key.
+
+    def other_key(self, name: str = "other") -> tuple[Path, str]:
+        directory = Path(self.temporary.name) / name
+        directory.mkdir()
+        return generate_test_owner_key(directory)
+
+    def denial(self) -> str:
+        """The admission denial's reason, or "admitted"."""
+
+        try:
+            self.admit()
+        except AdmissionDenied as denied:
+            return denied.reason_code
+        return "admitted"
+
+    def test_an_emptied_signer_file_does_not_accept_another_key(self) -> None:
+        identity = self.observe()[0]
+        original = self.state.allowed_signers_path.read_bytes()
+        self.state.allowed_signers_path.write_bytes(b"")
+        key, public = self.other_key()
+        with self.assertRaisesRegex(StateError, "Replace a lost owner key"):
+            self.state.install_owner_public_key(public)
+        with self.assertRaises((LedgerError, StateError)):
+            attest_provider(
+                self.ledger, self.project_id, key, "codex", identity["account_fingerprint"]
+            )
+        self.assert_denied("billing_attestation_missing")
+        # The key on record may be put back.
+        self.state.install_owner_public_key(original.decode("ascii").split(" ", 1)[1])
+        self.assertEqual(self.state.allowed_signers_path.read_bytes(), original)
+        self.assertEqual(self.state.owner_key_report()["state"], "ok")
+
+    def test_a_swapped_signer_file_signs_nothing_and_stops_admission(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.attest("codex", fingerprint)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+        original = self.state.allowed_signers_path.read_bytes()
+        key, public = self.other_key()
+        fields = public.split()
+        self.state.allowed_signers_path.write_bytes(
+            f"codex-agents-owner {fields[0]} {fields[1]}\n".encode("ascii")
+        )
+        with self.assertRaisesRegex(StateError, "not the owner key on record"):
+            self.state.owner_allowed_signers()
+        self.assertEqual(self.state.owner_key_report()["state"], "mismatch")
+        self.assert_denied("billing_attestation_missing")
+        with self.assertRaises((LedgerError, StateError)):
+            attest_provider(self.ledger, self.project_id, key, "codex", fingerprint)
+        # Putting the recorded key back restores what it signed.
+        self.state.allowed_signers_path.write_bytes(original)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+
+    def test_replacing_the_key_cancels_what_the_old_key_signed(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.attest("codex", fingerprint)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+        key, public = self.other_key()
+        report = self.ledger.replace_owner_key(public, now_ms=NOW)
+        self.assertEqual(report["state"], "ok")
+        self.assertEqual(report["replacements"], 1)
+        self.assertEqual(report["last_replaced_at_ms"], NOW)
+        listed = subprocess.run(
+            ["ssh-keygen", "-l", "-f", f"{key}.pub"], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(report["fingerprint"], listed.stdout.split()[1])
+        self.assert_denied("billing_attestation_missing")
+        # The old key can no longer sign; the new one can.
+        with self.assertRaises(LedgerError):
+            attest_provider(
+                self.ledger, self.project_id, self.owner_private_key, "codex", fingerprint,
+                issued_at=2,
+            )
+        attest_provider(self.ledger, self.project_id, key, "codex", fingerprint, issued_at=3)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+
+    def test_an_interrupted_replacement_fails_closed_and_can_be_finished(self) -> None:
+        self.observe()
+        key, public = self.other_key()
+        with mock.patch.object(
+            self.state, "_write_owner_signers", side_effect=OSError("interrupted")
+        ):
+            with self.assertRaises(OSError):
+                self.ledger.replace_owner_key(public, now_ms=NOW)
+        self.assertEqual(self.state.owner_key_report()["state"], "mismatch")
+        self.assert_denied("billing_attestation_missing")
+        report = self.ledger.replace_owner_key(public, now_ms=NOW + 1)
+        self.assertEqual(report["state"], "ok")
+        self.assertEqual(report["replacements"], 1)
+        self.assertEqual(report["last_replaced_at_ms"], NOW)
+
+    def test_a_run_admitted_before_the_replacement_does_not_launch(self) -> None:
+        identity = self.observe()[0]
+        attestation = (
+            {"provider": "codex", "account_fingerprint": identity["account_fingerprint"],
+             "observed_at_ms": 1, "codex_credits_spending_disabled": True},
+            DIGEST_B,
+        )
+        self.assertEqual(
+            evaluate_launch(
+                provider="codex", identity=identity, billing=[], headroom=[],
+                now_ms=NOW + 1, attestations=[],
+            ),
+            "billing_attestation_missing",
+        )
+        self.assertNotEqual(
+            evaluate_launch(
+                provider="codex", identity=identity, billing=[], headroom=[],
+                now_ms=NOW + 1, attestations=[attestation],
+            ),
+            "billing_attestation_missing",
+        )
+
+    def test_launch_recheck_refuses_after_the_key_is_replaced(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.observe()
+        run = self.open_run()
+        after = self.observe()[0]
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            self.assertIsNone(self.ledger.launch_recheck(
+                self.project_id, run_handle=run["run_handle"], identity=after
+            ))
+        self.ledger.replace_owner_key(self.other_key()[1], now_ms=NOW)
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            self.assertEqual("billing_attestation_missing", self.ledger.launch_recheck(
+                self.project_id, run_handle=run["run_handle"], identity=after
+            ))
+
+    def test_a_replaced_key_cannot_come_back(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        original = self.owner_private_key.with_suffix(".pub").read_text()
+        _, public = self.other_key()
+        self.ledger.replace_owner_key(public, now_ms=NOW)
+        with self.assertRaisesRegex(LedgerError, "replaced earlier"):
+            self.ledger.replace_owner_key(original, now_ms=NOW + 1)
+        self.assert_denied("billing_attestation_missing")
+
+    @staticmethod
+    def key_blob(*parts: bytes) -> str:
+        blob = b"".join(len(part).to_bytes(4, "big") + part for part in parts)
+        return base64.b64encode(blob).decode("ascii")
+
+    def test_a_public_key_must_parse_before_it_is_recorded(self) -> None:
+        before = self.state.owner_key_report()
+        good = self.owner_private_key.with_suffix(".pub").read_text().split()[1]
+        raw = base64.b64decode(good)
+        ed = b"ssh-ed25519"
+        for bad in (
+            "ssh-ed25519 AAAAA",
+            "ssh-ed25519 QUJD",
+            "ssh-rsa " + good,
+            f"ssh-ed25519 {self.key_blob(ed, b'x' * 5)}",
+            f"ssh-ed25519 {self.key_blob(ed)}",
+            f"ssh-ed25519 {base64.b64encode(raw + b'tail').decode('ascii')}",
+            f"ssh-ed25519 {self.key_blob(ed, b'x' * 32, b'extra')}",
+            "ssh-rsa " + self.key_blob(b"ssh-rsa", b"\x01\x00\x01", b"\x7f" * 64),
+            "ssh-rsa " + self.key_blob(b"ssh-rsa", b"\x00\x01\x00\x01", b"\x7f" * 256),
+            "ssh-rsa " + self.key_blob(b"ssh-rsa", b"\x01\x00\x01", b"\x00" + b"\x7f" * 256),
+            "ecdsa-sha2-nistp256 " + self.key_blob(
+                b"ecdsa-sha2-nistp256", b"nistp384", b"\x04" + b"x" * 64
+            ),
+            "ecdsa-sha2-nistp256 " + self.key_blob(
+                b"ecdsa-sha2-nistp256", b"nistp256", b"\x03" + b"x" * 32
+            ),
+            "sk-ssh-ed25519@openssh.com "
+            + self.key_blob(b"sk-ssh-ed25519@openssh.com", b"x" * 32),
+        ):
+            with self.subTest(bad=bad), self.assertRaisesRegex(StateError, "public key is invalid"):
+                self.ledger.replace_owner_key(bad, now_ms=NOW)
+        self.assertEqual(self.state.owner_key_report(), before)
+
+    def test_every_allowed_key_type_is_accepted(self) -> None:
+        for key_type, bits in (("rsa", "3072"), ("ecdsa", "256")):
+            directory = Path(self.temporary.name) / f"real-{key_type}"
+            directory.mkdir()
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", key_type, "-b", bits, "-N", "", "-f", str(directory / "k")],
+                check=True,
+            )
+            line = self.state._owner_signer_content((directory / "k.pub").read_text())
+            self.assertTrue(OWNER_SIGNER_LINE.fullmatch(line))
+        for key_type, parts in (
+            ("sk-ssh-ed25519@openssh.com", (b"x" * 32, b"ssh:")),
+            ("sk-ecdsa-sha2-nistp256@openssh.com", (b"nistp256", b"\x04" + b"x" * 64, b"ssh:")),
+        ):
+            self.state._owner_signer_content(
+                f"{key_type} {self.key_blob(key_type.encode('ascii'), *parts)}"
+            )
+
+    def test_a_replaced_rsa_key_cannot_come_back_in_another_encoding(self) -> None:
+        directory = Path(self.temporary.name) / "rsa"
+        directory.mkdir()
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "rsa", "-b", "3072", "-N", "", "-f", str(directory / "k")],
+            check=True,
+        )
+        rsa = (directory / "k.pub").read_text()
+        self.ledger.replace_owner_key(rsa, now_ms=NOW)
+        self.ledger.replace_owner_key(self.other_key()[1], now_ms=NOW + 1)
+        with self.assertRaisesRegex(LedgerError, "replaced earlier"):
+            self.ledger.replace_owner_key(rsa, now_ms=NOW + 2)
+        fields = rsa.split()
+        parts = [
+            bytes(part) for part in _ssh_key_parts(base64.b64decode(fields[1]))
+        ]
+        padded = self.key_blob(parts[0], parts[1], b"\x00" + parts[2])
+        with self.assertRaisesRegex(StateError, "public key is invalid"):
+            self.ledger.replace_owner_key(f"ssh-rsa {padded}", now_ms=NOW + 2)
+        # A history row spelled the padded way, as an older version could have enrolled, still counts.
+        self.assertEqual(
+            _owner_key_identity(f"codex-agents-owner ssh-rsa {padded}\n".encode("ascii")),
+            _owner_key_identity(f"codex-agents-owner ssh-rsa {fields[1]}\n".encode("ascii")),
+        )
+
+    def test_damaged_signer_files_do_not_block_opening_or_replacing(self) -> None:
+        for name, damage in (
+            ("unreadable", lambda path: path.chmod(0o000)),
+            ("directory", lambda path: (path.unlink(), path.mkdir())),
+            ("fifo", lambda path: (path.unlink(), os.mkfifo(path))),
+        ):
+            with self.subTest(name):
+                base = Path(self.temporary.name) / f"damaged-{name}"
+                base.mkdir()
+                state = LearningState(base / "state")
+                state.allowed_signers_path.write_bytes(b"two\nlines\n")
+                damage(state.allowed_signers_path)
+                fresh = LearningLedger(state, client_capabilities=self.clients)
+                try:
+                    report = fresh.replace_owner_key(self.other_key(f"key-{name}")[1], now_ms=NOW)
+                    self.assertEqual((report["state"], report["replacements"]), ("ok", 1))
+                finally:
+                    fresh.close()
+
+    def test_verification_uses_the_checked_bytes_not_the_file(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        old_line = self.state.allowed_signers_path.read_bytes()
+        _, public = self.other_key()
+        self.ledger.replace_owner_key(public, now_ms=NOW)
+        authority = OwnerGrantAuthority.for_state(self.state)
+        self.state.allowed_signers_path.write_bytes(old_line)  # after the check
+        with self.ledger._lock:
+            row = self.ledger._connection.execute(
+                "SELECT subject_record_id,signature FROM owner_attestations WHERE project_id=?",
+                (self.project_id,),
+            ).fetchone()
+            content = self.ledger._connection.execute(
+                "SELECT content FROM records WHERE project_id=? AND record_id=?",
+                (self.project_id, row["subject_record_id"]),
+            ).fetchone()
+        self.assertFalse(authority.verify_owner_record(
+            self.project_id, json.loads(bytes(content["content"])), bytes(row["signature"])
+        ))
+
+    def test_a_damaged_signer_file_with_no_record_can_be_replaced_or_enrolled(self) -> None:
+        base = Path(self.temporary.name) / "fresh"
+        base.mkdir()
+        state = LearningState(base / "state")
+        state.allowed_signers_path.write_bytes(b"two\nlines\n")
+        fresh = LearningLedger(state, client_capabilities=self.clients)
+        try:
+            self.assertEqual(state.owner_key_report()["state"], "mismatch")
+            report = fresh.replace_owner_key(self.other_key()[1], now_ms=NOW)
+            self.assertEqual((report["state"], report["replacements"]), ("ok", 1))
+        finally:
+            fresh.close()
+        state.allowed_signers_path.unlink()
+        self.assertEqual(state.owner_key_report()["state"], "mismatch")  # a key is on record
+        base = Path(self.temporary.name) / "deleted"
+        base.mkdir()
+        untouched = LearningState(base / "state")
+        untouched.allowed_signers_path.unlink()
+        self.assertEqual(untouched.owner_key_report()["state"], "not_configured")
+
+    def test_the_key_history_only_grows_and_needs_a_first_key(self) -> None:
+        for statement in (
+            "DELETE FROM owner_key_history",
+            "UPDATE owner_key_history SET reason='replaced'",
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.ledger._connection.execute(statement)
+        base = Path(self.temporary.name) / "fresh"
+        base.mkdir()
+        fresh_state = LearningState(base / "state")
+        fresh = LearningLedger(fresh_state, client_capabilities=self.clients)
+        try:
+            self.assertEqual(fresh_state.owner_key_report()["state"], "not_configured")
+            with self.assertRaisesRegex(LedgerError, "nothing to replace"):
+                fresh.replace_owner_key(self.other_key()[1], now_ms=NOW)
+        finally:
+            fresh.close()
 
     # S3b: client version, Codex plan, the run-count backstop, restrictive
     # rate-limit events.
