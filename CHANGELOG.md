@@ -23,8 +23,9 @@
 - **Independent verification.** A routed Claude Opus/high source review found a false packaged-fallback
   warning, QA documentation overclaims and a misleading collector-down status message. These are
   corrected, with CLI regressions for missing-attestation guidance, slow signature lookup and unavailable
-  status. The lookup uses a longer status timeout; signature checks still share the collector thread, so
-  large attestation histories can delay hooks. Historical lifecycle gaps cannot be attributed from
+  status. The lookup uses a longer status timeout; signature checks still share the collector thread,
+  so status can delay or drop hook events and produce ambiguous failure counters as attestations grow.
+  Historical lifecycle gaps cannot be attributed from
   aggregate counters alone. The earlier Haiku research report was rejected by its routed Codex/high
   verifier for overclaims; only the reproduced hook collision informed the fix.
 

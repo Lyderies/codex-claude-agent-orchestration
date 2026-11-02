@@ -76,7 +76,8 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
    A bridged result has exactly one accepted attempt and no repair. Add `terminal_state` only
    when there is an authoritative host terminal fact; for a bridge copy the returned
    `bridge_report.terminal_state` exactly when set. Never copy a child's timeout claim.
-   Pass the exact task, assignment, parent grant, route and returned result with the observation.
+   Pass the exact task, assignment, parent grant and returned result with the observation.
+   This command derives the route itself; do not pass `--route`.
    Always finish with `learning-record-host-result`, even for a failed or timed-out
    child. Keep the printed `host_outcome_digest`: it is the one identifier for this
    outcome that verification and operational QA accept (not the `out:` record ID).
