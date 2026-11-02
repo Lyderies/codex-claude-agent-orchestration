@@ -1075,6 +1075,73 @@ def _check_owner_mode(path: Path, *, directory: bool) -> None:
         raise StateError("state file has another hard link")
 
 
+def _ssh_key_parts(blob: bytes) -> list[bytes]:
+    """The length-prefixed fields of a public key blob; nothing may be left over."""
+
+    parts: list[bytes] = []
+    position = 0
+    while position < len(blob):
+        length = int.from_bytes(blob[position:position + 4], "big")
+        end = position + 4 + length
+        if position + 4 > len(blob) or end > len(blob):
+            raise ValueError("truncated public key")
+        parts.append(blob[position + 4:end])
+        position = end
+    return parts
+
+
+def _require_canonical_key(key_type: str, parts: list[bytes]) -> None:
+    """Refuse a blob that is not its key type's one encoding of a usable key.
+
+    One key must have one spelling: `ssh-keygen` treats a padded RSA integer as the same
+    key, so a second spelling could bring back a key the history has retired.
+    """
+
+    if not parts or parts[0] != key_type.encode("ascii"):
+        raise ValueError("wrong public key type")
+    if key_type == "ssh-ed25519":
+        valid = len(parts) == 2 and len(parts[1]) == 32
+    elif key_type == "sk-ssh-ed25519@openssh.com":
+        valid = len(parts) == 3 and len(parts[1]) == 32 and bool(parts[2])
+    elif key_type == "ssh-rsa":
+        valid = (
+            len(parts) == 3
+            and all(_is_minimal_positive_integer(part) for part in parts[1:])
+            and len(parts[2].lstrip(b"\0")) >= 128
+        )
+    elif key_type in {"ecdsa-sha2-nistp256", "sk-ecdsa-sha2-nistp256@openssh.com"}:
+        valid = (
+            len(parts) == (3 if key_type.startswith("ecdsa") else 4)
+            and parts[1] == b"nistp256"
+            and len(parts[2]) == 65
+            and parts[2][0] == 4
+            and all(parts[3:])
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("malformed public key")
+
+
+def _is_minimal_positive_integer(value: bytes) -> bool:
+    if not value or value[0] & 0x80 or not any(value):
+        return False
+    return value[0] != 0 or bool(value[1] & 0x80)
+
+
+def _owner_key_identity(signer_line: bytes) -> bytes:
+    """What makes two signer lines the same key, whichever way an older one was encoded."""
+
+    fields = signer_line.split()
+    try:
+        parts = _ssh_key_parts(base64.b64decode(fields[2]))
+    except (ValueError, IndexError):
+        return signer_line
+    if fields[1] == b"ssh-rsa":
+        parts = [parts[0], *(part.lstrip(b"\0") for part in parts[1:])]
+    return b"\0".join(len(part).to_bytes(4, "big") + part for part in parts)
+
+
 def _signer_fingerprint(signer_line: bytes) -> str:
     """The SHA256 fingerprint `ssh-keygen -l` prints for a canonical signer line."""
 
@@ -1207,10 +1274,11 @@ class LearningState:
             raise StateError("owner public key is invalid")
         try:
             blob = base64.b64decode(fields[1], validate=True)
+            parts = _ssh_key_parts(blob)
+            _require_canonical_key(fields[0], parts)
         except ValueError as exc:
             raise StateError("owner public key is invalid") from exc
-        length = int.from_bytes(blob[:4], "big")
-        if blob[4:4 + length] != fields[0].encode("ascii") or len(blob) <= 4 + length:
+        if base64.b64encode(blob).decode("ascii") != fields[1]:
             raise StateError("owner public key is invalid")
         return f"codex-agents-owner {fields[0]} {fields[1]}\n".encode("ascii")
 
@@ -1832,7 +1900,10 @@ class LearningLedger:
             path = self.state.allowed_signers_path
             if path.is_symlink() or not path.is_file():
                 return
-            content = path.read_bytes()[: OWNER_SIGNERS_MAX_BYTES + 1]
+            try:
+                content = path.read_bytes()[: OWNER_SIGNERS_MAX_BYTES + 1]
+            except OSError:
+                return  # opening the ledger must not depend on a damaged signer file
             if OWNER_SIGNER_LINE.fullmatch(content) is None:
                 return
             self._connection.execute(
@@ -1854,20 +1925,29 @@ class LearningLedger:
 
         content = self.state._owner_signer_content(public_key)
         timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
+        path = self.state.allowed_signers_path
+        damaged = path.is_dir() and not path.is_symlink()
+        if damaged:
+            os.rmdir(path)  # refuses a non-empty one, before anything is recorded
         with self._lock, self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
             row = self._connection.execute(
                 "SELECT signer_line FROM owner_key_history ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
-            path = self.state.allowed_signers_path
             if row is None and not (
-                path.is_symlink() or (path.exists() and path.stat().st_size > 0)
+                damaged
+                or path.is_symlink()
+                or (path.exists() and (not path.is_file() or path.stat().st_size > 0))
             ):
                 raise LedgerError("no owner key is on record, so there is nothing to replace")
             if row is None or bytes(row["signer_line"]) != content:
-                if self._connection.execute(
-                    "SELECT 1 FROM owner_key_history WHERE signer_line=?", (content,)
-                ).fetchone() is not None:
+                identity = _owner_key_identity(content)
+                if any(
+                    _owner_key_identity(bytes(earlier["signer_line"])) == identity
+                    for earlier in self._connection.execute(
+                        "SELECT signer_line FROM owner_key_history"
+                    ).fetchall()
+                ):
                     raise LedgerError("that key was replaced earlier; use a new key")
                 self._connection.execute(
                     "INSERT INTO owner_key_history(signer_line,reason,recorded_at_ms) "

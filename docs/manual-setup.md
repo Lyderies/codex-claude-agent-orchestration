@@ -135,7 +135,8 @@ No child runs until you confirm that each account cannot be charged beyond its s
   passphrase" in `./setup.sh`, or run
   `python3 -I -B -S -X pycache_prefix=/dev/null scripts/attest.py --change-passphrase`.
 
-Run it again whenever your billing settings change. Owner key rotation is not available yet.
+Run it again whenever your billing settings change. If you lose the passphrase, choose "Replace a lost owner
+key" in `./setup.sh`.
 
 ## 5. Optional: Codex orchestrator profile
 

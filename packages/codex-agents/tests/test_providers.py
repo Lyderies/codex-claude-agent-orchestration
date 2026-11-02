@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import hashlib
+import base64
 import json
 import os
 import sqlite3
@@ -35,7 +36,10 @@ from codex_agents.learning_store import (
     LearningLedger,
     LearningState,
     LedgerError,
+    OWNER_SIGNER_LINE,
     StateError,
+    _owner_key_identity,
+    _ssh_key_parts,
     authorize_collector_runtime,
 )
 from codex_agents.providers import (
@@ -1258,13 +1262,101 @@ class AdmissionTests(unittest.TestCase):
             self.ledger.replace_owner_key(original, now_ms=NOW + 1)
         self.assert_denied("billing_attestation_missing")
 
+    @staticmethod
+    def key_blob(*parts: bytes) -> str:
+        blob = b"".join(len(part).to_bytes(4, "big") + part for part in parts)
+        return base64.b64encode(blob).decode("ascii")
+
     def test_a_public_key_must_parse_before_it_is_recorded(self) -> None:
         before = self.state.owner_key_report()
-        for bad in ("ssh-ed25519 AAAAA", "ssh-ed25519 QUJD", "ssh-rsa " + (
-                self.owner_private_key.with_suffix(".pub").read_text().split()[1])):
+        good = self.owner_private_key.with_suffix(".pub").read_text().split()[1]
+        raw = base64.b64decode(good)
+        ed = b"ssh-ed25519"
+        for bad in (
+            "ssh-ed25519 AAAAA",
+            "ssh-ed25519 QUJD",
+            "ssh-rsa " + good,
+            f"ssh-ed25519 {self.key_blob(ed, b'x' * 5)}",
+            f"ssh-ed25519 {self.key_blob(ed)}",
+            f"ssh-ed25519 {base64.b64encode(raw + b'tail').decode('ascii')}",
+            f"ssh-ed25519 {self.key_blob(ed, b'x' * 32, b'extra')}",
+            "ssh-rsa " + self.key_blob(b"ssh-rsa", b"\x01\x00\x01", b"\x7f" * 64),
+            "ssh-rsa " + self.key_blob(b"ssh-rsa", b"\x00\x01\x00\x01", b"\x7f" * 256),
+            "ssh-rsa " + self.key_blob(b"ssh-rsa", b"\x01\x00\x01", b"\x00" + b"\x7f" * 256),
+            "ecdsa-sha2-nistp256 " + self.key_blob(
+                b"ecdsa-sha2-nistp256", b"nistp384", b"\x04" + b"x" * 64
+            ),
+            "ecdsa-sha2-nistp256 " + self.key_blob(
+                b"ecdsa-sha2-nistp256", b"nistp256", b"\x03" + b"x" * 32
+            ),
+            "sk-ssh-ed25519@openssh.com "
+            + self.key_blob(b"sk-ssh-ed25519@openssh.com", b"x" * 32),
+        ):
             with self.subTest(bad=bad), self.assertRaisesRegex(StateError, "public key is invalid"):
                 self.ledger.replace_owner_key(bad, now_ms=NOW)
         self.assertEqual(self.state.owner_key_report(), before)
+
+    def test_every_allowed_key_type_is_accepted(self) -> None:
+        for key_type, bits in (("rsa", "3072"), ("ecdsa", "256")):
+            directory = Path(self.temporary.name) / f"real-{key_type}"
+            directory.mkdir()
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", key_type, "-b", bits, "-N", "", "-f", str(directory / "k")],
+                check=True,
+            )
+            line = self.state._owner_signer_content((directory / "k.pub").read_text())
+            self.assertTrue(OWNER_SIGNER_LINE.fullmatch(line))
+        for key_type, parts in (
+            ("sk-ssh-ed25519@openssh.com", (b"x" * 32, b"ssh:")),
+            ("sk-ecdsa-sha2-nistp256@openssh.com", (b"nistp256", b"\x04" + b"x" * 64, b"ssh:")),
+        ):
+            self.state._owner_signer_content(
+                f"{key_type} {self.key_blob(key_type.encode('ascii'), *parts)}"
+            )
+
+    def test_a_replaced_rsa_key_cannot_come_back_in_another_encoding(self) -> None:
+        directory = Path(self.temporary.name) / "rsa"
+        directory.mkdir()
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "rsa", "-b", "3072", "-N", "", "-f", str(directory / "k")],
+            check=True,
+        )
+        rsa = (directory / "k.pub").read_text()
+        self.ledger.replace_owner_key(rsa, now_ms=NOW)
+        self.ledger.replace_owner_key(self.other_key()[1], now_ms=NOW + 1)
+        with self.assertRaisesRegex(LedgerError, "replaced earlier"):
+            self.ledger.replace_owner_key(rsa, now_ms=NOW + 2)
+        fields = rsa.split()
+        parts = [
+            bytes(part) for part in _ssh_key_parts(base64.b64decode(fields[1]))
+        ]
+        padded = self.key_blob(parts[0], parts[1], b"\x00" + parts[2])
+        with self.assertRaisesRegex(StateError, "public key is invalid"):
+            self.ledger.replace_owner_key(f"ssh-rsa {padded}", now_ms=NOW + 2)
+        # A history row spelled the padded way, as an older version could have enrolled, still counts.
+        self.assertEqual(
+            _owner_key_identity(f"codex-agents-owner ssh-rsa {padded}\n".encode("ascii")),
+            _owner_key_identity(f"codex-agents-owner ssh-rsa {fields[1]}\n".encode("ascii")),
+        )
+
+    def test_damaged_signer_files_do_not_block_opening_or_replacing(self) -> None:
+        for name, damage in (
+            ("unreadable", lambda path: path.chmod(0o000)),
+            ("directory", lambda path: (path.unlink(), path.mkdir())),
+            ("fifo", lambda path: (path.unlink(), os.mkfifo(path))),
+        ):
+            with self.subTest(name):
+                base = Path(self.temporary.name) / f"damaged-{name}"
+                base.mkdir()
+                state = LearningState(base / "state")
+                state.allowed_signers_path.write_bytes(b"two\nlines\n")
+                damage(state.allowed_signers_path)
+                fresh = LearningLedger(state, client_capabilities=self.clients)
+                try:
+                    report = fresh.replace_owner_key(self.other_key(f"key-{name}")[1], now_ms=NOW)
+                    self.assertEqual((report["state"], report["replacements"]), ("ok", 1))
+                finally:
+                    fresh.close()
 
     def test_verification_uses_the_checked_bytes_not_the_file(self) -> None:
         identity = self.observe()[0]

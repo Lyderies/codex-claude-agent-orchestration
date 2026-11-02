@@ -1372,6 +1372,8 @@ def check_trusted_state(state_root: Path, *, replacing: bool = False) -> None:
     """
 
     signers = state_root / "owner-allowed-signers"
+    if replacing and not os.path.lexists(state_root):
+        raise AttestError("no owner key is configured yet, so there is nothing to replace")
     if not replacing and not os.path.lexists(signers):
         return  # nothing to trust; the caller reports that no key is configured
     check_path_safe(state_root)
@@ -1409,13 +1411,13 @@ def replace_owner_key(target: Path, state_root: Path, cli_state: Path | None) ->
     check_trusted_state(state_root, replacing=True)
     try:
         configured = configured_public_key(state_root)
+        shown = describe_key(*configured) if configured else "none"
     except AttestError:
         shown = "unreadable"
     else:
         if configured is None and not _owner_key_on_record(state_root):
             raise AttestError("no owner key is configured yet, so there is nothing to replace. "
                               "Choose Re-run the billing attestation only")
-        shown = describe_key(*configured) if configured else "none"
     print(REPLACE_ADVICE)
     print(f"Owner key now: {shown}")
     if input("Type REPLACE to continue: ").strip() != "REPLACE":

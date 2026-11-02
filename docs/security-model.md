@@ -69,8 +69,9 @@ and tools installed under your home folder, which the rule then runs.
 
 The passphrase protects your key; it cannot stop a program swapping in a different key. The ledger records
 the enrolled key, and a signer file that does not match is refused: nothing is signed, and every billing
-statement stops counting, at admission and at launch, because each signature is checked against the current
-key. A replaced key cannot be made current again.
+statement stops counting, because each signature is checked against the current key. That applies when a run
+opens and when a bridged child launches; a native Claude child opened before the change can still start. A
+replaced key cannot be made current again.
 
 - "Replace a lost owner key" cannot ask for the old key, since that is what was lost. Nothing proves
   cryptographically who replaced it, as at first setup. The new key's date shows in the wizard's menu and in
@@ -81,7 +82,8 @@ key. A replaced key cannot be made current again.
   sandbox: deny rules cover the commands, edits to `~/.local/state/codex-agents` and shell commands naming
   it, but they are a policy layer that another spelling can miss, and they name only that default folder, not
   an `XDG_STATE_HOME` one. A program running as your user with no sandbox could edit the ledger and the
-  signer file together, or run the replacement itself. Nothing in your user account can prevent that.
+  signer file together, or run the replacement itself, and a ledger whose key history was emptied enrols
+  whatever the signer file then holds. Nothing in your user account can prevent that.
 - The record starts from the signer file the first time a ledger opens after a key is enrolled, or after
   updating to this version, so it cannot catch a change made before then.
 

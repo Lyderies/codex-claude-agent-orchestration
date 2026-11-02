@@ -1928,6 +1928,8 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Stopped.")
         self.assertEqual(self.finish(), 0)
 
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "operational checks use the macOS sandbox, so verify is not ready elsewhere")
     def test_verify_retry_back_and_the_summary_return_to_the_menu(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())

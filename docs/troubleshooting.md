@@ -21,7 +21,8 @@ setup, choose "Update the install and walk through every step" first and skip th
 
 Replacing the key cancels every billing statement the old key signed, in every project, so each project's
 children are refused with `billing_attestation_missing` until you choose "Re-run the billing attestation
-only" there. A run opened before the replacement is refused at launch too. The old key file stays in
+only" there. A bridged child opened before the replacement is refused at launch too; a native Claude child
+is checked only when its run opens, so one opened earlier can still start. The old key file stays in
 `~/.ssh`; the new one is `codex-agents-owner-2` (or the next free number).
 
 Only billing statements and grants not yet used are cancelled. QA, calibrations and promotions the old key
