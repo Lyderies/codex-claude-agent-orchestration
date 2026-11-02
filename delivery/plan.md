@@ -220,14 +220,22 @@ Planned, not yet designed or estimated. Order of work:
 
    Fix: a worked task and assignment example in the Codex skill; `host-command` prints a ready-to-run
    unquoted command; `input validation failed` names the failing field without echoing its value.
-2. **Child liveness** (below).
-3. **Smaller items:**
+
+   Implemented on `feature/g2-codex-skill-input-forms` (Codex package 0.8.11). It still needs a real
+   Codex primary run, including whether the rule matches a path that has to be quoted.
+2. **Owner-key rotation ("replace a lost owner key").** Moved up (owner decision, 2026-11-02).
+   Attestations are kept per project, so without the owner key's passphrase no new project can be
+   attested. That blocks dogfooding from a temp copy and returns `billing_attestation_missing` for
+   any project without a statement. Needs an independent security review.
+3. **Child liveness** (below).
+4. **Smaller items:**
    - A Claude Haiku 5.5 inventory child returned `invalid_result`; check result-contract reliability,
      or route inventory to Sonnet.
    - Wizard step 8 text should also name the clone and folders that contain a set-up project.
    - The /hooks trust line should say it matters only on a main checkout.
    - The `tests/test_attest.py` `_finish_child` helper should close the pty before its blocking wait.
-   - Owner-key rotation ("replace a lost owner key").
+   - `validate-assignment` recomputes the base route and ignores a released learning candidate, so
+     it can refuse the model or effort `learning-route` returned (found in the input forms review).
    - A Homebrew Python upgrade changes the interpreter's real path and so stales the rule and hooks
      until setup runs again; consider a stable path that is still trusted.
 
