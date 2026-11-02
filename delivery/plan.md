@@ -269,6 +269,11 @@ Planned, not yet designed or estimated. Order of work:
      patch workflow.
    - The checks recipe warns about bytecode. The `qa_pytest.py` silent exit, bytecode handling and
      coding mapping belong to the project itself: hand them over as a note.
+   - **Found while setting up (2026-11-02):** the wrappers in `docs/manual-setup.md` start a subprocess,
+     which QA's sandbox refuses, so a project built from that recipe always fails QA, with no output to
+     explain it because QA discards it. A wrapper's first line also takes no interpreter flags. The Claude
+     skill doesn't document the `result_attempts` observation form, and `host observation admission
+     rejected` hides the reason. `test_session_guard` needs a file larger than QA's size limit.
    - **New release rule in `CONTRIBUTING.md` (owner decision, 2026-11-02):** try each release on a real
      install from its `version/*` branch before opening the pull request to `main`. 0.2.1 reached
      `main` before this had been done.
