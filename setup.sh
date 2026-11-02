@@ -1888,7 +1888,7 @@ verify_install() { # verify_install -> sets LAST_* and records problems in LIST
 # only when check-runtime passed (OK=1); otherwise say not to, with its plain reason.
 hooks_trust_line() {
   if [ "$1" -eq 1 ]; then
-    list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks"
+    list_add info "In Codex, open /hooks and trust the orchestrator's learning hooks (main checkout only)"
   else
     list_add warn "Do not trust the orchestrator's learning hooks in Codex yet: $RUNTIME_WHY"
   fi
@@ -2522,7 +2522,7 @@ unsupported_home() {
 commands_screen() {
   screen_reset; begin_step 8
   body "Codex runs each command in a sandbox, and that sandbox blocks the orchestrator's background service, so a Codex session cannot orchestrate this project on its own. This rule lets only the orchestrator's everyday commands for this project run outside the sandbox; owner commands, such as registration, billing attestation and promotion, stay blocked. To undo it later, use the remove command shown at the end of setup."
-  body "Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). It runs a protected copy of the orchestrator in ~/.codex that sessions opened on a project cannot change. Never open Codex on your home folder, its parent or / while the rule exists."
+  body "Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). It runs a protected copy of the orchestrator in ~/.codex that sessions opened on a project cannot change. Never open Codex on the orchestrator clone, a folder that contains a set-up project, your home folder, its parent or / while the rule exists."
   if [ "$RULE_STATUS" = stale ]; then
     list_add warn "A rule for this project already exists and differs from this one, for example after a Python upgrade (the rule names the exact Python build) or a package update. It stays unchanged unless you replace it; until then Codex sessions may not reach the orchestrator."
   fi

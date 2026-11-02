@@ -87,3 +87,35 @@ exists in both folders, keep the one in use, move the other out of both places, 
 
 Unset `XDG_STATE_HOME`, or point it at a hidden folder in your home such as `~/.local/state`, and run
 again. The default records folder is `~/.local/state/codex-agents`.
+
+## Hook ingestion is idle or has never received an event
+
+`learning-status` separates a running collector from event delivery. `freshness.state: idle` means
+hooks have delivered events before and there is no recent activity; it does not prove a hook failure.
+`awaiting_hook_review_or_first_event` means no hook events have been recorded: on the main checkout,
+open `/hooks` and review the hooks after installation. Linked worktrees load their main checkout's hooks;
+the checkout guard ignores their events rather than attributing them to the main checkout.
+
+`client_failures.hook_ingest_rejected.last_reason_code` holds only a fixed collector code. For example,
+`record_conflict` means an event identifier had different contents; `capability_mismatch` or
+`provenance_mismatch` means the existing ingest contract rejected the event. `transport_unavailable`
+means delivery was not confirmed; it does not prove the collector refused the event. Counts are historical
+and are not reset by an idle session. Lifecycle hooks fire only at their lifecycle boundaries, and
+bridged children have hooks disabled: their run lifecycle comes from the managed host records instead.
+
+`provider_attestations` shows `present`, `missing` or `identity_missing` for each provider, using the
+latest observed account and admission's owner-verified project lookup. `unavailable` means the collector
+could not report it. This is attestation status, not admission: fresh identity, billing, headroom and the
+other gates still apply. For `billing_attestation_missing`, choose "Re-run the billing attestation only"
+for that project in `./setup.sh`.
+
+## Operational QA fails without test output
+
+QA keeps stdout and stderr private. `learning-run-operational-checks` returns separate `diagnostics`
+with a fixed reason code and exit code for each check; the receipt's check report is unchanged.
+`nonzero_exit` means the wrapper failed, `deadline_elapsed` means it timed out, and
+`temporary_storage_limit`, `temporary_storage_invalid` or `temporary_storage_unstable` names a storage
+guard. `snapshot_rejected`, `launch_rejected`, `execution_rejected` and `snapshot_changed` identify the
+stage without revealing paths or exception values. A terminated process may have a negative exit code;
+large-file fixtures can exceed QA's resource limit. Inspect the wrapper locally, retaining the guard.
+See the [in-process wrapper recipe and bytecode warning](manual-setup.md#operational-checks).

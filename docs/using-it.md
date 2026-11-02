@@ -26,6 +26,17 @@ The skill first runs `host-command` and stops, with the reason, unless the Codex
 Do not start Codex from inside a Claude Code session, for example from Claude Code's terminal tool: it
 inherits Claude Code's environment markers, and the host check then refuses with `host_client_unknown`.
 
+## Read-only patch workflow
+
+Children in this release are read-only. The primary writes code in the project and delegates bounded
+research and independent review. A coding route can ask a read-only implementation worker for a proposed
+patch in its result; the primary checks and applies that patch, runs the project checks and requests
+independent verification. A patch in a child's reply has not changed the project.
+
+A project agent mapped to `workspace-write` is not eligible for a Codex child yet. Validation names the
+packaged read-only role that handles that family instead. This warning does not grant write access or
+change the route's model or effort; those still come from `learning-route`.
+
 ## When a task is denied
 
 A denial comes back as a `reason_code`, and no child starts. Admission fails closed, for example on an
@@ -41,4 +52,5 @@ messages and their fixes are in [troubleshooting](troubleshooting.md); nearly ev
 - Re-attest whenever your billing settings change.
 - Close every Codex session in the project before installing or updating.
 - After every install or update (a Python upgrade needs one), trust the orchestrator's learning hooks
-  again in Codex's `/hooks`; the wizard tells you when.
+  again in Codex's `/hooks` on a main checkout; linked worktrees load their main checkout's hooks.
+  The wizard tells you when.

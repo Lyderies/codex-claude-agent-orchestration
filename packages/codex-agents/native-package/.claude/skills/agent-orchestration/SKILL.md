@@ -59,6 +59,24 @@ markers, never set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, and never pass `--ba
    the returned `result`, unedited, with `bridge_report.terminal_state`, when set, as the
    observation's `terminal_state`; any other result, or a dropped or added terminal
    state, is refused, and there is no repair. Treat `reviewed: false` as unverified.
+   Write the observation JSON for `--observation` in this form (substitute the exact opened handle):
+
+   ```json
+   {
+     "run_handle": "hrn_<48 lowercase hex characters>",
+     "result_attempts": [
+       {"status": "accepted", "reason_code": null, "receipt_id": null}
+     ]
+   }
+   ```
+
+   `accepted` means structurally accepted, including a failed semantic result. Each attempt has
+   exactly those three keys. For a native structural repair only, prepend one `rejected` attempt
+   using the validator's exact `reason_code` and single-use `repair_receipt` as `receipt_id`.
+   A bridged result has exactly one accepted attempt and no repair. Add `terminal_state` only
+   when there is an authoritative host terminal fact; for a bridge copy the returned
+   `bridge_report.terminal_state` exactly when set. Never copy a child's timeout claim.
+   Pass the exact task, assignment, parent grant, route and returned result with the observation.
    Always finish with `learning-record-host-result`, even for a failed or timed-out
    child. Keep the printed `host_outcome_digest`: it is the one identifier for this
    outcome that verification and operational QA accept (not the `out:` record ID).

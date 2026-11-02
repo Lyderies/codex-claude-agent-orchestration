@@ -135,6 +135,11 @@ def _finish_child(pid: int, fd: int) -> int:
 
     import time
 
+    # Closing the master releases a child blocked on terminal input or output.
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     status = 0
     end = time.time() + 5
     try:
@@ -148,10 +153,6 @@ def _finish_child(pid: int, fd: int) -> int:
                 break
             time.sleep(0.05)
     except (ChildProcessError, ProcessLookupError, OSError):
-        pass
-    try:
-        os.close(fd)
-    except OSError:
         pass
     return status
 
