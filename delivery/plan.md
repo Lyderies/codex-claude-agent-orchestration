@@ -226,9 +226,39 @@ Planned, not yet designed or estimated. Order of work:
 2. **Owner-key rotation ("replace a lost owner key").** Moved up (owner decision, 2026-11-02).
    Attestations are kept per project, so without the owner key's passphrase no new project can be
    attested. That blocks dogfooding from a temp copy and returns `billing_attestation_missing` for
-   any project without a statement. Needs an independent security review.
-3. **Child liveness** (below).
-4. **Smaller items:**
+   any project without a statement. Needs an independent security review. Ships as release 0.2.1,
+   Codex package 0.8.11, and is reviewed by hand because the toolchain cannot run children until it
+   ships. Agreed work (owner decision, 2026-11-02):
+   - **Test the gap first.** An empty or deleted `owner-allowed-signers` accepts any new key, and the
+     passphrase is checked only in `attest.py`, so a program able to write that file might enrol its
+     own key and sign. Found by reading the code; try it against a throwaway state folder, from both
+     Codex and Claude primary contexts.
+   - **Pin the enrolled key in the ledger,** so an empty or edited signer file fails closed. Remove the
+     messages that tell people to delete the file.
+   - **Wizard option "Replace a lost owner key":** real terminal, old and new fingerprints shown, typed
+     confirmation, a new passphrase-protected key, the old key file left in place.
+   - **Out of reach of agents:** not in `host-command`, a Claude deny rule, checked against the Codex
+     rule, tested from both primaries.
+   - **Crash-safe:** the ledger record and the file swap survive an interruption; re-running finishes.
+   - **Cancel old attestations:** replacing the key cancels statements signed with the old key (owner
+     decision). The same option must cover a stolen key.
+   - **Visible:** `learning-status` and the wizard show when the key was last replaced.
+   - **Documented residual:** without the old key nothing proves cryptographically who replaced it,
+     as at first setup, and an unsandboxed program under the same user could tamper with the ledger.
+3. **Readiness and hook diagnostics,** from the local-routing first-run report (ORCH-1 to ORCH-4).
+   Release 0.2.2, Codex package 0.8.12, built with the toolchain from a temp copy, which also gives
+   input forms their first real Codex primary run:
+   - Record the collector's fixed rejection code, then find why `hook_ingest_rejected` keeps rising and
+     why `session_started` and `subagent_started` stopped on 2026-10-30 while tool events continue.
+   - Status separates idle from "no events since the hooks were installed, open /hooks".
+   - `learning-status` shows each provider's attestation state using admission's lookup; admission
+     does not change. `billing_attestation_missing` names the wizard option.
+   - The coding-mapping warning says where coding routes; `docs/using-it.md` documents the read-only
+     patch workflow.
+   - The checks recipe warns about bytecode. The `qa_pytest.py` silent exit, bytecode handling and
+     coding mapping belong to the project itself: hand them over as a note.
+4. **Child liveness** (below).
+5. **Smaller items:**
    - A Claude Haiku 5.5 inventory child returned `invalid_result`; check result-contract reliability,
      or route inventory to Sonnet.
    - Wizard step 8 text should also name the clone and folders that contain a set-up project.
