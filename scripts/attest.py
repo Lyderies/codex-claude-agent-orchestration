@@ -1306,6 +1306,7 @@ def _default_key_file(configured: tuple[str, str]) -> Path | None:
     needs no passphrase. The full check (deriving the public key) happens afterwards.
     """
 
+    without_public = None
     for key in owner_key_locations():
         try:
             check_key_location(key)
@@ -1314,14 +1315,16 @@ def _default_key_file(configured: tuple[str, str]) -> Path | None:
         except (AttestError, OSError):
             continue
         adjacent = Path(str(key) + ".pub")
-        if os.path.lexists(adjacent):
-            try:
-                if _split_public(adjacent.read_text()) != configured:
-                    continue
-            except (OSError, UnicodeDecodeError, AttestError):
-                continue
-        return key
-    return None
+        if not os.path.lexists(adjacent):
+            # Only if no other file matches: this could be a key already replaced.
+            without_public = without_public or key
+            continue
+        try:
+            if _split_public(adjacent.read_text()) == configured:
+                return key
+        except (OSError, UnicodeDecodeError, AttestError):
+            continue
+    return without_public
 
 
 def locate_key_file(configured: tuple[str, str]) -> Path:
@@ -1359,25 +1362,26 @@ def _in_working_tree(path: Path) -> bool:
     return any(os.path.lexists(folder / ".git") for folder in (real, *real.parents))
 
 
-def check_trusted_state(state_root: Path) -> None:
+def check_trusted_state(state_root: Path, *, replacing: bool = False) -> None:
     """Trust the owner-key record only if an agent could not have written it.
 
     The standalone passphrase change has no project to anchor on, so the state directory and
     the signer file must be real, yours, not writable by others, and outside every temporary
     folder and Git working tree (places an agent or a project could plant a forged file).
+    A replacement overwrites the signer file, so that file's own state does not stop it.
     """
 
     signers = state_root / "owner-allowed-signers"
-    if not os.path.lexists(signers):
+    if not replacing and not os.path.lexists(signers):
         return  # nothing to trust; the caller reports that no key is configured
     check_path_safe(state_root)
-    for path in (state_root, signers):
+    for path in (state_root,) if replacing else (state_root, signers):
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
             raise AttestError("the owner key record may not be a symbolic link")
         if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise AttestError("the owner key record must be owned by you and not writable by others")
-    if not stat.S_ISREG(signers.lstat().st_mode):
+    if not replacing and not stat.S_ISREG(signers.lstat().st_mode):
         raise AttestError("the owner key record is not a regular file")
     if _in_temp_root(state_root) or _in_working_tree(state_root):
         raise AttestError("the owner key record is in a temporary folder or a project; refusing to trust it")
@@ -1391,17 +1395,29 @@ REPLACE_ADVICE = (
 )
 
 
+def _owner_key_on_record(state_root: Path) -> bool:
+    store = clone_module("learning_store")
+    try:
+        return store.LearningState(state_root, create=False).recorded_owner_key() is not None
+    except (store.StateError, OSError):
+        return True  # the replacement itself decides; a failed read must not hide a record
+
+
 def replace_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> Path:
     """Create a new owner key, make it the owner key, and return it."""
 
-    check_trusted_state(state_root)
-    print(REPLACE_ADVICE)
+    check_trusted_state(state_root, replacing=True)
     try:
         configured = configured_public_key(state_root)
     except AttestError:
-        print("Owner key now: unreadable")
+        shown = "unreadable"
     else:
-        print(f"Owner key now: {describe_key(*configured) if configured else 'none'}")
+        if configured is None and not _owner_key_on_record(state_root):
+            raise AttestError("no owner key is configured yet, so there is nothing to replace. "
+                              "Choose Re-run the billing attestation only")
+        shown = describe_key(*configured) if configured else "none"
+    print(REPLACE_ADVICE)
+    print(f"Owner key now: {shown}")
     if input("Type REPLACE to continue: ").strip() != "REPLACE":
         raise AttestError("nothing was changed")
     key = next(

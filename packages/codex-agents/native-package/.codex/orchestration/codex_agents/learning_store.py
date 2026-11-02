@@ -1205,6 +1205,13 @@ class LearningState:
             or "PRIVATE" in public_key
         ):
             raise StateError("owner public key is invalid")
+        try:
+            blob = base64.b64decode(fields[1], validate=True)
+        except ValueError as exc:
+            raise StateError("owner public key is invalid") from exc
+        length = int.from_bytes(blob[:4], "big")
+        if blob[4:4 + length] != fields[0].encode("ascii") or len(blob) <= 4 + length:
+            raise StateError("owner public key is invalid")
         return f"codex-agents-owner {fields[0]} {fields[1]}\n".encode("ascii")
 
     def install_owner_public_key(self, public_key: str) -> Path:
@@ -1253,7 +1260,13 @@ class LearningState:
         return self.allowed_signers_path
 
     def owner_allowed_signers(self) -> Path:
-        """The allowed-signers file, only while it names exactly one owner key.
+        """The allowed-signers file, only while it passes `owner_signer_line`."""
+
+        self.owner_signer_line()
+        return self.allowed_signers_path
+
+    def owner_signer_line(self) -> bytes:
+        """The allowed-signers bytes, only while they name exactly one owner key.
 
         It must be exactly the single canonical line `install_owner_public_key` writes:
         `ssh-keygen -Y verify` accepts a signature from any key the file lists, so a second
@@ -1283,7 +1296,7 @@ class LearningState:
             raise StateError(
                 f"owner allowed-signers is not the owner key on record; {OWNER_KEY_REPLACE_HINT}"
             )
-        return self.allowed_signers_path
+        return content
 
     def recorded_owner_key(self) -> dict[str, Any] | None:
         """The owner key the ledger last recorded, or None before one is recorded.
@@ -1342,8 +1355,10 @@ class LearningState:
                 )
             self.owner_allowed_signers()
             report["state"] = "ok"
-        except (StateError, OSError) as exc:
-            not_configured = recorded is None and "not configured" in str(exc)
+        except (StateError, OSError, ValueError) as exc:
+            not_configured = recorded is None and (
+                isinstance(exc, FileNotFoundError) or "not configured" in str(exc)
+            )
             report["state"] = "not_configured" if not_configured else "mismatch"
         return report
 
@@ -1831,8 +1846,10 @@ class LearningLedger:
 
         The old key is not asked for, since it is what was lost. The record is committed
         first and the signer file follows: an interruption between them fails closed until
-        the same replacement is run again, and that run finishes it. Anything the old key
-        signed stops counting, because signatures are checked against the current key.
+        the same replacement is run again, and that run finishes it. Billing statements the
+        old key signed stop counting, because admission checks them against the current key,
+        and a key once replaced cannot come back, which would revive them. With no record
+        yet, a signer file that holds anything can be replaced; an empty one is first setup.
         """
 
         content = self.state._owner_signer_content(public_key)
@@ -1842,9 +1859,16 @@ class LearningLedger:
             row = self._connection.execute(
                 "SELECT signer_line FROM owner_key_history ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
-            if row is None:
+            path = self.state.allowed_signers_path
+            if row is None and not (
+                path.is_symlink() or (path.exists() and path.stat().st_size > 0)
+            ):
                 raise LedgerError("no owner key is on record, so there is nothing to replace")
-            if bytes(row["signer_line"]) != content:
+            if row is None or bytes(row["signer_line"]) != content:
+                if self._connection.execute(
+                    "SELECT 1 FROM owner_key_history WHERE signer_line=?", (content,)
+                ).fetchone() is not None:
+                    raise LedgerError("that key was replaced earlier; use a new key")
                 self._connection.execute(
                     "INSERT INTO owner_key_history(signer_line,reason,recorded_at_ms) "
                     "VALUES(?,'replaced',?)",
@@ -3605,7 +3629,7 @@ class LearningLedger:
             raise LedgerError("upgrade reconciliation request has expired")
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if not authority.verify_upgrade_reconciliation_signature(request, signature):
             raise LedgerError("upgrade reconciliation owner signature is invalid")
         with self._lock, self._connection:
@@ -4951,7 +4975,7 @@ class LearningLedger:
         if receipt is None:
             return False
         try:
-            authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+            authority = OwnerGrantAuthority.for_state(self.state)
             return authority.verify_owner_record(
                 project_id, record, bytes(receipt["signature"])
             )
@@ -6513,7 +6537,7 @@ class LearningLedger:
         )
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if not authority.verify_qa_attestation(project_id, qa, signature):
             raise LedgerError("verified QA attestation is invalid")
         timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
@@ -6645,7 +6669,7 @@ class LearningLedger:
             raise LedgerError("authenticated owner record type is unsupported")
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if not authority.verify_owner_record(project_id, checked, signature):
             raise LedgerError("owner record signature is invalid")
         timestamp = now_ms if now_ms is not None else time.time_ns() // 1_000_000
@@ -7759,7 +7783,7 @@ class LearningLedger:
         authorization_timestamp = time.time_ns() // 1_000_000
         from .learning_engine import OwnerGrantAuthority
 
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         if (
             not authority.verify(checked_grant)
             or not checked_grant["issued_at_ms"]
@@ -8218,7 +8242,7 @@ class LearningLedger:
             json.loads(bytes(row["content"])) for row in promotion_rows
         ]
         active: list[tuple[int, dict[str, Any]]] = []
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         for row in candidate_rows:
             candidate = json.loads(bytes(row["content"]))
             parts = candidate["task_slice"].split("-")
@@ -8319,7 +8343,7 @@ class LearningLedger:
             (json.loads(bytes(row["content"])), int(row["source_sequence"]))
             for row in outcome_rows
         ]
-        authority = OwnerGrantAuthority(self.state.owner_allowed_signers())
+        authority = OwnerGrantAuthority.for_state(self.state)
         active: list[dict[str, Any]] = []
         for row in candidate_rows:
             candidate = json.loads(bytes(row["content"]))

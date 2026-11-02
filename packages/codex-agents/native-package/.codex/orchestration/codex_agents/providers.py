@@ -1235,6 +1235,9 @@ def evaluate_launch(
         return "codex_spend_control_reached"
     if paid_usage_digest(provider, fingerprint, billing, now_ms, current) is not None:
         return "paid_usage_usable"
+    if attestation is None:
+        # A replaced or swapped owner key cancels the statement a run was admitted on.
+        return "billing_attestation_missing"
     latest = _latest([
         item for item in billing
         if item[0]["provider"] == provider

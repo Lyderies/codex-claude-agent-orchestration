@@ -86,8 +86,9 @@ PROTECTED_EDITS = (
     "/.codex/**", "/.agents/**", "/.claude/settings*.json", "/.git/**",
     "~/.local/state/codex-agents/**",
 )
-# Shell commands a Claude primary may never run: any that names the owner's records.
-PROTECTED_SHELL = ("*.local/state/codex-agents*",)
+# Shell commands a Claude primary may never run: any that names the owner's records, or
+# replaces the owner key through the human step.
+PROTECTED_SHELL = ("*.local/state/codex-agents*", "*attest.py*--replace-owner-key*")
 CLI_PATTERN = "*.codex/orchestration/cli.py"
 MAX_SETTINGS_BYTES = 1024 * 1024
 # Every owner-only command an earlier release's installer denied (0.8.8 and 0.8.9). A recorded

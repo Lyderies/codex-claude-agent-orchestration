@@ -560,6 +560,7 @@ class UmbrellaInstallTests(unittest.TestCase):
                      "~/.local/state/codex-agents/**"):
             self.assertIn(f"Edit({path})", rules)
         self.assertIn("Bash(*.local/state/codex-agents*)", rules)
+        self.assertIn("Bash(*attest.py*--replace-owner-key*)", rules)
         self.assertIn("learning-replace-owner-key", owner)
         self.assertNotIn("learning-replace-owner-key", primary)
 

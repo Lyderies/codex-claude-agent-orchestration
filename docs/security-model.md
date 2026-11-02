@@ -69,17 +69,21 @@ and tools installed under your home folder, which the rule then runs.
 
 The passphrase protects your key; it cannot stop a program swapping in a different key. The ledger records
 the enrolled key, and a signer file that does not match is refused: nothing is signed, and every billing
-statement stops counting, because admission checks each signature against the current key.
+statement stops counting, at admission and at launch, because each signature is checked against the current
+key. A replaced key cannot be made current again.
 
 - "Replace a lost owner key" cannot ask for the old key, since that is what was lost. Nothing proves
   cryptographically who replaced it, as at first setup. The new key's date shows in the wizard's menu and in
   `learning-status`, so a replacement you did not make can be seen.
+- Replacing a key cancels billing statements and grants not yet used. QA, calibrations and promotions the
+  old key approved stay in force, so after a stolen key review those yourself.
 - A sandboxed Codex session cannot write your records (see the session guard). A Claude primary has no
-  sandbox: deny rules cover the command, edits to `~/.local/state/codex-agents` and shell commands naming
-  it, but they are a policy layer. A program running as your user with no sandbox could edit the ledger and
-  the signer file together, or run the replacement itself. Nothing in your user account can prevent that.
-- The record starts from the signer file the first time a ledger of this version opens, so it cannot catch
-  a change made before then.
+  sandbox: deny rules cover the commands, edits to `~/.local/state/codex-agents` and shell commands naming
+  it, but they are a policy layer that another spelling can miss, and they name only that default folder, not
+  an `XDG_STATE_HOME` one. A program running as your user with no sandbox could edit the ledger and the
+  signer file together, or run the replacement itself. Nothing in your user account can prevent that.
+- The record starts from the signer file the first time a ledger opens after a key is enrolled, or after
+  updating to this version, so it cannot catch a change made before then.
 
 ## The protected copy and the Codex rule
 

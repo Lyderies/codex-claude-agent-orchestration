@@ -21,8 +21,13 @@ setup, choose "Update the install and walk through every step" first and skip th
 
 Replacing the key cancels every billing statement the old key signed, in every project, so each project's
 children are refused with `billing_attestation_missing` until you choose "Re-run the billing attestation
-only" there. Other owner approvals the old key signed also stop counting. The old key file stays in
+only" there. A run opened before the replacement is refused at launch too. The old key file stays in
 `~/.ssh`; the new one is `codex-agents-owner-2` (or the next free number).
+
+Only billing statements and grants not yet used are cancelled. QA, calibrations and promotions the old key
+approved stay in force, so if the key may have been stolen rather than lost, review those too. A signed
+learning release registry stops routing with `learning release registry signature is invalid`, because its
+signature is the old key's: release those candidates again, or empty the registry, which is unsigned.
 
 ## "owner allowed-signers is not the owner key on record"
 

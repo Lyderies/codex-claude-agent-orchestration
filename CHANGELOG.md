@@ -16,13 +16,14 @@
   project, so a project not yet attested cannot run children without a new signature.
 - **Replace a lost owner key.** A new wizard option (`attest.py --replace-owner-key`, CLI
   `learning-replace-owner-key`) creates a new passphrase-protected key, records it and signs for the project.
-  It cancels what the old key signed.
+  It cancels billing statements and unused grants the old key signed, at admission and at launch; QA,
+  calibrations and promotions stay in force, and a replaced key cannot be made current again.
 - **Owner key tampering closed at the ledger level.** An emptied or edited signer file used to accept any
   new key, even one with no passphrase, and billing statements kept counting after a swap. The ledger now
   records the enrolled key (`owner_key_history`, append-only), a signer file that differs is refused, and
-  admission checks each statement's signature against the current key. `learning-status` reports
-  `owner_key`. Claude deny rules now cover the records folder. The security model's new section lists what
-  this cannot stop.
+  admission checks each statement's signature against the current key, using the checked bytes rather than
+  re-reading the file. `learning-status` reports `owner_key`. Claude deny rules now cover the default records
+  folder. The security model's new section lists what this cannot stop.
 
 ## 0.2.0: cross-provider read-only routing (G2; dogfood toolchain v1, Codex package 0.8.10)
 

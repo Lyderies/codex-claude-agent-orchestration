@@ -29,6 +29,7 @@ from codex_agents.learning_contracts import (
     validate_learning_record,
 )
 from codex_agents.routing import load_policy
+from codex_agents.learning_engine import OwnerGrantAuthority
 from codex_agents.learning_store import (
     PRODUCER_AUTHORITY,
     LearningLedger,
@@ -1208,6 +1209,103 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(report["state"], "ok")
         self.assertEqual(report["replacements"], 1)
         self.assertEqual(report["last_replaced_at_ms"], NOW)
+
+    def test_a_run_admitted_before_the_replacement_does_not_launch(self) -> None:
+        identity = self.observe()[0]
+        attestation = (
+            {"provider": "codex", "account_fingerprint": identity["account_fingerprint"],
+             "observed_at_ms": 1, "codex_credits_spending_disabled": True},
+            DIGEST_B,
+        )
+        self.assertEqual(
+            evaluate_launch(
+                provider="codex", identity=identity, billing=[], headroom=[],
+                now_ms=NOW + 1, attestations=[],
+            ),
+            "billing_attestation_missing",
+        )
+        self.assertNotEqual(
+            evaluate_launch(
+                provider="codex", identity=identity, billing=[], headroom=[],
+                now_ms=NOW + 1, attestations=[attestation],
+            ),
+            "billing_attestation_missing",
+        )
+
+    def test_launch_recheck_refuses_after_the_key_is_replaced(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        self.observe()
+        run = self.open_run()
+        after = self.observe()[0]
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            self.assertIsNone(self.ledger.launch_recheck(
+                self.project_id, run_handle=run["run_handle"], identity=after
+            ))
+        self.ledger.replace_owner_key(self.other_key()[1], now_ms=NOW)
+        with mock.patch.object(self.ledger, "_clock_ms", return_value=self.clock + 1):
+            self.assertEqual("billing_attestation_missing", self.ledger.launch_recheck(
+                self.project_id, run_handle=run["run_handle"], identity=after
+            ))
+
+    def test_a_replaced_key_cannot_come_back(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        original = self.owner_private_key.with_suffix(".pub").read_text()
+        _, public = self.other_key()
+        self.ledger.replace_owner_key(public, now_ms=NOW)
+        with self.assertRaisesRegex(LedgerError, "replaced earlier"):
+            self.ledger.replace_owner_key(original, now_ms=NOW + 1)
+        self.assert_denied("billing_attestation_missing")
+
+    def test_a_public_key_must_parse_before_it_is_recorded(self) -> None:
+        before = self.state.owner_key_report()
+        for bad in ("ssh-ed25519 AAAAA", "ssh-ed25519 QUJD", "ssh-rsa " + (
+                self.owner_private_key.with_suffix(".pub").read_text().split()[1])):
+            with self.subTest(bad=bad), self.assertRaisesRegex(StateError, "public key is invalid"):
+                self.ledger.replace_owner_key(bad, now_ms=NOW)
+        self.assertEqual(self.state.owner_key_report(), before)
+
+    def test_verification_uses_the_checked_bytes_not_the_file(self) -> None:
+        identity = self.observe()[0]
+        self.attest("codex", identity["account_fingerprint"])
+        old_line = self.state.allowed_signers_path.read_bytes()
+        _, public = self.other_key()
+        self.ledger.replace_owner_key(public, now_ms=NOW)
+        authority = OwnerGrantAuthority.for_state(self.state)
+        self.state.allowed_signers_path.write_bytes(old_line)  # after the check
+        with self.ledger._lock:
+            row = self.ledger._connection.execute(
+                "SELECT subject_record_id,signature FROM owner_attestations WHERE project_id=?",
+                (self.project_id,),
+            ).fetchone()
+            content = self.ledger._connection.execute(
+                "SELECT content FROM records WHERE project_id=? AND record_id=?",
+                (self.project_id, row["subject_record_id"]),
+            ).fetchone()
+        self.assertFalse(authority.verify_owner_record(
+            self.project_id, json.loads(bytes(content["content"])), bytes(row["signature"])
+        ))
+
+    def test_a_damaged_signer_file_with_no_record_can_be_replaced_or_enrolled(self) -> None:
+        base = Path(self.temporary.name) / "fresh"
+        base.mkdir()
+        state = LearningState(base / "state")
+        state.allowed_signers_path.write_bytes(b"two\nlines\n")
+        fresh = LearningLedger(state, client_capabilities=self.clients)
+        try:
+            self.assertEqual(state.owner_key_report()["state"], "mismatch")
+            report = fresh.replace_owner_key(self.other_key()[1], now_ms=NOW)
+            self.assertEqual((report["state"], report["replacements"]), ("ok", 1))
+        finally:
+            fresh.close()
+        state.allowed_signers_path.unlink()
+        self.assertEqual(state.owner_key_report()["state"], "mismatch")  # a key is on record
+        base = Path(self.temporary.name) / "deleted"
+        base.mkdir()
+        untouched = LearningState(base / "state")
+        untouched.allowed_signers_path.unlink()
+        self.assertEqual(untouched.owner_key_report()["state"], "not_configured")
 
     def test_the_key_history_only_grows_and_needs_a_first_key(self) -> None:
         for statement in (

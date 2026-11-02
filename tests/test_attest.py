@@ -218,6 +218,7 @@ class FakeWorld:
             pub = public_path.read_text().split()
             state = Path(option("--state-root"))
             enrolled = self.enrol_as or f"{pub[0]} {pub[1]}"
+            (state / "owner-allowed-signers").unlink(missing_ok=True)  # replaced, not written through
             (state / "owner-allowed-signers").write_text(f"codex-agents-owner {enrolled}\n")
             report = {"ready": True}
         elif name == "provider-observe":
@@ -466,6 +467,34 @@ class AttestTests(AttestHarness):
         (self.state / "owner-allowed-signers").write_text("two\nlines\n")
         self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
         self.assertIn("Owner key now: unreadable", self.output)
+
+    def test_replacing_with_no_key_anywhere_creates_nothing(self) -> None:
+        self.set_providers(codex=True)
+        self.state.chmod(0o700)
+        attest.clone_module("learning_store").LearningState(self.state)  # a real, empty state
+        self.assertEqual(self.run_main([], replace=True), 1)
+        self.assertIn("nothing to replace", self.output)
+        self.assertFalse(any(c[:2] == ["/usr/bin/ssh-keygen", "-t"] for c in self.world.calls))
+
+    def test_a_symlinked_signer_file_does_not_block_a_replacement(self) -> None:
+        self.set_providers(codex=True)
+        self.configure_old_key()
+        signers = self.state / "owner-allowed-signers"
+        planted = self.root / "planted"
+        planted.write_text("codex-agents-owner ssh-ed25519 AAAAold\n")
+        signers.unlink()
+        signers.symlink_to(planted)
+        self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        self.assertFalse(signers.is_symlink())
+        self.assertEqual(planted.read_text(), "codex-agents-owner ssh-ed25519 AAAAold\n")
+
+    def test_a_key_with_no_public_file_loses_to_one_that_matches(self) -> None:
+        self.set_providers(codex=True)
+        old = self.configure_old_key()
+        self.assertEqual(self.run_main(["REPLACE", "y", "n", "y"], replace=True), 0)
+        Path(f"{old}.pub").unlink()
+        self.assertEqual(self.run_main(["y", "n", "y"]), 0)
+        self.assertIn(f"Using the owner key file at {self.home / '.ssh/codex-agents-owner-2'}", self.output)
 
     def test_a_replaced_key_is_found_again_at_its_numbered_location(self) -> None:
         self.set_providers(codex=True)
