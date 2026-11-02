@@ -791,9 +791,13 @@ def validate_package(root: Path) -> dict[str, Any]:
         for family, sandbox in effective_policy.get(sandboxes_key, {}).items():
             agent = effective_policy.get(roles_key, {}).get(family)
             if agent is not None and sandbox != "read-only":
+                fallback = (EXPECTED_ROLE_MAP[family] if roles_key == "project_agent_roles"
+                            else EXPECTED_VERIFICATION_ROLE)
                 warnings.append(
                     f"{agent} is {sandbox}; Codex children are bridged read-only in this "
-                    "release, so it is not used for Codex routes"
+                    "release, so it is not used for Codex routes. "
+                    f"{family} routes use the packaged read-only "
+                    f"{fallback} role; the primary applies proposed patches"
                 )
     # The smoke routes check the package policy alone: neither a project's
     # provider configuration nor its agent mapping changes what they expect.

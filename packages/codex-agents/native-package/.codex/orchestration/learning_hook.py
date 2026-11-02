@@ -153,9 +153,11 @@ def _record(args: argparse.Namespace, raw: bytes, checkout_root: Path | None) ->
             raise
         try:
             client.ingest(binding, record)
-        except CollectorError:
+        except CollectorError as exc:
             admission_failure = True
-            client_health_increment(state, project_root, "hook_ingest_rejected")
+            client_health_increment(
+                state, project_root, "hook_ingest_rejected", reason_code=exc.code or "unknown_rejection"
+            )
             raise
     except CollectorError as exc:
         # The stage-specific counters above distinguish admission failure. Collector

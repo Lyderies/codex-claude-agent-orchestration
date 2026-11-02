@@ -2118,7 +2118,10 @@ def _committed_and_clean(git_executable: str, root: Path, commit: str, relative:
         os.close(descriptor)
 
 
-def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> dict[str, Any]:
+def run_operational_check_suite(
+    project_root: Path, *, scratch_root: Path,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Run the exact project-approved QA commands without a shell or inherited secrets.
 
     Each check's sealed snapshot and work directory are a fresh owner-only
@@ -2152,6 +2155,8 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
         for check in checks:
             status = "failed"
             return_code: int | None = None
+            phase = "snapshot"
+            reason_code = None
             process: subprocess.Popen[bytes] | None = None
             try:
                 temporary = private_directory(scratch_root, "scratch", "qa-")
@@ -2199,6 +2204,7 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
                         sealed / "runtime-libraries"
                         if check["runtime_libraries"] else None,
                     )
+                    phase = "launch"
                     process = subprocess.Popen(
                         command,
                         cwd=root,
@@ -2211,6 +2217,7 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
                             check["timeout_seconds"]
                         ),
                     )
+                    phase = "execution"
                     status, return_code = _wait_for_qa_process(
                         process,
                         work=work,
@@ -2220,8 +2227,13 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
                             if QA_WORK_DIRECTORY_TOKEN in check["argv"] else None
                         ),
                     )
-                except (ContractError, OSError, subprocess.SubprocessError):
+                except (ContractError, OSError, subprocess.SubprocessError) as exc:
                     status = "unavailable"
+                    reason_code = {
+                        "operational check temporary storage exceeds its bounds": "temporary_storage_limit",
+                        "operational check temporary storage is invalid": "temporary_storage_invalid",
+                        "operational check temporary storage is unstable": "temporary_storage_unstable",
+                    }.get(str(exc), f"{phase}_rejected")
                 finally:
                     cleanup_error: ContractError | None = None
                     if process is not None:
@@ -2229,6 +2241,7 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
                             _terminate_process_group(process)
                         except ContractError as exc:
                             cleanup_error = exc
+                            reason_code = "cleanup_rejected"
                             status = "unavailable"
                             return_code = None
                     if guard is not None:
@@ -2237,6 +2250,7 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
                         except ContractError:
                             changed = True
                         if changed:
+                            reason_code = "snapshot_changed"
                             status = "unavailable"
                             return_code = None
                         guard.close()
@@ -2261,6 +2275,16 @@ def run_operational_check_suite(project_root: Path, *, scratch_root: Path) -> di
                     "return_code": return_code,
                 }
             )
+            if diagnostics is not None:
+                diagnostics.append({
+                    "check_id": check["check_id"],
+                    "status": status,
+                    "return_code": return_code,
+                    "reason_code": reason_code or {
+                        "passed": "check_passed", "failed": "nonzero_exit",
+                        "timeout": "deadline_elapsed",
+                    }.get(status, "runner_unavailable"),
+                })
             report[group].append(
                 {
                     "check_id": check["check_id"],

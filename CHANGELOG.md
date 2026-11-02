@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.2: readiness and hook diagnostics (Codex package 0.8.12)
+
+- Repeated hook deliveries include their observation time in their identity, matching their timestamped
+  contents. Previously, a repeated payload carrying a turn, agent or tool ID could conflict with the
+  earlier record and be rejected. Conflicts remain denied and now return the fixed `record_conflict`
+  code. Hook health retains the last fixed ingestion rejection code without event contents.
+- `learning-status` distinguishes idle ingestion from waiting for the first hook event and points to
+  `/hooks` on the main checkout. It shows each provider's attestation state using admission's existing
+  owner-verified project/account lookup. `billing_attestation_missing` names the wizard's re-attestation
+  option; admission and child permissions are unchanged.
+- Validation names the packaged read-only fallback for an ignored writable project mapping. The usage
+  guide documents proposed patches applied by the primary; wizard step 8 names the clone and folders
+  containing set-up projects, and the hook trust reminder applies to main checkouts.
+- The manual QA recipe runs Python wrappers in-process and puts no flags in their first line. It warns
+  about bytecode and resource limits. Operational QA returns separate fixed failure-stage codes and
+  exit status, while keeping stdout/stderr private and preserving the check report and receipt contracts.
+- The Claude skill documents `result_attempts`. Observation admission errors name the failed contract
+  rule without values. The attestation test helper closes its pty before waiting for the child.
+- Contributors must test a release on a real install from its `version/*` branch before opening its
+  pull request to `main`. This feature branch does not satisfy that owner-run release gate.
+
 ## 0.2.1: Codex primary usability and owner key replacement (Codex package 0.8.11)
 
 - **Codex skill input forms.** A Codex primary kept failing on its own inputs, so:

@@ -281,12 +281,18 @@ class PackageValidationTests(unittest.TestCase):
                 any("smoke" in error or "eligible" in error for error in report["errors"]),
                 report,
             )
-            for name in ("implementation_worker", "verification_worker"):
-                self.assertIn(
-                    f"{name} is workspace-write; Codex children are bridged read-only in "
-                    "this release, so it is not used for Codex routes",
-                    report["warnings"],
-                )
+            self.assertIn(
+                "implementation_worker is workspace-write; Codex children are bridged read-only in "
+                "this release, so it is not used for Codex routes. coding routes use the packaged "
+                "read-only codex_agents_implementation_worker role; the primary applies proposed patches",
+                report["warnings"],
+            )
+            self.assertIn(
+                "verification_worker is workspace-write; Codex children are bridged read-only in "
+                "this release, so it is not used for Codex routes. coding routes use the packaged "
+                "read-only codex_agents_verification_worker role; the primary applies proposed patches",
+                report["warnings"],
+            )
 
     def test_operational_checks_must_be_committed_and_clean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
