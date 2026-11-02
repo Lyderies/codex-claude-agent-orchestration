@@ -15,14 +15,26 @@ If it then says the key file has another link elsewhere, make a fresh copy in `~
 
 ## I lost my owner key passphrase
 
-Signed attestations stay valid (admission uses the latest per account), but you cannot sign new ones: owner
-key rotation is not available yet. To stop a provider's children, disable it in `provider-routing.json`.
+Signed attestations stay valid, but you cannot sign new ones: owner key rotation is not available yet.
+Attestations are kept per project (admission uses the project's latest for the account), so a project you
+have not attested yet cannot run children. To stop a provider's children, disable it in
+`provider-routing.json`.
 
 ## Codex reports the collector unreachable or "filesystem operation failed"
 
 The command ran inside Codex's sandbox. Run `./setup.sh`, choose "Update the install and walk through every
 step", and allow the rule in step 8 (Commands): the default there is "No, not now", so press Down once to
 "Yes, allow these commands" before Enter. Then start a new Codex session in the project's folder.
+
+## "input validation failed"
+
+With a `field` beside it, a task, assignment, parent grant or route was refused. The `field` names where to
+look, such as `task.family`; the value is never printed. A `field` naming a whole object (`task`,
+`assignment`) means it is not an object or has a key the contract does not allow. The worked example in the
+orchestrate-agents skill's `references/contracts.md` shows valid forms.
+
+Without a `field`, the cause is something else: an unreadable or invalid input file, or a check that depends
+on this machine or project.
 
 ## The Codex rule is "stale" after a Python or package upgrade
 

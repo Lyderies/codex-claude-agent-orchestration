@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import stat
 import sys
 import unicodedata
@@ -116,6 +117,8 @@ MAX_RULE_BYTES = 65_536
 # Line breaks, other control characters, invisible format characters and
 # unpaired surrogates never reach a rule file, even quoted.
 _REFUSED_CATEGORIES = {"Cc", "Cf", "Cs", "Zl", "Zp"}
+_SHELL_SPECIAL = frozenset(" \t\n'\"\\$`&;|<>()*?[]{}!")
+_SHELL_SPECIAL_FIRST = frozenset("~#")
 
 
 class HostCommandError(RuntimeError):
@@ -670,6 +673,17 @@ def argv_prefix(
     python = interpreter_path(interpreter, project_root=root)
     copy = runtime_copy_root(root, environ)
     return [python, *PYTHON_FLAGS, str(copy / CLI_RELATIVE)]
+
+
+def shell_command(argv: list[str]) -> str:
+    """`argv` as one line of shell, quoting only a word that cannot run without it."""
+
+    # Not shlex.join: its ASCII allowlist also quotes words such as a non-ASCII path.
+    return " ".join(
+        word if word and word[0] not in _SHELL_SPECIAL_FIRST and not set(word) & _SHELL_SPECIAL
+        else shlex.quote(word)
+        for word in argv
+    )
 
 
 def rule_file_name(project_root: Path) -> str:

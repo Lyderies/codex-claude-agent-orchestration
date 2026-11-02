@@ -10,6 +10,7 @@ import io
 import json
 import os
 import runpy
+import shlex
 import shutil
 import stat
 import subprocess
@@ -43,6 +44,7 @@ from codex_agents.host_commands import (
     rule_status,
     runtime_copy_problem,
     runtime_copy_root,
+    shell_command,
     write_rule,
 )
 from codex_agents import session_guard
@@ -878,6 +880,8 @@ class HostCommandCliTests(unittest.TestCase):
         copy = expected_copy(self.codex_home, self.project)
         self.assertEqual(
             {"ready": False, "argv_prefix": [BASE_PYTHON, *PYTHON_FLAGS, str(copy / CLI_RELATIVE)],
+             # Nothing to run yet: without the rule it would stay sandboxed.
+             "command_prefix": None, "next_command": None,
              "codex_rule": "missing",
              "rule_file": str(rule_path(self.project, self.environ)),
              "runtime_copy": str(copy),
@@ -901,6 +905,18 @@ class HostCommandCliTests(unittest.TestCase):
         report = self.run_cli("host-command")
         self.assertEqual(("installed", True), (report["codex_rule"], report["ready"]))
         self.assertEqual(str(Path(written["runtime_copy"]) / CLI_RELATIVE), report["argv_prefix"][-1])
+        # The text the primary runs is the same words, also from a link to the project.
+        self.assertEqual(shell_command(report["argv_prefix"]), report["command_prefix"])
+        link = self.base / "project-link"
+        link.symlink_to(self.project)
+        for root in (self.project, link):
+            with self.subTest(root=root):
+                report = self.run_cli("host-command", "--project-root", str(root), own_project=False)
+                self.assertEqual(
+                    [*report["argv_prefix"], "learning-status", "--project-root",
+                     str(self.project.resolve())],
+                    shlex.split(report["next_command"]),
+                )
         # The binding records the installing clone (this source tree's repository).
         binding = json.loads((Path(written["runtime_copy"]) / BINDING_RELATIVE).read_text())
         self.assertEqual(str(Path(os.path.realpath(BUNDLE_ROOT)).parents[2]), binding["clone_root"])
@@ -1076,6 +1092,7 @@ class HostCommandCliTests(unittest.TestCase):
         self.assertEqual(("unsupported", False, None), (
             report["codex_rule"], report["ready"], report["argv_prefix"]
         ))
+        self.assertEqual((None, None), (report["command_prefix"], report["next_command"]))
         self.assertIn("only in ~/.codex", report["reason"])
         refused = self.run_cli(
             "install-codex-rule", expected=2, env={"CODEX_HOME": str(elsewhere)}
@@ -1102,6 +1119,25 @@ class HostCommandCliTests(unittest.TestCase):
              "error": "the project has no install manifest; install the package first"},
             report,
         )
+
+
+class ShellCommandTests(unittest.TestCase):
+    def test_a_word_is_quoted_only_when_it_cannot_run_without_it(self) -> None:
+        self.assertEqual(
+            "/usr/bin/python3 -I -X pycache_prefix=/dev/null /a/cli.py learning-status",
+            shell_command(
+                ["/usr/bin/python3", "-I", "-X", "pycache_prefix=/dev/null", "/a/cli.py",
+                 "learning-status"]
+            ),
+        )
+        for word in ("/b c", "/b'c", "/b$c", "/b;c", "~/b", "#b", ""):
+            with self.subTest(word=word):
+                line = shell_command(["/a/cli.py", word])
+                self.assertNotEqual(f"/a/cli.py {word}", line)
+                self.assertEqual(["/a/cli.py", word], shlex.split(line))
+        for word in ("/opt/jos\u00e9/x", "/a~b", "/a#b", "/a+b,c@d%e"):
+            with self.subTest(word=word):
+                self.assertEqual(f"/a/cli.py {word}", shell_command(["/a/cli.py", word]))
 
 
 class SandboxHintTests(unittest.TestCase):

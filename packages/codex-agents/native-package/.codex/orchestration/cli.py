@@ -157,6 +157,7 @@ from codex_agents.host_commands import (  # noqa: E402
     configured_codex_home,
     install_rule as install_codex_rule,
     installer_root,
+    project_cli,
     remove_rule as remove_codex_rule,
     render_rule as render_codex_rule,
     rule_path as codex_rule_path,
@@ -164,6 +165,7 @@ from codex_agents.host_commands import (  # noqa: E402
     runtime_binding,
     runtime_copy_problem,
     runtime_copy_root,
+    shell_command,
 )
 from codex_agents.claude_host import (  # noqa: E402
     ClaudeHostDenied,
@@ -2992,7 +2994,8 @@ def main() -> int:
             except CodexHomeUnsupported as exc:
                 # The rule and its copy live only in the real ~/.codex.
                 report = {
-                    "ready": False, "argv_prefix": None, "codex_rule": "unsupported",
+                    "ready": False, "argv_prefix": None, "command_prefix": None,
+                    "next_command": None, "codex_rule": "unsupported",
                     "reason": str(exc), "rule_file": None, "runtime_copy": None,
                 }
             else:
@@ -3012,9 +3015,16 @@ def main() -> int:
                         )
                     except (HostCommandError, TypeError):
                         clone = None  # no copy yet: nothing recorded to protect
+                # Text to run as printed: the rule does not match quoted command words.
+                runnable = status == "installed" and prefix is not None
                 report = {
                     "ready": status == "installed",
                     "argv_prefix": prefix,
+                    "command_prefix": shell_command(prefix) if runnable else None,
+                    "next_command": shell_command([
+                        *prefix, "learning-status",
+                        "--project-root", str(project_cli(args.project_root)[0]),
+                    ]) if runnable else None,
                     "codex_rule": status,
                     "rule_file": str(codex_rule_path(args.project_root)),
                     "runtime_copy": runtime_copy,
@@ -3094,8 +3104,12 @@ def main() -> int:
             "reason_code": exc.reason_code,
         })
         return 2
-    except ContractError:
-        _print({"ready": False, "error": "input validation failed"})
+    except ContractError as exc:
+        # Only the field's name is printed: the message can hold the input's values.
+        report = {"ready": False, "error": "input validation failed"}
+        if exc.field is not None:
+            report["field"] = exc.field
+        _print(report)
         return 2
     except (
         CatalogError,
