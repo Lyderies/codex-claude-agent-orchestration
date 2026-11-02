@@ -68,6 +68,7 @@ OWNER_COMMANDS = {
     "learning-serve",
     "learning-record-billing-attestation",
     "learning-configure-owner-key",
+    "learning-replace-owner-key",
     "learning-create-grant-request",
     "learning-attach-grant-signature",
     "learning-delete-project",

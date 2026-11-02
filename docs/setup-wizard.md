@@ -20,8 +20,9 @@ private log, shown only if something fails. `NO_COLOR=1` gives plain output. Pat
    that has never been set up needs a prepared `operational-checks.json` (see the
    [recipe](manual-setup.md#operational-checks)); the wizard asks for its path and works from a private
    snapshot of it. An existing install offers: update the install and walk through every step, verify the
-   install only, re-run the billing attestation only, change the owner key passphrase, choose another
-   path, or quit.
+   install only, re-run the billing attestation only, change the owner key passphrase, replace a lost
+   owner key, choose another path, or quit. The menu warns if the owner key file does not match its record,
+   and says when the key was last replaced.
 3. **Providers.** Codex children, Claude children and which Claude models, and "Let Codex sessions
    orchestrate Claude children". An existing `provider-routing.json` can be kept.
 4. **Install.** The screen starts with "Close every Codex session in this project first": the learning

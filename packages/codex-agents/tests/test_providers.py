@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ from codex_agents.learning_store import (
     LearningLedger,
     LearningState,
     LedgerError,
+    StateError,
     authorize_collector_runtime,
 )
 from codex_agents.providers import (
@@ -1113,6 +1115,117 @@ class AdmissionTests(unittest.TestCase):
                 "no_paid_overage": False, "no_usage_credits": True, "issued_at": 5,
             })
         self.assert_denied("billing_attestation_missing")
+
+    # Replacing a lost owner key.
+
+    def other_key(self, name: str = "other") -> tuple[Path, str]:
+        directory = Path(self.temporary.name) / name
+        directory.mkdir()
+        return generate_test_owner_key(directory)
+
+    def denial(self) -> str:
+        """The admission denial's reason, or "admitted"."""
+
+        try:
+            self.admit()
+        except AdmissionDenied as denied:
+            return denied.reason_code
+        return "admitted"
+
+    def test_an_emptied_signer_file_does_not_accept_another_key(self) -> None:
+        identity = self.observe()[0]
+        original = self.state.allowed_signers_path.read_bytes()
+        self.state.allowed_signers_path.write_bytes(b"")
+        key, public = self.other_key()
+        with self.assertRaisesRegex(StateError, "Replace a lost owner key"):
+            self.state.install_owner_public_key(public)
+        with self.assertRaises((LedgerError, StateError)):
+            attest_provider(
+                self.ledger, self.project_id, key, "codex", identity["account_fingerprint"]
+            )
+        self.assert_denied("billing_attestation_missing")
+        # The key on record may be put back.
+        self.state.install_owner_public_key(original.decode("ascii").split(" ", 1)[1])
+        self.assertEqual(self.state.allowed_signers_path.read_bytes(), original)
+        self.assertEqual(self.state.owner_key_report()["state"], "ok")
+
+    def test_a_swapped_signer_file_signs_nothing_and_stops_admission(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.attest("codex", fingerprint)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+        original = self.state.allowed_signers_path.read_bytes()
+        key, public = self.other_key()
+        fields = public.split()
+        self.state.allowed_signers_path.write_bytes(
+            f"codex-agents-owner {fields[0]} {fields[1]}\n".encode("ascii")
+        )
+        with self.assertRaisesRegex(StateError, "not the owner key on record"):
+            self.state.owner_allowed_signers()
+        self.assertEqual(self.state.owner_key_report()["state"], "mismatch")
+        self.assert_denied("billing_attestation_missing")
+        with self.assertRaises((LedgerError, StateError)):
+            attest_provider(self.ledger, self.project_id, key, "codex", fingerprint)
+        # Putting the recorded key back restores what it signed.
+        self.state.allowed_signers_path.write_bytes(original)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+
+    def test_replacing_the_key_cancels_what_the_old_key_signed(self) -> None:
+        identity = self.observe()[0]
+        fingerprint = identity["account_fingerprint"]
+        self.attest("codex", fingerprint)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+        key, public = self.other_key()
+        report = self.ledger.replace_owner_key(public, now_ms=NOW)
+        self.assertEqual(report["state"], "ok")
+        self.assertEqual(report["replacements"], 1)
+        self.assertEqual(report["last_replaced_at_ms"], NOW)
+        listed = subprocess.run(
+            ["ssh-keygen", "-l", "-f", f"{key}.pub"], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(report["fingerprint"], listed.stdout.split()[1])
+        self.assert_denied("billing_attestation_missing")
+        # The old key can no longer sign; the new one can.
+        with self.assertRaises(LedgerError):
+            attest_provider(
+                self.ledger, self.project_id, self.owner_private_key, "codex", fingerprint,
+                issued_at=2,
+            )
+        attest_provider(self.ledger, self.project_id, key, "codex", fingerprint, issued_at=3)
+        self.assertNotEqual(self.denial(), "billing_attestation_missing")
+
+    def test_an_interrupted_replacement_fails_closed_and_can_be_finished(self) -> None:
+        self.observe()
+        key, public = self.other_key()
+        with mock.patch.object(
+            self.state, "_write_owner_signers", side_effect=OSError("interrupted")
+        ):
+            with self.assertRaises(OSError):
+                self.ledger.replace_owner_key(public, now_ms=NOW)
+        self.assertEqual(self.state.owner_key_report()["state"], "mismatch")
+        self.assert_denied("billing_attestation_missing")
+        report = self.ledger.replace_owner_key(public, now_ms=NOW + 1)
+        self.assertEqual(report["state"], "ok")
+        self.assertEqual(report["replacements"], 1)
+        self.assertEqual(report["last_replaced_at_ms"], NOW)
+
+    def test_the_key_history_only_grows_and_needs_a_first_key(self) -> None:
+        for statement in (
+            "DELETE FROM owner_key_history",
+            "UPDATE owner_key_history SET reason='replaced'",
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.ledger._connection.execute(statement)
+        base = Path(self.temporary.name) / "fresh"
+        base.mkdir()
+        fresh_state = LearningState(base / "state")
+        fresh = LearningLedger(fresh_state, client_capabilities=self.clients)
+        try:
+            self.assertEqual(fresh_state.owner_key_report()["state"], "not_configured")
+            with self.assertRaisesRegex(LedgerError, "nothing to replace"):
+                fresh.replace_owner_key(self.other_key()[1], now_ms=NOW)
+        finally:
+            fresh.close()
 
     # S3b: client version, Codex plan, the run-count backstop, restrictive
     # rate-limit events.

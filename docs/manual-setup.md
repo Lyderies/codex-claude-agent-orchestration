@@ -127,7 +127,7 @@ No child runs until you confirm that each account cannot be charged beyond its s
 - It creates the owner key at `~/.ssh/codex-agents-owner` if you have none. Any owner key must be a file in
   your own `~/.ssh` (no symbolic link on its path, the folder writable only by you), checked again before
   every use; a key anywhere else is refused. Keys without a passphrase are refused, and signing runs
-  without `ssh-agent`, so no program, including an AI agent, can sign in your name. The owner key record
+  without `ssh-agent`, so no program, including an AI agent, can use your key to sign in your name. The owner key record
   must hold exactly one key.
 - It asks whether pay-as-you-go extra usage and Codex credit spending are turned off, and has you sign each
   answer. It signs in memory, only the bytes it rebuilt from your answers, and checks the signature.

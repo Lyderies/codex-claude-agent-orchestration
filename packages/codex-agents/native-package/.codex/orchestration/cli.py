@@ -1224,6 +1224,12 @@ def build_parser() -> argparse.ArgumentParser:
     learning_owner_key.add_argument("--state-root", type=Path)
     learning_owner_key.add_argument("--public-key", required=True, type=Path)
 
+    learning_replace_owner_key = subparsers.add_parser(
+        "learning-replace-owner-key", help="replace a lost owner public SSH key"
+    )
+    _add_learning_project(learning_replace_owner_key)
+    learning_replace_owner_key.add_argument("--public-key", required=True, type=Path)
+
     learning_grant_request = subparsers.add_parser(
         "learning-create-grant-request", help="create exact bytes for detached owner signing"
     )
@@ -1617,6 +1623,7 @@ def main() -> int:
                     "collector_health": health.get("collector_health", {}),
                     "client_failures": client_failures,
                     "ingestion": health["ingestion"],
+                    "owner_key": state.owner_key_report(),
                 }
             except CollectorError as exc:
                 client_failures = client_health_snapshot(state, args.project_root)
@@ -2955,6 +2962,15 @@ def main() -> int:
             state = LearningState(args.state_root)
             path = state.install_owner_public_key(args.public_key.read_text())
             report = {"ready": True, "allowed_signers": path.name}
+        elif args.command == "learning-replace-owner-key":
+            ledger, _project_id = _learning_ledger(args)
+            try:
+                report = {
+                    "ready": True,
+                    "owner_key": ledger.replace_owner_key(args.public_key.read_text()),
+                }
+            finally:
+                _close_ledger(ledger)
         elif args.command == "learning-create-grant-request":
             ledger, project_id = _learning_ledger(args)
             try:

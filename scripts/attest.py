@@ -668,7 +668,8 @@ def owner_tool(argv: list[str]) -> int:
     copy; ``copy-input SOURCE DESTINATION`` snapshots an owner-chosen input file;
     ``client-status codex|claude [PROJECT]`` runs that client's sign-in status command as the
     runtime would (client_status) and exits with its code, printing Claude's JSON for the
-    wizard to parse and nothing for Codex; ``legacy-state`` prints legacy_state_report as JSON.
+    wizard to parse and nothing for Codex; ``legacy-state`` prints legacy_state_report as JSON;
+    ``owner-key`` prints the state's owner key report as JSON.
     """
 
     try:
@@ -683,6 +684,14 @@ def owner_tool(argv: list[str]) -> int:
             return 0
         if argv == ["legacy-state"]:
             print(json.dumps(legacy_state_report(), sort_keys=True))
+            return 0
+        if argv == ["owner-key"]:
+            store = clone_module("learning_store")
+            try:
+                state = store.LearningState(default_state_root(), create=False)
+                print(json.dumps(state.owner_key_report(), sort_keys=True))
+            except (store.StateError, OSError) as exc:
+                raise AttestError("the owner key record could not be read") from exc
             return 0
         if len(argv) in (2, 3) and argv[0] == "client-status" and argv[1] in CLIENT_COMMANDS:
             code, output = client_status(argv[1], Path(argv[2]) if len(argv) == 3 else None)
@@ -1107,6 +1116,7 @@ def offer_retry() -> bool:
     """After a wrong passphrase: True to try again (the default), False to give up."""
 
     print("That passphrase did not unlock the key.")
+    print("If it is lost, exit and choose Replace a lost owner key in ./setup.sh.")
     while True:
         answer = input("Try again or Exit? [T/e] ").strip().lower()
         if answer in ("", "t", "try", "try again"):
@@ -1138,6 +1148,12 @@ def default_key() -> Path:
     under the account database's home folder."""
 
     return ssh_folder() / "codex-agents-owner"
+
+
+def owner_key_locations() -> list[Path]:
+    """The default key file, then the numbered ones a replacement creates beside it."""
+
+    return [default_key(), *(ssh_folder() / f"codex-agents-owner-{n}" for n in range(2, 100))]
 
 
 def _create_key(path: Path) -> None:
@@ -1202,8 +1218,8 @@ SIGNER_LINE = re.compile(
 )
 EXTRA_SIGNERS = (
     "the owner key record does not hold exactly one owner key, so nothing will be signed. Do "
-    "not attest until you know why: delete owner-allowed-signers in the learning state folder "
-    "and run the attestation again"
+    "not attest until you know why. If you did not change it, a program may have: run ./setup.sh "
+    "and choose Replace a lost owner key"
 )
 
 
@@ -1273,8 +1289,8 @@ def ensure_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> 
 
 ENROLLED_MISMATCH = (
     "the owner key now configured is not the key shown above, so nothing was signed. Do not "
-    "attest until you know why: delete owner-allowed-signers in the learning state folder and "
-    "run the attestation again"
+    "attest until you know why. If you did not change it, a program may have: run ./setup.sh "
+    "and choose Replace a lost owner key"
 )
 
 NOT_A_PATH = (
@@ -1290,21 +1306,22 @@ def _default_key_file(configured: tuple[str, str]) -> Path | None:
     needs no passphrase. The full check (deriving the public key) happens afterwards.
     """
 
-    try:
-        key = default_key()
-        check_key_location(key)
-        if not stat.S_ISREG(key.lstat().st_mode):
-            return None
-    except (AttestError, OSError):
-        return None
-    adjacent = Path(str(key) + ".pub")
-    if os.path.lexists(adjacent):
+    for key in owner_key_locations():
         try:
-            if _split_public(adjacent.read_text()) != configured:
-                return None
-        except (OSError, UnicodeDecodeError, AttestError):
-            return None
-    return key
+            check_key_location(key)
+            if not stat.S_ISREG(key.lstat().st_mode):
+                continue
+        except (AttestError, OSError):
+            continue
+        adjacent = Path(str(key) + ".pub")
+        if os.path.lexists(adjacent):
+            try:
+                if _split_public(adjacent.read_text()) != configured:
+                    continue
+            except (OSError, UnicodeDecodeError, AttestError):
+                continue
+        return key
+    return None
 
 
 def locate_key_file(configured: tuple[str, str]) -> Path:
@@ -1364,6 +1381,49 @@ def check_trusted_state(state_root: Path) -> None:
         raise AttestError("the owner key record is not a regular file")
     if _in_temp_root(state_root) or _in_working_tree(state_root):
         raise AttestError("the owner key record is in a temporary folder or a project; refusing to trust it")
+
+
+REPLACE_ADVICE = (
+    "This replaces your owner key without the old one, for when its passphrase is lost.\n"
+    "Every billing statement signed with the old key stops counting, in every project, so\n"
+    "children stop there until you sign again. This project is signed next. The old key file\n"
+    "stays where it is. If you did not expect to be here, stop: a program may have sent you."
+)
+
+
+def replace_owner_key(target: Path, state_root: Path, cli_state: Path | None) -> Path:
+    """Create a new owner key, make it the owner key, and return it."""
+
+    check_trusted_state(state_root)
+    print(REPLACE_ADVICE)
+    try:
+        configured = configured_public_key(state_root)
+    except AttestError:
+        print("Owner key now: unreadable")
+    else:
+        print(f"Owner key now: {describe_key(*configured) if configured else 'none'}")
+    if input("Type REPLACE to continue: ").strip() != "REPLACE":
+        raise AttestError("nothing was changed")
+    key = next(
+        (path for path in owner_key_locations()
+         if not os.path.lexists(path) and not os.path.lexists(Path(str(path) + ".pub"))),
+        None,
+    )
+    if key is None:
+        raise AttestError("no free owner key file name is left in your ~/.ssh folder")
+    print(f"Creating the new owner key at {key}")
+    _create_key(key)
+    print("Enter the new passphrase once more, to check you can use it.")
+    with key_snapshot(key) as copy:
+        validate_private_key(key, copy)
+        derived = derive_public(key, copy)
+    print(f"New owner key: {describe_key(*derived)}")
+    run_cli(target, ["learning-replace-owner-key", "--project-root", str(target)], cli_state,
+            files={"--public-key": f"{derived[0]} {derived[1]}\n".encode("ascii")})
+    if configured_public_key(state_root) != derived:
+        raise AttestError(ENROLLED_MISMATCH)
+    print("The owner key was replaced. Keep the new passphrase somewhere safe.")
+    return key
 
 
 KEY_UNCHANGED = "the passphrase was not changed: your key file is as it was. Run the change again"
@@ -1609,6 +1669,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target", type=Path, help="project with the packages installed")
     parser.add_argument("--change-passphrase", action="store_true",
                         help="change the owner key's passphrase instead of attesting")
+    parser.add_argument("--replace-owner-key", action="store_true",
+                        help="replace a lost owner key, then attest the target")
     parser.add_argument(
         "--state-root", type=Path,
         help="learning state directory (default: platform default; an installed project's "
@@ -1647,7 +1709,8 @@ def main(argv: list[str] | None = None) -> int:
         trusted_python(target)
         check_project_runtime(target)
         providers = enabled_providers(target)
-        key = ensure_owner_key(target, state_root, cli_state)
+        key = (replace_owner_key(target, state_root, cli_state) if args.replace_owner_key
+               else ensure_owner_key(target, state_root, cli_state))
         done = [p for p in providers if attest_provider(target, key, p, cli_state)]
     except AttestError as exc:
         print(f"Stopped: {exc}", file=sys.stderr)

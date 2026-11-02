@@ -15,10 +15,20 @@ If it then says the key file has another link elsewhere, make a fresh copy in `~
 
 ## I lost my owner key passphrase
 
-Signed attestations stay valid, but you cannot sign new ones: owner key rotation is not available yet.
-Attestations are kept per project (admission uses the project's latest for the account), so a project you
-have not attested yet cannot run children. To stop a provider's children, disable it in
-`provider-routing.json`.
+Run `./setup.sh`, pick the project and choose "Replace a lost owner key". It creates a new key with a new
+passphrase, then signs for that project. If the wizard says the project's orchestrator differs from this
+setup, choose "Update the install and walk through every step" first and skip the attestation step.
+
+Replacing the key cancels every billing statement the old key signed, in every project, so each project's
+children are refused with `billing_attestation_missing` until you choose "Re-run the billing attestation
+only" there. Other owner approvals the old key signed also stop counting. The old key file stays in
+`~/.ssh`; the new one is `codex-agents-owner-2` (or the next free number).
+
+## "owner allowed-signers is not the owner key on record"
+
+The owner key file in your records no longer matches the key the ledger recorded, so nothing can be signed
+and billing statements stop counting. If you did not change it, a program may have, so find out what ran
+before going further. To go on, choose "Replace a lost owner key" in `./setup.sh`.
 
 ## Codex reports the collector unreachable or "filesystem operation failed"
 

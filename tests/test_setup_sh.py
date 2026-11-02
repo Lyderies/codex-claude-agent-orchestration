@@ -914,6 +914,8 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("Profile: exists with the same settings", text)
         self.assertIn("network_access is off", text)
         self.assertIn('"Change the owner key passphrase"', text)
+        self.assertIn('"Replace a lost owner key"', text)
+        self.assertIn('attest.py" --target "$PROJECT" --replace-owner-key', text)
         self.assertIn("attest.py\" --change-passphrase", text)
         self.assertIn('"$HOME/agent-orchestration-setup-summary.txt"', text)
         self.assertNotIn('"$PWD/agent-orchestration-setup-summary.txt"', text)
@@ -1861,7 +1863,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Update the install")
         self.settle()
         self.assertGreater(self.pid, 0)  # still running: a failure never ended the wizard
-        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
         self.expect("Stopped.")
         self.assertEqual(self.finish(), 0)
 
@@ -1900,6 +1902,32 @@ class WizardTerminalTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin",
                          "operational checks use the macOS sandbox, so verify is not ready elsewhere")
+    def test_replace_a_lost_owner_key_is_offered_and_can_be_backed_out_of(self) -> None:
+        import json
+        project, checks = self.make_project(base=self.non_temporary_base())
+        routing_in = self.base / "par.json"
+        routing_in.write_text(json.dumps({"version": 1, "roles": {}, "verifiers": {}}))
+        subprocess.run(
+            [TRUSTED_PY, str(ROOT / "scripts" / "install.py"), "install", "--target", str(project),
+             "--project-agent-routing", str(routing_in), "--operational-checks", str(checks), "--apply"],
+            check=True, capture_output=True, env=self.env)
+        self.start(project, {"FAKE_RULE": "missing"})
+        self.expect("Everything looks good")
+        self.send("\r")
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Replace a lost owner key")
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\r")
+        self.expect("Use this only if you can no longer unlock your owner key")
+        self.expect("Replace the owner key")
+        self.send("\x1b[B\r")  # Back to the main menu
+        self.expect("Project path")
+        self.send("\r")
+        self.expect("Update the install")
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.expect("Stopped.")
+        self.assertEqual(self.finish(), 0)
+
     def test_verify_retry_back_and_the_summary_return_to_the_menu(self) -> None:
         import json
         project, checks = self.make_project(base=self.non_temporary_base())
@@ -1936,7 +1964,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.expect("Project path")
         self.send("\r")
         self.expect("Update the install")
-        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
+        self.send("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r")  # Quit
         self.expect("Stopped.")
         self.assertEqual(self.finish(), 0)
 
