@@ -1607,7 +1607,9 @@ def main() -> int:
                         ORCHESTRATION_ROOT / "cli.py",
                         project_root=args.project_root,
                     )
-                    health = CollectorClient(state.socket).health(args.project_root)
+                    # Status verifies owner signatures using admission's lookup. Give
+                    # that read more time than the short hook-delivery socket timeout.
+                    health = CollectorClient(state.socket, timeout=5.0).health(args.project_root)
                 client_failures = client_health_snapshot(state, args.project_root)
                 report = {
                     "ready": True,
@@ -1624,6 +1626,15 @@ def main() -> int:
                 }
             except CollectorError as exc:
                 client_failures = client_health_snapshot(state, args.project_root)
+                ingestion = empty_ingestion_snapshot(
+                    registered=exc.code != "project_unregistered"
+                )
+                if exc.code != "project_unregistered":
+                    ingestion["ingestion_state"] = "unavailable"
+                    ingestion["freshness"] = {
+                        "state": "unavailable", "age_ms": None,
+                        "message": "Hook delivery is unknown while the collector is unavailable.",
+                    }
                 report = _with_codex_hint(args.command, {
                     "ready": False,
                     "active": False,
@@ -1632,9 +1643,7 @@ def main() -> int:
                         provider: {"state": "unavailable"} for provider in ("codex", "claude")
                     },
                     "client_failures": client_failures,
-                    "ingestion": empty_ingestion_snapshot(
-                        registered=exc.code != "project_unregistered"
-                    ),
+                    "ingestion": ingestion,
                     "owner_key": state.owner_key_report(),
                 })
         elif args.command == "learning-backup-project":

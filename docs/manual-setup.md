@@ -23,21 +23,22 @@ A project that has never been set up needs `operational-checks.json`. It names t
 commands, with their hashes, that operational QA may run. Write two small Python wrappers and commit them
 before computing their hashes: the installer checks that each file matches a clean commit.
 
-Both wrappers must run **in-process**. QA denies starting another process, so `subprocess`, `os.system`,
-`os.exec*` and wrappers that launch `python`, `pytest` or `gitleaks` as a command fail. Use the test runner's
+Both wrappers must run **in-process**. QA denies starting another process, so `subprocess`, `os.system` and
+wrappers that launch `python`, `pytest` or `gitleaks` as a command fail. Use the test runner's
 Python API and a project-maintained Python security scanner that also runs in-process. The example below
 assumes `scripts/scan_secrets.py` exists and exits nonzero on findings; supply and test that scanner first.
 A scanner needing Python packages also needs a pinned `runtime_tree` in the check configuration.
 
 The first line is only `#!` plus the absolute trusted interpreter path, **with no interpreter flags**.
-QA checks that line and starts the interpreter itself with isolation flags. Set `QA_PYTHON` to the real
+QA checks that line, snapshots the pinned interpreter and starts it directly with a minimal environment.
+It does not take flags from the first line. Set `QA_PYTHON` to the real
 trusted interpreter file (not a symlink or macOS's `/usr/bin/python3` shim).
 
 ```sh
 cd /path/to/project
 QA_PYTHON=/absolute/path/to/trusted/python3
-printf '#!%s\nimport unittest\nsuite = unittest.defaultTestLoader.discover("tests")\nraise SystemExit(0 if unittest.TextTestRunner().run(suite).wasSuccessful() else 1)\n' "$QA_PYTHON" > qa-check
-printf '#!%s\nimport runpy\nrunpy.run_path("scripts/scan_secrets.py", run_name="__main__")\n' "$QA_PYTHON" > qa-security
+printf '#!%s\nimport os, sys, unittest\nsys.path.insert(0, os.getcwd())\nsuite = unittest.defaultTestLoader.discover("tests")\nraise SystemExit(0 if unittest.TextTestRunner().run(suite).wasSuccessful() else 1)\n' "$QA_PYTHON" > qa-check
+printf '#!%s\nimport os, runpy, sys\nsys.path.insert(0, os.getcwd())\nrunpy.run_path("scripts/scan_secrets.py", run_name="__main__")\n' "$QA_PYTHON" > qa-security
 chmod 700 qa-check qa-security
 git add qa-check qa-security scripts/scan_secrets.py && git commit -m "Add QA check wrappers"
 INTERP=$(shasum -a 256 "$QA_PYTHON" | cut -d' ' -f1)   # sha256sum on Linux

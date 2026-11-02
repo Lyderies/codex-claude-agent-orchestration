@@ -160,8 +160,8 @@ def _record(args: argparse.Namespace, raw: bytes, checkout_root: Path | None) ->
             )
             raise
     except CollectorError as exc:
-        # The stage-specific counters above distinguish admission failure. Collector
-        # startup and transport failures remain visible under collector_unavailable.
+        # Bind/ingest failures, including unconfirmed transport failures, are counted
+        # by stage above. Startup transport failures count as collector_unavailable.
         if (
             not admission_failure
             and "state" in locals()

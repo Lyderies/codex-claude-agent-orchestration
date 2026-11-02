@@ -33,9 +33,12 @@ research and independent review. A coding route can ask a read-only implementati
 patch in its result; the primary checks and applies that patch, runs the project checks and requests
 independent verification. A patch in a child's reply has not changed the project.
 
-A project agent mapped to `workspace-write` is not eligible for a Codex child yet. Validation names the
-packaged read-only role that handles that family instead. This warning does not grant write access or
-change the route's model or effort; those still come from `learning-route`.
+A project agent mapped to `workspace-write` is not eligible for a Codex child yet. Routing skips that
+Codex candidate and tries the remaining eligible providers in policy order; it denies the task if none
+is eligible. In a Codex-only project that family is unavailable until its mapping is read-only. There is
+no automatic replacement with a packaged role. The project owner can align its mapping for read-only
+patch authorship; the primary can meanwhile write code and delegate eligible research and review tasks.
+The provider, model, effort and role still come from `learning-route`.
 
 ## When a task is denied
 

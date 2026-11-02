@@ -895,8 +895,8 @@ class SetupScriptTests(unittest.TestCase):
         text = SETUP.read_text(encoding="utf-8")
         self.assertIn("Every Codex session on this machine loads this rule from $RULE_FILE (mode 0600). "
                       "It runs a protected copy of the orchestrator in ~/.codex that sessions opened on a "
-                      "project cannot change. Never open Codex on your home folder, its parent or / while "
-                      "the rule exists.", text)
+                      "project cannot change. Never open Codex on the orchestrator clone, a folder that "
+                      "contains a set-up project, your home folder, its parent or / while the rule exists.", text)
         self.assertNotIn("It applies to Codex sessions started in this project's root folder", text)
         self.assertIn("Setup commits with Git's plumbing commands only (hash-object, update-index, write-tree, "
                       "commit-tree, update-ref), which start no hook, filter, signing program, pager or "
@@ -2146,7 +2146,7 @@ class WizardTerminalTests(unittest.TestCase):
         self.send("\r")
         self.expect("Commit now")
         plain = re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\(B", "", self.screen))
-        self.assertIn("In Codex, open /hooks and trust the orchestrator's learning hooks", plain)
+        self.assertIn("In Codex, open /hooks and trust the orchestrator's learning hooks (main checkout only)", plain)
         self.assertNotIn("Do not trust", plain)
         self.send("\x1b[B\r")
         self.finish_after_install()
