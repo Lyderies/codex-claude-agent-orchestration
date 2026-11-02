@@ -326,6 +326,10 @@ def _close_ledger(ledger: LearningLedger | _RestartingLedger) -> None:
 
 # Codex's sandbox blocks the collector's socket and state, so a sandboxed primary
 # gets this alongside the unchanged error.
+BILLING_ATTESTATION_HINT = (
+    'Run ./setup.sh for this project and choose "Re-run the billing attestation only".'
+)
+
 CODEX_SANDBOX_HINT = (
     "If this ran inside the Codex sandbox: run host-command --project-root "
     "<exact-root> and repeat this command with its argv_prefix; if codex_rule is not "
@@ -3117,7 +3121,10 @@ def main() -> int:
         return 2
     except BridgeRefused as exc:
         # Refusal messages are fixed strings; they never carry prompts or paths.
-        _print({"ready": False, "error": "dispatch refused", "reason": str(exc)})
+        report = {"ready": False, "error": "dispatch refused", "reason": str(exc)}
+        if str(exc) == "launch denied: billing_attestation_missing":
+            report["hint"] = BILLING_ATTESTATION_HINT
+        _print(report)
         return 2
     except AdmissionDenied as exc:
         report = {
@@ -3126,9 +3133,7 @@ def main() -> int:
             "reason_code": exc.reason_code,
         }
         if exc.reason_code == "billing_attestation_missing":
-            report["hint"] = (
-                'Run ./setup.sh for this project and choose "Re-run the billing attestation only".'
-            )
+            report["hint"] = BILLING_ATTESTATION_HINT
         _print(report)
         return 2
     except ContractError as exc:

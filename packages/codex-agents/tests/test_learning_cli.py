@@ -37,6 +37,7 @@ from cli import _RestartingLedger, _close_ledger
 from cli import main as cli_main
 from codex_agents.learning_engine import generate_candidate, runtime_fixture_digest
 from codex_agents.providers import AdmissionDenied
+from codex_agents.bridge import BridgeRefused
 from tests.learning_support import (
     DIGEST_A,
     DIGEST_B,
@@ -423,11 +424,18 @@ class LearningCliTests(unittest.TestCase):
             self._stop_collector()
 
     def test_missing_billing_attestation_names_the_wizard_option(self) -> None:
-        with mock.patch.object(LearningLedger, "observe_provider",
-                               side_effect=AdmissionDenied("billing_attestation_missing")):
-            report = self._observe("claude", expected=2)
-        self.assertEqual("billing_attestation_missing", report["reason_code"])
-        self.assertIn('"Re-run the billing attestation only"', report["hint"])
+        for failure, field, reason in (
+            (AdmissionDenied("billing_attestation_missing"),
+             "reason_code", "billing_attestation_missing"),
+            (BridgeRefused("launch denied: billing_attestation_missing"),
+             "reason", "launch denied: billing_attestation_missing"),
+        ):
+            with self.subTest(field=field), mock.patch.object(
+                LearningLedger, "observe_provider", side_effect=failure
+            ):
+                report = self._observe("claude", expected=2)
+            self.assertEqual(reason, report[field])
+            self.assertIn('"Re-run the billing attestation only"', report["hint"])
 
     def test_status_allows_time_for_owner_signature_verification(self) -> None:
         ledger = LearningLedger(LearningState(self.state_root, create=False))
