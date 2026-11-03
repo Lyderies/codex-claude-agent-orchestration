@@ -123,10 +123,13 @@ for that project in `./setup.sh`.
 ## Operational QA fails without test output
 
 QA keeps stdout and stderr private. `learning-run-operational-checks` returns separate `diagnostics`
-with a fixed reason code and exit code for each check; the receipt's check report is unchanged.
+with a fixed reason code and exit code for each returned check; the receipt's check report is unchanged.
+These are the checks' exit codes: a successful CLI call can still report a failing check. A cleanup
+failure aborts the command before it returns per-check diagnostics; the command fails closed.
 `nonzero_exit` means the wrapper failed, `deadline_elapsed` means it timed out, and
 `temporary_storage_limit`, `temporary_storage_invalid` or `temporary_storage_unstable` names a storage
 guard. `snapshot_rejected`, `launch_rejected`, `execution_rejected` and `snapshot_changed` identify the
-stage without revealing paths or exception values. A terminated process may have a negative exit code;
+stage without revealing paths or exception values. `runner_unavailable` is the fixed fallback when no
+more specific reason applies. A terminated process may have a negative exit code;
 large-file fixtures can exceed QA's resource limit. Inspect the wrapper locally, retaining the guard.
 See the [in-process wrapper recipe and bytecode warning](manual-setup.md#operational-checks).

@@ -15,7 +15,8 @@
   names the clone and folders containing set-up projects, and the hook trust reminder applies to main checkouts.
 - The manual QA recipe runs Python wrappers in-process and puts no flags in their first line. It warns
   about bytecode and resource limits. Operational QA returns separate fixed failure-stage codes and
-  exit status, while keeping stdout/stderr private and preserving the check report and receipt contracts.
+  each check's exit code, while keeping stdout/stderr private and preserving the check report and receipt
+  contracts.
 - The Claude skill documents `result_attempts`. Observation admission errors name the failed contract
   rule without values. The attestation test helper closes its pty before waiting for the child.
 - The Codex session guard now reports the existing sandbox-disabled refusal when Codex omits
@@ -31,6 +32,16 @@
   Historical lifecycle gaps cannot be attributed from
   aggregate counters alone. The earlier Haiku research report was rejected by its routed Codex/high
   verifier for overclaims; only the reproduced hook collision informed the fix.
+- **Release security review continuation.** A routed Codex Astra/high source review and its independent
+  Claude Opus/high verifier found no reproducible authority, privacy or QA-diagnostic security defect.
+  The verifier caught SECURITY.md still naming the previous release; its version text is corrected.
+  Both operational checks passed, but managed QA rejected the original review's documentation criterion.
+  That recorded rejection remains; these documentation corrections have local checks only.
+  The repository suite passed 271 tests (two skipped), and the Claude suite passed 100. The Codex suite
+  passed 710 of 711; the remaining bytecode-fixture test conflicted with the invocation's cache-prefix
+  override and passed in a 17-test focused rerun without it. Ruff and the file and new-commit identifier
+  scans passed. The full-history scan still flags two pre-existing merge authors against the local
+  private denylist. Source review and these checks do not satisfy the real-install release gate.
 
 ## 0.2.1: Codex primary usability and owner key replacement (Codex package 0.8.11)
 
