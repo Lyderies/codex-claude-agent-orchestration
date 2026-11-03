@@ -160,8 +160,10 @@ def normalize_hook(
         value = payload.get(field)
         if isinstance(value, (str, bool, int)):
             identity_parts.append(str(value))
-    if not any((turn, agent, tool_use)):
-        identity_parts.append(str(timestamp))
+    # Hook deliveries are observations, not a replay protocol. Their content includes
+    # the observation time, so their identity must include it too, even with a turn,
+    # agent or tool ID. Otherwise a repeated payload conflicts with the first record.
+    identity_parts.append(str(timestamp))
     event_code, status = mapping
     stop_reason = {
         "SessionEnd": "completed",

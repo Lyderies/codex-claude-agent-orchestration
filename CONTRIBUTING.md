@@ -34,6 +34,9 @@ CI runs the identifier guard, Ruff and all three suites on Linux and macOS.
 - Changes to authority, containment or billing logic need an independent security review before
   release, recorded in the CHANGELOG. Everything else needs tests, Ruff and a clean identifier scan.
 - Describe user-visible changes in [CHANGELOG.md](CHANGELOG.md).
+- Before opening a release pull request from `version/*` to `main`, try that release on a real
+  install from its `version/*` branch. Record what ran and its results; unit tests and a disposable
+  install alone do not satisfy this release gate.
 
 ## No identifiers
 

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.2: readiness and hook diagnostics (Codex package 0.8.12)
+
+- Repeated hook deliveries include their observation time in their identity, matching their timestamped
+  contents. Previously, a repeated payload carrying a turn, agent or tool ID could conflict with the
+  earlier record and be rejected. Conflicts remain denied and now return the fixed `record_conflict`
+  code. Hook health retains the last fixed ingestion rejection code without event contents.
+- `learning-status` distinguishes idle ingestion from waiting for the first hook event and points to
+  `/hooks` on the main checkout. It shows each provider's attestation state using admission's existing
+  owner-verified project/account lookup. `billing_attestation_missing` names the wizard's re-attestation
+  option; admission and child permissions are unchanged.
+- Validation explains that a writable Codex mapping is skipped: routing tries other eligible providers
+  or denies the task. The usage guide documents proposed patches applied by the primary; wizard step 8
+  names the clone and folders containing set-up projects, and the hook trust reminder applies to main checkouts.
+- The manual QA recipe runs Python wrappers in-process and puts no flags in their first line. It warns
+  about bytecode and resource limits. Operational QA returns separate fixed failure-stage codes and
+  each check's exit code, while keeping stdout/stderr private and preserving the check report and receipt
+  contracts.
+- The Claude skill documents `result_attempts`. Observation admission errors name the failed contract
+  rule without values. The attestation test helper closes its pty before waiting for the child.
+- The Codex session guard now reports the existing sandbox-disabled refusal when Codex omits
+  filesystem entries for `danger-full-access`, rather than masking it as an unknown record format.
+  Sandboxed sessions still require the complete filesystem policy; admission is unchanged.
+- Contributors must test a release on a real install from its `version/*` branch before opening its
+  pull request to `main`. This feature branch does not satisfy that owner-run release gate.
+- **Independent verification.** A routed Claude Opus/high source review found a false packaged-fallback
+  warning, QA documentation overclaims and a misleading collector-down status message. These are
+  corrected, with CLI regressions for missing-attestation guidance, slow signature lookup and unavailable
+  status. The lookup uses a longer status timeout; signature checks still share the collector thread,
+  so status can delay or drop hook events and produce ambiguous failure counters as attestations grow.
+  Historical lifecycle gaps cannot be attributed from
+  aggregate counters alone. The earlier Haiku research report was rejected by its routed Codex/high
+  verifier for overclaims; only the reproduced hook collision informed the fix.
+- **Release security review continuation.** A routed Codex Astra/high source review and its independent
+  Claude Opus/high verifier found no reproducible authority, privacy or QA-diagnostic security defect.
+  The verifier caught SECURITY.md still naming the previous release; its version text is corrected.
+  Both operational checks passed, but managed QA rejected the original review's documentation criterion.
+  That recorded rejection remains; these documentation corrections have local checks only.
+  The repository suite passed 271 tests (two skipped), and the Claude suite passed 100. The Codex suite
+  passed 710 of 711; the remaining bytecode-fixture test conflicted with the invocation's cache-prefix
+  override and passed in a 17-test focused rerun without it. Ruff and the file and new-commit identifier
+  scans passed. The full-history scan still flags two pre-existing merge authors against the local
+  private denylist. Source review and these checks do not satisfy the real-install release gate.
+
 ## 0.2.1: Codex primary usability and owner key replacement (Codex package 0.8.11)
 
 - **Codex skill input forms.** A Codex primary kept failing on its own inputs, so:

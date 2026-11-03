@@ -958,7 +958,7 @@ class VerifiedQaTests(unittest.TestCase):
                 encoding="utf-8",
             )
             failing.write_text(
-                f"#!{sys.executable}\nraise SystemExit(1)\n", encoding="utf-8"
+                f"#!{sys.executable}\nprint('SENTINEL_PROJECT_SECRET')\nraise SystemExit(1)\n", encoding="utf-8"
             )
             passing.chmod(0o700)
             failing.chmod(0o700)
@@ -1017,7 +1017,12 @@ class VerifiedQaTests(unittest.TestCase):
                 cwd=root,
                 check=True,
             )
-            report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
+            diagnostics = []
+            report = run_operational_check_suite(root, scratch_root=self.qa_scratch(),
+                                                 diagnostics=diagnostics)
+        self.assertEqual({"check_id": "security", "status": "failed", "return_code": 1,
+                          "reason_code": "nonzero_exit"}, diagnostics[1])
+        self.assertNotIn("SENTINEL_PROJECT_SECRET", json.dumps([report, diagnostics]))
         self.assertTrue(report["deterministic_checks"][0]["passed"])
         self.assertFalse(report["security_checks"][0]["passed"])
         self.assertEqual(
@@ -1334,7 +1339,9 @@ class VerifiedQaTests(unittest.TestCase):
                 f"#!{sys.executable}\n"
                 "import os\n"
                 "from pathlib import Path\n"
-                "Path(os.environ['TMPDIR'], 'output').write_bytes(b'x' * 4096)\n",
+                # Each file fits RLIMIT_FSIZE; the aggregate must still be refused.
+                "for index in range(300):\n"
+                "    Path(os.environ['TMPDIR'], str(index)).write_bytes(b'x' * 4)\n",
                 encoding="utf-8",
             )
             script.chmod(0o700)
@@ -1372,8 +1379,11 @@ class VerifiedQaTests(unittest.TestCase):
                 check=True,
             )
 
+            diagnostics = []
             with patch("codex_agents.learning_engine.MAX_QA_TEMP_BYTES", 1024):
-                report = run_operational_check_suite(root, scratch_root=self.qa_scratch())
+                report = run_operational_check_suite(root, scratch_root=self.qa_scratch(),
+                                                     diagnostics=diagnostics)
+            self.assertEqual("temporary_storage_limit", diagnostics[0]["reason_code"])
             self.assertFalse(report["deterministic_checks"][0]["passed"])
             self.assertFalse(report["security_checks"][0]["passed"])
 

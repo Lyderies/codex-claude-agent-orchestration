@@ -149,6 +149,24 @@ class SessionGuardTests(GuardTestCase):
         self.check()
         self.assertEqual("ok", session_guard_status(self.copy, self.clone))
 
+    def test_disabled_sandbox_without_filesystem_entries_is_refused_specifically(self) -> None:
+        path = self.sessions.write(self.project, sandbox="danger-full-access")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        context = records[-1]["payload"]
+        context.pop("file_system_sandbox_policy")
+        context["permission_profile"] = {"type": "disabled"}
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        self.assert_refused("runs without its sandbox (danger-full-access)")
+
+    def test_sandboxed_sessions_still_require_filesystem_entries(self) -> None:
+        for sandbox in ("workspace-write", "read-only", "unknown-sandbox"):
+            with self.subTest(sandbox=sandbox):
+                path = self.sessions.write(self.project, sandbox=sandbox)
+                records = [json.loads(line) for line in path.read_text().splitlines()]
+                records[-1]["payload"].pop("file_system_sandbox_policy")
+                path.write_text("".join(json.dumps(record) + "\n" for record in records))
+                self.assert_refused("not in the format")
+
     def test_a_read_only_session_is_accepted(self) -> None:
         self.sessions.write(
             self.project, sandbox="read-only", entries=[special_entry("root", "read")],

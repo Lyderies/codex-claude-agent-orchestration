@@ -20,19 +20,28 @@ CLI=packages/codex-agents/native-package/.codex/orchestration/cli.py
 ## Operational checks
 
 A project that has never been set up needs `operational-checks.json`. It names the exact test and security
-commands, with their hashes, that operational QA may run. In the project, write two small wrapper scripts
-(one runs your tests, one runs a secret scanner), commit them, then compute the hashes. The wrappers must
-be committed, because the installer checks that each file matches a clean commit. The security example
-uses `gitleaks` (`brew install gitleaks`, or download it from the project's release page); any equivalent
-secret scanner works the same way.
+commands, with their hashes, that operational QA may run. Write two small Python wrappers and commit them
+before computing their hashes: the installer checks that each file matches a clean commit.
+
+Both wrappers must run **in-process**. QA denies starting another process, so `subprocess`, `os.system` and
+wrappers that launch `python`, `pytest` or `gitleaks` as a command fail. Use the test runner's
+Python API and a project-maintained Python security scanner that also runs in-process. The example below
+assumes `scripts/scan_secrets.py` exists and exits nonzero on findings; supply and test that scanner first.
+A scanner needing Python packages also needs a pinned `runtime_tree` in the check configuration.
+
+The first line is only `#!` plus the absolute trusted interpreter path, **with no interpreter flags**.
+QA checks that line, snapshots the pinned interpreter and starts it directly with a minimal environment.
+It does not take flags from the first line. Set `QA_PYTHON` to the real
+trusted interpreter file (not a symlink or macOS's `/usr/bin/python3` shim).
 
 ```sh
 cd /path/to/project
-printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["python3", "-m", "unittest", "discover"]))\n' > qa-check
-printf '#!/usr/bin/python3\nimport subprocess, sys\nsys.exit(subprocess.call(["gitleaks", "detect", "--no-banner", "--redact"]))\n' > qa-security
+QA_PYTHON=/absolute/path/to/trusted/python3
+printf '#!%s\nimport os, sys, unittest\nsys.path.insert(0, os.getcwd())\nsuite = unittest.defaultTestLoader.discover("tests")\nraise SystemExit(0 if unittest.TextTestRunner().run(suite).wasSuccessful() else 1)\n' "$QA_PYTHON" > qa-check
+printf '#!%s\nimport os, runpy, sys\nsys.path.insert(0, os.getcwd())\nrunpy.run_path("scripts/scan_secrets.py", run_name="__main__")\n' "$QA_PYTHON" > qa-security
 chmod 700 qa-check qa-security
-git add qa-check qa-security && git commit -m "Add QA check wrappers"
-INTERP=$(shasum -a 256 /usr/bin/python3 | cut -d' ' -f1)   # sha256sum on Linux
+git add qa-check qa-security scripts/scan_secrets.py && git commit -m "Add QA check wrappers"
+INTERP=$(shasum -a 256 "$QA_PYTHON" | cut -d' ' -f1)   # sha256sum on Linux
 check() { # check ID WRAPPER
   printf '{"check_id": "%s", "driver": "python-wrapper", "argv": ["./%s"], "executable_sha256": "%s", "interpreter_sha256": "%s", "runtime_tree": null, "timeout_seconds": 600}' \
     "$1" "$2" "$(shasum -a 256 "$2" | cut -d' ' -f1)" "$INTERP"
@@ -45,7 +54,18 @@ Give `../operational-checks.json` to the wizard when it asks, or to the installe
 `--operational-checks`. The format is described by
 `packages/codex-agents/native-package/.codex/orchestration/schemas/operational-checks.schema.json` and
 used by `tests/test_install.py`. Operational QA runs these commands inside macOS's sandbox (with the
-`xcrun` lookup cache off) and fails closed on other systems.
+`xcrun` lookup cache off) and fails closed on other systems. The sandbox also limits temporary storage
+and file sizes; tests requiring larger fixtures cannot pass that QA gate unchanged.
+
+QA suppresses stdout and stderr because tests and scanners can print project secrets. The agent receives
+only fixed diagnostic codes, the check's status and its exit code, alongside the unchanged receipt.
+For a nonzero exit, inspect the wrapper locally in your own terminal; check that it runs in-process and
+that its imports and fixtures fit the sandbox. Do not paste raw test or scanner output into run records.
+
+Keep bytecode out of installed orchestration folders. Use `-I -B -S -X pycache_prefix=/dev/null` for CLI
+commands: `-B` alone stops writes but still reads existing `.pyc` files. Ordinary tests or imports may leave
+`__pycache__` behind; an extra file in `.codex/orchestration` makes verification and the protected command
+rule refuse the install. Have the owner clean or reinstall it through setup, then verify again.
 
 ## 1. Install
 

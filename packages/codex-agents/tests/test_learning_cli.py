@@ -24,6 +24,7 @@ from codex_agents.learning_contracts import (
 from codex_agents.learning_adapters import load_client_capabilities
 from codex_agents.learning_store import (
     CollectorClient,
+    CollectorServer,
     CollectorError,
     CollectorMaintenance,
     CollectorRestartError,
@@ -35,6 +36,8 @@ from codex_agents.learning_store import (
 from cli import _RestartingLedger, _close_ledger
 from cli import main as cli_main
 from codex_agents.learning_engine import generate_candidate, runtime_fixture_digest
+from codex_agents.providers import AdmissionDenied
+from codex_agents.bridge import BridgeRefused
 from tests.learning_support import (
     DIGEST_A,
     DIGEST_B,
@@ -420,11 +423,59 @@ class LearningCliTests(unittest.TestCase):
         finally:
             self._stop_collector()
 
+    def test_missing_billing_attestation_names_the_wizard_option(self) -> None:
+        for failure, field, reason in (
+            (AdmissionDenied("billing_attestation_missing"),
+             "reason_code", "billing_attestation_missing"),
+            (BridgeRefused("launch denied: billing_attestation_missing"),
+             "reason", "launch denied: billing_attestation_missing"),
+        ):
+            with self.subTest(field=field), mock.patch.object(
+                LearningLedger, "observe_provider", side_effect=failure
+            ):
+                report = self._observe("claude", expected=2)
+            self.assertEqual(reason, report[field])
+            self.assertIn('"Re-run the billing attestation only"', report["hint"])
+
+    def test_status_allows_time_for_owner_signature_verification(self) -> None:
+        ledger = LearningLedger(LearningState(self.state_root, create=False))
+        server = CollectorServer(ledger)
+        original = ledger.provider_attestation_status
+
+        def slow_report(project_id):
+            time.sleep(0.35)  # Longer than the hook client's short delivery timeout.
+            return original(project_id)
+
+        server.start()
+        try:
+            with mock.patch.object(ledger, "provider_attestation_status", side_effect=slow_report):
+                report = self._run("learning-status")
+            self.assertEqual("present", report["provider_attestations"]["codex"]["state"])
+        finally:
+            server.stop()
+            ledger.close()
+
+    def test_unavailable_collector_does_not_claim_hooks_have_never_delivered(self) -> None:
+        stdout = io.StringIO()
+        arguments = ["cli.py", "learning-status", "--state-root", str(self.state_root),
+                     "--project-root", str(self.project)]
+        with mock.patch.object(sys, "argv", arguments), contextlib.redirect_stdout(stdout), \
+                mock.patch("cli.ensure_collector", side_effect=CollectorError(
+                    "unavailable", code="transport_unavailable")):
+            self.assertEqual(1, cli_main())
+        report = json.loads(stdout.getvalue())
+        self.assertEqual("unavailable", report["ingestion"]["ingestion_state"])
+        self.assertEqual("unavailable", report["ingestion"]["freshness"]["state"])
+        self.assertNotIn("/hooks", report["ingestion"]["freshness"]["message"])
+        self.assertEqual("unavailable", report["provider_attestations"]["codex"]["state"])
+
     def test_status_recovers_collector_and_direct_command_restarts_it(self) -> None:
         try:
             first = self._run("learning-status")
             self.assertTrue(first["ready"])
             self.assertTrue(first["active"])
+            self.assertEqual("present", first["provider_attestations"]["codex"]["state"])
+            self.assertEqual("identity_missing", first["provider_attestations"]["claude"]["state"])
             self.assertEqual(
                 "awaiting_hook_review_or_first_event",
                 first["ingestion"]["freshness"]["state"],

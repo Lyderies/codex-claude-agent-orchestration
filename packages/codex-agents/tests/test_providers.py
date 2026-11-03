@@ -1100,6 +1100,26 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "not belong to a Claude run"):
             self.event(codex_run, status="allowed")
 
+    def test_attestation_status_uses_current_owner_and_account_in_this_project(self) -> None:
+        def report():
+            return self.ledger.provider_attestation_status(self.project_id)
+        self.assertEqual("identity_missing", report()["codex"]["state"])
+        identity = self.observe()[0]
+        self.assertEqual("missing", report()["codex"]["state"])
+        self.attest("codex", "0" * 64)
+        self.assertEqual("missing", report()["codex"]["state"])
+        self.attest("codex", identity["account_fingerprint"])
+        self.assertEqual("present", report()["codex"]["state"])
+        other = Path(self.temporary.name) / "other-project"
+        other.mkdir()
+        other_id = self.ledger.register_project(other)
+        self.assertEqual("identity_missing",
+                         self.ledger.provider_attestation_status(other_id)["codex"]["state"])
+        key, public = self.other_key()
+        self.ledger.replace_owner_key(public)
+        self.assertEqual("missing", report()["codex"]["state"])
+        self.assertNotIn(identity["account_fingerprint"], json.dumps(report()))
+
     def test_attestations_require_an_owner_signature(self) -> None:
         identity = self.observe()[0]
         record = billing_attestation_record({

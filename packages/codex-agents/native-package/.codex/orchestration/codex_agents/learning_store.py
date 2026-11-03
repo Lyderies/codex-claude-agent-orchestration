@@ -180,6 +180,12 @@ SOURCE_BY_PRODUCER = {
     "provider": "provider",
 }
 HOOK_EVENT_CODES = tuple(value[0] for value in HOOK_EVENTS.values())
+HOOK_INGEST_REASON_CODES = {
+    "binding_invalid", "provenance_mismatch", "capability_mismatch",
+    "operation_rejected", "operation_invalid", "project_unregistered", "record_conflict",
+    "request_timeout", "request_oversized", "request_invalid", "protocol_mismatch",
+    "transport_unavailable", "response_invalid", "unknown_rejection",
+}
 HOOK_REJECTION_CODES = {
     "hook_normalization_rejected",
     "hook_binding_rejected",
@@ -202,6 +208,10 @@ def empty_ingestion_snapshot(*, registered: bool) -> dict[str, Any]:
                 "awaiting_hook_review_or_first_event" if registered else "unregistered"
             ),
             "age_ms": None,
+            "message": (
+                "No events since the hooks were installed; open /hooks on the main checkout."
+                if registered else "Project is not registered."
+            ),
         },
         "hook_event_counts": {code: 0 for code in HOOK_EVENT_CODES},
         "coverage": {
@@ -5580,7 +5590,8 @@ class LearningLedger:
         try:
             checked_observation = validate_host_observation(observation)
         except ContractError as exc:
-            raise LedgerError("host observation admission rejected") from exc
+            # validate_host_observation uses only fixed rule text and internal field names.
+            raise LedgerError(f"host observation admission rejected: {exc}") from exc
         try:
             checked_result = validate_result(result, assignment=assignment)
         except ContractError as exc:
@@ -6292,6 +6303,32 @@ class LearningLedger:
             "orchestration_id": orchestration_id,
             "worker_result": worker_result,
         }
+
+    def provider_attestation_status(self, project_id: str) -> dict[str, Any]:
+        """Display only, using admission's owner-verified project/account lookup."""
+
+        from .providers import _latest
+
+        report = {}
+        with self._lock:
+            for provider in ("codex", "claude"):
+                identity = _latest(self._provider_records_locked(
+                    project_id, "provider_identity", provider
+                ))
+                attestations = self._provider_records_locked(
+                    project_id, "billing_attestation", provider
+                )
+                if identity is None:
+                    status = "identity_missing"
+                else:
+                    fingerprint = identity[0]["account_fingerprint"]
+                    attestation = _latest([
+                        item for item in attestations
+                        if item[0]["account_fingerprint"] == fingerprint
+                    ])
+                    status = "present" if attestation is not None else "missing"
+                report[provider] = {"state": status}
+        return report
 
     def billing_waived_by_attestation(
         self, project_id: str, record: dict[str, Any]
@@ -9045,14 +9082,21 @@ class LearningLedger:
         freshness = (
             "awaiting_hook_review_or_first_event"
             if age is None
-            else "fresh" if age <= INGESTION_FRESH_MS else "stale"
+            else "fresh" if age <= INGESTION_FRESH_MS else "idle"
         )
         snapshot.update(
             accepted_hook_event_count=sum(counts.values()),
             last_accepted_hook_event_at_ms=last_accepted,
             rejected_hook_event_count=rejected_count,
             last_rejected_hook_event_at_ms=last_rejected,
-            freshness={"state": freshness, "age_ms": age},
+            freshness={
+                "state": freshness, "age_ms": age,
+                "message": (
+                    "No events since the hooks were installed; open /hooks on the main checkout."
+                    if age is None else "Hooks have delivered events; no recent activity."
+                    if freshness == "idle" else "Hooks are delivering events."
+                ),
+            },
             hook_event_counts=counts,
             managed_lifecycle={
                 "orchestrations_active": sum(
@@ -9604,9 +9648,14 @@ class CollectorServer:
                     or record["event_code"] not in binding.event_codes
                 ):
                     return {"ok": False, "code": "capability_mismatch"}
-                result = self.ledger.append(
-                    binding.project_id, record, producer=binding.producer
-                )
+                try:
+                    result = self.ledger.append(
+                        binding.project_id, record, producer=binding.producer
+                    )
+                except LedgerError as exc:
+                    if str(exc) == "record identifier conflicts with existing content":
+                        return {"ok": False, "code": "record_conflict"}
+                    raise
                 return {"ok": True, **result}
             if request.get("op") == "issue_result_repair" and set(request) == {
                 "protocol",
@@ -9636,6 +9685,9 @@ class CollectorServer:
                 if "project_root" in request:
                     project_root = Path(request["project_root"])
                     project_id = self.ledger.project_for_root(project_root)
+                    response["provider_attestations"] = (
+                        self.ledger.provider_attestation_status(project_id)
+                    )
                     response["collector_health"] = self.ledger.health_snapshot(
                         project_id
                     )
@@ -9701,13 +9753,13 @@ class CollectorClient:
                 if len(raw) > 16_384:
                     raise CollectorError("collector response is oversized")
         except OSError as exc:
-            raise CollectorError("collector is unavailable") from exc
+            raise CollectorError("collector is unavailable", code="transport_unavailable") from exc
         finally:
             client.close()
         try:
             response = json.loads(bytes(raw).split(b"\n", 1)[0])
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CollectorError("collector response is invalid") from exc
+            raise CollectorError("collector response is invalid", code="response_invalid") from exc
         if not isinstance(response, dict) or response.get("ok") is not True:
             code = response.get("code", "unknown") if isinstance(response, dict) else "unknown"
             raise CollectorError(f"collector rejected request: {code}", code=code)
@@ -9846,7 +9898,11 @@ def _client_health_data(state: LearningState) -> dict[str, Any]:
         for counter in counters.values():
             if (
                 not isinstance(counter, dict)
-                or set(counter) != {"count", "updated_at_ms"}
+                or set(counter) not in ({"count", "updated_at_ms"},
+                                        {"count", "updated_at_ms", "last_reason_code"})
+                or ("last_reason_code" in counter
+                    and (not isinstance(counter["last_reason_code"], str)
+                         or counter["last_reason_code"] not in HOOK_INGEST_REASON_CODES))
                 or not isinstance(counter["count"], int)
                 or isinstance(counter["count"], bool)
                 or counter["count"] < 1
@@ -9864,6 +9920,7 @@ def client_health_increment(
     code: str,
     *,
     now_ms: int | None = None,
+    reason_code: str | None = None,
 ) -> None:
     """Persist one content-free, project-keyed client failure counter."""
 
@@ -9890,6 +9947,11 @@ def client_health_increment(
             "count": int(current.get("count", 0)) + 1,
             "updated_at_ms": timestamp,
         }
+        if reason_code is not None and code == "hook_ingest_rejected":
+            project[code]["last_reason_code"] = (
+                reason_code if isinstance(reason_code, str) and reason_code in HOOK_INGEST_REASON_CODES
+                else "unknown_rejection"
+            )
         temporary = state.root / f".collector-client-health.{secrets.token_hex(8)}.tmp"
         payload = canonical_json(data) + b"\n"
         file_descriptor = os.open(

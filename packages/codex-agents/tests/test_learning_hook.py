@@ -19,6 +19,8 @@ from codex_agents.learning_adapters import (
     reconcile_run,
 )
 from codex_agents.learning_store import (
+    CollectorClient,
+    CollectorError,
     CollectorServer,
     LearningLedger,
     LearningState,
@@ -92,6 +94,40 @@ class LearningHookTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode)
         self.assertEqual("", completed.stdout)
         self.assertEqual("", completed.stderr)
+
+    def test_repeated_lifecycle_deliveries_ingest_without_content_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            base = Path(directory)
+            state = LearningState(base / "state")
+            project = base / "project"
+            project.mkdir()
+            ledger = LearningLedger(state)
+            project_id = ledger.register_project(project)
+            server = CollectorServer(ledger)
+            server.start()
+            try:
+                client = CollectorClient(state.socket)
+                for event in ("SessionStart", "SubagentStart", "UserPromptSubmit", "PreToolUse"):
+                    payload = {"hook_event_name": event, "session_id": "session",
+                               "turn_id": "turn", "agent_id": "agent", "tool_use_id": "tool"}
+                    for timestamp in (100, 101):
+                        record = normalize_hook(payload, digest_key=state.digest_key(),
+                                                client_version="codex-hooks-v1",
+                                                observed_at_ms=timestamp)
+                        binding = client.bind(project, "session", "hook", "codex-hooks-v1")
+                        self.assertTrue(client.ingest(binding, record)["stored"])
+                # An actual content conflict stays denied, with a fixed diagnostic.
+                conflict = {**record, "observed_at_ms": 102}
+                binding = client.bind(project, "session", "hook", "codex-hooks-v1")
+                with self.assertRaises(CollectorError) as rejected:
+                    client.ingest(binding, conflict)
+                self.assertEqual("record_conflict", rejected.exception.code)
+                counts = ledger.ingestion_snapshot(project_id)["hook_event_counts"]
+                for code in ("session_started", "subagent_started", "turn_started", "tool_started"):
+                    self.assertEqual(2, counts[code])
+            finally:
+                server.stop()
+                ledger.close()
 
     def test_deleted_project_hook_does_not_recreate_client_failures(self) -> None:
         payload = json.loads((FIXTURES / "hook-pre-tool.json").read_text())
@@ -211,6 +247,8 @@ class LearningHookTests(unittest.TestCase):
                 health = client_health_snapshot(state, project)
                 self.assertEqual(1, health["hook_binding_rejected"]["count"])
                 self.assertEqual(1, health["hook_ingest_rejected"]["count"])
+                self.assertEqual("capability_mismatch",
+                                 health["hook_ingest_rejected"]["last_reason_code"])
                 self.assertNotIn("rejection-session", json.dumps(health))
             finally:
                 server.stop()

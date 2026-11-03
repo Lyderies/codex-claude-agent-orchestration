@@ -326,6 +326,10 @@ def _close_ledger(ledger: LearningLedger | _RestartingLedger) -> None:
 
 # Codex's sandbox blocks the collector's socket and state, so a sandboxed primary
 # gets this alongside the unchanged error.
+BILLING_ATTESTATION_HINT = (
+    'Run ./setup.sh for this project and choose "Re-run the billing attestation only".'
+)
+
 CODEX_SANDBOX_HINT = (
     "If this ran inside the Codex sandbox: run host-command --project-root "
     "<exact-root> and repeat this command with its argv_prefix; if codex_rule is not "
@@ -1607,7 +1611,9 @@ def main() -> int:
                         ORCHESTRATION_ROOT / "cli.py",
                         project_root=args.project_root,
                     )
-                    health = CollectorClient(state.socket).health(args.project_root)
+                    # Status verifies owner signatures using admission's lookup. Give
+                    # that read more time than the short hook-delivery socket timeout.
+                    health = CollectorClient(state.socket, timeout=5.0).health(args.project_root)
                 client_failures = client_health_snapshot(state, args.project_root)
                 report = {
                     "ready": True,
@@ -1619,18 +1625,29 @@ def main() -> int:
                     "collector_health": health.get("collector_health", {}),
                     "client_failures": client_failures,
                     "ingestion": health["ingestion"],
+                    "provider_attestations": health["provider_attestations"],
                     "owner_key": state.owner_key_report(),
                 }
             except CollectorError as exc:
                 client_failures = client_health_snapshot(state, args.project_root)
+                ingestion = empty_ingestion_snapshot(
+                    registered=exc.code != "project_unregistered"
+                )
+                if exc.code != "project_unregistered":
+                    ingestion["ingestion_state"] = "unavailable"
+                    ingestion["freshness"] = {
+                        "state": "unavailable", "age_ms": None,
+                        "message": "Hook delivery is unknown while the collector is unavailable.",
+                    }
                 report = _with_codex_hint(args.command, {
                     "ready": False,
                     "active": False,
                     "error": "collector or project registration is unavailable",
+                    "provider_attestations": {
+                        provider: {"state": "unavailable"} for provider in ("codex", "claude")
+                    },
                     "client_failures": client_failures,
-                    "ingestion": empty_ingestion_snapshot(
-                        registered=exc.code != "project_unregistered"
-                    ),
+                    "ingestion": ingestion,
                     "owner_key": state.owner_key_report(),
                 })
         elif args.command == "learning-backup-project":
@@ -2282,8 +2299,9 @@ def main() -> int:
                     host_outcome_digest=args.host_outcome_digest,
                     verifier_host_outcome_digest=args.verifier_host_outcome_digest,
                 )
+                diagnostics: list[dict[str, object]] = []
                 check_report = run_operational_check_suite(
-                    args.project_root, scratch_root=ledger.state.root
+                    args.project_root, scratch_root=ledger.state.root, diagnostics=diagnostics
                 )
                 receipt = ledger.issue_operational_check_receipt(
                     project_id,
@@ -2295,6 +2313,7 @@ def main() -> int:
                     "ready": True,
                     **receipt,
                     "check_report": check_report,
+                    "diagnostics": diagnostics,
                 }
             finally:
                 _close_ledger(ledger)
@@ -3102,14 +3121,20 @@ def main() -> int:
         return 2
     except BridgeRefused as exc:
         # Refusal messages are fixed strings; they never carry prompts or paths.
-        _print({"ready": False, "error": "dispatch refused", "reason": str(exc)})
+        report = {"ready": False, "error": "dispatch refused", "reason": str(exc)}
+        if str(exc) == "launch denied: billing_attestation_missing":
+            report["hint"] = BILLING_ATTESTATION_HINT
+        _print(report)
         return 2
     except AdmissionDenied as exc:
-        _print({
+        report = {
             "ready": False,
             "error": "provider admission denied",
             "reason_code": exc.reason_code,
-        })
+        }
+        if exc.reason_code == "billing_attestation_missing":
+            report["hint"] = BILLING_ATTESTATION_HINT
+        _print(report)
         return 2
     except ContractError as exc:
         # Only the field's name is printed: the message can hold the input's values.

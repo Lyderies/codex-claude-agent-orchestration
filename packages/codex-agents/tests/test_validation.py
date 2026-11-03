@@ -281,10 +281,13 @@ class PackageValidationTests(unittest.TestCase):
                 any("smoke" in error or "eligible" in error for error in report["errors"]),
                 report,
             )
-            for name in ("implementation_worker", "verification_worker"):
+            for agent, kind in (("implementation_worker", "worker"), ("verification_worker", "verifier")):
                 self.assertIn(
-                    f"{name} is workspace-write; Codex children are bridged read-only in "
-                    "this release, so it is not used for Codex routes",
+                    f"{agent} is workspace-write; Codex children are bridged read-only in this "
+                    f"release, so the Codex coding {kind} candidate is skipped. "
+                    "Routing tries the remaining eligible provider candidates in policy order, "
+                    "or denies the task if none is eligible. A read-only Codex mapping is needed "
+                    "to use this family with Codex",
                     report["warnings"],
                 )
 

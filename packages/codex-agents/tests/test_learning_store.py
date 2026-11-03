@@ -447,6 +447,32 @@ class LearningStoreTests(unittest.TestCase):
             LearningLedger(other_state)
         self.assertEqual(b"untouched", outside.read_bytes())
 
+    def test_host_observation_rejection_names_rule_without_values(self) -> None:
+        for observation, rule in (
+            ({"run_handle": "SECRET", "result_attempts": []}, "run_handle is invalid"),
+            ({"run_handle": "hrn_" + "a" * 48, "result_attempts": []},
+             "result_attempts must contain"),
+            ({"SECRET": "SECRET"}, "unknown or missing fields"),
+        ):
+            with self.subTest(rule=rule), self.assertRaises(LedgerError) as raised:
+                self.ledger.commit_host_result(
+                    self.project_a_id, assignment={}, task={}, route={}, result={},
+                    observation=observation, execution_configuration={},
+                )
+            self.assertIn(rule, str(raised.exception))
+            self.assertNotIn("SECRET", str(raised.exception))
+
+    def test_hook_rejection_reason_is_closed_and_does_not_double_count(self) -> None:
+        for reason in ("provenance_mismatch", "SECRET"):
+            client_health_increment(self.state, self.project_a, "hook_ingest_rejected",
+                                    reason_code=reason, now_ms=5)
+        health = client_health_snapshot(self.state, self.project_a)
+        self.assertEqual({"count": 2, "updated_at_ms": 5,
+                          "last_reason_code": "unknown_rejection"}, health["hook_ingest_rejected"])
+        self.assertNotIn("SECRET", self.state.client_health.read_text())
+        self.assertEqual(2, self.ledger.ingestion_snapshot(
+            self.project_a_id, client_failures=health)["rejected_hook_event_count"])
+
     def test_registration_and_scoped_reads_are_partitioned(self) -> None:
         self.ledger.append(self.project_a_id, event_record("evt_a"), producer="hook", now_ms=2)
         self.ledger.append(self.project_b_id, event_record("evt_b"), producer="hook", now_ms=2)
@@ -508,7 +534,8 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual(208, fresh["last_accepted_hook_event_at_ms"])
         self.assertEqual(3, fresh["rejected_hook_event_count"])
         self.assertEqual(330, fresh["last_rejected_hook_event_at_ms"])
-        self.assertEqual({"state": "fresh", "age_ms": 192}, fresh["freshness"])
+        self.assertEqual("fresh", fresh["freshness"]["state"])
+        self.assertEqual(192, fresh["freshness"]["age_ms"])
         self.assertNotIn("run_1", json.dumps(fresh))
         self.assertNotIn("hook_0", json.dumps(fresh))
         snapshot_selects = [
@@ -521,7 +548,8 @@ class LearningStoreTests(unittest.TestCase):
         stale = self.ledger.ingestion_snapshot(
             self.project_a_id, now_ms=208 + INGESTION_FRESH_MS + 1
         )
-        self.assertEqual("stale", stale["freshness"]["state"])
+        self.assertEqual("idle", stale["freshness"]["state"])
+        self.assertNotIn("/hooks", stale["freshness"]["message"])
         empty_root = Path(self.temporary.name) / "empty-project"
         empty_root.mkdir()
         empty_id = self.ledger.register_project(empty_root, now_ms=1)
@@ -529,6 +557,7 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual(
             "awaiting_hook_review_or_first_event", awaiting["freshness"]["state"]
         )
+        self.assertIn("/hooks", awaiting["freshness"]["message"])
         self.assertEqual(1, self.ledger.ingestion_snapshot(
             self.project_b_id, now_ms=400
         )["accepted_hook_event_count"])

@@ -791,9 +791,13 @@ def validate_package(root: Path) -> dict[str, Any]:
         for family, sandbox in effective_policy.get(sandboxes_key, {}).items():
             agent = effective_policy.get(roles_key, {}).get(family)
             if agent is not None and sandbox != "read-only":
+                route_kind = "worker" if roles_key == "project_agent_roles" else "verifier"
                 warnings.append(
                     f"{agent} is {sandbox}; Codex children are bridged read-only in this "
-                    "release, so it is not used for Codex routes"
+                    f"release, so the Codex {family} {route_kind} candidate is skipped. "
+                    "Routing tries the remaining eligible provider candidates in policy order, "
+                    "or denies the task if none is eligible. A read-only Codex mapping is needed "
+                    "to use this family with Codex"
                 )
     # The smoke routes check the package policy alone: neither a project's
     # provider configuration nor its agent mapping changes what they expect.
