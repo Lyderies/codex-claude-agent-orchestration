@@ -269,7 +269,9 @@ def _absolute(value: object) -> Path:
     return Path(os.path.normpath(value))
 
 
-def _read_session(folder: int, name: str, thread_id: str, day: str) -> SessionRecord:
+def _read_session(
+    folder: int, name: str, thread_id: str, day: str, *, refuse_unsandboxed: bool = False
+) -> SessionRecord:
     descriptor = _open_record(folder, name)
     try:
         meta = _first_record(descriptor)
@@ -288,6 +290,11 @@ def _read_session(folder: int, name: str, thread_id: str, day: str) -> SessionRe
     policy = turn.get("sandbox_policy")
     _shape(isinstance(policy, dict) and isinstance(policy.get("type"), str))
     sandbox_type = policy["type"]
+    if refuse_unsandboxed and sandbox_type in UNSANDBOXED_TYPES:
+        # Codex omits filesystem entries when its sandbox is disabled. The guard
+        # already has a definitive refusal; do not mask it as an unknown format.
+        # The warning scanner keeps its existing parsing through the default.
+        raise SessionRefused(REASONS["unsandboxed"])
     # A workspace root is writable in every mode but read-only, where only the
     # policy's explicit write entries count.
     writable = [] if sandbox_type == "read-only" else list(workspace_roots)
@@ -333,7 +340,9 @@ def find_session(thread_id: str | None) -> SessionRecord:
         for day, folder in _day_folders(sessions):
             for name in _names(folder, ROLLOUT_NAME):
                 if ROLLOUT_NAME.fullmatch(name).group(1) == thread_id:
-                    matches.append(_read_session(folder, name, thread_id, day))
+                    matches.append(_read_session(
+                        folder, name, thread_id, day, refuse_unsandboxed=True
+                    ))
     except OSError as exc:
         raise SessionRefused(UNKNOWN_SHAPE) from exc
     finally:

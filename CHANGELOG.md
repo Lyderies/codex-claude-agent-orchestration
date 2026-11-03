@@ -18,6 +18,9 @@
   exit status, while keeping stdout/stderr private and preserving the check report and receipt contracts.
 - The Claude skill documents `result_attempts`. Observation admission errors name the failed contract
   rule without values. The attestation test helper closes its pty before waiting for the child.
+- The Codex session guard now reports the existing sandbox-disabled refusal when Codex omits
+  filesystem entries for `danger-full-access`, rather than masking it as an unknown record format.
+  Sandboxed sessions still require the complete filesystem policy; admission is unchanged.
 - Contributors must test a release on a real install from its `version/*` branch before opening its
   pull request to `main`. This feature branch does not satisfy that owner-run release gate.
 - **Independent verification.** A routed Claude Opus/high source review found a false packaged-fallback

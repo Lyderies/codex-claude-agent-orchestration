@@ -64,6 +64,17 @@ The session guard refused the command. Quit that session and start Codex in the 
 never on a folder that contains a set-up project, the orchestrator clone, your home folder, a folder above
 it or `/`. "Run Codex without --ephemeral" means the session left no record to check.
 
+## "This Codex session runs without its sandbox (danger-full-access)"
+
+Open a normal sandboxed Codex session on the project itself. A disabled permission profile cannot
+launch managed children through the protected command rule. Do not disable the guard or grant more
+filesystem access to resolve this refusal.
+
+Codex 0.164 omits filesystem-policy entries when its sandbox is disabled. Older orchestrator builds
+reported that case as an unrecognized session-record format. The updated diagnostic identifies the
+sandbox-disabled mode directly; it continues to refuse it. An unknown format in a sandboxed session
+still needs investigation before managed commands can run.
+
 ## Codex refuses with `host_client_unknown`
 
 The orchestrator tells Codex and Claude Code apart by the environment markers each client sets. A Codex
